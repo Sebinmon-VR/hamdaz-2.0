@@ -1,0 +1,1304 @@
+<title>Hamdaz 2.0 Rebuild Plan</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=Newsreader:ital,opsz,wght@0,6..72,300;0,6..72,400;0,6..72,500;1,6..72,400&family=JetBrains+Mono:wght@400;500;700&display=swap">
+
+<style>
+/* ─────────── tokens: light is the bare :root ─────────── */
+:root{
+  --paper:#F3F5F3;
+  --surface:#FFFFFF;
+  --surface-2:#EAEEEC;
+  --ink:#14202A;
+  --ink-2:#41525E;
+  --ink-3:#6E7F89;
+  --rule:#D3DAD8;
+  --rule-2:#E4E9E7;
+  --accent:#1F6F7A;
+  --accent-soft:#DCEAEC;
+  --legacy:#8A5E28;
+  --legacy-soft:#F0E6D6;
+  --critical:#9B372E;
+  --critical-soft:#F4E1DE;
+  --good:#2F6B4F;
+  --good-soft:#DFEBE4;
+  --shadow:0 1px 2px rgba(20,32,42,.05), 0 8px 24px -16px rgba(20,32,42,.25);
+  --f-display:"Archivo","Helvetica Neue",Arial,sans-serif;
+  --f-body:"Newsreader",Georgia,"Times New Roman",serif;
+  --f-mono:"JetBrains Mono",ui-monospace,"SFMono-Regular",Consolas,monospace;
+  --measure:68ch;
+  --wide:min(1180px, 94vw);
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --paper:#0E1519; --surface:#161F25; --surface-2:#1D282F;
+    --ink:#E2E9E8; --ink-2:#A9B8BD; --ink-3:#7C8D94;
+    --rule:#2A3840; --rule-2:#212D34;
+    --accent:#5BB3BE; --accent-soft:#193A40;
+    --legacy:#C99C5E; --legacy-soft:#3A2E1C;
+    --critical:#D9776B; --critical-soft:#3B211D;
+    --good:#6FB78F; --good-soft:#1B3229;
+    --shadow:0 1px 2px rgba(0,0,0,.35), 0 8px 24px -16px rgba(0,0,0,.7);
+  }
+}
+:root[data-theme="dark"]{
+  --paper:#0E1519; --surface:#161F25; --surface-2:#1D282F;
+  --ink:#E2E9E8; --ink-2:#A9B8BD; --ink-3:#7C8D94;
+  --rule:#2A3840; --rule-2:#212D34;
+  --accent:#5BB3BE; --accent-soft:#193A40;
+  --legacy:#C99C5E; --legacy-soft:#3A2E1C;
+  --critical:#D9776B; --critical-soft:#3B211D;
+  --good:#6FB78F; --good-soft:#1B3229;
+  --shadow:0 1px 2px rgba(0,0,0,.35), 0 8px 24px -16px rgba(0,0,0,.7);
+}
+
+*{box-sizing:border-box}
+body{background:var(--paper);color:var(--ink);font-family:var(--f-body);
+  font-size:17px;line-height:1.65;-webkit-font-smoothing:antialiased;margin:0}
+::selection{background:var(--accent-soft);color:var(--ink)}
+a{color:var(--accent);text-underline-offset:3px;text-decoration-thickness:1px}
+a:focus-visible{outline:2px solid var(--accent);outline-offset:3px;border-radius:2px}
+
+.shell{max-width:var(--wide);margin:0 auto;padding:0 clamp(18px,4vw,40px)}
+
+/* masthead */
+.masthead{border-bottom:1px solid var(--ink);padding:clamp(40px,7vw,84px) 0 26px;margin-bottom:8px}
+.eyebrow{font-family:var(--f-mono);font-size:11px;font-weight:500;letter-spacing:.18em;
+  text-transform:uppercase;color:var(--ink-3);display:flex;flex-wrap:wrap;gap:10px 22px;margin-bottom:26px}
+.eyebrow span{white-space:nowrap}
+h1{font-family:var(--f-display);font-weight:700;font-size:clamp(2.5rem,7vw,4.6rem);
+  line-height:.98;letter-spacing:-.03em;text-wrap:balance;margin:0 0 18px}
+h1 em{font-style:normal;color:var(--accent)}
+.standfirst{font-size:clamp(1.06rem,2.1vw,1.28rem);color:var(--ink-2);max-width:60ch;
+  line-height:1.55;margin:0;font-weight:300}
+.stamps{display:flex;flex-wrap:wrap;gap:8px;margin-top:26px}
+.stamp{font-family:var(--f-mono);font-size:11px;font-weight:500;letter-spacing:.04em;
+  padding:5px 11px;border:1px solid var(--rule);border-radius:2px;color:var(--ink-2);background:var(--surface)}
+.stamp.warn{border-color:var(--critical);color:var(--critical);background:var(--critical-soft)}
+.stamp.on{border-color:var(--accent);color:var(--accent);background:var(--accent-soft)}
+.stamp.off{border-color:var(--rule);color:var(--ink-3);background:var(--surface-2);text-decoration:line-through}
+
+/* layout */
+.doc{display:grid;grid-template-columns:1fr;gap:0}
+@media(min-width:1060px){.doc{grid-template-columns:186px minmax(0,1fr);gap:56px;align-items:start}
+  .rail{position:sticky;top:24px;padding-top:56px;display:block}}
+.rail{display:none}
+.rail-title{font-family:var(--f-mono);font-size:10px;letter-spacing:.18em;text-transform:uppercase;
+  color:var(--ink-3);margin-bottom:14px}
+.rail ol{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:1px}
+.rail a{display:grid;grid-template-columns:22px 1fr;gap:8px;align-items:baseline;
+  font-family:var(--f-display);font-size:12.5px;line-height:1.35;color:var(--ink-2);
+  text-decoration:none;padding:5px 6px 5px 0;border-radius:2px}
+.rail a:hover{color:var(--accent);background:var(--surface)}
+.rail a b{font-family:var(--f-mono);font-size:10.5px;font-weight:500;color:var(--ink-3)}
+
+/* sections */
+section{padding-top:56px;scroll-margin-top:20px}
+.sec-head{display:grid;grid-template-columns:auto 1fr;gap:14px;align-items:baseline;
+  border-top:1px solid var(--ink);padding-top:16px;margin-bottom:6px}
+.sec-num{font-family:var(--f-mono);font-size:12px;font-weight:700;color:var(--accent);letter-spacing:.06em}
+h2{font-family:var(--f-display);font-weight:600;font-size:clamp(1.5rem,3.2vw,2.05rem);
+  letter-spacing:-.022em;line-height:1.12;margin:0;text-wrap:balance}
+h3{font-family:var(--f-display);font-weight:600;font-size:1.06rem;letter-spacing:-.008em;
+  margin:38px 0 12px;color:var(--ink)}
+h3 .n{font-family:var(--f-mono);font-size:11px;font-weight:500;color:var(--ink-3);
+  margin-right:9px;letter-spacing:.05em}
+h4{font-family:var(--f-display);font-weight:600;font-size:.9rem;letter-spacing:.01em;margin:26px 0 8px}
+p{margin:0 0 1.05em;max-width:var(--measure)}
+.lede{font-size:1.1rem;color:var(--ink-2);max-width:62ch;font-weight:300}
+ul,ol{max-width:var(--measure);padding-left:1.25em;margin:0 0 1.15em}
+li{margin-bottom:.42em}
+li::marker{color:var(--ink-3)}
+strong{font-weight:500;color:var(--ink)}
+code{font-family:var(--f-mono);font-size:.82em;background:var(--surface-2);
+  padding:.1em .38em;border-radius:2px;color:var(--ink)}
+s{color:var(--ink-3);text-decoration-color:var(--rule)}
+
+/* tables */
+.tw{overflow-x:auto;margin:0 0 22px;border:1px solid var(--rule);border-radius:3px;background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-family:var(--f-display);font-size:13.5px;line-height:1.5}
+th{text-align:left;font-weight:600;font-size:10.5px;font-family:var(--f-mono);letter-spacing:.11em;
+  text-transform:uppercase;color:var(--ink-3);padding:11px 14px;border-bottom:1px solid var(--rule);
+  white-space:nowrap;background:var(--surface-2)}
+td{padding:11px 14px;border-bottom:1px solid var(--rule-2);vertical-align:top;color:var(--ink-2)}
+tr:last-child td{border-bottom:0}
+td:first-child{color:var(--ink);font-weight:500}
+td.num,th.num{font-family:var(--f-mono);font-variant-numeric:tabular-nums;text-align:right}
+td.id{font-family:var(--f-mono);font-size:11.5px;color:var(--ink-3);text-align:center;width:1%}
+
+.chip{display:inline-block;font-family:var(--f-mono);font-size:10px;font-weight:500;
+  letter-spacing:.07em;text-transform:uppercase;padding:3px 8px;border-radius:2px;
+  border:1px solid transparent;white-space:nowrap}
+.chip.hi{background:var(--critical-soft);color:var(--critical);border-color:var(--critical)}
+.chip.md{background:var(--legacy-soft);color:var(--legacy);border-color:var(--legacy)}
+.chip.port{background:var(--good-soft);color:var(--good);border-color:var(--good)}
+.chip.rebuild{background:var(--accent-soft);color:var(--accent);border-color:var(--accent)}
+.chip.defer{background:var(--surface-2);color:var(--ink-3);border-color:var(--rule)}
+.chip.ro{background:var(--critical-soft);color:var(--critical);border-color:var(--critical)}
+
+/* callout */
+.note{border-left:2px solid var(--accent);background:var(--surface);padding:16px 20px;
+  margin:0 0 24px;max-width:var(--measure);box-shadow:var(--shadow);border-radius:0 3px 3px 0}
+.note.danger{border-left-color:var(--critical)}
+.note.wide{max-width:none}
+.note p{margin:0 0 .7em;font-size:.96rem}
+.note p:last-child{margin:0}
+.note .k{display:block;font-family:var(--f-mono);font-size:10px;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--ink-3);margin-bottom:7px}
+.note.danger .k{color:var(--critical)}
+
+/* constraints */
+.cons{display:grid;gap:1px;background:var(--rule);border:1px solid var(--rule);
+  border-radius:3px;overflow:hidden;margin:0 0 24px}
+.con{background:var(--surface);padding:14px 16px;display:grid;grid-template-columns:auto 1fr;gap:14px;align-items:start}
+.con .cid{font-family:var(--f-mono);font-size:10.5px;font-weight:700;color:var(--critical);
+  border:1px solid var(--critical);background:var(--critical-soft);border-radius:2px;padding:3px 6px;line-height:1}
+.con.soft .cid{color:var(--ink-3);border-color:var(--rule);background:var(--surface-2)}
+.con b{display:block;font-family:var(--f-display);font-size:13.5px;font-weight:600;margin-bottom:3px}
+.con span{font-size:14px;color:var(--ink-2);line-height:1.5}
+
+/* metrics */
+.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(148px,1fr));gap:1px;
+  background:var(--rule);border:1px solid var(--rule);border-radius:3px;margin-bottom:24px;overflow:hidden}
+.metric{background:var(--surface);padding:16px 16px 14px}
+.metric .v{font-family:var(--f-display);font-weight:700;font-size:1.75rem;letter-spacing:-.03em;
+  color:var(--ink);font-variant-numeric:tabular-nums;line-height:1}
+.metric .v small{font-size:.5em;font-weight:500;color:var(--ink-3);margin-left:3px;letter-spacing:0}
+.metric .l{font-family:var(--f-mono);font-size:10px;letter-spacing:.09em;text-transform:uppercase;
+  color:var(--ink-3);margin-top:8px;line-height:1.4}
+
+/* architecture */
+.arch{border:1px solid var(--rule);border-radius:3px;overflow:hidden;background:var(--surface);margin-bottom:10px}
+.layer{padding:15px 18px;border-bottom:1px solid var(--rule)}
+.layer:last-child{border-bottom:0}
+.layer .lh{display:flex;flex-wrap:wrap;align-items:baseline;gap:10px;margin-bottom:11px}
+.layer .lt{font-family:var(--f-display);font-weight:600;font-size:13.5px;letter-spacing:-.01em}
+.layer .ls{font-family:var(--f-mono);font-size:10.5px;color:var(--ink-3);letter-spacing:.03em}
+.boxes{display:flex;flex-wrap:wrap;gap:6px}
+.box{font-family:var(--f-mono);font-size:11px;padding:6px 10px;border-radius:2px;
+  border:1px solid var(--rule);background:var(--surface-2);color:var(--ink-2)}
+.layer.fe{background:var(--accent-soft)}
+.layer.fe .box{border-color:var(--accent);color:var(--accent);background:transparent}
+.layer.ext{background:var(--legacy-soft)}
+.layer.ext .box{border-color:var(--legacy);color:var(--legacy);background:transparent}
+.flow{font-family:var(--f-mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--ink-3);text-align:center;padding:9px 0;background:var(--surface-2);
+  border-bottom:1px solid var(--rule)}
+.flow.block{color:var(--critical);background:var(--critical-soft);border-bottom-color:var(--critical)}
+.cap{font-family:var(--f-mono);font-size:10.5px;color:var(--ink-3);margin:0 0 24px;line-height:1.5}
+
+pre{font-family:var(--f-mono);font-size:11.5px;line-height:1.62;background:var(--surface);
+  border:1px solid var(--rule);border-radius:3px;padding:16px 18px;overflow-x:auto;
+  margin:0 0 22px;color:var(--ink-2);-moz-tab-size:2;tab-size:2}
+pre b{color:var(--accent);font-weight:500}
+pre i{color:var(--ink-3);font-style:normal}
+pre u{color:var(--legacy);text-decoration:none}
+
+/* phases */
+.phases{display:flex;flex-direction:column;gap:1px;background:var(--rule);
+  border:1px solid var(--rule);border-radius:3px;overflow:hidden;margin-bottom:14px}
+.phase{background:var(--surface);padding:17px 18px;display:grid;grid-template-columns:auto 1fr;gap:16px;align-items:start}
+.phase.deferred{background:var(--surface-2)}
+.phase .pn{font-family:var(--f-mono);font-size:11px;font-weight:700;color:var(--accent);
+  border:1px solid var(--accent);border-radius:2px;padding:4px 7px;line-height:1;white-space:nowrap;margin-top:2px}
+.phase.deferred .pn{color:var(--ink-3);border-color:var(--rule)}
+.phase h4{margin:0 0 5px;font-size:14.5px}
+.phase .meta{display:flex;flex-wrap:wrap;gap:6px 14px;margin-bottom:8px;font-family:var(--f-mono);
+  font-size:10px;letter-spacing:.07em;text-transform:uppercase;color:var(--ink-3)}
+.phase p{margin:0 0 7px;font-size:14.2px;line-height:1.55;max-width:74ch}
+.phase .exit{font-size:13.4px;color:var(--ink-2);max-width:74ch;margin:0}
+.phase .exit b{font-family:var(--f-mono);font-size:9.5px;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--accent);font-weight:500;margin-right:7px}
+.bar{height:5px;background:var(--surface-2);border-radius:2px;overflow:hidden;display:flex;
+  margin-bottom:26px;border:1px solid var(--rule)}
+.bar i{display:block;height:100%;border-right:1px solid var(--surface)}
+.bar i:last-child{border-right:0}
+
+/* questions */
+.qs{list-style:none;padding:0;max-width:var(--measure);counter-reset:q}
+.qs li{counter-increment:q;display:grid;grid-template-columns:26px 1fr;gap:12px;
+  padding:13px 0;border-bottom:1px solid var(--rule-2);margin:0}
+.qs li:last-child{border-bottom:0}
+.qs li::before{content:counter(q,decimal-leading-zero);font-family:var(--f-mono);
+  font-size:10.5px;color:var(--accent);font-weight:500;padding-top:5px}
+.qs li p{margin:0;font-size:15px}
+.qs li p b{display:block;font-family:var(--f-display);font-weight:600;font-size:14px;margin-bottom:2px}
+
+/* dead code */
+.dead{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:1px;
+  background:var(--rule);border:1px solid var(--rule);border-radius:3px;overflow:hidden;margin-bottom:22px}
+.dead > div{background:var(--surface);padding:14px 16px}
+.dead h4{margin:0 0 4px;font-size:12.5px}
+.dead .ct{font-family:var(--f-mono);font-size:10px;letter-spacing:.09em;text-transform:uppercase;
+  color:var(--ink-3);margin-bottom:9px}
+.dead ul{margin:0;padding:0;list-style:none;font-family:var(--f-mono);font-size:11px;
+  line-height:1.75;color:var(--ink-3);max-width:none}
+.dead li{margin:0;text-decoration:line-through;text-decoration-color:var(--rule)}
+.dead p{font-family:var(--f-mono);font-size:10.5px;color:var(--ink-3);margin:9px 0 0;line-height:1.5}
+
+footer{border-top:1px solid var(--ink);margin-top:70px;padding:24px 0 60px;
+  font-family:var(--f-mono);font-size:10.5px;letter-spacing:.06em;color:var(--ink-3);
+  display:flex;flex-wrap:wrap;gap:8px 26px;justify-content:space-between}
+
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+
+<div class="shell">
+
+  <header class="masthead">
+    <div class="eyebrow">
+      <span>Hamdaz · Internal</span><span>Project Plan · Draft v2</span><span>23 Aug 2026</span>
+    </div>
+    <h1>Rebuilding the<br>Hamdaz <em>ERP</em></h1>
+    <p class="standfirst">
+      A one-team Flask application becomes a multi-team platform: real teams and roles, an admin
+      control plane where policy is configured rather than coded, a developer panel that shows
+      everything the system is doing — and a database the company actually owns.
+    </p>
+    <div class="stamps">
+      <span class="stamp on">FastAPI + Next.js</span>
+      <span class="stamp on">Postgres as source of truth</span>
+      <span class="stamp on">Admin-configurable rules engine</span>
+      <span class="stamp warn">Live SharePoint — READ ONLY</span>
+      <span class="stamp">Sandbox: /sites/sandbox</span>
+      <span class="stamp warn">Legacy repo is LIVE</span>
+      <span class="stamp off">AI · deferred to P9</span>
+      <span class="stamp off">Pinecone · dropped</span>
+    </div>
+  </header>
+
+  <div class="doc">
+
+    <nav class="rail" aria-label="Contents">
+      <div class="rail-title">Contents</div>
+      <ol>
+        <li><a href="#s1"><b>01</b><span>Summary &amp; scope</span></a></li>
+        <li><a href="#s2"><b>02</b><span>Legacy audit</span></a></li>
+        <li><a href="#s3"><b>03</b><span>Architecture</span></a></li>
+        <li><a href="#s4"><b>04</b><span>Teams &amp; RBAC</span></a></li>
+        <li><a href="#s5"><b>05</b><span>Admin &amp; rules</span></a></li>
+        <li><a href="#s6"><b>06</b><span>Developer panel</span></a></li>
+        <li><a href="#s7"><b>07</b><span>Data model</span></a></li>
+        <li><a href="#s8"><b>08</b><span>Connectors</span></a></li>
+        <li><a href="#s9"><b>09</b><span>Delivery phases</span></a></li>
+        <li><a href="#s10"><b>10</b><span>Non-functionals</span></a></li>
+        <li><a href="#s11"><b>11</b><span>Risks</span></a></li>
+        <li><a href="#s12"><b>12</b><span>Next steps</span></a></li>
+        <li><a href="#s13"><b>13</b><span>Open questions</span></a></li>
+      </ol>
+    </nav>
+
+    <main>
+
+<!-- ══ 1 ══ -->
+<section id="s1">
+  <div class="sec-head"><span class="sec-num">01</span><h2>Summary &amp; scope</h2></div>
+  <p class="lede">
+    Hamdaz 2.0 replaces the single-team Flask ERP with a multi-team platform on FastAPI, Postgres
+    and Next.js. Five goals drive it.
+  </p>
+  <ol>
+    <li><strong>Multi-team.</strong> The old system served one team, with roles hardcoded in an Excel
+      file on OneDrive. The new one supports arbitrary teams, each with managers, members and custom roles.</li>
+    <li><strong>Admin control plane.</strong> Create teams, define roles and permissions, assign
+      members and configure modules — from a UI, with no code deploys.</li>
+    <li><strong>Rules on everything.</strong> Admins configure the <em>policies</em> the system runs
+      on — how tasks are assigned, who approves what, how leave is granted — without a developer. §5.</li>
+    <li><strong>Developer panel.</strong> Live visibility into every job, connector, request and
+      action, plus the ability to define new tools without shipping code.</li>
+    <li><strong>Own the data.</strong> Postgres becomes the source of truth. SharePoint, Zoho and
+      Graph become <em>read</em> connectors, not the database.</li>
+  </ol>
+
+  <h3><span class="n">1.1</span>Standing constraints</h3>
+  <div class="cons">
+    <div class="con">
+      <span class="cid">C1</span>
+      <div><b>The legacy repo is live</b>
+        <span><code>C:\Users\ansha\Hamdaz-</code> is a read-only reference. No file in it is edited, ever.</span></div>
+    </div>
+    <div class="con">
+      <span class="cid">C2</span>
+      <div><b>Live SharePoint is read-only</b>
+        <span>Hamdaz 2.0 <strong>never writes or pushes to any live SharePoint site</strong>. The
+          single writable target is the dedicated sandbox — <code>/sites/sandbox</code>. Enforced
+          three independent ways — §8.1.</span></div>
+    </div>
+    <div class="con soft">
+      <span class="cid">C3</span>
+      <div><b>AI is out of scope for v1</b>
+        <span>The assistant, procurement AI and AI document analysis are deferred to Phase 9, after cut-over.</span></div>
+    </div>
+    <div class="con soft">
+      <span class="cid">C4</span>
+      <div><b>Pinecone is not used</b>
+        <span>Confirmed dead in the legacy system — imported and instantiated, never queried. Not carried forward.</span></div>
+    </div>
+  </div>
+
+  <h3><span class="n">1.2</span>Explicitly deferred</h3>
+  <div class="tw">
+    <table>
+      <thead><tr><th>Deferred</th><th>Why</th><th>When</th></tr></thead>
+      <tbody>
+        <tr><td>AI personal assistant</td><td>Not needed now</td><td>Phase 9</td></tr>
+        <tr><td>Procurement AI — analyze, draft email, find distributors</td><td>Not needed now</td><td>Phase 9</td></tr>
+        <tr><td>AI document analysis and RFQ-vs-quote comparison</td><td>Not needed now</td><td>Phase 9</td></tr>
+        <tr><td>AI summary of supplier email replies</td><td>Tracking still ships — only the summary defers</td><td>Phase 9</td></tr>
+        <tr><td>pgvector and embeddings</td><td>Exists only to serve AI retrieval</td><td>Phase 9</td></tr>
+        <tr><td>Pinecone</td><td>Dead in the legacy system</td><td><strong>Never</strong></td></tr>
+        <tr><td><strong>Any</strong> SharePoint write</td><td>SharePoint is live</td><td>A cut-over decision — §9 P8</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Non-AI document tools <strong>do</strong> ship in v1: PDF merge, technical proposal generation,
+    and quote export to docx and xlsx. None of them call an LLM.</p>
+</section>
+
+<!-- ══ 2 ══ -->
+<section id="s2">
+  <div class="sec-head"><span class="sec-num">02</span><h2>Legacy system audit</h2></div>
+  <p>Measured from the legacy repo at commit <code>63ed3bb</code> on <code>main</code>.</p>
+
+  <h3><span class="n">2.1</span>What is there</h3>
+  <div class="metrics">
+    <div class="metric"><div class="v">7,900<small>LOC</small></div><div class="l">Python across 9 modules</div></div>
+    <div class="metric"><div class="v">3,022</div><div class="l">Lines in app.py</div></div>
+    <div class="metric"><div class="v">94</div><div class="l">Routes, zero blueprints</div></div>
+    <div class="metric"><div class="v">43</div><div class="l">Jinja templates</div></div>
+    <div class="metric"><div class="v">13</div><div class="l">SharePoint write paths</div></div>
+    <div class="metric"><div class="v">0</div><div class="l">Tests · types · migrations</div></div>
+  </div>
+
+  <h3><span class="n">2.2</span>Why it needs rebuilding</h3>
+  <p>Root causes, not symptoms. Each one is why a specific decision in §3 was made.</p>
+  <div class="tw">
+    <table>
+      <thead><tr><th class="id">#</th><th>Root cause</th><th>Evidence in the code</th><th>Consequence</th></tr></thead>
+      <tbody>
+        <tr><td class="id">1</td><td>Roles live in a OneDrive Excel file</td>
+          <td><code>index()</code> reads <code>get_user_details_from_excell()</code>, branches on a <code>role</code> string, picks a template by name</td>
+          <td>Cannot express teams, managers or per-module permission. Adding a role means editing a spreadsheet and an <code>if/elif</code> chain.</td></tr>
+        <tr><td class="id">2</td><td>Superusers and approvers read from SharePoint at boot</td>
+          <td><code>SUPERUSERS = superusers_from_sl()</code> at import time, refreshed by a thread</td>
+          <td>Authorization state is global, eventually consistent, and unauditable.</td></tr>
+        <tr><td class="id">3</td><td>Global mutable state used as the database</td>
+          <td>Module-level <code>tasks</code>, <code>df</code> and <code>user_analytics</code>, mutated by a background thread</td>
+          <td>Unsafe across gunicorn workers — each holds a divergent copy. Scaling out corrupts analytics.</td></tr>
+        <tr><td class="id">4</td><td>Background jobs run inside the web process</td>
+          <td>Three <code>while True</code> + <code>sleep()</code> threads at 60 s, 45 s and 1800 s</td>
+          <td>Every worker runs its own copy — duplicated SharePoint writes and duplicated emails. No retry, no visibility, no dead-letter.</td></tr>
+        <tr><td class="id">5</td><td>No single source of truth</td>
+          <td>Data split across SharePoint lists, OneDrive Excel, Cosmos DB (10 containers) and Zoho Books</td>
+          <td>Cross-entity queries impossible; joins done in pandas, in-process.</td></tr>
+        <tr><td class="id">6</td><td>Three competing CSS systems</td>
+          <td><code>base.html</code> loads Bootstrap 5.3 <em>and</em> Tailwind 2.2 from CDN, while <code>package.json</code> builds Tailwind 3.4 locally</td>
+          <td>Inconsistent UI, oversized payload, specificity wars. The root cause of the &ldquo;bad UI&rdquo;.</td></tr>
+        <tr><td class="id">7</td><td>No tests, no types, no migrations</td>
+          <td><code>tests/</code> holds one ad-hoc script and two <code>.txt</code> dumps</td>
+          <td>Every change is a production experiment.</td></tr>
+        <tr><td class="id">8</td><td>No audit trail</td>
+          <td>No action log anywhere in the codebase</td>
+          <td>Cannot answer &ldquo;who approved this quote?&rdquo; or &ldquo;why was this assigned to Rahul?&rdquo;</td></tr>
+        <tr><td class="id">9</td><td><strong>Assignment logic is hardcoded</strong></td>
+          <td><code>swp()</code>, <code>calculate_priority_score()</code> and <code>assign_priority_rank()</code> embed the rotation policy in Python</td>
+          <td>Changing how work is distributed needs a developer and a deploy. This is exactly what §5.4 fixes.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3><span class="n">2.3</span>Confirmed dead code — not ported</h3>
+  <p>Verified by cross-referencing every <code>def</code> against every <code>.py</code> and
+    <code>.html</code> file. <strong>26 functions are defined and never called.</strong></p>
+
+  <div class="note danger">
+    <span class="k">Dead dependency — Pinecone</span>
+    <p><code>app.py</code> imports it, constructs the client, and creates
+      <code>index = pc.Index("hamdaz")</code>. There is <strong>no <code>index.query</code> or
+      <code>index.upsert</code> call anywhere in the repo</strong> — a live API key and a paid vendor
+      doing nothing. Dropped entirely.</p>
+  </div>
+
+  <div class="dead">
+    <div>
+      <h4>sharepoint_items.py</h4>
+      <div class="ct">18 unreferenced</div>
+      <ul>
+        <li>compute_user_analytics</li><li>ensure_sharepoint_folder</li>
+        <li>extract_usernames_from_df</li><li>fetch_filtered_sharepoint_data</li>
+        <li>fetch_user_planner_tasks</li><li>generate_sharepoint_filter_endpoint</li>
+        <li>get_all_customers_from_onedrive</li><li>get_list_columns</li>
+        <li>get_teams_stauts</li><li>get_user_details</li>
+        <li>get_user_profile_photo</li><li>get_user_tasks_details_from_excell</li>
+        <li>get_user_teams_chats</li><li>list_org_users</li>
+        <li>save_distributors_data_to_sharepoint</li><li>send_quote_approval_email</li>
+        <li>update_sharepoint_item</li><li>upload_file_to_sharepoint</li>
+      </ul>
+    </div>
+    <div>
+      <h4>cosmos · zoho · sharepoint_data</h4>
+      <div class="ct">7 unreferenced</div>
+      <ul>
+        <li>get_item_distributors</li><li>get_user_leave_count</li>
+        <li>fetch_sales_orders</li><li>get_purchase_orders</li>
+        <li>structure_items_data</li><li>structure_quotes_data</li>
+        <li>get_user_display_name</li>
+      </ul>
+    </div>
+    <div>
+      <h4>Shadowed duplicates</h4>
+      <div class="ct">2 latent bugs</div>
+      <ul>
+        <li>generate_quote_excel — L1209 &amp; L1770</li>
+        <li>fetch_items — L81 &amp; L244</li>
+      </ul>
+      <p>The first definition is unreachable in both cases.</p>
+    </div>
+    <div>
+      <h4>Orphan templates</h4>
+      <div class="ct">12 never rendered</div>
+      <ul>
+        <li>ai_tasks.html</li><li>datasheets.html</li><li>generate_profile.html</li>
+        <li>business_dev_team.html</li><li>customer_success_dashboard.html</li>
+        <li>pages/chat.html</li><li>pages/chatbot.html</li><li>pages/assistant.html</li>
+        <li>pages/components/progress.html</li><li>pages/components/form.html</li>
+        <li>competitor_profile.html</li><li>pg.html</li>
+      </ul>
+    </div>
+  </div>
+  <p>Also dropped: a commented-out <code>@app.route("/line_items")</code>, roughly 61 commented-out
+    code lines, 46 stray <code>print()</code> calls surviving alongside the newer
+    <code>logger.py</code>, the <code>scratch/</code> directory, the <code>tests/test_out*.txt</code>
+    dumps, and the committed <code>.venv/</code> and <code>node_modules/</code>.</p>
+
+  <h3><span class="n">2.4</span>Module inventory — the porting checklist</h3>
+  <p>Nineteen areas from the 94 routes. <span class="chip port">Port</span> — logic is sound, move it
+    into a tested service. <span class="chip rebuild">Rebuild</span> — the legacy approach
+    <em>is</em> the problem. <span class="chip defer">Defer</span> — Phase 9, after cut-over.</p>
+  <div class="tw">
+    <table>
+      <thead><tr><th class="id">#</th><th>Module</th><th class="num">Routes</th><th>Source</th><th>Disposition</th></tr></thead>
+      <tbody>
+        <tr><td class="id">1</td><td>Auth &amp; onboarding</td><td class="num">4</td><td>Azure AD + Excel</td><td><span class="chip rebuild">Rebuild</span></td></tr>
+        <tr><td class="id">2</td><td>Role-routed dashboards</td><td class="num">3</td><td>Excel role string</td><td><span class="chip rebuild">Rebuild</span></td></tr>
+        <tr><td class="id">3</td><td>Proposals &amp; task assignment</td><td class="num">2</td><td>SharePoint</td><td><span class="chip port">Port · read-only ingest</span></td></tr>
+        <tr><td class="id">4</td><td>Workload rotation &amp; priority</td><td class="num">—</td><td>SharePoint</td><td><span class="chip rebuild">Rebuild as rules · §5.4</span></td></tr>
+        <tr><td class="id">5</td><td>Business Development / partnerships</td><td class="num">2</td><td>SharePoint</td><td><span class="chip port">Port · read-only</span></td></tr>
+        <tr><td class="id">6</td><td>Customer Success</td><td class="num">1</td><td>SharePoint</td><td><span class="chip port">Port · stub today</span></td></tr>
+        <tr><td class="id">7</td><td>Quotes &amp; approvals</td><td class="num">6</td><td>Cosmos + Zoho</td><td><span class="chip port">Port</span></td></tr>
+        <tr><td class="id">8</td><td>Vendors &amp; distributors</td><td class="num">3</td><td>Cosmos + Zoho</td><td><span class="chip port">Port</span></td></tr>
+        <tr><td class="id">9</td><td>Contacts &amp; business cards</td><td class="num">3</td><td>OneDrive Excel</td><td><span class="chip port">Port · one-time import</span></td></tr>
+        <tr><td class="id">10</td><td>Supplier email tracking</td><td class="num">2</td><td>Cosmos + Graph</td><td><span class="chip port">Port · minus AI summary</span></td></tr>
+        <tr><td class="id">11</td><td>Mail client</td><td class="num">7</td><td>Graph</td><td><span class="chip port">Port</span></td></tr>
+        <tr><td class="id">12</td><td>AI personal assistant</td><td class="num">6</td><td>Cosmos + OpenAI</td><td><span class="chip defer">Defer → P9</span></td></tr>
+        <tr><td class="id">13</td><td>Procurement AI</td><td class="num">5</td><td>Cosmos + OpenAI</td><td><span class="chip defer">Defer → P9</span></td></tr>
+        <tr><td class="id">14</td><td>Shared projects &amp; collaboration</td><td class="num">7</td><td>Cosmos</td><td><span class="chip port">Port</span></td></tr>
+        <tr><td class="id">15</td><td>Notifications</td><td class="num">2</td><td>Cosmos</td><td><span class="chip rebuild">Rebuild</span></td></tr>
+        <tr><td class="id">16</td><td>Document tools</td><td class="num">6</td><td>Files (+ OpenAI)</td><td><span class="chip port">Merge · TP · export</span> <span class="chip defer">analyze · RFQ → P9</span></td></tr>
+        <tr><td class="id">17</td><td>Leave management</td><td class="num">14</td><td>Cosmos</td><td><span class="chip port">Port + rules</span></td></tr>
+        <tr><td class="id">18</td><td>Reports</td><td class="num">3</td><td>pandas</td><td><span class="chip rebuild">Rebuild</span></td></tr>
+        <tr><td class="id">19</td><td>Zoho Books sync</td><td class="num">—</td><td>Zoho → Cosmos</td><td><span class="chip rebuild">Rebuild as connector</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ══ 3 ══ -->
+<section id="s3">
+  <div class="sec-head"><span class="sec-num">03</span><h2>Target architecture</h2></div>
+
+  <div class="arch">
+    <div class="layer fe">
+      <div class="lh"><span class="lt">Frontend</span><span class="ls">Next.js 15 · TypeScript · Tailwind 4 · shadcn/ui</span></div>
+      <div class="boxes">
+        <span class="box">dashboard</span><span class="box">proposals</span><span class="box">quotes</span>
+        <span class="box">vendors</span><span class="box">contacts</span><span class="box">mail</span>
+        <span class="box">leave</span><span class="box">admin + rules</span><span class="box">developer</span>
+      </div>
+    </div>
+    <div class="flow">REST + SSE · typed client generated from OpenAPI</div>
+    <div class="layer">
+      <div class="lh"><span class="lt">Backend</span><span class="ls">FastAPI · Pydantic v2 · SQLAlchemy 2 · Alembic</span></div>
+      <div class="boxes">
+        <span class="box">api/ routers</span><span class="box">core/ auth · rbac · <b>rules</b> · audit</span>
+        <span class="box">services/</span><span class="box">connectors/</span>
+        <span class="box">models/ ORM</span><span class="box">workers/ Celery</span>
+      </div>
+    </div>
+    <div class="layer">
+      <div class="lh"><span class="lt">State</span><span class="ls">source of truth · broker · realtime</span></div>
+      <div class="boxes">
+        <span class="box">Postgres 16</span><span class="box">Redis — broker · cache · pub/sub</span>
+        <span class="box">Azure Blob — documents</span>
+      </div>
+    </div>
+    <div class="flow">↑ one-way sync workers — read only, idempotent, retried, audited ↑</div>
+    <div class="flow block">╳ no write path exists back to SharePoint — C2</div>
+    <div class="layer ext">
+      <div class="lh"><span class="lt">External systems</span><span class="ls">connectors, never the database</span></div>
+      <div class="boxes">
+        <span class="box">SharePoint — READ ONLY</span><span class="box">MS Graph — mail · users</span>
+        <span class="box">Zoho Books</span><span class="box">OneDrive Excel — import once</span>
+      </div>
+    </div>
+  </div>
+  <p class="cap">Petrol = what we build and own. Brass = systems we read from but no longer depend on for state.</p>
+
+  <h3><span class="n">3.1</span>Key decisions</h3>
+  <div class="tw">
+    <table>
+      <thead><tr><th>Decision</th><th>Choice</th><th>Rationale</th></tr></thead>
+      <tbody>
+        <tr><td>Backend</td><td>FastAPI + Pydantic v2</td><td>Keeps the Python integration logic; async suits Graph and Zoho fan-out; free OpenAPI becomes a typed frontend client</td></tr>
+        <tr><td>Database</td><td>Postgres 16 + SQLAlchemy 2 + Alembic</td><td>Real foreign keys, transactions, row-level scoping, versioned migrations</td></tr>
+        <tr><td>Background work</td><td>Celery + Redis, <strong>separate process</strong></td><td>Kills root cause 4. Retries, dead-lettering and a run history the developer panel reads</td></tr>
+        <tr><td>Frontend</td><td>Next.js 15 + Tailwind 4 + shadcn/ui</td><td>One CSS system — kills root cause 6</td></tr>
+        <tr><td>Auth</td><td>Azure AD OIDC → own JWT session</td><td>Microsoft SSO stays; authorization moves into Postgres and out of Excel</td></tr>
+        <tr><td><strong>Policy</strong></td><td><strong>Declarative rules engine in Postgres</strong></td><td>Kills root cause 9. Admins change assignment, approval and leave policy with no deploy — §5.2</td></tr>
+        <tr><td><strong>SharePoint</strong></td><td><strong>Read-only connector with no write methods</strong></td><td>C2, enforced three independent ways — §8.1</td></tr>
+        <tr><td>Cosmos DB</td><td><strong>Retire.</strong> All 10 containers → Postgres</td><td>Removes the second database and its hand-rolled query strings</td></tr>
+        <tr><td>Pinecone</td><td><strong>Drop.</strong> Confirmed dead</td><td>C4</td></tr>
+        <tr><td>Vector search</td><td>Deferred to P9 — pgvector arrives with AI</td><td>No AI in v1, so no retrieval need</td></tr>
+        <tr><td>Documents</td><td>Azure Blob Storage</td><td>Replaces ad-hoc SharePoint and OneDrive file writes, which C2 forbids anyway</td></tr>
+        <tr><td>Realtime</td><td>SSE over Redis pub/sub</td><td>Presence, notifications and the developer live feed without a WebSocket server</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ══ 4 ══ -->
+<section id="s4">
+  <div class="sec-head"><span class="sec-num">04</span><h2>Multi-team &amp; RBAC</h2></div>
+<pre>Organization <i>(Hamdaz)</i>
+ └── <b>Team</b>              <i>Pre-Sales · Business Development · Customer Success · Procurement</i>
+      ├── <b>Membership</b>   <i>user × team × role</i>
+      │    └── <b>Role</b>    <i>system-defined or admin-created</i>
+      │         └── <b>Permission[]</b>   <i>granular — e.g. quotes.approve</i>
+      └── <u>Labels</u>            <i>user categories the rules read — New Joiner, Senior…  §5.3</i></pre>
+  <ul>
+    <li>A user belongs to <strong>many</strong> teams, with a <strong>different role in each</strong>.</li>
+    <li>A team enables a set of <strong>modules</strong> — so one platform serves teams doing unlike work.</li>
+    <li>Permissions are <strong>scoped</strong>: <code>own</code>, <code>team</code>, <code>all</code>.</li>
+  </ul>
+  <div class="note">
+    <span class="k">The key separation</span>
+    <p><strong>Roles grant permission. Labels drive policy.</strong> They are separate axes. A Senior
+      and a New Joiner may both be <code>team_member</code> — identical permissions — yet receive very
+      different workloads, because the assignment rules read their labels, not their role. §5.4.</p>
+  </div>
+
+  <h3><span class="n">4.1</span>Built-in roles</h3>
+  <div class="tw">
+    <table>
+      <thead><tr><th>Role</th><th>Scope</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr><td><code>super_admin</code></td><td>Organization</td><td>Everything, including both panels</td></tr>
+        <tr><td><code>developer</code></td><td>Organization</td><td>Developer panel, tool builder, connector config, logs. <strong>No business-data writes.</strong></td></tr>
+        <tr><td><code>org_manager</code></td><td>Organization</td><td>Cross-team reports, approvals, leave oversight</td></tr>
+        <tr><td><code>team_manager</code></td><td>Team</td><td>Manage members, assignments and approvals; edit team-scoped rules</td></tr>
+        <tr><td><code>team_member</code></td><td>Team</td><td>Do the work</td></tr>
+        <tr><td><code>viewer</code></td><td>Team</td><td>Read-only</td></tr>
+        <tr><td><em>custom</em></td><td>Team or org</td><td>Composed from the permission registry in the admin UI</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3><span class="n">4.2</span>Permission registry</h3>
+<pre>proposals.{read, create, update, delete, assign, reassign}
+quotes.{read, create, update, submit, approve, reject, export}
+vendors.{read, create, update}          contacts.{read, update}
+leave.{request, cancel, read_own, read_team, approve, configure}
+mail.{read, send, delete}               reports.{read_own, read_team, read_org}
+<b>rules</b>.{read, edit_team, edit_org, simulate, publish}
+<b>labels</b>.{read, assign, manage}
+<b>admin</b>.{teams.manage, users.manage, roles.manage, modules.configure}
+<b>dev</b>.{panel.view, logs.read, jobs.manage, tools.create, connectors.configure, flags.manage}</pre>
+  <p>Declared once in <code>core/rbac.py</code>, enforced by a FastAPI dependency —
+    <code>require("quotes.approve", scope="team")</code> — and rendered as a checkbox in the admin
+    role editor. One registry drives enforcement, the UI and the docs, so they cannot drift.</p>
+
+  <h3><span class="n">4.3</span>Migrating the legacy roles</h3>
+  <div class="tw">
+    <table>
+      <thead><tr><th>Legacy mechanism</th><th>Becomes</th></tr></thead>
+      <tbody>
+        <tr><td><code>SUPERUSERS</code> SharePoint list</td><td>Membership rows with <code>super_admin</code></td></tr>
+        <tr><td><code>approvers</code> SharePoint list</td><td>The <code>quotes.approve</code> permission</td></tr>
+        <tr><td>Excel <code>role = "pre-sales"</code></td><td>Team <em>Pre-Sales</em> + <code>team_member</code></td></tr>
+        <tr><td>Excel <code>role = "business development"</code></td><td>Team <em>Business Development</em> + <code>team_member</code></td></tr>
+        <tr><td>Excel <code>role = "customer success"</code></td><td>Team <em>Customer Success</em> + <code>team_member</code></td></tr>
+        <tr><td>Excel <code>role = "ai"</code></td><td>The <code>developer</code> role</td></tr>
+        <tr><td>Excel <code>flag = 1</code></td><td><code>user.status = 'active'</code></td></tr>
+        <tr><td><code>EXCLUDED_USERS</code> list</td><td>The <code>excluded-from-rotation</code> status label</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ══ 5 ══ -->
+<section id="s5">
+  <div class="sec-head"><span class="sec-num">05</span><h2>Admin panel &amp; rules engine</h2></div>
+  <p>Route group <code>app/(app)/admin/</code>, gated on <code>admin.*</code>, <code>rules.*</code>
+    and <code>labels.*</code>.</p>
+
+  <h3><span class="n">5.1</span>Screens</h3>
+  <div class="tw">
+    <table>
+      <thead><tr><th>Screen</th><th>Capabilities</th></tr></thead>
+      <tbody>
+        <tr><td>Teams</td><td>Create, rename and archive; set the team lead; enable or disable modules per team; team settings</td></tr>
+        <tr><td>Members</td><td>Invite from Azure AD; assign to teams; set a role per team; bulk actions; deactivate; view a member's full team, role and label matrix</td></tr>
+        <tr><td>Roles &amp; permissions</td><td>Create custom roles; a permission matrix grouped by module with scope selectors; clone a role; see who holds it before changing it</td></tr>
+        <tr><td><strong>Labels</strong></td><td>Create and manage user category labels; assign manually or by auto-rule — §5.3</td></tr>
+        <tr><td><strong>Rules</strong></td><td>The rules engine UI: pick a decision point, build conditions and actions, simulate, publish — §5.2</td></tr>
+        <tr><td><strong>Assignment policy</strong></td><td>The dedicated builder for <code>proposal.assign</code>: capacity, ratios, eligibility, preview — §5.4</td></tr>
+        <tr><td>Approval workflows</td><td>Who approves what, in what order, with thresholds and fallbacks. Replaces the hardcoded <code>approvers</code> list</td></tr>
+        <tr><td>Leave configuration</td><td>Holidays, leave types, concurrency rules, approval chain, blackout periods</td></tr>
+        <tr><td>Modules</td><td>Toggle modules org-wide or per team; configure module settings</td></tr>
+        <tr><td>Data connectors</td><td>Health, last sync and record counts; trigger a resync. <strong>SharePoint carries a permanent READ-ONLY badge</strong></td></tr>
+        <tr><td>Audit log</td><td>Filterable, exportable log of every mutating action: who, what, when, before → after</td></tr>
+        <tr><td>Organization settings</td><td>Branding, domains, notification defaults, session policy</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="note">
+    <span class="k">Design rule</span>
+    <p>Every one of these must be doable in the UI. If an admin has to ask a developer to edit a
+      SharePoint list or a spreadsheet, we have rebuilt the old system.</p>
+  </div>
+
+  <h3><span class="n">5.2</span>The rules engine</h3>
+  <p class="lede">The requirement is <em>&ldquo;the admin can set rules on everything.&rdquo;</em>
+    Delivering that without building a hundred bespoke settings screens means one declarative engine,
+    evaluated at named <strong>decision points</strong>.</p>
+  <p>A decision point is a moment where the system makes a choice. Each declares the <strong>facts</strong>
+    available in its context, the <strong>actions</strong> it accepts, and a <strong>default policy</strong>
+    shipped with the product. The admin UI reads that registry and renders a builder offering only
+    <em>valid</em> conditions and actions — the same single-registry pattern used for permissions, so
+    the UI can never drift from what the engine supports.</p>
+  <div class="tw">
+    <table>
+      <thead><tr><th>Decision point</th><th>Fires when</th><th>Configurable actions</th></tr></thead>
+      <tbody>
+        <tr><td><code>proposal.assign</code></td><td>A proposal arrives or is reassigned</td><td>Pick assignee, set priority, notify — <strong>§5.4</strong></td></tr>
+        <tr><td><code>proposal.escalate</code></td><td>Bid closing date approaches, or an SLA breaches</td><td>Notify, reassign, raise priority, flag to manager</td></tr>
+        <tr><td><code>proposal.validate</code></td><td>Before a status change</td><td>Require fields, block, warn</td></tr>
+        <tr><td><code>quote.approval_route</code></td><td>A quote is submitted</td><td>Choose the approver chain by amount, margin, customer or team</td></tr>
+        <tr><td><code>quote.validate</code></td><td>Before submit</td><td>Require attachments and fields, enforce a margin floor</td></tr>
+        <tr><td><code>leave.eligibility</code></td><td>Leave is requested</td><td>Auto-approve, require approval, block, cap concurrency</td></tr>
+        <tr><td><code>leave.handoff</code></td><td>Leave is approved</td><td>Pick who inherits the ongoing proposals — reuses <code>proposal.assign</code></td></tr>
+        <tr><td><code>user.label</code></td><td>A user joins or their attributes change</td><td>Grant or revoke labels automatically — §5.3</td></tr>
+        <tr><td><code>notification.route</code></td><td>Any domain event</td><td>Who is notified, on which channel, how urgently</td></tr>
+        <tr><td><code>visibility.field</code></td><td>A record is rendered</td><td>Mask or hide fields by label or role</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h4>Rule shape</h4>
+  <p>Every rule is <code>conditions → actions</code>, ordered, first match winning unless the set is
+    marked <code>evaluate_all</code>:</p>
+<pre><b>decision_point</b>: quote.approval_route
+<b>team</b>: pre-sales
+<b>rules</b>:
+  - name: Large deals go to the MD
+    conditions:
+      all:
+        - {fact: quote.total,    op: "&gt;=", value: 500000}
+        - {fact: quote.currency, op: "=",  value: "AED"}
+    actions:
+      - {type: require_approval, approver_role: org_manager}
+      - {type: notify, target: team_lead}
+
+  - name: Thin margin needs a second look
+    conditions:
+      all:
+        - {fact: quote.margin_pct, op: "&lt;", value: 12}
+    actions:
+      - {type: require_approval, approver_role: team_manager}
+
+  - name: Default
+    conditions: {always: true}
+    actions:
+      - {type: auto_approve}</pre>
+
+  <h4>Three properties make this trustworthy — all three are requirements</h4>
+  <div class="tw">
+    <table>
+      <thead><tr><th class="id">#</th><th>Property</th><th>What it means</th></tr></thead>
+      <tbody>
+        <tr><td class="id">1</td><td><strong>Simulate before publish</strong></td><td>Every rule set can be dry-run against real current data. The admin sees exactly what <em>would</em> happen — which quotes route where, who <em>would</em> get the next ten proposals — before anything takes effect.</td></tr>
+        <tr><td class="id">2</td><td><strong>Versioned and revertible</strong></td><td>Publishing creates a new version. Every version is diffable and revertible, with author and timestamp recorded.</td></tr>
+        <tr><td class="id">3</td><td><strong>Explainable</strong></td><td>Every evaluation writes a <code>rule_evaluations</code> row capturing the input facts, which rules matched and the outcome — so both panels can answer <em>&ldquo;why did Rahul get this proposal?&rdquo;</em> with the actual decision trace. The old system can never do this.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3><span class="n">5.3</span>User category labels</h3>
+  <p>Labels are the vocabulary rules speak in — an admin-created tag on a user, optionally scoped to a team.</p>
+  <div class="tw">
+    <table>
+      <thead><tr><th>Kind</th><th>Examples</th><th>Typically drives</th></tr></thead>
+      <tbody>
+        <tr><td><code>category</code></td><td>New Joiner · Senior · Mid · Junior · Team Lead · Part-time</td><td>Capacity, ratios, approval routing</td></tr>
+        <tr><td><code>skill</code></td><td>Networking · Security · CCTV · Fire Alarm</td><td>Eligibility — only tag-matching people get certain work</td></tr>
+        <tr><td><code>status</code></td><td>On Probation · Excluded from Rotation · On Notice</td><td>Eligibility, capacity</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Labels are assigned manually or granted automatically by a <code>user.label</code> rule — for
+    example <em>joined within 90 days → New Joiner</em>, with an <code>expires_at</code> so it falls
+    off by itself. The legacy <code>EXCLUDED_USERS</code> list becomes the
+    <code>excluded-from-rotation</code> status label.</p>
+
+  <h3><span class="n">5.4</span>Assignment rules — the worked example</h3>
+  <p>This is the case you raised, so it gets the full treatment. <code>proposal.assign</code> has a
+    dedicated builder because it is the most-used policy in the system.</p>
+<pre><b>policy</b>: pre_sales_default          <i># team-scoped, versioned, simulatable</i>
+<b>team</b>: pre-sales
+
+<i>─── 1. ELIGIBILITY — hard filters, applied first ──────────────────</i>
+<b>eligibility</b>:
+  member_of_team: true
+  not_on_leave: true
+  not_labelled: [excluded-from-rotation, on-notice]
+  requires_labels: []              <i># e.g. [security] for security proposals</i>
+  max_open_tasks:
+    default: 8
+    by_label: {new_joiner: 3, part_time: 4}
+
+<i>─── 2. CAPACITY — "a new joiner should get less work" ─────────────</i>
+<b>capacity</b>:
+  default: 1.0
+  by_label:
+    new_joiner:   0.4              <i># carries 40% of a normal load</i>
+    on_probation: 0.3
+    part_time:    0.5
+    team_lead:    0.6              <i># has management duties too</i>
+    senior:       1.0
+
+<i>─── 3. DISTRIBUTION — how the winner is chosen ────────────────────</i>
+<b>distribution</b>:
+  mode: weighted_least_loaded      <i># least_loaded | round_robin | ratio</i>
+                                   <i># | weighted_least_loaded | manual</i>
+  factors:
+    load_vs_capacity:       {weight: 0.45, direction: lower_is_better}
+    open_task_count:        {weight: 0.30, direction: lower_is_better}
+    days_since_last_assign: {weight: 0.25, direction: higher_is_better}
+
+  <i># when mode: ratio — "assign like in ratios"</i>
+  ratio:
+    by: label
+    targets: {senior: 3, mid: 2, junior: 1}
+    window: rolling_30d            <i># drift measured here and corrected</i>
+
+<i>─── 4. TIE-BREAK &amp; FALLBACK ───────────────────────────────────────</i>
+<b>tie_break</b>: longest_idle
+<b>on_no_eligible_candidate</b>: notify_manager   <i># never silently drop work</i>
+
+<i>─── 5. OVERRIDE ──────────────────────────────────────────────────</i>
+<b>allow_manual_override</b>: true        <i># manager can reassign; reason required, audited</i></pre>
+
+  <h4>How this satisfies each thing you asked for</h4>
+  <div class="tw">
+    <table>
+      <thead><tr><th>Your requirement</th><th>Mechanism</th></tr></thead>
+      <tbody>
+        <tr><td>&ldquo;a new joinee to be less task assigned&rdquo;</td>
+          <td><code>capacity.by_label.new_joiner: 0.4</code>. Combined with the <code>load_vs_capacity</code>
+            factor, a new joiner holding 2 tasks scores as effectively 5 — so the engine stops feeding
+            them work sooner. No special-casing in code.</td></tr>
+        <tr><td>&ldquo;multiple job assigned persons to be less task assigned&rdquo;</td>
+          <td>The <code>open_task_count</code> factor pushes busy people down the ranking, and
+            <code>max_open_tasks</code> is a hard ceiling they cannot exceed.</td></tr>
+        <tr><td>&ldquo;assign like in ratios&rdquo;</td>
+          <td><code>mode: ratio</code> with <code>targets</code>, measured over a rolling window so
+            short-term luck self-corrects.</td></tr>
+        <tr><td>&ldquo;rules on category labels of users&rdquo;</td>
+          <td>§5.3 — labels are first-class, and every clause above can key off them.</td></tr>
+        <tr><td>&ldquo;other areas if possible&rdquo;</td>
+          <td>The same engine covers the ten decision points in §5.2 — approvals, escalation, leave,
+            notifications, field visibility.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="note">
+    <span class="k">Preview is mandatory</span>
+    <p>Before publishing, the builder shows the next ten assignments under the new policy, current
+      distribution versus target ratio, per-member effective load, and a diff against the live policy.
+      An assignment policy nobody can predict is an assignment policy nobody will trust.</p>
+  </div>
+</section>
+
+<!-- ══ 6 ══ -->
+<section id="s6">
+  <div class="sec-head"><span class="sec-num">06</span><h2>Developer panel</h2></div>
+  <p>Route group <code>app/(app)/developer/</code>, gated on <code>dev.*</code>.</p>
+
+  <h3><span class="n">6.1</span>Observability — see everything that is running</h3>
+  <div class="tw">
+    <table>
+      <thead><tr><th>Screen</th><th>What it shows</th></tr></thead>
+      <tbody>
+        <tr><td>Live activity feed</td><td>An SSE stream of every request, job start and finish, and connector call — filterable by user, team, module and status. The old system has none of this.</td></tr>
+        <tr><td>Jobs &amp; schedules</td><td>Every Celery task: schedule, last run, duration, status, retry count, arguments, result or traceback. Run now, pause, retry, cancel, replay with the same arguments</td></tr>
+        <tr><td>Connector health</td><td>Up/down, latency p50 and p95, error rate, rate-limit headroom, token expiry, last successful sync, delta cursor. <strong>SharePoint is badged READ-ONLY with its write-guard status shown</strong></td></tr>
+        <tr><td><strong>Rule inspector</strong></td><td>Live view of <code>rule_evaluations</code>: which decision points fired, what facts they saw, which rules matched, what they decided. The debugger for §5.2</td></tr>
+        <tr><td>Request tracing</td><td>A per-request timeline: route → service → DB queries → outbound calls, with timings. The correlation ID appears in error responses so users can quote it</td></tr>
+        <tr><td>Error inbox</td><td>Grouped exceptions with counts, first and last seen, stack trace and affected users; mark resolved</td></tr>
+        <tr><td>Audit explorer</td><td>The full audit log with before → after diffs, exportable</td></tr>
+        <tr><td>Metrics</td><td>Request rate, latency and errors; queue depth; DB pool; cache hit rate</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3><span class="n">6.2</span>Tool builder — create capabilities without a deploy</h3>
+<pre><b>name</b>: find_overdue_proposals
+<b>description</b>: List proposals past their bid closing date for a team
+<b>scope</b>: team
+<b>permission</b>: proposals.read
+<b>parameters</b>:                    <i># JSON Schema — validated, and rendered as a form</i>
+  team_id:      {type: string,  required: true}
+  days_overdue: {type: integer, default: 0}
+<b>implementation</b>:
+  type: sql_query                <i># sql_query | http_request | connector_call</i>
+  query: |
+    SELECT ... FROM proposals
+    WHERE team_id = :team_id AND bcd &lt; now() - :days_overdue
+<b>surfaces</b>:
+  - ui_action                    <i># a button on the Proposals page</i>
+  - scheduled                    <i># runs on a cron; result notified</i>
+  - report                       <i># appears in the reports list</i></pre>
+  <div class="tw">
+    <table>
+      <thead><tr><th>Type</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td><code>sql_query</code></td><td>Parameterised query against a <strong>read-only</strong> Postgres role. Bound parameters only — never string interpolation</td></tr>
+        <tr><td><code>http_request</code></td><td>Calls an internal or approved external endpoint, against a domain allowlist</td></tr>
+        <tr><td><code>connector_call</code></td><td>Invokes a registered connector method with a declared permission requirement. <strong>SharePoint write methods do not exist to be called</strong> — §8.1</td></tr>
+        <tr><td><s><code>pipeline</code></s></td><td><em>Deferred to P9</em> — this is the LLM-composing type, and there is no AI in v1</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Supporting screens: <strong>feature flags</strong> with per-org, per-team and per-user rollout;
+    <strong>API keys and webhooks</strong>; a <strong>read-only DB console</strong>; and
+    <strong>connector config</strong> whose secrets live in Azure Key Vault and are never rendered
+    back to the browser.</p>
+
+  <h3><span class="n">6.3</span>Safety rails</h3>
+  <div class="note danger">
+    <span class="k">Tool creation is a privilege-escalation surface</span>
+    <p>So it is constrained by design: tools execute under the <strong>calling user's</strong>
+      permissions, never the author's. SQL runs as a read-only Postgres role. Write tools require an
+      explicit <code>connector_call</code> with a declared permission and <code>super_admin</code>
+      approval before activation. <strong>No SharePoint write path exists to invoke.</strong> No
+      arbitrary Python execution, ever. Every run is audited, rate-limited and timed out. Tools are
+      versioned — each version diffable and revertible.</p>
+  </div>
+</section>
+
+<!-- ══ 7 ══ -->
+<section id="s7">
+  <div class="sec-head"><span class="sec-num">07</span><h2>Data model</h2></div>
+<pre><i>─── identity &amp; access ────────────────────────────────────────────</i>
+<b>users</b>(id, azure_object_id, email, display_name, photo_url, status, joined_at, created_at)
+<b>teams</b>(id, slug, name, description, lead_user_id, enabled_modules jsonb, settings jsonb, archived_at)
+<b>roles</b>(id, team_id NULL, key, name, is_system, description)
+<b>permissions</b>(key, module, description)              <i>-- seeded from the registry</i>
+<b>role_permissions</b>(role_id, permission_key, scope)   <i>-- scope: own | team | all</i>
+<b>memberships</b>(id, user_id, team_id, role_id, joined_at, UNIQUE(user_id, team_id))
+
+<i>─── labels &amp; rules  §5.2–5.4 ─────────────────────────────────────</i>
+<b>labels</b>(id, key, name, kind, color, description, team_id NULL)   <i>-- category|skill|status</i>
+<b>label_assignments</b>(id, user_id, label_id, team_id NULL, assigned_by,
+                  granted_by_rule_id NULL, expires_at, created_at)
+<b>rule_sets</b>(id, decision_point, team_id NULL, name, enabled, priority,
+          version, published_by, published_at, evaluate_all bool)
+<b>rules</b>(id, rule_set_id, position, name, conditions jsonb, actions jsonb, enabled)
+<b>rule_set_versions</b>(id, rule_set_id, version, snapshot jsonb, author_id, created_at)
+<b>rule_evaluations</b>(id, decision_point, rule_set_id, rule_set_version, entity_type, entity_id,
+                 facts jsonb, matched_rule_ids jsonb, outcome jsonb,
+                 actor_id, simulated bool, duration_ms, created_at)
+<b>assignment_policies</b>(id, team_id, name, version, eligibility jsonb, capacity jsonb,
+                    distribution jsonb, tie_break, fallback, active, published_by, published_at)
+
+<i>─── core business ────────────────────────────────────────────────</i>
+<b>proposals</b>(id, team_id, external_ref, title, customer_id, status, submission_status,
+          assigned_to, previous_owner, bcd, priority_score, source, source_id, …)
+<b>proposal_events</b>(id, proposal_id, actor_id, type, payload jsonb, created_at)
+<b>quotes</b>(id, team_id, proposal_id, zoho_estimate_id, customer_id, currency,
+       subtotal, tax, total, margin_pct, status, created_by, created_at)
+<b>quote_items</b>(id, quote_id, sku, description, quantity, rate, discount, line_total)
+<b>approvals</b>(id, entity_type, entity_id, step, approver_id, status, remarks,
+          routed_by_rule_id NULL, decided_at)
+<b>vendors</b>(id, name, zoho_id, contact jsonb, metadata jsonb)
+<b>item_distributors</b>(id, item_sku, vendor_id, source, confidence, last_seen_at)
+<b>contacts</b>(id, name, company, email, phone, source, metadata jsonb)
+<b>customers</b>(id, zoho_id, name, metadata jsonb)
+<b>partnerships</b>(id, product_group, product, manufacturer, competitor, status, fields jsonb)
+
+<i>─── supplier email ───────────────────────────────────────────────</i>
+<b>tracked_emails</b>(id, proposal_id, message_id, tracking_id, to_email, subject, body,
+               sent_by, replied_at, reply_body, status)   <i>-- reply_summary → P9</i>
+<b>supplier_quotes</b>(id, proposal_id, tracking_id, supplier_email, parsed jsonb, status)
+
+<i>─── collaboration ────────────────────────────────────────────────</i>
+<b>shared_projects</b>(id, proposal_id, created_by, created_at)
+<b>project_members</b>(project_id, user_id, invited_by, accepted_at)
+<b>project_messages</b>(id, project_id, user_id, content, created_at)
+<b>presence</b>(user_id, project_id, last_seen_at)
+<b>notifications</b>(id, user_id, type, title, body, entity_type, entity_id,
+              routed_by_rule_id NULL, read_at, created_at)
+
+<i>─── leave &amp; documents ────────────────────────────────────────────</i>
+<b>leave_requests</b>(id, user_id, team_id, type, start_date, end_date, days, reason,
+               status, approver_id, remarks, handoff_to, decided_at, created_at)
+<b>leave_settings</b>(id, team_id NULL, key, value jsonb)
+<b>holidays</b>(id, team_id NULL, title, start_date, end_date, type)
+<b>documents</b>(id, team_id, entity_type, entity_id, blob_url, filename, mime, size, uploaded_by)
+
+<i>─── platform / developer panel ───────────────────────────────────</i>
+<b>audit_log</b>(id, actor_id, team_id, action, entity_type, entity_id, before jsonb,
+          after jsonb, ip, user_agent, correlation_id, created_at)
+<b>job_runs</b>(id, task_name, args jsonb, status, started_at, finished_at, duration_ms,
+         error, retries, correlation_id)
+<b>connector_status</b>(name, <u>mode</u>, healthy, last_success_at, last_error, latency_ms, cursor jsonb)
+                                                   <i>-- mode: read_only | read_write</i>
+<b>tools</b>(id, name, description, scope, permission_key, parameters jsonb,
+      implementation jsonb, surfaces jsonb, version, active, created_by, approved_by)
+<b>tool_runs</b>(id, tool_id, actor_id, params jsonb, result jsonb, status, duration_ms, created_at)
+<b>feature_flags</b>(key, description, rules jsonb, updated_by, updated_at)
+
+<i>─── DEFERRED to Phase 9 (AI) ─────────────────────────────────────</i>
+<i>-- ai_sessions, ai_messages, prompts, embeddings(vector)  — pgvector arrives with P9</i></pre>
+  <p><code>audit_log</code> is append-only; <code>rule_evaluations</code> is its policy-side twin.
+    Together they answer both <em>who did this?</em> and <em>why did the system do this?</em> Every
+    team-scoped table carries <code>team_id</code>, and a SQLAlchemy query filter applies the
+    caller's scope automatically — so no router can leak another team's rows.</p>
+</section>
+
+<!-- ══ 8 ══ -->
+<section id="s8">
+  <div class="sec-head"><span class="sec-num">08</span><h2>Connector layer</h2></div>
+  <p>One base interface, one implementation per source, all running <strong>in workers only</strong>
+    — never inside a request handler.</p>
+  <div class="tw">
+    <table>
+      <thead><tr><th>Connector</th><th>Mode</th><th>Responsibilities</th></tr></thead>
+      <tbody>
+        <tr><td><code>sharepoint</code></td><td><span class="chip ro">Read only · all live sites</span></td><td>Delta-syncs <code>Proposals</code>, partnership and config lists <strong>into</strong> Postgres. The delta cursor lives in <code>connector_status</code>, not a module global</td></tr>
+        <tr><td><code>sharepoint_sandbox</code></td><td><span class="chip port">Read + write · sandbox only</span></td><td>Write-path integration testing against <code>/sites/sandbox</code> → <code>sandboxlist</code>. Hard-bound to the sandbox site ID at construction — §8.1.1</td></tr>
+        <tr><td><code>graph_mail</code></td><td>Read + send</td><td>Inbox listing, send, drafts, supplier-reply matching. Sending is gated outside production — §8.2</td></tr>
+        <tr><td><code>graph_users</code></td><td>Read only</td><td>Directory sync into <code>users</code> for admin invitations</td></tr>
+        <tr><td><code>zoho_books</code></td><td>Read (write at cut-over)</td><td>Items, estimates, purchase orders and customers into Postgres</td></tr>
+        <tr><td><code>onedrive_excel</code></td><td>Read once, then delete</td><td>One-time import of contacts, customers and users. The Excel dependency is then removed entirely</td></tr>
+        <tr><td><code>blob</code></td><td>Read + write</td><td>Document storage with signed URLs. This is where files go now that C2 forbids SharePoint uploads</td></tr>
+        <tr><td><s><code>openai</code></s></td><td>—</td><td><em>Deferred to P9</em></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3><span class="n">8.1</span>Enforcing the SharePoint read-only rule</h3>
+  <p>The legacy system has <strong>13 SharePoint and OneDrive write paths</strong>, several on hot
+    code paths — the 60-second background thread calls <code>update_user_analytics_in_sharepoint</code>
+    and <code>add_item_to_sharepoint</code> on every tick, from every worker. None of these may exist
+    in 2.0 while SharePoint is live.</p>
+  <div class="tw">
+    <table>
+      <thead><tr><th>Legacy write function — deliberately not ported</th><th>Wrote to</th></tr></thead>
+      <tbody>
+        <tr><td><code>update_user_analytics_in_sharepoint</code></td><td><code>useranalytics</code> list — <strong>every 60 s, per worker</strong></td></tr>
+        <tr><td><code>add_item_to_sharepoint</code></td><td><code>useranalytics</code> list</td></tr>
+        <tr><td><code>delete_user_from_useranalytics</code></td><td><code>useranalytics</code> list</td></tr>
+        <tr><td><code>add_sharepoint_list_item</code></td><td><code>Proposals</code> list</td></tr>
+        <tr><td><code>update_sharepoint_item</code> · <code>update_sharepoint_item_with_link</code></td><td>List items</td></tr>
+        <tr><td><code>handoff_proposals_to_user</code></td><td><code>Proposals</code> — reassignment on leave</td></tr>
+        <tr><td><code>save_partnership_update</code></td><td>Partnership list</td></tr>
+        <tr><td><code>add_user_to_excludelist</code> · <code>remove_user_from_excludelist</code></td><td><code>excludeusers</code> list</td></tr>
+        <tr><td><code>ensure_sharepoint_folder</code> · <code>upload_file_to_sharepoint</code> · <code>upload_file_to_sharepoint_folder</code></td><td>Document libraries</td></tr>
+        <tr><td><code>add_or_update_user_in_excel</code> · <code>update_contact_in_onedrive_excel</code> · <code>upload_photo_to_onedrive</code></td><td>OneDrive Excel and files</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h4>Three independent guards, because one is not enough</h4>
+  <div class="tw">
+    <table>
+      <thead><tr><th class="id">#</th><th>Guard</th><th>Mechanism</th></tr></thead>
+      <tbody>
+        <tr><td class="id">1</td><td><strong>Structural</strong></td><td>The production <code>sharepoint</code> connector exposes <strong>no write methods at all</strong> — no <code>create</code>, <code>update</code>, <code>patch</code>, <code>upload</code> or <code>delete</code> to call, from a service, a worker or a developer-panel tool. You cannot misuse an API that does not exist. Write capability lives in a <em>separate</em> <code>SharePointSandboxWriter</code>, used only by tests and local development, hard-bound to the sandbox site at construction.</td></tr>
+        <tr><td class="id">2</td><td><strong>Runtime — site allowlist, checked by ID</strong></td><td>Every non-GET request is checked against an allowlist of writable site <strong>IDs</strong> holding exactly one entry: the sandbox. Anything else raises <code>SharePointWriteForbidden</code> before a socket opens. The check compares the resolved site <em>ID</em>, not the URL string, so a mistyped or spoofed path cannot slip through. <code>connector_status.mode</code> shows <code>read_only</code> for every live site.</td></tr>
+        <tr><td class="id">3</td><td><strong>CI</strong></td><td>A workflow step greps the connector directory for write verbs and fails the build on any match <strong>outside</strong> the sandbox-writer module. The guard cannot be quietly removed without an obvious, reviewable diff.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Where the legacy system wrote to SharePoint, 2.0 writes to Postgres instead. The
+    <code>useranalytics</code> list in particular becomes derived data — computed on demand from
+    <code>proposals</code> — which removes both the write <em>and</em> the 60-second sync entirely.</p>
+
+  <h3><span class="n">8.1.1</span>The sandbox site</h3>
+  <p><code>hamdaz1.sharepoint.com/sites/sandbox</code> → list <code>sandboxlist</code> — currently
+    empty, and the only SharePoint target Hamdaz 2.0 may write to.</p>
+  <div class="tw">
+    <table>
+      <thead><tr><th>Site</th><th>List</th><th>State</th><th>Permitted</th></tr></thead>
+      <tbody>
+        <tr><td><code>/sites/sandbox</code></td><td><code>sandboxlist</code></td><td>Empty — seeded in Phase 0</td><td><span class="chip port">Read + write</span></td></tr>
+        <tr><td><code>/sites/ProposalTeam</code></td><td><code>Proposals</code></td><td>Live production</td><td><span class="chip ro">Read only</span></td></tr>
+        <tr><td><code>/sites/Test</code></td><td>config &amp; ops lists</td><td><strong>Live despite the name</strong></td><td><span class="chip ro">Read only</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="note">
+    <span class="k">Why this matters more than it looks</span>
+    <p>Without it, the SharePoint write path could only ever be tested against fixtures — and
+      fixtures cannot catch what actually breaks at cut-over: Graph API throttling behaviour,
+      <code>ETag</code> concurrency conflicts, column type coercion, and lookup and person field
+      quirks. The sandbox turns the Phase 8 SharePoint decision (§13 Q2) from a gamble into
+      something we can rehearse.</p>
+    <p><strong>Phase 0 seeding task.</strong> Read the live <code>Proposals</code> schema — reading
+      is permitted — mirror its columns into <code>sandboxlist</code>, then populate synthetic rows
+      covering the awkward cases: person fields, lookups, multi-value columns, empty and malformed
+      dates, and unicode in titles.</p>
+  </div>
+  <div class="note danger">
+    <span class="k">A caution about /sites/Test</span>
+    <p>It is misleadingly named and is <strong>not</strong> a sandbox. It holds <strong>live</strong>
+      config and operational lists — <code>superusers</code>, <code>approvers</code>,
+      <code>excludeusers</code>, <code>useranalytics</code>, quotes — that the production app reads
+      on every boot. It is read-only like any other live site, and its site ID must never appear in
+      the write allowlist. Only <code>/sites/sandbox</code> is writable.</p>
+  </div>
+  <p>Day-to-day development still runs primarily against <strong>recorded fixtures</strong> captured
+    from read-only syncs, plus a seeded Postgres dataset — that keeps the test suite fast, offline
+    and deterministic. The sandbox is for the integration tests that genuinely need a real Graph
+    endpoint.</p>
+
+  <h3><span class="n">8.2</span>Adjacent live side effects — a recommendation</h3>
+  <div class="note">
+    <span class="k">My inference, not your instruction — flagging for a decision</span>
+    <p>C2 is about SharePoint, but the same reasoning applies to anything with a real-world effect.
+      The legacy system sends live email through Graph from several paths —
+      <code>send_quote_approval_email</code>, <code>/api/send_email</code>,
+      <code>/api/mails/send</code> and the supplier-email sync. A development build that sends a real
+      quote request to a real supplier is a worse outcome than a stray SharePoint row.</p>
+    <p><strong>Recommendation:</strong> outbound mail is disabled outside production by default.
+      Non-production environments capture messages to an outbox table the developer panel renders, so
+      the flow is fully testable without anything leaving the building. Zoho writes get the same
+      treatment. See §13 Q3.</p>
+  </div>
+</section>
+
+<!-- ══ 9 ══ -->
+<section id="s9">
+  <div class="sec-head"><span class="sec-num">09</span><h2>Delivery phases</h2></div>
+  <p>Estimates assume a <strong>small team of 2–3 engineers</strong>. Phases 4 through 7 are the
+    parallelisable bulk — with 4–5 engineers the total compresses considerably.</p>
+
+  <div class="bar" role="img" aria-label="Relative phase durations across roughly 33 weeks to cut-over, plus a deferred AI phase">
+    <i style="width:6%;background:var(--accent);opacity:.3"></i>
+    <i style="width:9%;background:var(--accent);opacity:.4"></i>
+    <i style="width:15%;background:var(--accent);opacity:.5"></i>
+    <i style="width:12%;background:var(--accent);opacity:.6"></i>
+    <i style="width:18%;background:var(--accent);opacity:.75"></i>
+    <i style="width:15%;background:var(--accent);opacity:.85"></i>
+    <i style="width:9%;background:var(--accent);opacity:.95"></i>
+    <i style="width:6%;background:var(--accent)"></i>
+    <i style="width:10%;background:var(--legacy)"></i>
+  </div>
+
+  <div class="phases">
+    <div class="phase"><span class="pn">P0</span><div>
+      <h4>Foundation</h4>
+      <div class="meta"><span>≈2 weeks</span><span>Weeks 1–2</span></div>
+      <p>Repo scaffolding and Docker Compose across Postgres, Redis, backend, worker, beat and
+        frontend. FastAPI skeleton with typed config, error handling, structured logging and
+        correlation IDs. Alembic. Next.js shell with Tailwind 4 and shadcn/ui. CI running ruff, mypy,
+        pytest, eslint and tsc — <strong>plus the SharePoint write-guard check</strong>, in from day
+        one. <strong>Seed the sandbox site</strong> (§8.1.1): mirror the live <code>Proposals</code>
+        schema into <code>sandboxlist</code> and populate synthetic rows covering the awkward field types.</p>
+      <p class="exit"><b>Exit</b><code>docker compose up</code> runs the full stack, CI is green, and the sandbox holds usable test data.</p>
+    </div></div>
+
+    <div class="phase"><span class="pn">P1</span><div>
+      <h4>Identity, teams &amp; RBAC</h4>
+      <div class="meta"><span>≈3 weeks</span><span>Weeks 3–5</span></div>
+      <p>Azure AD OIDC into our own session. Users, teams, roles, permissions and memberships, plus
+        the permission registry, the enforcement dependency and the automatic team-scope query
+        filter. Audit-log middleware.</p>
+      <p class="exit"><b>Exit</b>A user signs in with Microsoft, lands in their team, and every mutating call is authorized and audited.</p>
+    </div></div>
+
+    <div class="phase"><span class="pn">P2</span><div>
+      <h4>Admin panel, labels &amp; rules engine</h4>
+      <div class="meta"><span>≈5 weeks</span><span>Weeks 6–10</span></div>
+      <p>Every screen in §5.1. The labels system with manual and automatic assignment. The rules
+        engine core: decision-point registry, condition and action evaluator, versioning,
+        publish and revert, <code>rule_evaluations</code> logging, and the simulate-before-publish
+        harness. Rules wired into the decision points available this early — <code>user.label</code>,
+        <code>notification.route</code>, <code>quote.approval_route</code>.</p>
+      <p class="exit"><b>Exit</b>An admin creates a team, a custom role, a label and a working rule set — and can simulate it before publishing.</p>
+    </div></div>
+
+    <div class="phase"><span class="pn">P3</span><div>
+      <h4>Developer panel &amp; tool builder</h4>
+      <div class="meta"><span>≈4 weeks</span><span>Weeks 11–14</span></div>
+      <p>Job runs, connector status, tools and feature flags. Live SSE activity feed, job control,
+        connector health, error inbox, request tracing, metrics and the rule inspector. Tool builder
+        with the three v1 implementation types, feature flags and the safety rails.</p>
+      <p class="exit"><b>Exit</b>A developer creates a working tool, surfaces it as a UI action, and watches it execute in the live feed — with no deploy.</p>
+    </div></div>
+
+    <div class="phase"><span class="pn">P4</span><div>
+      <h4>Proposals &amp; the assignment engine</h4>
+      <div class="meta"><span>≈6 weeks</span><span>Weeks 15–20</span></div>
+      <p>SharePoint <strong>read-only</strong> connector and delta sync into <code>proposals</code>.
+        Proposal list, detail and reassignment. <strong>The <code>proposal.assign</code> policy engine</strong>
+        — eligibility, capacity by label, ratio and weighted-least-loaded distribution, tie-breaks,
+        fallback and manual override — with the preview harness. Escalation rules. Shared projects,
+        presence, notifications and reports.</p>
+      <p class="exit"><b>Exit</b>Pre-Sales can run a full day's proposal work in 2.0, and an admin can change how work is distributed without a developer.</p>
+    </div></div>
+
+    <div class="phase"><span class="pn">P5</span><div>
+      <h4>Commercial modules</h4>
+      <div class="meta"><span>≈5 weeks</span><span>Weeks 21–25</span></div>
+      <p>Zoho connector. Quotes, line items, the rule-routed approval workflow and export to docx and
+        xlsx. Vendors, distributors, contacts, customers, partnerships and competitor profiles.</p>
+      <p class="exit"><b>Exit</b>The quote lifecycle works end to end, from creation through approval to export.</p>
+    </div></div>
+
+    <div class="phase"><span class="pn">P6</span><div>
+      <h4>Communication &amp; documents</h4>
+      <div class="meta"><span>≈3 weeks</span><span>Weeks 26–28</span></div>
+      <p>Graph mail client. Supplier email tracking and raw reply capture, without the AI summary.
+        Non-AI document tools: PDF merge, technical proposal generation and quote export. Outbox
+        gating per §8.2.</p>
+      <p class="exit"><b>Exit</b>Parity with the legacy mail and document modules, minus the deferred AI pieces.</p>
+    </div></div>
+
+    <div class="phase"><span class="pn">P7</span><div>
+      <h4>Leave management</h4>
+      <div class="meta"><span>≈2 weeks</span><span>Weeks 29–30</span></div>
+      <p>Requests, availability and concurrency rules, holidays, the rule-driven approval chain,
+        handoff of ongoing proposals reusing the §5.4 engine, the expiry job and the admin leave console.</p>
+      <p class="exit"><b>Exit</b>Parity with the 14 legacy leave routes, with the policy now admin-configurable.</p>
+    </div></div>
+
+    <div class="phase"><span class="pn">P8</span><div>
+      <h4>Data migration &amp; cut-over</h4>
+      <div class="meta"><span>≈3 weeks</span><span>Weeks 31–33</span></div>
+      <p>Migration scripts moving 10 Cosmos containers to Postgres, SharePoint history into
+        <code>proposals</code>, and OneDrive Excel into contacts, customers and users. Repeatable
+        dry-runs with a reconciliation report. A parallel run with 2.0 read-only alongside live 1.0,
+        diffed daily. UAT per team. A cut-over runbook and rollback plan. <strong>The decision on
+        SharePoint's future is made here</strong> — retire it, or lift C2 and add a writeback
+        connector for external consumers.</p>
+      <p class="exit"><b>Exit</b>2.0 is live; 1.0 is read-only, then decommissioned.</p>
+    </div></div>
+
+    <div class="phase deferred"><span class="pn">P9</span><div>
+      <h4>AI — deferred</h4>
+      <div class="meta"><span>≈5 weeks</span><span>After cut-over</span></div>
+      <p>pgvector and embeddings. The AI assistant on the tool registry. Procurement analyzer. AI
+        document analysis and RFQ-versus-quote comparison. Supplier reply summarisation. The
+        <code>pipeline</code> tool type. Prompt manager with versioning. Per-team token budgets and
+        spend visibility.</p>
+      <p class="exit"><b>Exit</b>The deferred §1.2 scope lands, on a platform that can already observe and govern it.</p>
+    </div></div>
+  </div>
+  <p class="cap">Indicative total to cut-over: ~33 weeks / ~8 months at 2–3 engineers, with AI following.</p>
+</section>
+
+<!-- ══ 10 ══ -->
+<section id="s10">
+  <div class="sec-head"><span class="sec-num">10</span><h2>Non-functional requirements</h2></div>
+  <div class="tw">
+    <table>
+      <thead><tr><th>Area</th><th>Target</th></tr></thead>
+      <tbody>
+        <tr><td>Performance</td><td>Dashboard p95 under 800 ms. List endpoints paginated and server-filtered — never a full-table read. Rule evaluation under 50 ms p95</td></tr>
+        <tr><td>Scalability</td><td>Stateless API, safe to scale horizontally — no global mutable state, so root cause 3 is structurally fixed</td></tr>
+        <tr><td>Reliability</td><td>Every external call retried with backoff behind a circuit breaker; jobs idempotent and replayable</td></tr>
+        <tr><td>Security</td><td>Azure AD SSO; least-privilege permissions; secrets in Key Vault; parameterised SQL only; CSRF on cookie auth; strict CSP; rate limits on tool endpoints</td></tr>
+        <tr><td><strong>Data safety</strong></td><td><strong>No write path to SharePoint exists (§8.1). Outbound mail gated outside production (§8.2)</strong></td></tr>
+        <tr><td>Auditability</td><td>Every mutating action in <code>audit_log</code>; every policy decision in <code>rule_evaluations</code></td></tr>
+        <tr><td>Testing</td><td>≥80% coverage on <code>services/</code>, and <strong>100% on the rules evaluator</strong> — it decides who gets work. Integration tests against real Postgres via testcontainers; connector tests against recorded fixtures; Playwright E2E on critical paths</td></tr>
+        <tr><td>Observability</td><td>Structured JSON logs, OpenTelemetry traces, <code>/health</code> and <code>/ready</code> — all surfaced in the developer panel</td></tr>
+        <tr><td>Accessibility</td><td>WCAG 2.1 AA; full keyboard navigation</td></tr>
+        <tr><td>Browsers</td><td>Evergreen Chrome, Edge and Safari; responsive to 1280 px and usable on tablet</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ══ 11 ══ -->
+<section id="s11">
+  <div class="sec-head"><span class="sec-num">11</span><h2>Risks</h2></div>
+  <div class="tw">
+    <table>
+      <thead><tr><th class="id">#</th><th>Risk</th><th>Impact</th><th>Mitigation</th></tr></thead>
+      <tbody>
+        <tr><td class="id">1</td><td>Legacy business rules are undocumented and exist only in code — especially <code>swp()</code> rotation, priority scoring and leave concurrency</td><td><span class="chip hi">High</span></td><td>Phases 2, 4 and 7 each open with a written spec extracted from the legacy code and <strong>confirmed with the team that uses it</strong>. The rules engine then makes the policy visible and editable, so it can never silently re-hide in code</td></tr>
+        <tr><td class="id">2</td><td>The Cosmos → Postgres migration loses or mangles records</td><td><span class="chip hi">High</span></td><td>Repeatable dry-runs, row-count and checksum reconciliation, and Cosmos kept read-only for 90 days after cut-over</td></tr>
+        <tr><td class="id">3</td><td><strong>An accidental write to a live SharePoint site corrupts production data</strong></td><td><span class="chip hi">High</span></td><td>Three independent guards (§8.1): no write methods on the production connector, an ID-checked site allowlist containing only the sandbox, and a CI check. Reviewed at every PR touching the connector</td></tr>
+        <tr><td class="id">4</td><td><code>/sites/Test</code> is mistaken for a sandbox because of its name</td><td><span class="chip md">Medium</span></td><td>It is live and read-only like any other site (§8.1.1). The real sandbox is <code>/sites/sandbox</code>. Only that site ID sits in the write allowlist, so the mistake cannot become a write</td></tr>
+        <tr><td class="id">5</td><td>A misconfigured assignment rule distributes work badly and nobody notices</td><td><span class="chip md">Medium</span></td><td>Simulate-before-publish is mandatory; <code>rule_evaluations</code> makes every decision explainable; versioned policies revert in one click; a distribution-drift alert surfaces in the admin panel</td></tr>
+        <tr><td class="id">6</td><td>The rules engine grows into a general-purpose programming language</td><td><span class="chip md">Medium</span></td><td>Decision points and their fact schemas are a <strong>fixed registry</strong>, extended deliberately in code. Conditions and actions are declarative data, never executable code</td></tr>
+        <tr><td class="id">7</td><td>The tool builder becomes a privilege-escalation hole</td><td><span class="chip hi">High</span></td><td>The §6.3 rails: caller-permission execution, a read-only SQL role, no arbitrary code, and admin approval for write tools</td></tr>
+        <tr><td class="id">8</td><td>Scope creep — nineteen modules is a lot of surface</td><td><span class="chip hi">High</span></td><td>Phases 4–7 are strictly parity-first. AI is already fenced into P9. New features only after cut-over</td></tr>
+        <tr><td class="id">9</td><td>Live email sent from a development build reaches real suppliers</td><td><span class="chip md">Medium</span></td><td>§8.2 outbox gating — pending your decision (§13 Q3)</td></tr>
+        <tr><td class="id">10</td><td>The Zoho Books connection is currently unauthorized in tooling</td><td><span class="chip md">Medium</span></td><td>Re-authorize before Phase 5</td></tr>
+        <tr><td class="id">11</td><td>The two systems diverge during the Phase 8 parallel run</td><td><span class="chip md">Medium</span></td><td>2.0 stays read-only through the parallel run; writes move at a single cut-over moment. C2 makes this structurally safe — 2.0 <em>cannot</em> write to the shared source</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ══ 12 ══ -->
+<section id="s12">
+  <div class="sec-head"><span class="sec-num">12</span><h2>Immediate next steps</h2></div>
+  <ol>
+    <li><strong>Confirm this plan</strong> — particularly §5.4, since the assignment rules are the
+      piece most likely to need adjusting against how the team actually works.</li>
+    <li><strong>Answer the open questions in §13.</strong></li>
+    <li><strong>Scaffold Phase 0</strong>: repo structure, Docker Compose, FastAPI and Next.js
+      skeletons, CI <strong>including the SharePoint write-guard</strong>.</li>
+    <li><strong>Audit SharePoint list consumers</strong> — this decides Phase 8's shape and is cheap now.</li>
+    <li><strong>Workshop the label taxonomy</strong> with team leads: what categories actually exist,
+      and what capacity should each one carry?</li>
+  </ol>
+</section>
+
+<!-- ══ 13 ══ -->
+<section id="s13">
+  <div class="sec-head"><span class="sec-num">13</span><h2>Open questions</h2></div>
+  <p>These change the plan's shape, so they are worth answering before Phase 0 closes.</p>
+  <ol class="qs">
+    <li><p><b>Which teams actually exist, and what does each do day to day?</b>
+      The legacy code only implements Pre-Sales properly — BD is partial and Customer Success is a stub.</p></li>
+    <li><p><b>Is anything outside this app reading or writing the SharePoint <code>Proposals</code> list?</b>
+      Power Automate, Power BI, manual editing? This decides whether SharePoint is retired at cut-over
+      or needs a writeback connector.</p></li>
+    <li><p><b>Do you want the §8.2 outbox gating for email and Zoho writes in non-production?</b>
+      I recommend yes — a development build must not email a real supplier.</p></li>
+    <li><p><b>What user categories do you actually use today, and what capacity should each carry?</b>
+      §5.4 uses New Joiner 0.4, Part-time 0.5 and Team Lead 0.6 as placeholders.</p></li>
+    <li><p><b>Is <code>weighted_least_loaded</code> the right default assignment mode, or do you want
+      fixed ratios as the primary?</b> Both ship; this only sets the default.</p></li>
+    <li><p><b>How many users today, and what growth do you expect?</b> This sizes the infrastructure.</p></li>
+    <li><p><b>Stay on Azure App Service, or move to Azure Container Apps?</b>
+      Container Apps suits the API + worker + beat process split considerably better.</p></li>
+    <li><p><b>Is there a fixed cut-over deadline driving this?</b>
+      If so, scope gets prioritised against the date rather than the other way around.</p></li>
+  </ol>
+</section>
+
+    </main>
+  </div>
+
+  <footer>
+    <span>Hamdaz 2.0 · Project Plan · Draft v2</span>
+    <span>Legacy audit @ 63ed3bb</span>
+    <span>23 August 2026</span>
+  </footer>
+</div>

@@ -1,0 +1,114 @@
+name: hamdaz
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: hamdaz
+      POSTGRES_PASSWORD: hamdaz
+      POSTGRES_DB: hamdaz
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hamdaz -d hamdaz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: ../backend
+      dockerfile: ../infra/Dockerfile.backend
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    environment: &backend_env
+      ENVIRONMENT: local
+      DATABASE_URL: postgresql+psycopg://hamdaz:hamdaz@postgres:5432/hamdaz
+      REDIS_URL: redis://redis:6379/0
+      LOG_FORMAT: console
+      LOG_LEVEL: DEBUG
+      # Read from infra/.env (see .env.example). Sign-in cannot work without them.
+      JWT_SECRET: ${JWT_SECRET:-dev-only-not-a-real-secret}
+      AZURE_TENANT_ID: ${AZURE_TENANT_ID:-}
+      AZURE_CLIENT_ID: ${AZURE_CLIENT_ID:-}
+      AZURE_CLIENT_SECRET: ${AZURE_CLIENT_SECRET:-}
+      AZURE_REDIRECT_URI: ${AZURE_REDIRECT_URI:-http://localhost:3000/api/v1/auth/callback}
+      CORS_ORIGINS: http://localhost:3000
+      # C2 — live SharePoint is read-only. Writes, when enabled, reach only /sites/sandbox.
+      SHAREPOINT_SANDBOX_WRITES_ENABLED: "false"
+      # §8.2 — a development build must not email a real supplier.
+      OUTBOUND_EMAIL_ENABLED: "false"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: ../backend
+      dockerfile: ../infra/Dockerfile.backend
+    command: celery -A app.workers.celery_app.celery_app worker --loglevel=info --concurrency=2
+    environment: *backend_env
+    volumes:
+      - ../backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # Exactly one beat instance. Two would double every scheduled job — which is precisely
+  # the bug the legacy in-process threads had.
+  beat:
+    build:
+      context: ../backend
+      dockerfile: ../infra/Dockerfile.backend
+    command: celery -A app.workers.celery_app.celery_app beat --loglevel=info
+    environment: *backend_env
+    volumes:
+      - ../backend:/app
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: ../infra/Dockerfile.frontend
+      target: dev
+    command: npm run dev
+    environment:
+      # Next proxies /api/v1/* here, so the browser stays on one origin and the session
+      # cookie is first-party.
+      BACKEND_URL: http://api:8000
+      NEXT_TELEMETRY_DISABLED: "1"
+    ports:
+      - "3000:3000"
+    volumes:
+      - ../frontend:/app
+      - /app/node_modules
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
+  redisdata:

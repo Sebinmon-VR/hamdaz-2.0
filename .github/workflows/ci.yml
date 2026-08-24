@@ -1,0 +1,129 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # Runs first and alone: constraint C2 protects live production data, so a violation
+  # should fail the build before anything else has a chance to look green.
+  sharepoint-write-guard:
+    name: SharePoint read-only guard (C2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Assert no write calls outside the sandbox module
+        working-directory: backend
+        run: python scripts/check_sharepoint_readonly.py
+
+  backend:
+    name: Backend — lint, types, tests
+    runs-on: ubuntu-latest
+    needs: sharepoint-write-guard
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: hamdaz
+          POSTGRES_PASSWORD: hamdaz
+          POSTGRES_DB: hamdaz_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U hamdaz"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql+psycopg://hamdaz:hamdaz@localhost:5432/hamdaz_test
+      REDIS_URL: redis://localhost:6379/0
+      JWT_SECRET: ci-secret-not-a-real-key
+      ENVIRONMENT: local
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+
+      - name: Install dependencies
+        working-directory: backend
+        run: uv sync --extra dev
+
+      - name: Lint (ruff)
+        working-directory: backend
+        run: uv run ruff check --output-format=github .
+
+      - name: Type check (mypy strict)
+        working-directory: backend
+        run: uv run mypy app
+
+      - name: Migrations apply cleanly
+        working-directory: backend
+        run: uv run alembic upgrade head
+
+      - name: Migrations match the models
+        working-directory: backend
+        # An empty autogenerate diff proves no model change was left without a migration.
+        run: |
+          uv run alembic check
+
+      - name: Tests
+        working-directory: backend
+        run: uv run pytest --cov=app --cov-report=term-missing
+
+      - name: Permission registry is consistent
+        working-directory: backend
+        run: uv run python -c "from app.core.rbac import validate_registry; validate_registry(); print('registry OK')"
+
+  frontend:
+    name: Frontend — lint, types, build
+    runs-on: ubuntu-latest
+    needs: sharepoint-write-guard
+
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
