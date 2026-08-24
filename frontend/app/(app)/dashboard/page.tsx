@@ -26,25 +26,29 @@ export default async function DashboardPage(): Promise<ReactNode> {
   const me = await requireMe();
   const headers = await forwardedHeaders();
 
-  const mine = await api
-    .get<Page<Proposal>>(`/proposals/${qs({ assigned_to: me.user_id, open_only: true, limit: 50 })}`, {
-      headers,
-    })
-    .catch(() => null);
-
-  const teamProposals = await api
-    .get<Page<Proposal>>(`/proposals/${qs({ open_only: true, limit: 100 })}`, { headers })
-    .catch(() => null);
-
   // Workload needs reports.read_team, which a plain member does not hold. Absence is a
   // normal state here, not an error.
   const workloadTeam = teamsWith(me, "reports.read_team")[0];
-  const workload =
+
+  // Awaited together, not in sequence. None of these three depends on another, and each is a
+  // separate HTTP call to the backend — chaining them made the page cost their sum. Every
+  // .catch() is per-request, so one failure still cannot take the others down with it.
+  const [mine, teamProposals, workload] = await Promise.all([
+    api
+      .get<Page<Proposal>>(
+        `/proposals/${qs({ assigned_to: me.user_id, open_only: true, limit: 50 })}`,
+        { headers },
+      )
+      .catch(() => null),
+    api
+      .get<Page<Proposal>>(`/proposals/${qs({ open_only: true, limit: 100 })}`, { headers })
+      .catch(() => null),
     workloadTeam && can(me, "reports.read_team", "team", workloadTeam)
-      ? await api
+      ? api
           .get<WorkloadRow[]>(`/proposals/workload/${workloadTeam}`, { headers })
           .catch((error: unknown) => (error instanceof ApiError ? null : null))
-      : null;
+      : Promise.resolve(null),
+  ]);
 
   const open = mine?.items ?? [];
   const dueSoon = open.filter((p) => {

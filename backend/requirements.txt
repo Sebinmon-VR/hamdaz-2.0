@@ -1,0 +1,28 @@
+# Azure App Service deployment manifest.
+#
+# pyproject.toml remains the source of truth for dependencies — this file exists only
+# because Azure's Oryx build system looks for requirements.txt and does not understand a
+# uv-managed pyproject. Without it, Oryx installs nothing, gunicorn falls back to its
+# placeholder app, and every route 404s while the site still looks "up".
+#
+# Versions are pinned to what the project was verified against. Regenerate after changing
+# dependencies in pyproject.toml:
+#
+#     uv pip compile pyproject.toml -o requirements.txt
+#
+# Extras matter here: uvicorn[standard] brings the event-loop and HTTP parsers, and
+# psycopg[binary] avoids needing libpq present on the build image.
+
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+pydantic==2.13.4
+pydantic-settings==2.15.0
+sqlalchemy==2.0.52
+alembic==1.19.1
+psycopg[binary,pool]==3.3.4
+python-jose[cryptography]==3.5.0
+httpx==0.28.1
+celery[redis]==5.6.3
+redis==6.4.0
+structlog==26.1.0
+python-multipart==0.0.32

@@ -6,6 +6,8 @@
  * re-checks everything on every call. The UI is a convenience, never a control.
  */
 
+import { cache } from "react";
+
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 
@@ -23,15 +25,26 @@ export async function forwardedHeaders(): Promise<Record<string, string>> {
   return cookie ? { cookie } : {};
 }
 
-/** The signed-in user, or null. Never throws for an ordinary signed-out visitor. */
-export async function getMe(): Promise<Me | null> {
+/**
+ * The signed-in user, or null. Never throws for an ordinary signed-out visitor.
+ *
+ * Wrapped in React's `cache` so the layout and the page it wraps share one call. Both need
+ * the principal — the layout to decide which nav sections to render, the page to filter its
+ * own data — and without deduplication every navigation paid for `/meta/me` twice. That is
+ * not a rounding error: the endpoint rebuilds the caller's whole permission set from the
+ * database, and against a remote Postgres it is seconds, not milliseconds.
+ *
+ * The cache lives for one server render, so a permission changed between navigations is
+ * still picked up on the next one.
+ */
+export const getMe = cache(async (): Promise<Me | null> => {
   try {
     return await api.get<Me>("/meta/me", { headers: await forwardedHeaders() });
   } catch (error) {
     if (error instanceof ApiError && error.isUnauthenticated) return null;
     throw error;
   }
-}
+});
 
 /** Require a session, or bounce to login. */
 export async function requireMe(): Promise<Me> {

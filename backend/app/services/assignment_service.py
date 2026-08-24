@@ -13,7 +13,7 @@ from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import joinedload, lazyload
 
 from app.core.errors import NotFoundError, ValidationError
 from app.core.logging import get_logger
@@ -82,13 +82,21 @@ async def build_candidates(
     now = now or datetime.now(UTC)
     window_start = now - timedelta(days=RATIO_WINDOW_DAYS)
 
+    # lazyload("*") matters more than it looks. User.memberships, User.label_assignments,
+    # Role.permissions and Membership.role are all lazy="selectin" on the models, so loading
+    # a user here otherwise drags in their memberships, roles, role permissions and labels —
+    # none of which this function reads. It only wants id, display_name and status.
     memberships = (
-        await session.scalars(
-            select(Membership)
-            .where(Membership.team_id == team_id)
-            .options(selectinload(Membership.user))
+        (
+            await session.scalars(
+                select(Membership)
+                .where(Membership.team_id == team_id)
+                .options(lazyload("*"), joinedload(Membership.user))
+            )
         )
-    ).all()
+        .unique()
+        .all()
+    )
 
     users = [
         m.user for m in memberships if m.user is not None and m.user.status is UserStatus.ACTIVE
@@ -136,12 +144,16 @@ async def build_candidates(
     )
 
     label_rows = (
-        await session.scalars(
-            select(LabelAssignment)
-            .where(LabelAssignment.user_id.in_(user_ids))
-            .options(selectinload(LabelAssignment.label))
+        (
+            await session.scalars(
+                select(LabelAssignment)
+                .where(LabelAssignment.user_id.in_(user_ids))
+                .options(lazyload("*"), joinedload(LabelAssignment.label))
+            )
         )
-    ).all()
+        .unique()
+        .all()
+    )
 
     labels_by_user: dict[uuid.UUID, set[str]] = {}
     for row in label_rows:
