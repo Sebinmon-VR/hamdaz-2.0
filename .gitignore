@@ -1,6 +1,17 @@
-# Python
+# ── secrets ───────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── local database dumps ──────────────────────────────────────────────
+_db_backup_*/
+*.dump
+*.sql.gz
+
+# ── python ────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
+*.egg-info/
 .venv/
 venv/
 .pytest_cache/
@@ -8,21 +19,11 @@ venv/
 .ruff_cache/
 .coverage
 htmlcov/
-*.egg-info/
+dist/
+build/
 
-# Node
-node_modules/
-.next/
-out/
-
-# Secrets — never commit these. The legacy repo committed .env and .venv.
-.env
-.env.local
-.env.*.local
-*.pem
-
-# OS / editor
-.DS_Store
-Thumbs.db
+# ── editors / os ──────────────────────────────────────────────────────
 .vscode/
 .idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,1713 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hamdaz ERP — Dev Sandbox</title>
+<style>
+  :root {
+    --bg:#eef0f3; --panel:#fff; --sunk:#f6f7f9; --ink:#14171a; --muted:#5b6570;
+    --line:#dde1e6; --accent:#2b6cb0; --ok:#1a7f47; --bad:#b42318; --warn:#8a5a00;
+    --mono: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace;
+    --get:#2b6cb0; --post:#1a7f47; --del:#b42318; --patch:#8a5a00; --put:#6b46c1;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0c0f13; --panel:#151a20; --sunk:#0f1318; --ink:#e6e9ed; --muted:#8f9bab;
+            --line:#242b34; --accent:#5aa2e8; --ok:#4ac585; --bad:#ff7b72; --warn:#e0b341;
+            --get:#5aa2e8; --post:#4ac585; --del:#ff7b72; --patch:#e0b341; --put:#a78bfa; }
+  }
+  * { box-sizing:border-box; }
+  html, body { height:100%; }
+  body { margin:0; background:var(--bg); color:var(--ink); overflow:hidden;
+         font:13.5px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; }
+
+  .app { display:grid; grid-template-rows:auto 1fr auto auto; height:100vh; }
+  .work { display:grid; min-height:0; }
+
+  header { display:flex; align-items:center; gap:9px; padding:0 14px; height:44px;
+           background:var(--panel); border-bottom:1px solid var(--line); }
+  header h1 { font-size:13px; margin:0; font-weight:650; white-space:nowrap; }
+  .spacer { flex:1; }
+  .chip { font:600 11px var(--mono); padding:3px 8px; border-radius:99px;
+          border:1px solid var(--line); color:var(--muted); white-space:nowrap; }
+  .chip.on { color:var(--ok); border-color:var(--ok); }
+  .chip.off { color:var(--bad); border-color:var(--bad); }
+
+  .pane { background:var(--panel); min-height:0; min-width:0; display:flex; flex-direction:column; }
+  .pane > .title { flex:none; display:flex; align-items:center; justify-content:space-between;
+        gap:8px; padding:8px 12px; border-bottom:1px solid var(--line); }
+  .pane > .title h2 { margin:0; font-size:10.5px; font-weight:700; letter-spacing:.08em;
+        text-transform:uppercase; color:var(--muted); white-space:nowrap; }
+  .scroll { flex:1; min-height:0; overflow:auto; }
+
+  #sidebar { border-right:1px solid var(--line); }
+  #context { border-left:1px solid var(--line); }
+  #console { border-top:1px solid var(--line); }
+
+  .split { background:transparent; z-index:5; }
+  .split.v { cursor:col-resize; width:5px; }
+  .split.h { cursor:row-resize; height:5px; }
+  .split:hover { background:var(--accent); opacity:.35; }
+
+  /* ── sidebar: one collapsible group per module ─────────────────────── */
+  .group { border-bottom:1px solid var(--line); }
+  .ghead { display:flex; align-items:center; gap:7px; width:100%; padding:8px 12px;
+           cursor:pointer; background:none; border:0; color:var(--ink); text-align:left;
+           font:700 10.5px var(--mono); letter-spacing:.09em; text-transform:uppercase; }
+  .ghead:hover { background:var(--sunk); color:var(--ink); }
+  .ghead .caret { color:var(--muted); transition:transform .12s; font-size:9px; width:9px; }
+  .group.open .ghead .caret { transform:rotate(90deg); }
+  .ghead .count { margin-left:auto; color:var(--muted); font-weight:600; }
+  .glist { display:none; padding-bottom:4px; }
+  .group.open .glist { display:block; }
+
+  .route { display:flex; align-items:center; gap:8px; padding:5px 12px 5px 18px;
+           cursor:pointer; border-left:2px solid transparent; }
+  .route:hover { background:var(--sunk); }
+  .route.sel { background:var(--sunk); border-left-color:var(--accent); }
+  .route.sel2 { background:var(--sunk); border-left-color:var(--warn); }
+  .route .m { font:700 9.5px var(--mono); width:44px; flex:none; text-align:right; }
+  .m.GET{color:var(--get)} .m.POST{color:var(--post)} .m.PUT{color:var(--put)}
+  .m.DELETE{color:var(--del)} .m.PATCH{color:var(--patch)}
+  .route .t { font-size:12.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+
+  /* ── split views ───────────────────────────────────────────────────── */
+  #stage { display:grid; min-height:0; min-width:0; }
+  .view { display:flex; flex-direction:column; min-height:0; min-width:0;
+          background:var(--sunk); border-right:1px solid var(--line); }
+  .view:last-child { border-right:0; }
+  .view.active .pathbar { box-shadow:inset 3px 0 0 var(--accent); }
+  .view:nth-child(3).active .pathbar { box-shadow:inset 3px 0 0 var(--warn); }
+
+  .pathbar { display:flex; align-items:center; gap:9px; padding:9px 14px;
+             border-bottom:1px solid var(--line); background:var(--panel); flex:none;
+             cursor:pointer; }
+  .pathbar code { font:12.5px var(--mono); color:var(--muted); overflow:hidden;
+                  text-overflow:ellipsis; white-space:nowrap; }
+
+  .body { padding:14px; }
+  .field { margin-bottom:11px; }
+  .field label { display:block; font-size:11px; font-weight:650; color:var(--muted);
+                 margin-bottom:4px; }
+  input[type=text], select, textarea {
+      width:100%; font:12.5px var(--mono); padding:7px 9px; border-radius:6px;
+      border:1px solid var(--line); background:var(--panel); color:var(--ink); }
+  textarea { min-height:66px; resize:vertical; }
+  .check { display:flex; align-items:center; gap:7px; font-size:12.5px;
+           margin-bottom:8px; cursor:pointer; }
+  .hint { color:var(--muted); font-size:11.5px; margin:8px 0 0; }
+  button { font:650 12.5px inherit; padding:7px 13px; border-radius:6px; cursor:pointer;
+           border:1px solid var(--line); background:var(--panel); color:var(--ink); }
+  button:hover { border-color:var(--accent); color:var(--accent); }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.primary:hover { filter:brightness(1.1); color:#fff; }
+  button.danger { border-color:var(--bad); color:var(--bad); }
+  button.on { border-color:var(--accent); color:var(--accent); }
+  .row { display:flex; gap:7px; flex-wrap:wrap; align-items:center; }
+
+  table { width:100%; border-collapse:collapse; }
+  thead th { position:sticky; top:0; background:var(--panel); text-align:left;
+             font:700 10px var(--mono); letter-spacing:.06em; text-transform:uppercase;
+             color:var(--muted); padding:7px 10px; border-bottom:1px solid var(--line); }
+  td { padding:6px 10px; border-bottom:1px solid var(--line); font-size:12.5px;
+       max-width:300px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  tbody tr { cursor:pointer; }
+  tbody tr:hover { background:var(--sunk); }
+  tbody tr.sel { background:color-mix(in srgb, var(--accent) 14%, transparent); }
+  td.mono { font-family:var(--mono); font-size:11.5px; color:var(--muted); }
+  .tag { font:600 10px var(--mono); padding:1px 6px; border-radius:99px;
+         border:1px solid var(--line); color:var(--muted); margin-left:5px; }
+
+  pre { margin:0; padding:12px 14px; font:12px/1.55 var(--mono); white-space:pre-wrap;
+        word-break:break-word; }
+  .status { font:700 11px var(--mono); padding:2px 8px; border-radius:99px;
+            border:1px solid currentColor; }
+  .s2{color:var(--ok)} .s4{color:var(--warn)} .s5{color:var(--bad)} .s0{color:var(--muted)}
+
+  .kv { padding:12px 14px; border-bottom:1px solid var(--line); }
+  .kv h3 { margin:0 0 8px; font:700 10px var(--mono); letter-spacing:.08em;
+           text-transform:uppercase; color:var(--muted); }
+  .kv dl { display:grid; grid-template-columns:auto 1fr; gap:5px 10px; margin:0; font-size:12px; }
+  .kv dt { color:var(--muted); white-space:nowrap; }
+  .kv dd { margin:0; font-family:var(--mono); font-size:11.5px; overflow-wrap:anywhere; }
+  .empty { color:var(--muted); font-size:12px; font-style:italic; }
+
+  .result { border-top:1px solid var(--line); }
+  .rhead { display:flex; align-items:center; justify-content:space-between; gap:8px;
+           padding:7px 14px; background:var(--panel); border-bottom:1px solid var(--line);
+           font:700 10px var(--mono); letter-spacing:.08em; text-transform:uppercase;
+           color:var(--muted); position:sticky; top:0; z-index:2; }
+  .card { padding:12px 14px; }
+  .card dl { display:grid; grid-template-columns:auto 1fr; gap:7px 14px; margin:0; }
+  .card dt { color:var(--muted); font-size:12px; white-space:nowrap; }
+  .card dd { margin:0; font-family:var(--mono); font-size:12px; overflow-wrap:anywhere; }
+  .card dl dl { grid-column:1 / -1; padding-left:12px;
+                border-left:2px solid var(--line); margin-top:4px; }
+  .pill { display:inline-block; font:600 10.5px var(--mono); padding:2px 7px;
+          border-radius:99px; border:1px solid var(--line); margin:0 4px 3px 0;
+          color:var(--muted); }
+  .pill.yes { color:var(--ok); border-color:var(--ok); }
+  .pill.no  { color:var(--bad); border-color:var(--bad); }
+  .banner { margin:12px 14px 0; padding:10px 12px; border-radius:7px; font-size:12.5px;
+            border:1px solid var(--bad);
+            background:color-mix(in srgb, var(--bad) 10%, transparent); }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <h1>Hamdaz ERP</h1>
+    <span class="chip" id="envChip">sandbox</span>
+    <span class="spacer"></span>
+    <button id="btnSplit" title="Show two routes side by side">Split view</button>
+    <span class="chip" id="sessChip">checking…</span>
+    <button id="btnLogin" class="primary">Sign in</button>
+    <button id="btnLogout">Sign out</button>
+  </header>
+
+  <div class="work" id="work">
+    <nav class="pane" id="sidebar">
+      <div class="title">
+        <h2>Modules</h2>
+        <div class="row">
+          <button id="btnExpand" title="Expand or collapse every module">All</button>
+          <span class="chip" id="routeCount"></span>
+        </div>
+      </div>
+      <div class="scroll" id="routeList"></div>
+    </nav>
+
+    <div class="split v" data-split="sidebar"></div>
+
+    <div id="stage"></div>
+
+    <div class="split v" data-split="context"></div>
+
+    <aside class="pane" id="context">
+      <div class="title"><h2>Context</h2><button id="ctxClear">Clear</button></div>
+      <div class="scroll" id="contextBody"></div>
+    </aside>
+  </div>
+
+  <div class="split h" data-split="console"></div>
+
+  <section class="pane" id="console">
+    <div class="title">
+      <h2>Response <span class="chip" id="respFrom"></span></h2>
+      <div class="row">
+        <span class="chip" id="respTime"></span>
+        <span class="status s0" id="respCode">—</span>
+      </div>
+    </div>
+    <div class="scroll"><pre id="respBody">Nothing sent yet.</pre></div>
+  </section>
+</div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const el = (tag, cls, text) => {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text != null) n.textContent = text;
+  return n;
+};
+
+/* ── the shared selection that ties the panes together ───────────────── */
+const ctx = { user:null, role:null, org:null, team:null, module:null,
+              session:null, lastRoute:null };
+
+const ROUTES = [
+  { g:"ops", m:"GET", p:"/health", t:"Health", auth:"public" },
+
+  { g:"auth", m:"GET", p:"/api/v1/auth/me", t:"Current user", auth:"session",
+    onOk:(d) => setUser({ id:d.id, name:d.display_name, email:d.email }) },
+  { g:"auth", m:"POST", p:"/api/v1/auth/logout", t:"Sign out", auth:"session" },
+
+  { g:"directory", m:"GET", p:"/api/v1/directory/users", t:"Org directory", auth:"session",
+    query:[ {n:"search", l:"Search name, email, title, department"},
+            {n:"include_guests", l:"Include guest accounts", type:"check"},
+            {n:"include_disabled", l:"Include disabled accounts", type:"check"},
+            {n:"limit", l:"Limit", def:"200"}, {n:"offset", l:"Offset", def:"0"} ],
+    rows:(d) => d.users,
+    cols:[ {k:"display_name", l:"Name"},
+           {k:(r) => r.email || r.user_principal_name, l:"Sign-in address", mono:true},
+           {k:(r) => r.job_title || "—", l:"Title"},
+           {k:(r) => r.department || "—", l:"Department"} ],
+    tags:(r) => [ !r.account_enabled && "disabled", r.is_guest && "guest" ],
+    pick:(r) => setOrg(r) },
+
+  { g:"directory", m:"GET", p:"/api/v1/directory/users/{object_id}", t:"One person", auth:"session",
+    params:[ {n:"object_id", l:"Entra object id", from:"org"} ] },
+
+  { g:"roles", m:"GET", p:"/api/v1/roles/me", t:"My roles", auth:"session",
+    onOk:(d) => setUser({ id:d.user_id, name:d.display_name, email:d.email,
+                          roles:d.role_keys, admin:d.is_admin, superAdmin:d.is_super_admin }) },
+  { g:"roles", m:"GET", p:"/api/v1/roles", t:"Role catalogue", auth:"session",
+    query:[ {n:"scope", l:"Scope", type:"select", opts:["", "global", "team"]} ],
+    rows:(d) => d,
+    cols:[ {k:"key", l:"Key", mono:true}, {k:"name", l:"Name"},
+           {k:"scope", l:"Scope"}, {k:(r) => r.description || "—", l:"Description"} ],
+    tags:(r) => [ r.is_system && "system" ],
+    pick:(r) => setRole(r) },
+  { g:"roles", m:"GET", p:"/api/v1/roles/assignments", t:"Who holds what", auth:"session",
+    rows:(d) => d,
+    cols:[ {k:"display_name", l:"Name"}, {k:"email", l:"Email", mono:true},
+           {k:(r) => r.role_keys.join(", ") || "—", l:"Roles", mono:true} ],
+    pick:(r) => setUser({ id:r.user_id, name:r.display_name, email:r.email, roles:r.role_keys }) },
+  { g:"roles", m:"GET", p:"/api/v1/roles/users/{user_id}", t:"A user's roles", auth:"session",
+    params:[ {n:"user_id", l:"User id or Entra object id", from:"any"} ] },
+
+  { g:"roles", m:"POST", p:"/api/v1/roles/users/{user_id}", t:"Grant a role", auth:"admin",
+    params:[ {n:"user_id", l:"User id or Entra object id", from:"any"} ],
+    body:[ {n:"role_key", l:"Role", type:"role"} ],
+    note:"Global roles only — a team role returns 409, because those are granted inside a " +
+         "team. If the person has never signed in they are provisioned automatically." },
+  { g:"roles", m:"DELETE", p:"/api/v1/roles/users/{user_id}/{role_key}", t:"Revoke a role",
+    auth:"admin",
+    params:[ {n:"user_id", l:"User id or Entra object id", from:"any"},
+             {n:"role_key", l:"Role", type:"role"} ] },
+  { g:"roles", m:"POST", p:"/api/v1/roles", t:"Create a role", auth:"admin",
+    body:[ {n:"key", l:"Key (lowercase, a-z0-9_)"}, {n:"name", l:"Display name"},
+           {n:"scope", l:"Scope", type:"select", opts:["global", "team"]},
+           {n:"description", l:"Description", type:"area"} ] },
+  { g:"roles", m:"PATCH", p:"/api/v1/roles/{key}", t:"Rename a role", auth:"admin",
+    params:[ {n:"key", l:"Role", type:"role"} ],
+    body:[ {n:"name", l:"New display name"}, {n:"description", l:"Description", type:"area"} ] },
+  { g:"roles", m:"DELETE", p:"/api/v1/roles/{key}", t:"Delete a role", auth:"admin",
+    params:[ {n:"key", l:"Role", type:"role"} ],
+    note:"System roles cannot be deleted, and neither can one still held by anyone." },
+  { g:"teams", m:"GET", p:"/api/v1/teams", t:"All teams", auth:"session",
+    query:[ {n:"search", l:"Search name or handle"},
+            {n:"include_archived", l:"Include archived", type:"check"} ],
+    rows:(d) => d,
+    cols:[ {k:"name", l:"Team"}, {k:"slug", l:"Handle", mono:true},
+           {k:"member_count", l:"Members"},
+           {k:(r) => r.description || "—", l:"Description"} ],
+    tags:(r) => [ r.archived_at && "archived" ],
+    pick:(r) => setTeam(r) },
+  { g:"teams", m:"GET", p:"/api/v1/teams/me", t:"My teams", auth:"session" },
+  { g:"teams", m:"GET", p:"/api/v1/teams/{ref}", t:"One team + members", auth:"session",
+    params:[ {n:"ref", l:"Team handle or id", from:"team"} ] },
+  { g:"teams", m:"GET", p:"/api/v1/teams/{ref}/members", t:"Team members", auth:"session",
+    params:[ {n:"ref", l:"Team handle or id", from:"team"} ],
+    rows:(d) => d,
+    cols:[ {k:"display_name", l:"Name"}, {k:"email", l:"Email", mono:true},
+           {k:(r) => r.role_keys.join(", "), l:"Roles in team", mono:true} ],
+    tags:(r) => [ !r.is_active && "inactive" ],
+    pick:(r) => setUser({ id:r.user_id, name:r.display_name, email:r.email,
+                          roles:r.role_keys }) },
+  { g:"teams", m:"GET", p:"/api/v1/teams/by-user/{user_id}", t:"Someone's teams",
+    auth:"session", params:[ {n:"user_id", l:"User id", from:"any"} ] },
+
+  { g:"teams", m:"POST", p:"/api/v1/teams", t:"Create a team", auth:"admin",
+    body:[ {n:"name", l:"Name"}, {n:"description", l:"Description", type:"area"},
+           {n:"slug", l:"Handle (optional — derived from the name)"} ] },
+  { g:"teams", m:"PATCH", p:"/api/v1/teams/{ref}", t:"Rename a team", auth:"admin",
+    params:[ {n:"ref", l:"Team handle or id", from:"team"} ],
+    body:[ {n:"name", l:"New name"}, {n:"description", l:"Description", type:"area"},
+           {n:"slug", l:"New handle"} ] },
+  { g:"teams", m:"POST", p:"/api/v1/teams/{ref}/members", t:"Add / set member roles",
+    auth:"admin",
+    params:[ {n:"ref", l:"Team handle or id", from:"team"} ],
+    body:[ {n:"user_id", l:"User id or Entra object id", from:"any"},
+           {n:"role_keys", l:"Roles in team", type:"teamroles", multi:true} ],
+    note:"Replaces whatever roles they already hold in this team. Someone who has " +
+         "never signed in is provisioned from the directory." },
+  { g:"teams", m:"PATCH", p:"/api/v1/teams/{ref}/members/{user_id}", t:"Change member roles",
+    auth:"admin",
+    params:[ {n:"ref", l:"Team handle or id", from:"team"},
+             {n:"user_id", l:"User id", from:"any"} ],
+    body:[ {n:"role_keys", l:"Roles in team", type:"teamroles", multi:true} ] },
+  { g:"teams", m:"DELETE", p:"/api/v1/teams/{ref}/members/{user_id}", t:"Remove a member",
+    auth:"admin",
+    params:[ {n:"ref", l:"Team handle or id", from:"team"},
+             {n:"user_id", l:"User id", from:"any"} ] },
+  { g:"teams", m:"POST", p:"/api/v1/teams/{ref}/archive", t:"Archive a team", auth:"admin",
+    params:[ {n:"ref", l:"Team handle or id", from:"team"} ] },
+  { g:"teams", m:"POST", p:"/api/v1/teams/{ref}/restore", t:"Restore a team", auth:"admin",
+    params:[ {n:"ref", l:"Team handle or id", from:"team"} ] },
+  { g:"teams", m:"DELETE", p:"/api/v1/teams/{ref}", t:"Delete a team", auth:"admin",
+    params:[ {n:"ref", l:"Team handle or id", from:"team"} ],
+    note:"Only an archived team can be deleted, so a live team cannot be destroyed " +
+         "by one mistaken call." },
+  { g:"users", m:"GET", p:"/api/v1/users/sections", t:"What a profile holds", auth:"session",
+    rows:(d) => d,
+    cols:[ {k:"key", l:"Section", mono:true}, {k:"label", l:"Label"},
+           {k:(r) => r.remote ? "Entra" : "local", l:"Source"},
+           {k:(r) => r.resettable ? "yes" : "no", l:"Reset clears it"} ] },
+  { g:"users", m:"GET", p:"/api/v1/users/{ref}", t:"Everything about a user",
+    auth:"session",
+    params:[ {n:"ref", l:"User id, Entra object id, or email", from:"any"} ],
+    query:[ {n:"include", l:"Sections (comma-separated, blank = all)"},
+            {n:"local_only", l:"Skip the Entra lookup", type:"check"} ],
+    note:"One call gathers every module's data, fanned out concurrently. New modules " +
+         "appear here automatically. meta.section_ms shows where the time went." },
+  { g:"users", m:"POST", p:"/api/v1/users/{ref}/reset", t:"Reset a user", auth:"admin",
+    params:[ {n:"ref", l:"User id, Entra object id, or email", from:"any"} ],
+    note:"Strips every module's data but keeps the account. Refuses on yourself, and " +
+         "on the last super admin. Their Entra account is never touched." },
+  { g:"users", m:"DELETE", p:"/api/v1/users/{ref}", t:"Delete a user", auth:"admin",
+    params:[ {n:"ref", l:"User id, Entra object id, or email", from:"any"} ],
+    note:"Removes them from the ERP entirely. Signing in again would create a fresh, " +
+         "empty account. A super admin must be demoted first." },
+  { g:"access", m:"GET", p:"/api/v1/modules", t:"Module catalogue", auth:"session",
+    rows:(d) => d,
+    cols:[ {k:"key", l:"Module", mono:true}, {k:"name", l:"Name"},
+           {k:(r) => r.pages.map((p) => p.key).join(", "), l:"Pages", mono:true},
+           {k:"description", l:"Description"} ],
+    tags:(r) => [ r.admin_only && "admin-only" ],
+    pick:(r) => setModule(r) },
+  { g:"access", m:"GET", p:"/api/v1/access/me", t:"What I can see", auth:"session",
+    note:"What a frontend calls on load to build its navigation. A super admin sees " +
+         "everything; everyone else sees the union of their teams' grants." },
+  { g:"access", m:"GET", p:"/api/v1/access/users/{user_id}", t:"What someone can see",
+    auth:"session", params:[ {n:"user_id", l:"User id", from:"any"} ] },
+  { g:"access", m:"GET", p:"/api/v1/teams/{ref}/access", t:"A team's modules",
+    auth:"session", params:[ {n:"ref", l:"Team handle or id", from:"team"} ] },
+
+  { g:"access", m:"POST", p:"/api/v1/teams/{ref}/access", t:"Grant a module to a team",
+    auth:"super_admin",
+    params:[ {n:"ref", l:"Team handle or id", from:"team"} ],
+    body:[ {n:"module_key", l:"Module", type:"module"},
+           {n:"page_keys", l:"Pages (none selected = the whole module)",
+            type:"pages", multi:true} ],
+    note:"Only a super admin may change visibility — a manager gets 403 here even " +
+         "though they can create teams. Admin-only modules return 409." },
+  { g:"access", m:"PUT", p:"/api/v1/teams/{ref}/access", t:"Replace a team's whole set",
+    auth:"super_admin",
+    params:[ {n:"ref", l:"Team handle or id", from:"team"} ],
+    body:[ {n:"modules", l:"JSON: {\"directory\": null, \"teams\": [\"list\"]}",
+            type:"json"} ],
+    note:"null means the whole module; a list pins it to those pages." },
+  { g:"access", m:"DELETE", p:"/api/v1/teams/{ref}/access/{module_key}",
+    t:"Take a module away", auth:"super_admin",
+    params:[ {n:"ref", l:"Team handle or id", from:"team"},
+             {n:"module_key", l:"Module", type:"module"} ] },
+  { g:"dashboards", m:"GET", p:"/api/v1/widgets", t:"Widget catalogue", auth:"session",
+    rows:(d) => d,
+    cols:[ {k:"key", l:"Widget", mono:true}, {k:"title", l:"Title"},
+           {k:"module", l:"Needs module", mono:true}, {k:"size", l:"Size"},
+           {k:"description", l:"Description"} ],
+    tags:(r) => [ r.default && "default", r.remote && "remote" ] },
+  { g:"dashboards", m:"GET", p:"/api/v1/teams/{ref}/dashboard", t:"Render a team dashboard",
+    auth:"session",
+    params:[ {n:"ref", l:"Team handle or id", from:"team"} ],
+    query:[ {n:"local_only", l:"Skip widgets that call Entra", type:"check"} ],
+    note:"Each team's own cards with that team's data. Which cards exist follows the " +
+         "modules the team holds — meta.widget_ms shows where the time went." },
+  { g:"dashboards", m:"GET", p:"/api/v1/teams/{ref}/dashboard/layout", t:"A team's layout",
+    auth:"session", params:[ {n:"ref", l:"Team handle or id", from:"team"} ],
+    note:"configured=false means these are defaults. 'available' is everything the " +
+         "team could add, given its modules." },
+  { g:"dashboards", m:"PUT", p:"/api/v1/teams/{ref}/dashboard/layout", t:"Arrange a dashboard",
+    auth:"admin",
+    params:[ {n:"ref", l:"Team handle or id", from:"team"} ],
+    body:[ {n:"widgets", l:"JSON list, in order",
+            type:"json",
+            sample:'{"widgets":[{"widget_key":"team_summary"},' +
+                   '{"widget_key":"team_members","options":{"limit":5}},' +
+                   '{"widget_key":"role_breakdown","enabled":false}]}'} ],
+    note:"Replaces the whole arrangement. A widget whose module the team lacks is " +
+         "refused rather than silently dropped." },
+  { g:"dashboards", m:"DELETE", p:"/api/v1/teams/{ref}/dashboard/layout",
+    t:"Reset to defaults", auth:"admin",
+    params:[ {n:"ref", l:"Team handle or id", from:"team"} ] },
+  { g:"dashboards", m:"GET", p:"/api/v1/dashboards/me", t:"My teams' dashboards",
+    auth:"session",
+    query:[ {n:"local_only", l:"Skip Entra widgets", type:"check", checked:true} ] },
+  { g:"proposals", m:"GET", p:"/api/v1/proposals/my-tasks", t:"My proposal tasks",
+    auth:"session",
+    query:[ {n:"open_only", l:"Hide completed — off shows ALL your tasks", type:"check"},
+            {n:"limit", l:"Limit", def:"500"} ],
+    rows:(d) => d.tasks,
+    cols:[ {k:(r) => (r.due_date || "").slice(0,10) || "—", l:"Due"},
+           {k:(r) => r.status || "—", l:"Status"},
+           {k:(r) => r.priority || "—", l:"Priority"},
+           {k:"title", l:"Proposal"},
+           {k:(r) => r.end_user || "—", l:"End user"} ],
+    tags:(r) => [ !r.is_open && "done" ],
+    note:"Read-only from the SharePoint Proposals list. 'Hide completed' now starts " +
+         "OFF, so the table shows every task assigned to you. The Summary card below " +
+         "the table carries `total` (everything assigned to you) and `open_count` " +
+         "— `total` is unaffected by the filter, so the two disagree whenever it " +
+         "is on. Two gates apply: your team must hold the proposals module, and you " +
+         "only ever see rows assigned to you, taken from your session." },
+  { g:"proposals", m:"GET", p:"/api/v1/proposals/workload", t:"Workload by person",
+    auth:"admin",
+    query:[ {n:"team", l:"Team handle — scopes to that team's members", from:"team",
+             def:"presalse"},
+            {n:"refresh", l:"Re-sweep SharePoint instead of using the cache",
+             type:"check"} ],
+    rows:(d) => d.people,
+    cols:[ {k:"name", l:"Person"}, {k:"total", l:"Total"}, {k:"completed", l:"Done"},
+           {k:"open", l:"Open"}, {k:"overdue", l:"Overdue"},
+           {k:"due_soon", l:"Due soon"},
+           {k:(r) => (r.next_deadline || "").slice(0,10) || "—", l:"Next deadline"} ],
+    note:"Admin-only. Every person carries total / completed / open / overdue / " +
+         "due_soon plus a by_status breakdown — total is the full count, not " +
+         "just the open ones. Scoped to a team it counts only that team's members: " +
+         "the SharePoint list holds people who are not on it, and 'excluded' says " +
+         "how many rows and who was left out. Clear the team box for everyone." },
+  { g:"proposals", m:"GET", p:"/api/v1/proposals/columns", t:"Proposals list schema",
+    auth:"session",
+    rows:(d) => d,
+    cols:[ {k:"name", l:"Field", mono:true}, {k:"display_name", l:"Label"},
+           {k:(r) => (r.choices || []).join(", ") || "—", l:"Choices"} ] },
+  { g:"analytics", m:"GET", p:"/api/v1/analytics/preview", t:"Who should get the next task",
+    auth:"session",
+    query:[ {n:"team", l:"Team handle — required", from:"team", def:"presalse"},
+            {n:"refresh", l:"Re-read SharePoint instead of the cache", type:"check"} ],
+    rows:(d) => d.entries,
+    cols:[ {k:(r) => r.priority_score == null ? "—" : r.priority_score, l:"Priority"},
+           {k:"display_name", l:"Person"},
+           {k:"total_tasks", l:"Total"},
+           {k:"open_tasks", l:"Open"},
+           {k:(r) => r.capacity, l:"Cap"},
+           {k:(r) => Number(r.effective_load).toFixed(1), l:"Load"},
+           {k:(r) => r.days_since_last_assign == null ? "never" : r.days_since_last_assign, l:"Idle d"},
+           {k:(r) => r.factor_total == null ? "—" : Number(r.factor_total).toFixed(3), l:"How close"},
+           {k:(r) => r.excluded_reason || "", l:"Why out"} ],
+    tags:(r) => [ r.excluded && "out" ],
+    note:"PRIORITY 1 is the highest — next in line — then 2, 3, 4, " +
+         "consecutive over the people " +
+         "who can actually be assigned, with no gaps. Anyone excluded has no rank " +
+         "and no score at all (out of the pool is not the same as ranked last). " +
+         "Task counts are read LIVE from SharePoint on every call; nothing is " +
+         "written anywhere, here or to SharePoint. Load is open/capacity — " +
+         "that is what makes a ratio real. A team is required, and only teams " +
+         "with an assignment policy of their own are in scope — presales " +
+         "today. Give another team a policy and it joins; there is no " +
+         "organisation-wide ranking, because teams do not share one queue." },
+  { g:"analytics", m:"POST", p:"/api/v1/analytics/runs", t:"Keep a ranking as a record",
+    auth:"session",
+    query:[ {n:"team", l:"Team handle — required", from:"team", def:"presalse"} ],
+    body:[ {n:"notes", l:"Why you are keeping this one"} ],
+    note:"Stored in POSTGRES. Nothing is sent to SharePoint — the " +
+         "testuseranalytics list is live and this does not touch it. The policy is " +
+         "frozen onto the row, so editing it next week cannot rewrite what this " +
+         "run was based on. Same people who may edit the policy." },
+  { g:"analytics", m:"GET", p:"/api/v1/analytics/runs", t:"Kept runs",
+    auth:"session",
+    query:[ {n:"team", l:"Only this team", from:"team"} ],
+    rows:(d) => d,
+    cols:[ {k:(r) => r.created_at.slice(0,16).replace("T"," "), l:"When"},
+           {k:(r) => r.team_name || "everyone", l:"Scope"},
+           {k:"people", l:"People"}, {k:"assignable", l:"In pool"},
+           {k:(r) => r.next_up || "—", l:"Next up"},
+           {k:(r) => r.created_by_name || "—", l:"By"} ],
+    note:"Only runs somebody chose to keep. Previewing stores nothing, so the " +
+         "history holds decisions rather than every time anyone looked." },
+  { g:"analytics", m:"GET", p:"/api/v1/analytics/runs/{run_id}/people/{user_id}", t:"Why one person scored that",
+    auth:"session",
+    params:[ {n:"run_id", l:"Run id"}, {n:"user_id", l:"User id"} ],
+    note:"The factor breakdown: the raw number, where it sat relative to " +
+         "everyone else, and how much each factor moved them. This is what makes " +
+         "a ranking arguable rather than merely announced." },
+  { g:"labels", m:"GET", p:"/api/v1/labels", t:"The label catalogue",
+    auth:"session",
+    query:[ {n:"team", l:"Also show this team’s own labels", from:"team"} ],
+    rows:(d) => d,
+    cols:[ {k:"key", l:"Key", mono:true}, {k:"name", l:"Name"}, {k:"kind", l:"Kind"},
+           {k:(r) => r.derived ? "automatic" : (r.is_system ? "system" : "—"), l:"Origin"},
+           {k:(r) => r.team_id ? "team" : "org-wide", l:"Scope"} ],
+    note:"Roles grant permission; labels drive policy. A Senior and a New Joiner " +
+         "can both be 'member' with identical permissions and still get very " +
+         "different workloads. 'automatic' labels are worked out at read time and " +
+         "cannot be handed out — change the underlying data instead." },
+  { g:"labels", m:"GET", p:"/api/v1/labels/people", t:"Everyone’s labels, as of today",
+    auth:"session",
+    query:[ {n:"team", l:"Judge team-scoped labels against this team", from:"team"},
+            {n:"new_joiner_days", l:"New-joiner window (days)", def:"90"} ],
+    rows:(d) => d,
+    cols:[ {k:"display_name", l:"Person"},
+           {k:(r) => (r.labels.map((l) => l.key).join(", ") || "—"), l:"Labels"},
+           {k:(r) => r.joined_on || "—", l:"Joined"},
+           {k:(r) => r.labels.filter((l) => l.source === "derived").length || "—", l:"Automatic"} ],
+    note:"Includes the two nobody assigns. Someone on approved leave shows " +
+         "'on-leave' until the day their leave ends, and a recent starter shows " +
+         "'new-joiner' until the window passes. Neither is stored, so neither can " +
+         "go stale — and no job has to run. Each carries a `reason`." },
+  { g:"labels", m:"POST", p:"/api/v1/labels", t:"Add a label",
+    auth:"session",
+    query:[ {n:"team", l:"Scope it to one team — blank for org-wide", from:"team"} ],
+    body:[ {n:"key", l:"Key, e.g. security-cleared"}, {n:"name", l:"Name"},
+           {n:"kind", l:"category | status | skill", def:"skill"},
+           {n:"description", l:"What it means"}, {n:"color", l:"Colour, e.g. #2b6cb0"} ],
+    note:"Super admin, CEO or manager only. No skills ship by default — " +
+         "competencies are specific to what a business actually sells." },
+  { g:"labels", m:"POST", p:"/api/v1/labels/assign", t:"Give someone a label",
+    auth:"session",
+    body:[ {n:"payload", l:"Assignment", type:"json",
+            def:JSON.stringify({user_id:"", label_key:"senior", team_id:null,
+                                expires_at:null, note:""}, null, 1)} ],
+    note:"expires_at makes it lapse on its own — a training period, a " +
+         "temporary exclusion — with no reaper job and no window where a " +
+         "stale label is still shaping who gets work. Re-assigning extends it." },
+  { g:"labels", m:"PUT", p:"/api/v1/labels/people/{user_id}/joined-on", t:"Set someone’s joining date",
+    auth:"session",
+    params:[ {n:"user_id", l:"User id"} ],
+    body:[ {n:"joined_on", l:"YYYY-MM-DD, or blank to clear"} ],
+    note:"Entra gives us no hire date, so this is where a real one goes. Unset, " +
+         "the new-joiner rule falls back to when they first appeared in this " +
+         "system — usually close, occasionally very wrong." },
+  { g:"assignment", m:"GET", p:"/api/v1/assignment/policies", t:"Every assignment policy",
+    auth:"session",
+    rows:(d) => d,
+    cols:[ {k:(r) => r.team_name || "(organisation default)", l:"Scope"},
+           {k:(r) => r.enabled ? "on" : "off", l:"On"},
+           {k:(r) => r.new_joiner_days + "d", l:"New-joiner"},
+           {k:(r) => r.exclude_on_leave ? "yes" : "no", l:"Skip on leave"},
+           {k:(r) => r.may_edit ? "yes" : "no", l:"You may edit"} ],
+    note:"A team uses its own policy when it has one and it is enabled; otherwise " +
+         "the organisation default. `may_edit` reflects YOUR reach — super " +
+         "admin and CEO anywhere, a manager only on teams they belong to." },
+  { g:"assignment", m:"GET", p:"/api/v1/assignment/preview", t:"What the policy means for real people",
+    auth:"session",
+    query:[ {n:"team", l:"One team — blank for everyone", from:"team"} ],
+    rows:(d) => d.people,
+    cols:[ {k:"display_name", l:"Person"},
+           {k:(r) => r.labels.join(", ") || "—", l:"Labels"},
+           {k:(r) => r.capacity, l:"Capacity"},
+           {k:"ratio", l:"Means"},
+           {k:(r) => r.max_open == null ? "—" : r.max_open, l:"Max open"},
+           {k:(r) => r.excluded ? "OUT" : "in", l:"Pool"} ],
+    tags:(r) => [ r.excluded && "excluded" ],
+    note:"Where a ratio stops being an abstract number. Nothing is assigned and " +
+         "nothing is written — this only says who would be in the pool and " +
+         "at what share. Capacity 0.5 means one task for every two." },
+  { g:"assignment", m:"PATCH", p:"/api/v1/assignment/policies/default", t:"Change the organisation default",
+    auth:"session",
+    body:[ {n:"payload", l:"Only the fields you want to change", type:"json",
+            def:JSON.stringify({capacity_by_label:{"new-joiner":0.5,"junior":0.7,
+              "mid":1.0,"senior":1.4,"lead":0.8,"training":0.4},
+              default_max_open:null, max_open_by_label:{"new-joiner":4},
+              exclude_on_leave:true, new_joiner_days:90}, null, 1)} ],
+    note:"Super admin or CEO only — the default governs teams a manager has " +
+         "nothing to do with. A patch, so anything you leave out is untouched. " +
+         "Capacity is a multiplier: 0.5 = one task for every two." },
+  { g:"assignment", m:"POST", p:"/api/v1/assignment/policies/team/{team_id}", t:"Give a team its own policy",
+    auth:"session",
+    params:[ {n:"team_id", l:"Team id"} ],
+    note:"Copied from the organisation default, so the first edit changes " +
+         "something that already works rather than a form of empty boxes." },
+  { g:"assignment", m:"PATCH", p:"/api/v1/assignment/policies/team/{team_id}", t:"Change one team’s policy",
+    auth:"session",
+    params:[ {n:"team_id", l:"Team id"} ],
+    body:[ {n:"payload", l:"Only the fields you want to change", type:"json",
+            def:JSON.stringify({capacity_by_label:{"new-joiner":0.5}}, null, 1)} ],
+    note:"A manager may change this only for a team they belong to. Refused " +
+         "edits come back 403 with the reason." },
+  { g:"templates", m:"GET", p:"/api/v1/templates", t:"Every form template",
+    auth:"session",
+    query:[ {n:"kind", l:"Narrow to one kind — blank lists them all"},
+            {n:"include_archived", l:"Also show archived ones", type:"check"} ],
+    rows:(d) => d,
+    cols:[ {k:"key", l:"Key", mono:true}, {k:"name", l:"Name"},
+           {k:"kind", l:"Kind", mono:true}, {k:"status", l:"Status"},
+           {k:(r) => "v" + r.version, l:"Ver"},
+           {k:"field_count", l:"Fields"}, {k:"grant_count", l:"Grants"} ],
+    note:"Lists every template by default — both boxes are optional filters. " +
+         "Archived ones are hidden unless you ask, since they are retired rather " +
+         "than current. A form's fields as DATA rather than code, so changing " +
+         "what presales must fill in is an edit rather than a deploy. Only a " +
+         "super admin creates or changes one." },
+  { g:"templates", m:"GET", p:"/api/v1/templates/usable", t:"What I can actually fill in",
+    auth:"session",
+    query:[ {n:"kind", l:"Narrow to one kind — blank lists them all"} ],
+    rows:(d) => d,
+    cols:[ {k:"key", l:"Key", mono:true}, {k:"name", l:"Name"},
+           {k:"kind", l:"Kind", mono:true}, {k:"field_count", l:"Fields"} ],
+    note:"The only question most callers have. Filters by the grants: which " +
+         "team, and what standing inside it." },
+  { g:"templates", m:"GET", p:"/api/v1/templates/{ref}", t:"One template in full",
+    auth:"session",
+    params:[ {n:"ref", l:"Key or id, e.g. quote_request"} ],
+    rows:(d) => d.fields,
+    cols:[ {k:"key", l:"Field", mono:true}, {k:"label", l:"Label"},
+           {k:"type", l:"Type"},
+           {k:(r) => r.required ? "yes" : "\u2014", l:"Required"},
+           {k:(r) => r.section || "\u2014", l:"Section"},
+           {k:(r) => r.maps_to || "\u2014", l:"Zoho field", mono:true} ],
+    note:"Every `maps_to` was read off a LIVE Zoho estimate \u2014 including " +
+         "cf_bcd, cf_portal and cf_quote_creater, the three custom fields this " +
+         "organisation actually uses. A field with no maps_to is ours alone and " +
+         "is never sent to Zoho (title, cost_rate, payment_terms). The line " +
+         "items field carries its own `columns`. `may_use` says whether YOU can " +
+         "fill it in." },
+  { g:"templates", m:"POST", p:"/api/v1/templates", t:"Create a template (super admin)",
+    auth:"session",
+    body:[ {n:"payload", l:"The form definition", type:"json",
+            def:JSON.stringify({key:"site_visit", name:"Site visit report",
+              kind:"site_visit", description:"Filled in after a site survey.",
+              sections:[{key:"visit", name:"Visit"}],
+              fields:[{key:"site", label:"Site", type:"text", section:"visit", required:true},
+                      {key:"visited_on", label:"Date", type:"date", section:"visit"},
+                      {key:"findings", label:"Findings", type:"textarea", section:"visit"}]},
+              null, 1)} ],
+    note:"Created as a DRAFT and granted to NOBODY, both deliberately: a " +
+         "half-written form should not be fillable, and a form appears for a " +
+         "team because somebody decided it should \u2014 not because it was " +
+         "saved. Publish it, then grant it." },
+  { g:"templates", m:"PATCH", p:"/api/v1/templates/{ref}", t:"Edit a template (super admin)",
+    auth:"session",
+    params:[ {n:"ref", l:"Key or id"} ],
+    body:[ {n:"payload", l:"Only what changes", type:"json",
+            def:JSON.stringify({name:"Quote request (v2)"}, null, 1)} ],
+    note:"A patch \u2014 anything left out is untouched. Sending `fields` " +
+         "replaces the whole field list, so send all of them. An archived " +
+         "template cannot be edited: records made from it would stop matching " +
+         "their own definition." },
+  { g:"templates", m:"PUT", p:"/api/v1/templates/{ref}/grants", t:"Who may use it (super admin)",
+    auth:"session",
+    params:[ {n:"ref", l:"Key or id"} ],
+    body:[ {n:"payload", l:"Grants \u2014 replaces them all", type:"json",
+            def:JSON.stringify([{team_id:null, allowed_roles:[],
+                                 note:"every team, anyone"},
+                                {team_id:"<presales team id>",
+                                 allowed_roles:["team_manager","manager"],
+                                 note:"presales, managers only"}], null, 1)} ],
+    note:"TWO independent questions. Omit team_id for every team; leave " +
+         "allowed_roles empty for anyone on that team. An EMPTY list of grants " +
+         "means nobody but a super admin \u2014 which is different from a grant " +
+         "with no team, meaning everybody." },
+  { g:"templates", m:"POST", p:"/api/v1/templates/{ref}/publish", t:"Publish (super admin)",
+    auth:"session",
+    params:[ {n:"ref", l:"Key or id"} ],
+    note:"Draft to active. A template with no fields cannot be published." },
+  { g:"templates", m:"POST", p:"/api/v1/templates/{ref}/archive", t:"Archive (super admin)",
+    auth:"session",
+    params:[ {n:"ref", l:"Key or id"} ],
+    note:"Retired but still readable. Archiving rather than deleting because a " +
+         "form somebody submitted last month is unreadable once the definition " +
+         "behind it has gone. `restore` brings it back." },
+  { g:"templates", m:"POST", p:"/api/v1/templates/{ref}/restore", t:"Restore (super admin)",
+    auth:"session",
+    params:[ {n:"ref", l:"Key or id"} ],
+    note:"Archived back to active." },
+  { g:"templates", m:"DELETE", p:"/api/v1/templates/{ref}", t:"Delete (super admin)",
+    auth:"session",
+    params:[ {n:"ref", l:"Key or id"} ],
+    note:"Only a template nothing was ever filled in from. Anything else is " +
+         "refused and must be archived instead." },
+  { g:"quoting", m:"POST", p:"/api/v1/quote-requests", t:"1. Raise a quote request",
+    auth:"session",
+    query:[ {n:"team", l:"Team handle", from:"team", def:"presalse"} ],
+    body:[ {n:"payload", l:"The form \u2014 Zoho estimate field names", type:"json",
+            def:JSON.stringify({title:"Firewall refresh \u2014 ADNOC",
+              customer_name:"ADNOC", reference_number:"MR-TRJ-24-01-0790",
+              currency:"AED", cf_bcd:"2026-09-30", cf_portal:"ADNOC",
+              payment_terms:"30 days net", delivery_terms:"4 weeks ex-stock",
+              multiple_supplier_quotes:false,
+              items:[{name:"FortiGate 201G", item_code:"FG-201G", quantity:2,
+                      rate:12000, cost_rate:9000},
+                     {name:"3yr subscription", quantity:2, rate:4000, cost_rate:3100}]},
+              null, 1)} ],
+    note:"Field names are Zoho's on purpose (customer_name, reference_number, " +
+         "expiry_date, items with `rate`, cf_bcd, cf_portal) so the integration " +
+         "later is a mapping rather than a rewrite. A win probability is worked " +
+         "out from your 593 decided estimates and frozen on with the counts " +
+         "behind it in `win_basis`. Totals are computed, never taken from you." },
+  { g:"quoting", m:"POST", p:"/api/v1/quote-requests/{request_id}/supplier-quotes", t:"2. Attach supplier quotes",
+    auth:"session",
+    params:[ {n:"request_id", l:"Quote request id"} ],
+    form:[ {n:"files", l:"Supplier quotes \u2014 pick several", type:"file", multiple:true,
+            accept:".pdf,.png,.jpg,.jpeg,.webp,.gif,.xlsx,.xls,.csv,.docx"} ],
+    note:"Reuses the comparison module rather than a second copy: each document " +
+         "is parsed locally first and only goes to Claude if that fails. Sets " +
+         "multiple_supplier_quotes and attaches the comparison. WHICH supplier " +
+         "wins is an approver's decision, not this step." },
+  { g:"quoting", m:"POST", p:"/api/v1/quote-requests/{request_id}/submit", t:"3. Send for approval",
+    auth:"session",
+    params:[ {n:"request_id", l:"Quote request id"} ],
+    note:"The quote LOCKS here. Editing it while approvers are looking would " +
+         "mean they approved something that no longer exists \u2014 the failure " +
+         "this module exists to prevent. Claiming several suppliers with no " +
+         "comparison attached is refused." },
+  { g:"quoting", m:"POST", p:"/api/v1/quote-requests/{request_id}/reviews", t:"4. Approve / reject / rework",
+    auth:"session",
+    params:[ {n:"request_id", l:"Quote request id"} ],
+    body:[ {n:"payload", l:"The decision", type:"json",
+            def:JSON.stringify({action:"rework",
+              note:"Margin on line 2 is too thin \u2014 requote.",
+              selected_supplier_quote_id:null}, null, 1)} ],
+    note:"action = approve | reject | rework | comment. A rejection or rework " +
+         "must say why. `rework` sends it back to the requester, bumps the " +
+         "revision and the loop goes round again; `comment` decides nothing. " +
+         "Approving a multi-supplier quote means naming the winner. Nobody may " +
+         "approve a quote they raised themselves." },
+  { g:"quoting", m:"POST", p:"/api/v1/quote-requests/{request_id}/comments", t:"Comment on anything",
+    auth:"session",
+    params:[ {n:"request_id", l:"Quote request id"} ],
+    body:[ {n:"payload", l:"Anchored comment", type:"json",
+            def:JSON.stringify({body:"This rate looks high against the last order.",
+              target_type:"item", target_ref:"<line id from the quote>"}, null, 1)} ],
+    note:"target_type = quote | field | item | supplier_quote. Anchored, not " +
+         "floating: a note on the rate is useful, the same note at the bottom of " +
+         "the page is not. Each records the revision it was written in, so an " +
+         "old note reads as old rather than as a live objection." },
+  { g:"quoting", m:"GET", p:"/api/v1/quote-requests", t:"All quote requests",
+    auth:"session",
+    query:[ {n:"team", l:"Team handle", from:"team"},
+            {n:"status", l:"draft | pending_approval | changes_requested | approved | rejected"} ],
+    rows:(d) => d,
+    cols:[ {k:(r) => r.reference || "\u2014", l:"Ref", mono:true},
+           {k:"title", l:"Title"}, {k:"customer_name", l:"Customer"},
+           {k:(r) => r.status.replace(/_/g," "), l:"Status"},
+           {k:(r) => "r" + r.revision, l:"Round"},
+           {k:(r) => Number(r.total).toLocaleString() + " " + r.currency, l:"Total"},
+           {k:(r) => r.win_probability == null ? "\u2014" : (r.win_probability*100).toFixed(0) + "%", l:"Win"},
+           {k:(r) => r.open_comments || "\u2014", l:"Notes"},
+           {k:(r) => r.assigned_to_name || "\u2014", l:"With"} ],
+    note:"Win % is the customer's own rate from your Zoho history, smoothed " +
+         "toward the 51% baseline \u2014 so two wins does not read as 100%." },
+  { g:"quoting", m:"GET", p:"/api/v1/quote-requests/mine", t:"Mine / waiting on me",
+    auth:"session",
+    rows:(d) => d,
+    cols:[ {k:"title", l:"Title"}, {k:(r) => r.status.replace(/_/g," "), l:"Status"},
+           {k:(r) => "r" + r.revision, l:"Round"},
+           {k:(r) => r.open_comments || "\u2014", l:"Open notes"} ],
+    note:"Quotes you raised, or that came back to you after a rework." },
+  { g:"quoting", m:"GET", p:"/api/v1/quote-requests/queue", t:"5. Ready for Zoho (the queue)",
+    auth:"session",
+    query:[ {n:"team", l:"Team handle", from:"team"},
+            {n:"mine_only", l:"Only the ones assigned to me", type:"check"} ],
+    rows:(d) => d,
+    cols:[ {k:(r) => r.reference || "\u2014", l:"Ref", mono:true},
+           {k:"title", l:"Title"}, {k:"customer_name", l:"Customer"},
+           {k:(r) => Number(r.total).toLocaleString() + " " + r.currency, l:"Total"},
+           {k:(r) => r.created_by_name || "\u2014", l:"Raised by"} ],
+    note:"Approved and waiting to be created in Zoho as an estimate. THIS IS " +
+         "WHERE THE MODULE STOPS \u2014 nothing pushes to Zoho, the list is live " +
+         "and that step is deliberately a later piece of work." },
+  { g:"quoting", m:"GET", p:"/api/v1/quote-requests/{request_id}", t:"One quote in full",
+    auth:"session",
+    params:[ {n:"request_id", l:"Quote request id"} ],
+    rows:(d) => d.items,
+    cols:[ {k:"name", l:"Item"}, {k:(r) => r.item_code || "\u2014", l:"Code", mono:true},
+           {k:"quantity", l:"Qty"}, {k:"rate", l:"Rate"},
+           {k:(r) => r.cost_rate == null ? "\u2014" : r.cost_rate, l:"Cost"},
+           {k:(r) => r.margin == null ? "\u2014" : Number(r.margin).toLocaleString(), l:"Margin"},
+           {k:"line_total", l:"Line total"} ],
+    note:"Everything an approver needs: the lines with margin where a cost is " +
+         "known, the supplier comparison in `comparison`, every comment and the " +
+         "whole review history. `may_approve` says whether YOU can decide it." },
+  { g:"quoting", m:"GET", p:"/api/v1/quote-requests/{request_id}/reviews", t:"The review history",
+    auth:"session",
+    params:[ {n:"request_id", l:"Quote request id"} ],
+    rows:(d) => d,
+    cols:[ {k:(r) => "r" + r.revision, l:"Round"}, {k:"action", l:"Action"},
+           {k:(r) => r.reviewer_name || "\u2014", l:"By"},
+           {k:(r) => r.note || "\u2014", l:"Note"} ],
+    note:"Appended, never edited. An approval history that can be rewritten is " +
+         "not a history." },
+  { g:"comparison", m:"POST", p:"/api/v1/comparisons/extract", t:"1. Read uploaded supplier quotes",
+    auth:"session",
+    form:[ {n:"files", l:"Supplier quotes — pick several at once", type:"file", multiple:true,
+            accept:".pdf,.png,.jpg,.jpeg,.webp,.gif,.xlsx,.xls,.csv,.docx"},
+           {n:"currency", l:"Comparison currency", def:"AED"} ],
+    rows:(d) => d.quotes,
+    cols:[ {k:"supplier_name", l:"Supplier"},
+           {k:(r) => r.quote_number || "—", l:"Quote no", mono:true},
+           {k:(r) => r.currency, l:"Cur"},
+           {k:(r) => r.items.length, l:"Lines"},
+           {k:(r) => r.delivery_time || "—", l:"Delivery"},
+           {k:(r) => r.extraction_note ? "see note" : "—", l:"Unsure?"} ],
+    note:"Claude reads each document and hands back a DRAFT. Nothing is saved. " +
+         "Check `extraction_note` on any quote before trusting it, and check " +
+         "`failed` for documents that could not be read — one bad scan does " +
+         "not lose the others. Copy the `quotes` array into the next step." },
+  { g:"comparison", m:"POST", p:"/api/v1/comparisons/analyse", t:"2. Compare (nothing saved)",
+    auth:"session",
+    body:[ {n:"currency", l:"Currency", def:"AED"},
+           {n:"quotes", l:"Quotes — paste from step 1, or type your own", type:"json",
+            def:JSON.stringify({quotes:[
+              {supplier_name:"Alpha Trading", currency:"AED", delivery_time:"4 weeks",
+               validity:"30 days", items:[
+                 {description:"Filter element FX-200", part_number:"FX-200", quantity:10, unit_price:120},
+                 {description:"Seal kit", part_number:"SK-9", quantity:4, unit_price:85}]},
+              {supplier_name:"Beta Supplies", currency:"AED", delivery_time:"8 weeks", items:[
+                 {description:"FX200 Filter Elm.", part_number:"FX-200", quantity:10, unit_price:105}]}
+            ]}, null, 1)} ],
+    rows:(d) => d.analysis.suppliers,
+    cols:[ {k:"supplier_name", l:"Supplier"},
+           {k:(r) => r.total.toLocaleString(), l:"Total"},
+           {k:(r) => r.line_count, l:"Lines"},
+           {k:(r) => r.missing_items.length ? "missing " + r.missing_items.length : "complete", l:"Scope"},
+           {k:(r) => r.delivery_time || "—", l:"Delivery"} ],
+    note:"This is the manual path too — no upload needed, just type the quotes. " +
+         "Line items are matched across suppliers by the model; every total, " +
+         "spread and saving is computed in Python. Read `analysis.insights` first: " +
+         "a supplier missing lines is cheaper for a reason that is not price." },
+  { g:"comparison", m:"POST", p:"/api/v1/comparisons", t:"3. Save the comparison",
+    auth:"session",
+    body:[ {n:"payload", l:"Comparison", type:"json",
+            def:JSON.stringify({title:"Filters and seals — Aug", reference:"RFQ-1042",
+              currency:"AED", quotes:[]}, null, 1)} ],
+    note:"Saves the quotes AND re-runs the analysis over what was stored, so the " +
+         "saved figures always follow from the saved line items rather than from " +
+         "whatever the request claimed." },
+  { g:"comparison", m:"GET", p:"/api/v1/comparisons", t:"Saved comparisons",
+    auth:"session",
+    rows:(d) => d,
+    cols:[ {k:"title", l:"Title"},
+           {k:(r) => r.reference || "—", l:"Ref", mono:true},
+           {k:(r) => r.supplier_count, l:"Suppliers"},
+           {k:(r) => r.item_count, l:"Items"},
+           {k:(r) => r.best_supplier || "—", l:"Cheapest"},
+           {k:(r) => r.best_total ? Number(r.best_total).toLocaleString() : "—", l:"Total"} ],
+    note:"Also accepts an X-API-Key header instead of a session, for machine " +
+         "callers. Writing and deleting still need a real user." },
+  { g:"comparison", m:"GET", p:"/api/v1/comparisons/{comparison_id}", t:"One comparison",
+    auth:"session",
+    params:[ {n:"comparison_id", l:"Comparison id"} ],
+    rows:(d) => d.analysis?.groups || [],
+    cols:[ {k:"label", l:"Item"},
+           {k:(r) => r.quoted_by + "/" + r.supplier_count, l:"Bid"},
+           {k:(r) => r.best ? r.best.supplier_name : "—", l:"Cheapest"},
+           {k:(r) => r.best ? Number(r.best.unit_price).toLocaleString() : "—", l:"Unit"},
+           {k:(r) => r.spread_pct != null ? r.spread_pct.toFixed(0) + "%" : "—", l:"Spread"} ],
+    note:"Matched line items with the cheapest source per line. The full stored " +
+         "analysis — split award, insights, per-supplier totals — is in the JSON." },
+  { g:"comparison", m:"DELETE", p:"/api/v1/comparisons/{comparison_id}", t:"Delete a comparison",
+    auth:"session",
+    params:[ {n:"comparison_id", l:"Comparison id"} ],
+    note:"Only the person who created it, or a super admin." },
+  { g:"quotes", m:"GET", p:"/api/v1/quotes", t:"All quotes",
+    auth:"session",
+    query:[ {n:"status", l:"draft / sent / invoiced / accepted / declined / expired"},
+            {n:"customer_name", l:"Customer contains"},
+            {n:"date_start", l:"From (YYYY-MM-DD)"},
+            {n:"date_end", l:"To (YYYY-MM-DD)"},
+            {n:"search", l:"Free text"},
+            {n:"limit", l:"Limit — leave blank for every quote"},
+            {n:"refresh", l:"Re-read Zoho instead of the 60s cache", type:"check"} ],
+    rows:(d) => d.quotes,
+    cols:[ {k:"number", l:"Quote", mono:true, link:(r) => r.web_url},
+           {k:(r) => r.date || "—", l:"Date"},
+           {k:(r) => r.status || "—", l:"Status"},
+           {k:(r) => (r.customer_name || "—").slice(0,32), l:"Customer"},
+           {k:(r) => `${r.total.toLocaleString()} ${r.currency_code || ""}`, l:"Total"},
+           {k:(r) => r.bcd || "—", l:"BCD"} ],
+    note:"Read-only from Zoho Books, which calls these 'estimates'. BCD is the " +
+         "cf_bcd custom field — the same bid closing date the SharePoint " +
+         "Proposals list holds, which is what makes the two joinable. Cached for " +
+         "60s because Zoho allows the whole org only 100 requests a minute. Every filter is optional — send it with everything blank and you get every quote." },
+  { g:"quotes", m:"GET", p:"/api/v1/quotes/by-number/{number}", t:"Find a quote by its number",
+    auth:"session",
+    params:[ {n:"number", l:"Quote number, e.g. QT-001645"} ],
+    note:"The bridge from SharePoint: paste a quote_no straight out of 'My " +
+         "proposal tasks' in the proposals group and it resolves to the quote." },
+  { g:"quotes", m:"GET", p:"/api/v1/quotes/{quote_id}", t:"One quote in full",
+    auth:"session",
+    params:[ {n:"quote_id", l:"Zoho estimate id"} ],
+    rows:(d) => d.line_items,
+    cols:[ {k:(r) => r.name || "—", l:"Item"},
+           {k:(r) => r.code || "—", l:"Code", mono:true},
+           {k:"quantity", l:"Qty"}, {k:"rate", l:"Rate"}, {k:"total", l:"Total"} ],
+    note:"Line items are tabled; the rest of the quote — totals, addresses, " +
+         "attached documents, sales orders, invoice ids — is in the JSON." },
+  { g:"quotes", m:"GET", p:"/api/v1/quotes/{quote_id}", t:"Attachments on a quote",
+    auth:"session",
+    params:[ {n:"quote_id", l:"Zoho estimate id"} ],
+    rows:(d) => d.documents,
+    cols:[ {k:"file_name", l:"File", link:(r) => r.download_url},
+           {k:(r) => r.file_size_formatted || "—", l:"Size"},
+           {k:(r) => r.uploaded_by || "—", l:"Uploaded by"},
+           {k:(r) => r.uploaded_on || "—", l:"On"} ],
+    note:"Click a file name to open it. The bytes are relayed through this API " +
+         "under your session, not linked straight to Zoho — Zoho wants an " +
+         "OAuth header a browser cannot send, and handing that token to the " +
+         "browser would leak read access to the whole organisation." },
+  { g:"quotes", m:"GET", p:"/api/v1/quotes/{quote_id}/related", t:"Records connected to a quote",
+    auth:"session",
+    params:[ {n:"quote_id", l:"Zoho estimate id"} ],
+    query:[ {n:"include", l:"customer, items, salesorders, invoices, comments — blank for all"} ],
+    note:"Each branch reports its own ok/error, so one failure does not blank the " +
+         "rest. Invoices always come back unreadable: this token's scope covers " +
+         "estimates but not invoices, so only the ids and totals the quote itself " +
+         "carries are available. Every branch costs upstream calls — ask for " +
+         "what a screen actually shows." },
+  { g:"leave", m:"GET", p:"/api/v1/leave/summary/me", t:"My leave at a glance",
+    auth:"session" },
+  { g:"leave", m:"GET", p:"/api/v1/leave/requests/me", t:"My requests", auth:"session",
+    rows:(d) => d,
+    cols:[ {k:"start_date", l:"From"}, {k:"end_date", l:"To"}, {k:"days", l:"Days"},
+           {k:"leave_type", l:"Type"}, {k:"status", l:"Status"},
+           {k:(r) => r.decision_note || "—", l:"Decision"} ],
+    tags:(r) => [ r.emergency_override && "override",
+                  r.decided_by === "system" && "auto" ] },
+  { g:"leave", m:"POST", p:"/api/v1/leave/requests", t:"Request leave", auth:"session",
+    body:[ {n:"leave_type", l:"Type", type:"select",
+            opts:["annual","sick","emergency","unpaid"]},
+           {n:"start_date", l:"From (YYYY-MM-DD)"},
+           {n:"end_date", l:"To (YYYY-MM-DD)"},
+           {n:"reason", l:"Reason", type:"area"} ],
+    note:"Open to every signed-in user. If HR has automatic decisions on, this is " +
+         "approved or rejected immediately and the reason comes back with it." },
+  { g:"leave", m:"POST", p:"/api/v1/leave/requests/{request_id}/cancel",
+    t:"Withdraw my request", auth:"session",
+    params:[ {n:"request_id", l:"Request id"} ] },
+  { g:"leave", m:"GET", p:"/api/v1/leave/calendar", t:"Who is off", auth:"session",
+    query:[ {n:"start", l:"From (YYYY-MM-DD, blank = today)"},
+            {n:"days", l:"Days ahead", def:"30"} ],
+    note:"Approved leave only, and open to everyone — seeing who is away is what " +
+         "stops people booking over each other." },
+
+  { g:"leave", m:"GET", p:"/api/v1/leave/requests", t:"All requests (HR)", auth:"admin",
+    query:[ {n:"status", l:"Status", type:"select",
+             opts:["","pending","approved","rejected","cancelled"]},
+            {n:"upcoming_only", l:"Only leave still ahead", type:"check"} ],
+    rows:(d) => d,
+    cols:[ {k:"user_name", l:"Person"}, {k:"start_date", l:"From"},
+           {k:"end_date", l:"To"}, {k:"days", l:"Days"}, {k:"status", l:"Status"},
+           {k:(r) => r.decision_note || "—", l:"Decision"} ],
+    tags:(r) => [ r.emergency_override && "override",
+                  r.decided_by === "system" && "auto" ],
+    note:"HR team only. A non-member gets 403 here even if they are a super admin — " +
+         "deciding leave is membership of the HR team, not a global role." },
+  { g:"leave", m:"POST", p:"/api/v1/leave/requests/{request_id}/approve",
+    t:"Approve a request (HR)", auth:"admin",
+    params:[ {n:"request_id", l:"Request id"} ],
+    body:[ {n:"note", l:"Note", type:"area"},
+           {n:"emergency", l:"Emergency — override the concurrent limit",
+            type:"check"} ],
+    note:"Without the emergency flag, approving past the limit returns 409. The rule " +
+         "can only be stepped over deliberately, and the override is recorded." },
+  { g:"leave", m:"POST", p:"/api/v1/leave/requests/{request_id}/reject",
+    t:"Reject a request (HR)", auth:"admin",
+    params:[ {n:"request_id", l:"Request id"} ],
+    body:[ {n:"note", l:"Reason (required)", type:"area"} ] },
+
+  { g:"leave", m:"GET", p:"/api/v1/leave/settings", t:"Leave rules", auth:"session",
+    note:"Readable by everyone: people should be able to see the rule that decided " +
+         "their request." },
+  { g:"leave", m:"PUT", p:"/api/v1/leave/settings", t:"Change the rules (HR)",
+    auth:"admin",
+    body:[ {n:"max_concurrent", l:"People allowed off on the same day"},
+           {n:"limit_scope", l:"Count against", type:"select",
+            opts:["organisation","team"]},
+           {n:"auto_decide", l:"Decide automatically on submission", type:"check",
+            checked:true},
+           {n:"notify_hr_by_email", l:"Email HR from the requester's mailbox",
+            type:"check"},
+           {n:"max_days_per_request", l:"Longest single request (days)"},
+           {n:"hr_team_slug", l:"HR team handle"} ],
+    note:"Email is OFF by default so a sandbox cannot mail real colleagues. Numbers " +
+         "left blank are unchanged." },
+];
+
+let roleKeys = [];
+let teamRoleKeys = [];
+let moduleCatalogue = [];
+
+/* ── views: one or two, each with its own route and result ───────────── */
+const views = [{ route:null }, { route:null }];
+let active = 0;
+let splitOn = false;
+
+const store = {
+  get(key, fallback) {
+    try { const v = localStorage.getItem(key); return v == null ? fallback : JSON.parse(v); }
+    catch (e) { return fallback; }
+  },
+  set(key, value) {
+    try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) { /* private mode */ }
+  },
+};
+
+/* ── sidebar: a collapsible group per module ─────────────────────────── */
+let openGroups = new Set(store.get("hamdaz.sandbox.groups", ["templates"]));
+
+function renderSidebar() {
+  const list = $("routeList");
+  list.replaceChildren();
+
+  const groups = new Map();
+  ROUTES.forEach((r, i) => {
+    if (!groups.has(r.g)) groups.set(r.g, []);
+    groups.get(r.g).push(i);
+  });
+
+  for (const [name, indexes] of groups) {
+    const group = el("div", "group" + (openGroups.has(name) ? " open" : ""));
+
+    const head = el("button", "ghead");
+    head.append(el("span", "caret", "▶"), el("span", null, name),
+                el("span", "count", String(indexes.length)));
+    head.onclick = () => {
+      group.classList.toggle("open");
+      if (group.classList.contains("open")) openGroups.add(name);
+      else openGroups.delete(name);
+      store.set("hamdaz.sandbox.groups", [...openGroups]);
+    };
+
+    const items = el("div", "glist");
+    for (const i of indexes) {
+      const r = ROUTES[i];
+      const row = el("div", "route");
+      row.dataset.i = i;
+      row.append(el("span", "m " + r.m, r.m), el("span", "t", r.t));
+      row.onclick = () => selectRoute(i);
+      items.append(row);
+    }
+    group.append(head, items);
+    list.append(group);
+  }
+
+  $("routeCount").textContent = ROUTES.length;
+  markSelection();
+}
+
+function markSelection() {
+  const a = views[0].route ? ROUTES.indexOf(views[0].route) : -1;
+  const b = splitOn && views[1].route ? ROUTES.indexOf(views[1].route) : -1;
+  for (const n of document.querySelectorAll(".route")) {
+    const i = Number(n.dataset.i);
+    n.classList.toggle("sel", i === a);
+    n.classList.toggle("sel2", i === b);
+  }
+}
+
+$("btnExpand").onclick = () => {
+  const names = [...new Set(ROUTES.map((r) => r.g))];
+  const allOpen = names.every((n) => openGroups.has(n));
+  openGroups = allOpen ? new Set() : new Set(names);
+  store.set("hamdaz.sandbox.groups", [...openGroups]);
+  renderSidebar();
+};
+
+/* ── stage: build one or two views ───────────────────────────────────── */
+function buildStage() {
+  const stage = $("stage");
+  stage.replaceChildren();
+  stage.style.gridTemplateColumns = splitOn ? "1fr 1fr" : "1fr";
+
+  const count = splitOn ? 2 : 1;
+  for (let i = 0; i < count; i++) {
+    const view = el("div", "view" + (i === active ? " active" : ""));
+    view.dataset.v = i;
+
+    const bar = el("div", "pathbar");
+    const method = el("span", "m GET", "—");
+    method.id = "m" + i;
+    method.style.width = "auto";
+    const path = el("code", null, "Pick a route");
+    path.id = "p" + i;
+    const auth = el("span", "chip");
+    auth.id = "a" + i;
+    bar.append(method, path, el("span", "spacer"), auth);
+    bar.onclick = () => focusView(i);
+
+    const body = el("div", "scroll");
+    body.id = "b" + i;
+    body.onmousedown = () => focusView(i);
+
+    view.append(bar, body);
+    stage.append(view);
+  }
+  for (let i = 0; i < count; i++) renderView(i);
+  markSelection();
+}
+
+function focusView(i) {
+  active = i;
+  document.querySelectorAll(".view").forEach((v, n) => v.classList.toggle("active", n === i));
+}
+
+$("btnSplit").onclick = () => {
+  splitOn = !splitOn;
+  $("btnSplit").classList.toggle("on", splitOn);
+  if (splitOn && !views[1].route) views[1].route = views[0].route;
+  if (!splitOn) active = 0;
+  store.set("hamdaz.sandbox.split", splitOn);
+  buildStage();
+};
+
+/* ── a route goes into whichever view has focus ──────────────────────── */
+function selectRoute(i) {
+  views[active].route = ROUTES[i];
+  ctx.lastRoute = ROUTES[i];
+  renderView(active);
+  markSelection();
+  renderContext();
+}
+
+/* ── form building ───────────────────────────────────────────────────── */
+function inputFor(f) {
+  if (f.type === "check") {
+    const wrap = el("label", "check");
+    const box = el("input");
+    box.type = "checkbox";
+    box.checked = Boolean(f.checked);
+    box.dataset.f = f.n;
+    wrap.append(box, el("span", null, f.l));
+    return wrap;
+  }
+  const wrap = el("div", "field");
+  wrap.append(el("label", null, f.l));
+  let input;
+  if (f.type === "file") {
+    input = el("input");
+    input.type = "file";
+    input.multiple = Boolean(f.multiple);
+    if (f.accept) input.accept = f.accept;
+  } else if (f.type === "module" || f.type === "pages") {
+    input = el("select");
+    if (f.type === "pages") { input.multiple = true; input.size = 4; }
+    const opts = f.type === "module"
+      ? moduleCatalogue.map((m) => m.key)
+      : (moduleCatalogue.find((m) => m.key === ctx.module?.key)?.pages || []).map((p) => p.key);
+    for (const o of opts) {
+      const opt = el("option", null, o);
+      opt.value = o;
+      input.append(opt);
+    }
+    if (f.type === "module" && ctx.module) input.value = ctx.module.key;
+  } else if (f.type === "json") {
+    input = el("textarea");
+    input.value = f.sample || "{}";
+    input.style.minHeight = "110px";
+    input.dataset.json = "1";
+  } else if (f.type === "teamroles") {
+    input = el("select");
+    input.multiple = true;
+    input.size = Math.max(3, teamRoleKeys.length);
+    for (const o of teamRoleKeys) {
+      const opt = el("option", null, o);
+      opt.value = o;
+      if (o === "member") opt.selected = true;
+      input.append(opt);
+    }
+  } else if (f.type === "select" || f.type === "role") {
+    input = el("select");
+    for (const o of (f.type === "role" ? roleKeys : f.opts)) {
+      const opt = el("option", null, o === "" ? "(any)" : o);
+      opt.value = o;
+      input.append(opt);
+    }
+  } else if (f.type === "area") {
+    input = el("textarea");
+  } else {
+    input = el("input");
+    input.type = "text";
+    input.spellcheck = false;
+    if (f.def) input.value = f.def;
+    if (f.from) {
+      const from = f.from === "org" ? ctx.org?.object_id
+                 : f.from === "team" ? ctx.team?.slug
+                 : (ctx.user?.id || ctx.org?.object_id);
+      if (from) input.value = from;
+      else if (!input.value) input.placeholder = "pick one from a result list";
+    }
+  }
+  input.dataset.f = f.n;
+  wrap.append(input);
+  return wrap;
+}
+
+function renderView(i) {
+  const view = views[i];
+  const body = $("b" + i);
+  if (!body) return;
+
+  if (!view.route) {
+    body.replaceChildren(el("div", "body"));
+    body.firstChild.append(el("p", "empty",
+      "Pick a route from the left. It loads into whichever view has focus."));
+    return;
+  }
+
+  const r = view.route;
+  $("m" + i).textContent = r.m;
+  $("m" + i).className = "m " + r.m;
+  $("p" + i).textContent = r.p;
+  $("a" + i).textContent = { public:"no auth", session:"signed in", admin:"admin only",
+                             super_admin:"super admin only" }[r.auth] || "";
+
+  const host = el("div", "body");
+  host.dataset.form = i;
+  for (const f of r.params || []) host.append(inputFor(f));
+  for (const f of r.query || []) host.append(inputFor(f));
+  for (const f of r.form || []) host.append(inputFor(f));
+  for (const f of r.body || []) host.append(inputFor(f));
+
+  const go = el("button", r.m === "DELETE" ? "danger" : "primary", "Send " + r.m);
+  go.onclick = () => send(i);
+  const bar = el("div", "row");
+  bar.append(go);
+  host.append(bar);
+  if (r.note) host.append(el("p", "hint", r.note));
+
+  const mount = el("div", "result");
+  mount.id = "r" + i;
+  body.replaceChildren(host, mount);
+}
+
+function readFields(i, spec) {
+  const scope = document.querySelector(`[data-form="${i}"]`);
+  const out = {};
+  for (const f of spec || []) {
+    const node = scope?.querySelector(`[data-f="${f.n}"]`);
+    if (!node) continue;
+    out[f.n] = node.type === "checkbox" ? node.checked
+             : node.type === "file" ? [...(node.files || [])]
+             : node.multiple ? [...node.selectedOptions].map((o) => o.value)
+             : node.value.trim();
+  }
+  return out;
+}
+
+/* ── sending ─────────────────────────────────────────────────────────── */
+async function send(i) {
+  focusView(i);
+  const r = views[i].route;
+  let path = r.p;
+
+  for (const [k, v] of Object.entries(readFields(i, r.params))) {
+    if (!v) { report(i, 0, `"${k}" is required for this route.`, null); return; }
+    path = path.replace(`{${k}}`, encodeURIComponent(v));
+  }
+
+  const q = new URLSearchParams();
+  for (const [k, v] of Object.entries(readFields(i, r.query))) {
+    if (v === true) q.set(k, "true");
+    else if (v && v !== false) q.set(k, v);
+  }
+  if ([...q].length) path += "?" + q;
+
+  let payload = null;
+  let multipart = false;
+  if (r.form?.length) {
+    // multipart/form-data. The Content-Type header is deliberately NOT set:
+    // the browser has to add it itself so it can include the MIME boundary.
+    const body = new FormData();
+    const fields = readFields(i, r.form);
+    let attached = 0;
+    for (const f of r.form) {
+      const v = fields[f.n];
+      if (Array.isArray(v)) { for (const file of v) { body.append(f.n, file); attached++; } }
+      else if (v !== "" && v != null) body.append(f.n, v);
+    }
+    if (!attached && r.form.some((f) => f.type === "file" && f.required !== false)) {
+      report(i, 0, "Choose at least one file for this route.", null);
+      return;
+    }
+    payload = body;
+    multipart = true;
+  } else if (r.body?.length) {
+    const fields = readFields(i, r.body);
+    for (const k of Object.keys(fields)) {
+      if (fields[k] === "") delete fields[k];
+      else if (Array.isArray(fields[k]) && fields[k].length === 0) delete fields[k];
+    }
+    const scope = document.querySelector(`[data-form="${i}"]`);
+    for (const f of r.body) {
+      const node = scope?.querySelector(`[data-f="${f.n}"]`);
+      if (node?.dataset.json && fields[f.n] !== undefined) {
+        try { Object.assign(fields, JSON.parse(node.value)); delete fields[f.n]; }
+        catch (e) { report(i, 0, "That field must be valid JSON: " + e.message, null); return; }
+      }
+    }
+    payload = JSON.stringify(fields);
+  }
+
+  const t0 = performance.now();
+  let res, text;
+  try {
+    // credentials:"include" is what carries the HttpOnly session cookie.
+    res = await fetch(path, {
+      method: r.m,
+      credentials: "include",
+      headers: payload && !multipart ? { "Content-Type": "application/json" } : {},
+      body: payload,
+    });
+    text = await res.text();
+  } catch (err) {
+    report(i, 0, "Request failed: " + err.message + "\n\nIs the server running?", null);
+    return;
+  }
+
+  const ms = Math.round(performance.now() - t0);
+  let data = null;
+  try { data = JSON.parse(text); } catch (e) { /* not JSON */ }
+  report(i, res.status, data ? JSON.stringify(data, null, 2) : (text || "(empty body)"), ms);
+
+  if (res.ok && r.onOk && data) r.onOk(data);
+  renderResult(i, r, res, data, text);
+  refreshSession();
+}
+
+function report(i, status, body, ms) {
+  const chip = $("respCode");
+  chip.textContent = status || "—";
+  chip.className = "status " +
+    (status >= 500 ? "s5" : status >= 400 ? "s4" : status ? "s2" : "s0");
+  $("respTime").textContent = ms == null ? "" : ms + " ms";
+  $("respFrom").textContent = splitOn ? "view " + (i + 1) : "";
+  $("respBody").textContent = body;
+}
+
+/* ── rendering any response ──────────────────────────────────────────── */
+const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+const isFlat = (v) => !isObj(v) && !Array.isArray(v);
+
+function valueNode(v) {
+  if (v === null || v === undefined || v === "") return el("span", "empty", "—");
+  if (typeof v === "boolean") return el("span", "pill " + (v ? "yes" : "no"), String(v));
+  if (Array.isArray(v)) {
+    if (!v.length) return el("span", "empty", "none");
+    if (v.every(isFlat)) {
+      const wrap = el("div");
+      for (const x of v) wrap.append(el("span", "pill", String(x)));
+      return wrap;
+    }
+    return genericTable(v);
+  }
+  if (isObj(v)) return kvList(v);
+  return el("span", null, String(v));
+}
+
+function kvList(obj) {
+  const dl = el("dl");
+  for (const [k, v] of Object.entries(obj)) {
+    dl.append(el("dt", null, k));
+    const dd = el("dd");
+    dd.append(valueNode(v));
+    dl.append(dd);
+  }
+  return dl;
+}
+
+function cellText(v) {
+  if (v === null || v === undefined || v === "") return "—";
+  if (Array.isArray(v)) return v.map(cellText).join(", ") || "—";
+  if (isObj(v)) return v.key ?? v.name ?? v.display_name ?? v.id ?? JSON.stringify(v);
+  return String(v);
+}
+
+function genericTable(rows) {
+  const keys = [...new Set(rows.flatMap((r) => (isObj(r) ? Object.keys(r) : [])))];
+  if (!keys.length) {
+    const wrap = el("div");
+    for (const r of rows) wrap.append(el("span", "pill", String(r)));
+    return wrap;
+  }
+  const table = el("table");
+  const thead = el("thead");
+  const htr = el("tr");
+  for (const k of keys) htr.append(el("th", null, k));
+  thead.append(htr);
+
+  const tbody = el("tbody");
+  for (const row of rows) {
+    const tr = el("tr");
+    for (const k of keys) tr.append(el("td", "mono", cellText(row[k])));
+    tr.onclick = () => {
+      tbody.querySelectorAll("tr").forEach((n) => n.classList.remove("sel"));
+      tr.classList.add("sel");
+      adoptRow(row);
+    };
+    tbody.append(tr);
+  }
+  table.append(thead, tbody);
+  return table;
+}
+
+/** Pick up whatever identity a row carries, so any list feeds the other routes. */
+function adoptRow(row) {
+  if (row.object_id) return setOrg(row);
+  if (row.user_id || (row.id && row.email)) {
+    return setUser({ id: row.user_id || row.id, name: row.display_name, email: row.email,
+                     roles: row.role_keys });
+  }
+  if (row.key && Array.isArray(row.pages)) return setModule(row);
+  if (row.slug && "member_count" in row) return setTeam(row);
+  if (row.key && row.scope) return setRole(row);
+}
+
+function resultHead(label, note) {
+  const head = el("div", "rhead");
+  head.append(el("span", null, label));
+  if (note) head.append(el("span", null, note));
+  return head;
+}
+
+function specTable(r, rows) {
+  const table = el("table");
+  const thead = el("thead");
+  const htr = el("tr");
+  for (const c of r.cols) htr.append(el("th", null, c.l));
+  thead.append(htr);
+
+  const tbody = el("tbody");
+  for (const row of rows) {
+    const tr = el("tr");
+    r.cols.forEach((c, n) => {
+      const td = el("td", c.mono ? "mono" : null);
+      const text = typeof c.k === "function" ? c.k(row) : row[c.k];
+      const href = c.link?.(row);
+      // Only absolute http(s) or a same-origin /api path: the value comes from
+      // an upstream system, and a javascript: href here would run on click.
+      if (href && /^(https?:\/\/|\/api\/)/i.test(href)) {
+        const a = el("a", null, String(text ?? ""));
+        a.href = href;
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        td.append(a);
+      } else {
+        td.textContent = text;
+      }
+      if (n === 0) {
+        for (const tag of (r.tags?.(row) || []).filter(Boolean)) td.append(el("span", "tag", tag));
+      }
+      tr.append(td);
+    });
+    tr.onclick = () => {
+      tbody.querySelectorAll("tr").forEach((n) => n.classList.remove("sel"));
+      tr.classList.add("sel");
+      r.pick?.(row);
+    };
+    tbody.append(tr);
+  }
+  table.append(thead, tbody);
+  return table;
+}
+
+function renderResult(i, r, res, data, text) {
+  const mount = $("r" + i);
+  if (!mount) return;
+  mount.replaceChildren();
+
+  if (data === null) {
+    if (res.status === 204) {
+      mount.append(resultHead("Result", "204 no content"));
+      mount.append(el("div", "card", text || "Done. The server returned no body."));
+    }
+    return;
+  }
+
+  if (!res.ok) {
+    mount.append(resultHead("Refused", String(res.status)));
+    const card = el("div", "card");
+    card.append(el("div", null, data.detail
+      ? (typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail))
+      : JSON.stringify(data)));
+    mount.append(card);
+    return;
+  }
+
+  if (r.rows) {
+    const rows = r.rows(data) || [];
+    mount.append(resultHead(r.t, rows.length + (rows.length === 1 ? " row" : " rows")));
+    if (!rows.length) mount.append(el("div", "card", "No matches."));
+    else mount.append(specTable(r, rows));
+    // Summary fields alongside a table are worth seeing, not hiding.
+    const extras = Object.fromEntries(
+      Object.entries(data).filter(([, v]) => isFlat(v) || isObj(v))
+    );
+    if (isObj(data) && Object.keys(extras).length) {
+      mount.append(resultHead("Summary", ""));
+      const card = el("div", "card");
+      card.append(kvList(extras));
+      mount.append(card);
+    }
+    return;
+  }
+
+  if (Array.isArray(data)) {
+    mount.append(resultHead(r.t, data.length + (data.length === 1 ? " row" : " rows")));
+    mount.append(data.length ? valueNode(data) : el("div", "card", "Empty."));
+    return;
+  }
+
+  mount.append(resultHead(r.t, ""));
+  const card = el("div", "card");
+  card.append(kvList(data));
+  mount.append(card);
+}
+
+/* ── context pane ────────────────────────────────────────────────────── */
+function block(title, pairs, emptyText) {
+  const box = el("div", "kv");
+  box.append(el("h3", null, title));
+  if (!pairs) { box.append(el("p", "empty", emptyText)); return box; }
+  const dl = el("dl");
+  for (const [k, v] of pairs) {
+    dl.append(el("dt", null, k), el("dd", null, v == null || v === "" ? "—" : String(v)));
+  }
+  box.append(dl);
+  return box;
+}
+
+function renderContext() {
+  const host = $("contextBody");
+  host.replaceChildren();
+
+  host.append(ctx.session
+    ? block("Session", [["name", ctx.session.display_name], ["email", ctx.session.email],
+                        ["user id", ctx.session.id]])
+    : block("Session", null, "Not signed in."));
+
+  host.append(ctx.team
+    ? block("Selected team", [["name", ctx.team.name], ["handle", ctx.team.slug],
+        ["id", ctx.team.id], ["members", ctx.team.member_count]])
+    : block("Selected team", null, "No team picked. Team fields fill in from here."));
+
+  host.append(ctx.user
+    ? block("Selected user", [["name", ctx.user.name], ["email", ctx.user.email],
+        ["id", ctx.user.id],
+        ...(ctx.user.roles ? [["roles", ctx.user.roles.join(", ") || "none"]] : [])])
+    : block("Selected user", null, "Nothing selected. Click a row in any result list."));
+
+  host.append(ctx.org
+    ? block("From directory", [["name", ctx.org.display_name],
+        ["address", ctx.org.email || ctx.org.user_principal_name],
+        ["object id", ctx.org.object_id], ["department", ctx.org.department]])
+    : block("From directory", null, "Nobody picked from the org directory."));
+
+  host.append(ctx.module
+    ? block("Selected module", [["key", ctx.module.key], ["name", ctx.module.name],
+        ["admin only", ctx.module.admin_only],
+        ["pages", ctx.module.pages.map((p) => p.key).join(", ")]])
+    : block("Selected module", null, "No module picked."));
+
+  host.append(ctx.role
+    ? block("Selected role", [["key", ctx.role.key], ["name", ctx.role.name],
+        ["scope", ctx.role.scope], ["system", ctx.role.is_system]])
+    : block("Selected role", null, "No role picked."));
+
+  if (ctx.lastRoute) {
+    host.append(block("Route", [["method", ctx.lastRoute.m], ["path", ctx.lastRoute.p],
+      ["requires", { public:"nothing", session:"a session", admin:"an admin role",
+                     super_admin:"super admin" }[ctx.lastRoute.auth]]]));
+  }
+}
+
+function refreshForms() {
+  for (let i = 0; i < (splitOn ? 2 : 1); i++) if (views[i].route) renderView(i);
+}
+function setUser(u) { ctx.user = u; renderContext(); }
+function setRole(r) { ctx.role = r; renderContext(); }
+function setTeam(t) { ctx.team = t; renderContext(); refreshForms(); }
+function setModule(m) { ctx.module = m; renderContext(); refreshForms(); }
+function setOrg(o) {
+  ctx.org = o;
+  // A directory pick counts as a user pick: an object_id is accepted anywhere a
+  // user id is, which is exactly the confusion this pane exists to remove.
+  ctx.user = { id:o.object_id, name:o.display_name, email:o.email || o.user_principal_name };
+  renderContext();
+}
+
+$("ctxClear").onclick = () => {
+  ctx.user = ctx.role = ctx.org = ctx.team = ctx.module = null;
+  renderContext();
+};
+
+/* ── session ─────────────────────────────────────────────────────────── */
+async function refreshSession() {
+  let me = null;
+  try {
+    const res = await fetch("/api/v1/auth/me", { credentials: "include" });
+    if (res.ok) me = await res.json();
+  } catch (e) { /* server down */ }
+  ctx.session = me && { id:me.id, email:me.email, display_name:me.display_name };
+  const chip = $("sessChip");
+  chip.textContent = me ? me.email : "signed out";
+  chip.className = "chip " + (me ? "on" : "off");
+  renderContext();
+}
+
+$("btnLogin").onclick = () => { location.href = "/api/v1/auth/login?next=/sandbox"; };
+$("btnLogout").onclick = async () => {
+  await fetch("/api/v1/auth/logout", { method:"POST", credentials:"include" });
+  report(active, 204, "Signed out.", null);
+  refreshSession();
+};
+
+async function loadRoleKeys() {
+  try {
+    const res = await fetch("/api/v1/roles", { credentials: "include" });
+    if (res.ok) {
+      const all = await res.json();
+      roleKeys = all.map((r) => r.key);
+      teamRoleKeys = all.filter((r) => r.scope === "team").map((r) => r.key);
+      refreshForms();
+    }
+  } catch (e) { /* not signed in yet */ }
+}
+
+async function loadModules() {
+  try {
+    const res = await fetch("/api/v1/modules", { credentials: "include" });
+    if (res.ok) { moduleCatalogue = await res.json(); refreshForms(); }
+  } catch (e) { /* not signed in yet */ }
+}
+
+/* ── layout: draggable splitters, remembered per browser ─────────────── */
+const layout = Object.assign(
+  { sidebar:236, context:310, console:200 },
+  store.get("hamdaz.sandbox.layout", {})
+);
+
+function applyLayout() {
+  $("work").style.gridTemplateColumns =
+    `${layout.sidebar}px 5px 1fr 5px ${layout.context}px`;
+  $("console").style.height = layout.console + "px";
+  store.set("hamdaz.sandbox.layout", layout);
+}
+
+for (const bar of document.querySelectorAll(".split")) {
+  bar.onmousedown = (down) => {
+    down.preventDefault();
+    const key = bar.dataset.split;
+    const axis = (e) => key === "sidebar" ? e.clientX
+                      : key === "context" ? -e.clientX : -e.clientY;
+    const start = axis(down);
+    const from = layout[key];
+    const move = (e) => {
+      layout[key] = Math.max(150, Math.min(780, from + (axis(e) - start)));
+      applyLayout();
+    };
+    const up = () => {
+      document.removeEventListener("mousemove", move);
+      document.removeEventListener("mouseup", up);
+    };
+    document.addEventListener("mousemove", move);
+    document.addEventListener("mouseup", up);
+  };
+}
+
+/* ── boot ────────────────────────────────────────────────────────────── */
+applyLayout();
+splitOn = store.get("hamdaz.sandbox.split", false);
+$("btnSplit").classList.toggle("on", splitOn);
+
+const start = ROUTES.findIndex((r) => r.p === "/api/v1/proposals/workload");
+views[0].route = ROUTES[start >= 0 ? start : 0];
+if (splitOn) views[1].route = views[1].route || views[0].route;
+ctx.lastRoute = views[0].route;
+
+renderSidebar();
+buildStage();
+
+const failure = new URLSearchParams(location.search).get("error");
+if (failure) {
+  const why = {
+    state_mismatch: "the state Entra returned was not the one we issued (CSRF check).",
+    expired_login: "no login-state cookie — the attempt timed out, or the URL was opened directly.",
+    missing_code: "Entra returned no authorization code.",
+    sign_in_failed: "the token exchange or signature check failed. Details are in the server log.",
+    account_disabled: "the user exists but is_active is false.",
+    access_denied: "sign-in was cancelled, or blocked by a Conditional Access policy.",
+  }[failure];
+  const box = el("div", "banner");
+  box.append("Sign-in did not complete: ", el("b", null, failure));
+  if (why) box.append(" — " + why);
+  $("b0").prepend(box);
+}
+
+refreshSession().then(loadRoleKeys).then(loadModules);
+</script>
+</body>
+</html>
