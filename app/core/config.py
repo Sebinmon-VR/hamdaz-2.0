@@ -151,6 +151,21 @@ class Settings(BaseSettings):
     cookie_samesite: Literal["lax", "strict", "none"] = "lax"
     cookie_domain: str | None = None
 
+    @field_validator("cookie_domain", mode="before")
+    @classmethod
+    def _blank_domain_is_none(cls, value: object) -> object:
+        """An empty value means "no domain", not a domain that is empty.
+
+        Leaving a setting blank is how a portal says "unset", and there is no
+        way to say it otherwise. Passed through, ``""`` reaches the browser as
+        ``Domain=`` on the session cookie, which a browser is entitled to throw
+        the whole cookie away over — and a dropped session cookie looks like
+        sign-in quietly not working rather than like a configuration mistake.
+        """
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
     #: Mail people about quotes — sent for approval, decided, commented on,
     #: reopened. On by default: an approval nobody is told about waits until
     #: somebody happens to look. Turn it off in a sandbox rather than mailing
