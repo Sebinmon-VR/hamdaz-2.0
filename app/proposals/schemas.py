@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import uuid
+
 from pydantic import BaseModel
 
 from app.proposals.sharepoint import ProposalTask
@@ -135,3 +137,56 @@ class WorkloadOut(BaseModel):
     elapsed_ms: int | None = None
     #: Time spent fetching from SharePoint; 0 when the sweep was cached.
     fetch_ms: int | None = None
+
+
+class MemberTasksOut(BaseModel):
+    """One team member's proposal rows, as their lead sees them.
+
+    The identity is the ERP user, not the SharePoint row's display name: the
+    join went the other way — this team's members were looked up in SharePoint,
+    rather than SharePoint rows being attributed to whoever they name. That is
+    what makes the set of people here exactly the team, and nobody else.
+    """
+
+    user_id: uuid.UUID
+    name: str
+    email: str
+    #: Their roles *inside this team*, so a lead can be told apart from a member.
+    role_keys: list[str]
+    sharepoint_user_id: str | None
+    #: False when they have no presence on the SharePoint site at all. Different
+    #: from having nothing assigned, and it needs saying differently: one is
+    #: "they are clear", the other is "nothing could ever reach them here".
+    in_sharepoint: bool
+    #: Everything assigned to them, before the open_only filter.
+    total: int
+    #: Not finished, whatever the deadline — includes bids that closed long ago.
+    open_count: int
+    #: Not finished *and* the bid is still open. The number to lead with; see
+    #: ProposalTask.is_active for why `open_count` is mostly an archive.
+    active_count: int
+    #: Live rows whose deadline falls inside the `soon_days` horizon.
+    due_soon_count: int
+    #: The nearest deadline still ahead of them, or None.
+    next_deadline: str | None
+    tasks: list[TaskOut]
+
+
+class TeamTasksOut(BaseModel):
+    """A whole team's proposal work, member by member, with the rows attached."""
+
+    scope: ScopeOut
+    #: The "due soon" horizon, in days.
+    soon_days: int
+    generated_at: str
+    member_count: int
+    #: Totals across the team, summed from the members below rather than
+    #: computed separately, so the header and the list cannot disagree.
+    total: int
+    open_count: int
+    active_count: int
+    #: Busiest first, on live work — see oversight.team_tasks for the ordering.
+    members: list[MemberTasksOut]
+    #: True when served from the per-team cache rather than re-swept.
+    cached: bool = False
+    age_seconds: int = 0

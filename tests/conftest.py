@@ -79,7 +79,13 @@ async def db(engine) -> AsyncIterator[AsyncSession]:
             text(
                 "truncate table users, roles, teams, modules, "
                 "leave_requests, leave_settings, labels, "
-                "assignment_policies, quote_requests, form_templates cascade"
+                "assignment_policies, quote_requests, form_templates, "
+                # Named explicitly rather than left to CASCADE: the HR tables
+                # hang off form_templates by a RESTRICT foreign key, and a test
+                # that leaked an opening would make the next one's seed fail on
+                # a template it could not replace.
+                "job_openings, job_applications, employee_documents, "
+                "review_cycles cascade"
             )
         )
 

@@ -158,6 +158,28 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         ),
     ),
     ModuleSpec(
+        key="hr",
+        name="HR",
+        description=(
+            "Hiring, employee documents and performance reviews. Listed here for "
+            "navigation; who may actually use it is membership of the HR team, "
+            "which the leave settings name, not a team grant. The candidate side "
+            "is not a page here at all — it is a public link with no route back."
+        ),
+        pages=(
+            PageSpec("openings", "Job openings", "/hr/openings"),
+            PageSpec("opening", "Opening", "/hr/openings/[id]"),
+            PageSpec("applications", "Applications", "/hr/applications"),
+            PageSpec("application", "Candidate", "/hr/applications/[id]"),
+            PageSpec("people", "Staff documents", "/hr/people"),
+            PageSpec("person", "Person", "/hr/people/[id]"),
+            PageSpec("cycles", "Review cycles", "/hr/reviews"),
+            PageSpec("cycle", "Review cycle", "/hr/reviews/[id]"),
+            PageSpec("my_reviews", "Reviews to write", "/hr/my-reviews"),
+            PageSpec("my_record", "My HR record", "/hr/me"),
+        ),
+    ),
+    ModuleSpec(
         key="templates",
         name="Form Templates",
         description=(

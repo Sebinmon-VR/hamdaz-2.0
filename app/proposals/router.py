@@ -10,6 +10,12 @@ Two independent gates, and both must pass:
 
 There is deliberately no "all tasks" endpoint. Per the brief, each person sees
 their own; a team-wide view would be a separate, explicitly authorised addition.
+
+``/team-tasks`` is that addition, and it is deliberately built the same way
+rather than by relaxing anything above. The people whose rows come back are
+derived from the team's membership, never named in the request, so a caller
+still cannot widen the answer — they can only ask about a team they already
+have authority over. Who that is lives in ``app.proposals.oversight``.
 """
 
 from __future__ import annotations
@@ -22,8 +28,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.access import service as access_service
 from app.auth.deps import CurrentUser
 from app.core.db import get_session
+from app.proposals import oversight as oversight_service
 from app.proposals.analytics import WorkloadCache, scope_for_team
-from app.proposals.schemas import ColumnOut, MyTasksOut, TaskOut, WorkloadOut
+from app.proposals.schemas import (
+    ColumnOut,
+    MyTasksOut,
+    TaskOut,
+    TeamTasksOut,
+    WorkloadOut,
+)
 from app.proposals.sharepoint import SharePointError, SharePointProposals
 from app.roles.deps import AdminUser, CurrentRoles
 from app.teams import service as teams_service
@@ -42,6 +55,10 @@ def get_sharepoint(request: Request) -> SharePointProposals:
 
 def get_workload_cache(request: Request) -> WorkloadCache:
     return request.app.state.workload_cache
+
+
+def get_team_tasks_cache(request: Request) -> oversight_service.TeamTasksCache:
+    return request.app.state.team_tasks_cache
 
 
 async def require_module(
@@ -180,3 +197,78 @@ async def workload(
         ) from exc
 
     return WorkloadOut(scope=scope, **summary)
+
+
+@router.get(
+    "/team-tasks",
+    response_model=TeamTasksOut,
+    summary="Every member of one team's proposal tasks, for that team's leadership",
+)
+async def team_tasks(
+    user: CurrentUser,
+    roles: CurrentRoles,
+    session: Session,
+    sharepoint: Annotated[SharePointProposals, Depends(get_sharepoint)],
+    cache: Annotated[
+        oversight_service.TeamTasksCache, Depends(get_team_tasks_cache)
+    ],
+    team: Annotated[str, Query(description="The team's slug (or id)")],
+    open_only: Annotated[
+        bool, Query(description="Hide tasks whose status is Completed")
+    ] = False,
+    limit: Annotated[
+        int, Query(ge=1, le=500, description="Rows per member, not for the team")
+    ] = 200,
+    refresh: Annotated[
+        bool, Query(description="Re-read SharePoint instead of using the cache")
+    ] = False,
+) -> TeamTasksOut:
+    """One team's proposal work, member by member, with the rows attached.
+
+    The gate is authority over *this* team: an administrator, or its own lead or
+    manager. It is checked against the team resolved from the request, so a lead
+    asking about somebody else's team is refused rather than served.
+
+    ``open_only`` defaults to False here, unlike ``/my-tasks``. A lead needs the
+    closed rows to see what a person actually got through, and the client filters
+    them; asking twice for one screen would be the only alternative.
+    """
+    try:
+        resolved = await teams_service.get_team(session, team)
+    except TeamError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
+
+    allowed = await oversight_service.oversight(
+        session, user=user, roles=roles, team_id=resolved.id
+    )
+    if not allowed.may_see:
+        # 403 rather than 404: the caller is authenticated and the team plainly
+        # exists — they can see it on the teams list. Pretending otherwise would
+        # make the API harder to use without making it safer.
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=allowed.reason)
+
+    try:
+        result = await oversight_service.team_tasks(
+            session,
+            team=resolved,
+            sharepoint=sharepoint,
+            cache=cache,
+            open_only=open_only,
+            limit=limit,
+            refresh=refresh,
+        )
+    except SharePointError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Could not read the Proposals list",
+        ) from exc
+
+    # The service works in domain rows so it stays testable without pydantic;
+    # the wire shape is put on here, at the edge, as the other endpoints do.
+    result["members"] = [
+        {**member, "tasks": [TaskOut.from_domain(t) for t in member["tasks"]]}
+        for member in result["members"]
+    ]
+    return TeamTasksOut(**result)

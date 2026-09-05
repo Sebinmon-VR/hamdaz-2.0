@@ -27,6 +27,10 @@ class FieldIn(BaseModel):
     maps_to: str | None = Field(default=None, max_length=64)
     #: For ``table`` — the columns of a repeating row, as field specs.
     columns: list[dict[str, Any]] | None = None
+    #: Makes the field count towards a score. ``{"tags": [...], "max": 5,
+    #: "weight": 1.0, "option_scores": {...}}`` — see ``app.forms.scoring``.
+    #: Only select, number, percent and checkbox fields may carry one.
+    scoring: dict[str, Any] | None = None
 
 
 class SectionIn(BaseModel):
@@ -93,6 +97,9 @@ class TemplateOut(BaseModel):
     sections: list[dict[str, Any]]
     fields: list[dict[str, Any]]
     created_by_name: str | None = None
+    #: Every tag this template can score against, in field order. Empty for a
+    #: template that only records answers rather than judging them.
+    score_tags: list[str] = Field(default_factory=list)
     grants: list[GrantOut] = Field(default_factory=list)
     #: Whether the caller may fill this in, and why not if they may not.
     may_use: bool = False
@@ -110,3 +117,6 @@ class TemplateSummaryOut(BaseModel):
     field_count: int
     grant_count: int
     description: str | None
+    #: Whether filling this in produces a score. Lets a list distinguish an
+    #: assessment from a plain form without opening either.
+    scored: bool = False

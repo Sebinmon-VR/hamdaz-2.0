@@ -25,6 +25,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.forms import scoring
 from app.forms.catalogue import TEMPLATES
 from app.models.team import Team, TeamMembership
 from app.models.templates import FormTemplate, TemplateGrant, TemplateStatus
@@ -84,8 +85,16 @@ async def seed_templates(session: AsyncSession) -> list[FormTemplate]:
             # would be a puzzle rather than a safeguard.
             status=TemplateStatus.ACTIVE,
         )
-        # Usable by every team, by anyone, until a super admin narrows it.
-        template.grants = [TemplateGrant(team_id=None, allowed_roles=[])]
+        # Usable by every team, by anyone, until a super admin narrows it —
+        # unless the spec says otherwise. A template whose access is decided
+        # somewhere else entirely ships with no grants, because appearing in
+        # everybody's "forms you can fill in" list would be a lie about it.
+        template.grants = [
+            TemplateGrant(
+                team_id=g.get("team_id"), allowed_roles=list(g.get("allowed_roles") or [])
+            )
+            for g in spec.get("grants", ({"team_id": None, "allowed_roles": []},))
+        ]
         session.add(template)
         existing[spec["key"]] = template
     await session.flush()
@@ -158,6 +167,17 @@ def _validate_fields(fields: list[Any]) -> list[dict]:
             raise TemplateError(f"Field {key!r} has no label")
         if not raw.get("type"):
             raise TemplateError(f"Field {key!r} has no type")
+        if raw.get("scoring"):
+            # Checked here, not when somebody fills the form in: a scoring block
+            # that cannot produce a number is a mistake by the admin writing the
+            # template, and they are the only person able to fix it.
+            try:
+                raw = {
+                    **raw,
+                    "scoring": scoring.validate_block(key, str(raw["type"]), raw["scoring"]),
+                }
+            except scoring.ScoringError as exc:
+                raise TemplateError(str(exc)) from exc
         out.append(raw)
     return out
 

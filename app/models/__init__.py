@@ -10,6 +10,22 @@ from app.models.comparison import (
     SupplierQuoteItem,
 )
 from app.models.dashboard import TeamDashboardWidget
+from app.models.hr import (
+    CLOSED_STAGES,
+    ApplicationFile,
+    ApplicationStage,
+    CycleStatus,
+    DocumentKind,
+    EmployeeDocument,
+    EmploymentType,
+    JobApplication,
+    JobOpening,
+    OpeningStatus,
+    PerformanceReview,
+    ReviewCycle,
+    ReviewerRelation,
+    ReviewStatus,
+)
 from app.models.labels import Label, LabelAssignment, LabelKind, LabelSource
 from app.models.leave import LeaveRequest, LeaveSettings, LeaveStatus, LeaveType
 from app.models.quoting import (
@@ -29,12 +45,21 @@ from app.models.zoho import ZohoToken
 
 __all__ = [
     "AnalyticsRun",
+    "ApplicationFile",
+    "ApplicationStage",
     "AssignmentPolicy",
     "Base",
+    "CLOSED_STAGES",
     "CommentTarget",
     "ComparisonStatus",
+    "CycleStatus",
+    "DocumentKind",
+    "EmployeeDocument",
+    "EmploymentType",
     "FieldType",
     "FormTemplate",
+    "JobApplication",
+    "JobOpening",
     "Label",
     "LabelAssignment",
     "LabelKind",
@@ -45,6 +70,8 @@ __all__ = [
     "LeaveType",
     "Module",
     "ModulePage",
+    "OpeningStatus",
+    "PerformanceReview",
     "QuoteComment",
     "QuoteComparison",
     "QuoteRequest",
@@ -53,6 +80,9 @@ __all__ = [
     "QuoteSource",
     "QuoteStatus",
     "ReviewAction",
+    "ReviewCycle",
+    "ReviewStatus",
+    "ReviewerRelation",
     "Role",
     "RoleScope",
     "SupplierQuote",

@@ -23,11 +23,14 @@ from app.dashboards.router import router as dashboards_router
 from app.directory.graph import GraphDirectory
 from app.directory.router import router as directory_router
 from app.forms.router import router as templates_router
+from app.hr.public import router as careers_router
+from app.hr.router import router as hr_router
 from app.labels.router import router as labels_router
 from app.leave.mailer import LeaveMailer
 from app.leave.router import router as leave_router
 from app.profiles.router import router as profiles_router
 from app.proposals.analytics import WorkloadCache
+from app.proposals.oversight import TeamTasksCache
 from app.proposals.router import router as proposals_router
 from app.proposals.sharepoint import SharePointProposals
 from app.quoting.mailer import QuoteMailer
@@ -61,6 +64,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.sharepoint = SharePointProposals(settings, http)
     # Shared by every admin: the aggregate is identical for all of them.
     app.state.workload_cache = WorkloadCache()
+    # Per team, and separate from the aggregate above because it holds whole
+    # rows rather than counts — see app/proposals/oversight.py.
+    app.state.team_tasks_cache = TeamTasksCache()
     # Sends as the requester. Disabled unless HR turns it on in leave settings.
     app.state.leave_mailer = LeaveMailer(settings, http)
     # Reads supplier quote documents. Holds no connection of its own; the
@@ -116,6 +122,12 @@ def create_app() -> FastAPI:
     app.include_router(analytics_router, prefix=settings.api_prefix)
     app.include_router(quoting_router, prefix=settings.api_prefix)
     app.include_router(templates_router, prefix=settings.api_prefix)
+    app.include_router(hr_router, prefix=settings.api_prefix)
+
+    # Mounted at the root, NOT under the API prefix, and holding no
+    # authentication dependency of any kind. That separation is the whole
+    # of the candidate-facing security model — see app/hr/public.py.
+    app.include_router(careers_router)
 
     # Dev console. Mounted, not merely guarded — in production the route does
     # not exist at all, so there is nothing to accidentally expose.

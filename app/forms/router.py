@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.deps import CurrentUser
 from app.core.db import get_session
-from app.forms import service
+from app.forms import scoring, service
 from app.forms.schemas import (
     GrantIn,
     GrantOut,
@@ -56,6 +56,7 @@ async def _out(
     body.created_by_name = (
         template.created_by.display_name if template.created_by else None
     )
+    body.score_tags = scoring.tags_of(template.fields or [])
     body.grants = [
         GrantOut(
             team_id=g.team_id,
@@ -83,6 +84,7 @@ def _summary(template: FormTemplate) -> TemplateSummaryOut:
         field_count=len(template.fields or []),
         grant_count=len(template.grants or []),
         description=template.description,
+        scored=scoring.is_scored(template.fields or []),
     )
 
 

@@ -126,6 +126,33 @@ class Settings(BaseSettings):
     def claude_configured(self) -> bool:
         return bool(self.anthropic_api_key)
 
+    # ── careers (the public application links) ─────────────────────────
+    #: The origin this API is reached at from outside, used to build the share
+    #: links HR copies. Left empty the links are built from the request itself,
+    #: which is right in development and wrong the moment a proxy rewrites the
+    #: host — so set it in production.
+    public_base_url: str = ""
+    #: A separate careers site, if one exists. Set it and the share link points
+    #: there instead of at the page this API serves; that site fetches the same
+    #: token through the JSON endpoint. Either way the candidate never reaches
+    #: an ERP URL.
+    careers_url: str = ""
+    #: Applications accepted per opening from one address per hour. Best effort
+    #: and in-process — it is a brake on a bored person with a form, not a
+    #: defence against a distributed flood, and it resets on deploy.
+    application_rate_limit: int = 10
+
+    def share_base(self, request_base: str = "") -> str:
+        """Where a candidate-facing link points."""
+        for candidate in (self.careers_url, self.public_base_url, request_base):
+            if candidate:
+                return candidate.rstrip("/")
+        return ""
+
+    def form_api_base(self, request_base: str = "") -> str:
+        """Where the JSON form lives. Never the careers site — that is a client."""
+        return (self.public_base_url or request_base or "").rstrip("/")
+
     # ── machine callers ────────────────────────────────────────────────
     #: Lets a service call this API with a header instead of a user session.
     #: Unset means header auth is off entirely — an empty key must never

@@ -35,7 +35,13 @@ CACHE_TTL_SECONDS: Final = 60
 SOON_DAYS: Final = 7
 
 
-def _parse(value: str | None) -> datetime | None:
+def parse_when(value: str | None) -> datetime | None:
+    """A SharePoint timestamp as a datetime, or None if it is unusable.
+
+    Public because the team-tasks view next door needs the identical reading of
+    a deadline; two modules parsing these strings slightly differently is how a
+    row ends up counted as due on one screen and not on the other.
+    """
     if not value:
         return None
     try:
@@ -94,7 +100,7 @@ class PersonWorkload:
 
 
 def _bucket(task: ProposalTask, now: datetime, soon: datetime) -> str:
-    when = _parse(task.deadline)
+    when = parse_when(task.deadline)
     if when is None:
         return "no_deadline"
     if when < now:
