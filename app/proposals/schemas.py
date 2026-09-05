@@ -29,8 +29,14 @@ class TaskOut(BaseModel):
     working_notes: str | None
     created_at: str | None
     modified_at: str | None
-    #: Deep link into SharePoint, where the work actually happens.
+    #: Deep link into SharePoint, where the work actually happens — the
+    #: display form, not Graph's internal item identifier. See ProposalTask.
     web_url: str | None
+    #: Whether the item has files at all.
+    has_attachments: bool = False
+    #: Straight to the attachment folder, or null when there is nothing there.
+    #: Opening it uses the viewer's own SharePoint access, not ours.
+    attachments_url: str | None = None
     is_open: bool
     #: The date that actually matters — BCD, falling back to DueDate.
     deadline: str | None
@@ -57,9 +63,69 @@ class TaskOut(BaseModel):
             created_at=task.created_at,
             modified_at=task.modified_at,
             web_url=task.web_url,
+            has_attachments=task.has_attachments,
+            attachments_url=task.attachments_url,
             is_open=task.is_open,
             deadline=task.deadline,
         )
+
+
+class TaskAttachmentOut(BaseModel):
+    """One file on a task. The download URL is ours, not SharePoint's, so the
+    caller's ERP session is what authorises the fetch."""
+
+    file_name: str
+    download_url: str
+
+
+class TaskUpdateIn(BaseModel):
+    """A patch. Anything left out is untouched.
+
+    Deliberately not every column. ``AssignedTo`` is reassignment — a workflow
+    decision with its own rules, not a field edit — and ``Attachments`` and
+    ``ContentType`` are SharePoint's own. Dates are passed as SharePoint stores
+    them (ISO 8601, e.g. ``2026-09-30T00:00:00Z``).
+    """
+
+    title: str | None = None
+    status: str | None = None
+    priority: str | None = None
+    start_date: str | None = None
+    due_date: str | None = None
+    bid_closing_date: str | None = None
+    end_user: str | None = None
+    submission_status: str | None = None
+    current_type: str | None = None
+    order_status: str | None = None
+    negotiation: str | None = None
+    negotiation_notes: str | None = None
+    quote_no: str | None = None
+    remarks: str | None = None
+    working_notes: str | None = None
+
+    #: Our field names -> the list's internal column names.
+    _COLUMNS = {
+        "title": "Title",
+        "status": "Status",
+        "priority": "Priority",
+        "start_date": "StartDate",
+        "due_date": "DueDate",
+        "bid_closing_date": "BCD",
+        "end_user": "EndUser",
+        "submission_status": "SubmissionStatus",
+        "current_type": "CurrentType",
+        "order_status": "OrderStatus",
+        "negotiation": "Negotiation",
+        "negotiation_notes": "NegotiationNotes",
+        "quote_no": "zohpquoteno",
+        "remarks": "Remarks",
+        "working_notes": "WorkingNotes",
+    }
+
+    def as_sharepoint_fields(self) -> dict[str, str]:
+        """Only what was actually sent, under SharePoint's own column names."""
+        sent = self.model_dump(exclude_unset=True, exclude_none=True)
+        return {self._COLUMNS[k]: v for k, v in sent.items() if k in self._COLUMNS}
 
 
 class MyTasksOut(BaseModel):

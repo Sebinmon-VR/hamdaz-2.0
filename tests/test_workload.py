@@ -33,7 +33,7 @@ def _task(
         bid_closing_date=bcd.isoformat().replace("+00:00", "Z") if bcd else None,
         end_user=None, submission_status=None, current_type=None, order_status=None,
         negotiation=None, quote_no=None, remarks=None, working_notes=None,
-        created_at=None, modified_at=None, web_url=None,
+        created_at=None, modified_at=None,
     )
 
 

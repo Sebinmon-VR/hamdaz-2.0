@@ -12,7 +12,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from app.core.config import Settings
+from app.core.config import Settings, get_settings
 from app.proposals.sharepoint import (
     ProposalTask,
     SharePointError,
@@ -116,7 +116,10 @@ def test_maps_a_list_row() -> None:
     assert task.end_user == "Adnoc"
     assert task.quote_no == "QT-1"
     assert task.due_date == "2025-05-01T00:00:00Z"
-    assert task.web_url == "https://sp/item/9"
+    # Built from the configured list URL and the id, not from Graph's webUrl,
+    # which is an internal handle that does not open.
+    assert task.web_url.endswith("/DispForm.aspx?ID=9")
+    assert task.web_url.startswith(get_settings().sharepoint_proposals_list_url)
 
 
 def test_assigned_to_name_is_display_only() -> None:

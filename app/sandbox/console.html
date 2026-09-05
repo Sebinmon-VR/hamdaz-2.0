@@ -215,7 +215,7 @@ const el = (tag, cls, text) => {
 
 /* ── the shared selection that ties the panes together ───────────────── */
 const ctx = { user:null, role:null, org:null, team:null, module:null,
-              session:null, lastRoute:null };
+              meeting:null, session:null, lastRoute:null };
 
 const ROUTES = [
   { g:"ops", m:"GET", p:"/health", t:"Health", auth:"public" },
@@ -995,6 +995,222 @@ const ROUTES = [
            {n:"hr_team_slug", l:"HR team handle"} ],
     note:"Email is OFF by default so a sandbox cannot mail real colleagues. Numbers " +
          "left blank are unchanged." },
+
+  /* ── Meetings: the signed-in person's own Outlook calendar ──────────
+     Read-only, and always THEIR mailbox — there is no parameter for whose
+     calendar to read. Needs the Calendars.Read application permission in
+     Entra; without it every call here answers 502 saying so. */
+  { g:"meetings", m:"GET", p:"/api/v1/meetings", t:"My meetings", auth:"session",
+    query:[ {n:"start", l:"First day (YYYY-MM-DD) — defaults to today"},
+            {n:"end", l:"Last day, inclusive — defaults to a week out"},
+            {n:"search", l:"Match subject, location, organizer or attendee"},
+            {n:"meetings_only", l:"Only events with other people on them", type:"check"},
+            {n:"include_cancelled", l:"Include cancelled", type:"check"},
+            {n:"limit", l:"Limit", def:"100"}, {n:"offset", l:"Offset", def:"0"} ],
+    rows:(d) => d.meetings,
+    cols:[ {k:(r) => (r.start || "").slice(0,16).replace("T"," ") || "—", l:"Starts"},
+           {k:"subject", l:"Subject"},
+           {k:(r) => (r.organizer && r.organizer.name) || "—", l:"Organizer"},
+           {k:(r) => r.attendee_count, l:"People"},
+           {k:(r) => r.location || (r.is_online ? "Online" : "—"), l:"Where"} ],
+    tags:(r) => [ r.is_cancelled && "cancelled", r.is_online && "online",
+                  r.is_recurring && "recurring", r.is_organizer && "mine" ],
+    pick:(r) => setMeeting(r),
+    note:"Recurring meetings arrive expanded into occurrences, so a weekly stand-up " +
+         "shows on each of its days. Times are UTC — the client renders local." },
+  { g:"meetings", m:"GET", p:"/api/v1/meetings/{event_id}", t:"One meeting, and who is in it",
+    auth:"session",
+    params:[ {n:"event_id", l:"Graph event id", from:"meeting"} ],
+    rows:(d) => d.attendees,
+    cols:[ {k:"name", l:"Name"}, {k:(r) => r.email || "—", l:"Email", mono:true},
+           {k:"kind", l:"Invited as"}, {k:"response", l:"Answer"} ],
+    tags:(r) => [ r.is_organizer && "organizer", r.is_resource && "room" ],
+    note:"Organizer first, then required, optional and rooms. An id from someone " +
+         "else's calendar is a 404 here — it is read out of your own mailbox." },
+
+  /* ── HR: hiring, documents, reviews ─────────────────────────────────
+     HR-team membership (the team named in leave settings) is the gate on
+     most of these — a global admin role is NOT enough, except super_admin
+     and ceo. Deletion is super_admin alone. */
+  { g:"hr", m:"GET", p:"/api/v1/hr/meta", t:"What the module offers",
+    auth:"session",
+    note:"Enumerations plus every form HR can choose between, per kind — " +
+         "posting_forms, application_forms, review_forms — with is_default " +
+         "marked. The default is the template whose key equals its kind." },
+  { g:"hr", m:"GET", p:"/api/v1/hr/openings", t:"Job openings", auth:"session",
+    query:[ {n:"status", l:"draft / open / closed / filled"} ],
+    rows:(d) => d,
+    cols:[ {k:"title", l:"Title"}, {k:"status", l:"Status"},
+           {k:(r) => r.location || "—", l:"Location"},
+           {k:"application_count", l:"Applications"},
+           {k:"new_application_count", l:"New"},
+           {k:(r) => r.publicly_listed ? "listed" : "link-only", l:"Visibility"} ] },
+  { g:"hr", m:"POST", p:"/api/v1/hr/openings", t:"Create an opening (HR)",
+    auth:"session",
+    body:[ {n:"payload", l:"The job — details is the posting form's answers",
+            type:"json",
+            def:JSON.stringify({title:"Senior Estimator", location:"Abu Dhabi",
+              employment_type:"full_time", publicly_listed:false,
+              details:{summary:"Price the bids that win us work.",
+                description:"Own estimating end to end.",
+                requirements:"Five years in MEP estimating.",
+                salary_range:"AED 18,000-22,000",
+                benefits:"Visa, insurance, annual ticket.",
+                hiring_manager:"(internal — never published)"}}, null, 2)} ],
+    note:"Created as a DRAFT with no live link. The `details` block is the " +
+         "job_posting template's answers; fields the template marks internal " +
+         "(hiring_manager, budget_code…) are stored but never published. " +
+         "Required posting fields are enforced at POST /post, not here — a " +
+         "draft may be half-written." },
+  { g:"hr", m:"POST", p:"/api/v1/hr/openings/{ref}/post", t:"Post it (HR)",
+    auth:"session",
+    params:[ {n:"ref", l:"Opening id or slug, e.g. senior-estimator"} ],
+    note:"Makes the share link live. The response's share_url is what HR " +
+         "copies to candidates; share_api_url is the same token as JSON. The " +
+         "advert must be complete now — an unfilled required posting field " +
+         "refuses here." },
+  { g:"hr", m:"GET", p:"/api/v1/hr/openings/{ref}", t:"One opening", auth:"session",
+    params:[ {n:"ref", l:"Id or slug"} ],
+    note:"share_url appears only once posted. Open it in a private window to " +
+         "see exactly what a candidate sees — no ERP session, no ERP links." },
+  { g:"hr", m:"POST", p:"/api/v1/hr/openings/{ref}/rotate-link",
+    t:"Revoke and reissue the share link (HR)", auth:"session",
+    params:[ {n:"ref", l:"Id or slug"} ],
+    note:"Every copy of the old URL dies immediately, including for a " +
+         "candidate half way through the form." },
+  { g:"hr", m:"GET", p:"/api/v1/hr/applications", t:"Applications (HR)",
+    auth:"session",
+    query:[ {n:"opening_id", l:"Limit to one opening"},
+            {n:"stage", l:"new / shortlisted / interviewed / offered / hired / rejected"} ],
+    rows:(d) => d,
+    cols:[ {k:"candidate_name", l:"Candidate"},
+           {k:(r) => r.score_percent ?? "—", l:"Score %"},
+           {k:"stage", l:"Stage"},
+           {k:(r) => (r.submitted_at || "").slice(0,10), l:"Applied"},
+           {k:(r) => (r.attachments || []).length, l:"Files"} ],
+    note:"Highest scoring first. The score is the application form's scoring " +
+         "blocks at work — a first ordering of the pile, not a decision." },
+  { g:"hr", m:"POST", p:"/api/v1/hr/applications/{application_id}/stage",
+    t:"Move a candidate (HR)", auth:"session",
+    params:[ {n:"application_id", l:"Application id"} ],
+    body:[ {n:"stage", l:"shortlisted / interviewed / offered / hired / rejected",
+            def:"shortlisted"},
+           {n:"note", l:"Why — kept on the record"} ] },
+  { g:"hr", m:"POST", p:"/api/v1/hr/people/{user_id}/documents",
+    t:"File a document against somebody (HR)", auth:"session",
+    params:[ {n:"user_id", l:"The person's user id"} ],
+    form:[ {n:"file", l:"The document — PDF, Word, image", type:"file"},
+           {n:"kind", l:"offer_letter / contract / visa / certificate / other",
+            def:"offer_letter"},
+           {n:"title", l:"What to call it"},
+           {n:"expires_on", l:"Expiry, e.g. a visa — YYYY-MM-DD"},
+           {n:"visible_to_employee", l:"May they see it? true/false", def:"true"} ],
+    note:"Only a super admin can DELETE one afterwards — HR files, one role " +
+         "destroys. The person sees it at /hr/me/documents unless " +
+         "visible_to_employee is false." },
+  { g:"hr", m:"GET", p:"/api/v1/hr/documents", t:"Documents (HR sees all)",
+    auth:"session",
+    query:[ {n:"user_id", l:"One person"},
+            {n:"expiring_within_days", l:"e.g. 60 — visas about to lapse"} ],
+    rows:(d) => d,
+    cols:[ {k:(r) => r.user_name || "—", l:"Person"}, {k:"kind", l:"Kind"},
+           {k:"title", l:"Title"},
+           {k:(r) => r.expires_on || "—", l:"Expires"},
+           {k:(r) => r.expired ? "EXPIRED" : "", l:""} ] },
+  { g:"hr", m:"GET", p:"/api/v1/hr/me/documents", t:"My own documents",
+    auth:"session",
+    rows:(d) => d,
+    cols:[ {k:"kind", l:"Kind"}, {k:"title", l:"Title"},
+           {k:(r) => r.file_name, l:"File", mono:true} ],
+    note:"Only what HR marked visible_to_employee. Download at " +
+         "/api/v1/hr/documents/{id}/download." },
+  { g:"hr", m:"POST", p:"/api/v1/hr/review-cycles", t:"Start a review cycle (HR)",
+    auth:"session",
+    body:[ {n:"payload", l:"The cycle", type:"json",
+            def:JSON.stringify({name:"2026 mid-year",
+              period_start:"2026-01-01", period_end:"2026-06-30",
+              due_on:"2026-07-15"}, null, 2)} ],
+    note:"Uses the performance_review template by default; pass template_id " +
+         "to pick probation_review or leadership_review instead. Draft until " +
+         "opened, and it cannot open with nobody nominated." },
+  { g:"hr", m:"POST", p:"/api/v1/hr/review-cycles/{cycle_id}/nominations",
+    t:"Nominate reviewers (HR)", auth:"session",
+    params:[ {n:"cycle_id", l:"Cycle id"} ],
+    body:[ {n:"payload", l:"Who reviews whom — self-review is subject == reviewer",
+            type:"json",
+            def:JSON.stringify({nominations:[
+              {subject_id:"<user id>", reviewer_id:"<user id>",
+               relation:"manager"}]}, null, 2)} ] },
+  { g:"hr", m:"POST", p:"/api/v1/hr/review-cycles/{cycle_id}/open",
+    t:"Open the cycle (HR)", auth:"session",
+    params:[ {n:"cycle_id", l:"Cycle id"} ] },
+  { g:"hr", m:"GET", p:"/api/v1/hr/reviews/mine", t:"Reviews I have to write",
+    auth:"session",
+    rows:(d) => d,
+    cols:[ {k:(r) => r.subject_name, l:"About"}, {k:(r) => r.cycle_name, l:"Cycle"},
+           {k:"status", l:"Status"}, {k:(r) => r.due_on || "—", l:"Due"} ],
+    note:"Anyone can hold nominations — being HR is not required to be asked." },
+  { g:"hr", m:"PUT", p:"/api/v1/hr/reviews/{review_id}", t:"Fill a review in",
+    auth:"session",
+    params:[ {n:"review_id", l:"From /reviews/mine"} ],
+    body:[ {n:"payload", l:"submit:false saves a draft; true freezes the score",
+            type:"json",
+            def:JSON.stringify({answers:{technical:"Above expectation",
+              communication:"Meets expectation", strengths:"…", development:"…"},
+              comment:"", submit:false}, null, 2)} ],
+    note:"Only the nominated reviewer may write — HR can read everything but " +
+         "write nothing here. Submitting computes the per-tag score and " +
+         "freezes it; editing the template later never restates it." },
+  { g:"hr", m:"GET", p:"/api/v1/hr/people/{user_id}/performance",
+    t:"Somebody's combined score (HR, or self)", auth:"session",
+    params:[ {n:"user_id", l:"The person"} ],
+    note:"Every submitted review about them, combined by points and maximums " +
+         "— not by averaging percentages, so a thorough reviewer outweighs a " +
+         "hasty one. The tags are the useful part." },
+  { g:"hr", m:"DELETE", p:"/api/v1/hr/openings/{ref}",
+    t:"Delete an opening + its applications (SUPER ADMIN)", auth:"super_admin",
+    params:[ {n:"ref", l:"Id or slug"} ],
+    note:"Super admin alone — HR membership is not enough, and that is the " +
+         "point. Returns exactly what was destroyed. Closing is almost always " +
+         "what is wanted instead." },
+
+  /* ── careers: the candidate side. No auth — that IS the feature. ──── */
+  { g:"careers", m:"GET", p:"/careers/openings", t:"Public careers list",
+    auth:"public",
+    rows:(d) => d,
+    cols:[ {k:"title", l:"Role"}, {k:(r) => r.location || "—", l:"Location"},
+           {k:(r) => r.closes_on || "—", l:"Closes"},
+           {k:"apply_url", l:"Apply link", mono:true} ],
+    note:"Only openings HR marked publicly_listed. Served OUTSIDE /api/v1 " +
+         "with no session anywhere near it; /careers is the same as a page." },
+  { g:"careers", m:"GET", p:"/apply/{token}/form", t:"What a candidate sees",
+    auth:"public",
+    params:[ {n:"token", l:"The share token — the tail of share_url"} ],
+    note:"No ids, no scoring, no maps_to — compare with the same template " +
+         "fetched through /api/v1/templates to see what is stripped. The " +
+         "hosted page for humans is /apply/{token}." },
+
+  /* ── proposals: one task's files, and editing it ───────────────────── */
+  { g:"proposals", m:"GET", p:"/api/v1/proposals/tasks/{task_id}/attachments",
+    t:"Files on one of my tasks", auth:"session",
+    params:[ {n:"task_id", l:"The SharePoint item id, e.g. 412"} ],
+    rows:(d) => d,
+    cols:[ {k:"file_name", l:"File", mono:true},
+           {k:"download_url", l:"Download", mono:true} ],
+    note:"Needs the Sites.Read.All consent on the 'Office 365 SharePoint " +
+         "Online' API — NOT a Graph permission. Until granted this answers " +
+         "503 with the exact instruction. Assignee or admin only; anyone " +
+         "else gets 404." },
+  { g:"proposals", m:"PATCH", p:"/api/v1/proposals/tasks/{task_id}",
+    t:"Edit one of my tasks — WRITES TO THE LIVE LIST", auth:"session",
+    params:[ {n:"task_id", l:"The SharePoint item id"} ],
+    body:[ {n:"payload", l:"Only whitelisted fields cross; AssignedTo never does",
+            type:"json",
+            def:JSON.stringify({status:"Submitted",
+              working_notes:"Prices agreed."}, null, 2)} ],
+    note:"The one place this app writes to SharePoint, and it is the real " +
+         "Proposals list the team works in. SharePoint's Modified-By will " +
+         "say the app; who really did it lives in our logs." },
 ];
 
 let roleKeys = [];
@@ -1196,6 +1412,7 @@ function inputFor(f) {
     if (f.from) {
       const from = f.from === "org" ? ctx.org?.object_id
                  : f.from === "team" ? ctx.team?.slug
+                 : f.from === "meeting" ? ctx.meeting?.event_id
                  : (ctx.user?.id || ctx.org?.object_id);
       if (from) input.value = from;
       else if (!input.value) input.placeholder = "pick one from a result list";
@@ -1572,6 +1789,12 @@ function renderContext() {
         ["pages", ctx.module.pages.map((p) => p.key).join(", ")]])
     : block("Selected module", null, "No module picked."));
 
+  host.append(ctx.meeting
+    ? block("Selected meeting", [["subject", ctx.meeting.subject],
+        ["starts", (ctx.meeting.start || "").slice(0,16).replace("T"," ")],
+        ["people", ctx.meeting.attendee_count], ["event id", ctx.meeting.event_id]])
+    : block("Selected meeting", null, "No meeting picked."));
+
   host.append(ctx.role
     ? block("Selected role", [["key", ctx.role.key], ["name", ctx.role.name],
         ["scope", ctx.role.scope], ["system", ctx.role.is_system]])
@@ -1591,6 +1814,7 @@ function setUser(u) { ctx.user = u; renderContext(); }
 function setRole(r) { ctx.role = r; renderContext(); }
 function setTeam(t) { ctx.team = t; renderContext(); refreshForms(); }
 function setModule(m) { ctx.module = m; renderContext(); refreshForms(); }
+function setMeeting(m) { ctx.meeting = m; renderContext(); refreshForms(); }
 function setOrg(o) {
   ctx.org = o;
   // A directory pick counts as a user pick: an object_id is accepted anywhere a
@@ -1600,7 +1824,7 @@ function setOrg(o) {
 }
 
 $("ctxClear").onclick = () => {
-  ctx.user = ctx.role = ctx.org = ctx.team = ctx.module = null;
+  ctx.user = ctx.role = ctx.org = ctx.team = ctx.module = ctx.meeting = null;
   renderContext();
 };
 

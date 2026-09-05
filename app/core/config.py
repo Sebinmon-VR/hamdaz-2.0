@@ -46,6 +46,20 @@ class Settings(BaseSettings):
         "9ded8786-1497-489f-a53c-9d316bc9b7e7"
     )
     sharepoint_proposals_list_id: str = "58ac33c7-f42e-4b27-afb0-4af09d90b397"
+    #: The list as a person opens it. Every link to a task is this plus the
+    #: item id, which is the only construction SharePoint actually documents:
+    #:
+    #:   {list_url}/DispForm.aspx?ID={id}   the task
+    #:   {list_url}/Attachments/{id}        its attachments
+    #:
+    #: Configured rather than taken from Graph. Graph's ``webUrl`` for a list
+    #: item is ``.../Proposals/412_.000`` — an internal handle that does not
+    #: render — so deriving a link from it means reshaping a value that was
+    #: never a link. This is one string, it changes only if the site is moved,
+    #: and it makes the URLs the same whether or not Graph returned anything.
+    sharepoint_proposals_list_url: str = (
+        "https://hamdaz1.sharepoint.com/sites/ProposalTeam/Lists/Proposals"
+    )
 
     # ── Zoho Books (quotes) ────────────────────────────────────────────
     #: READ ONLY, like SharePoint. Zoho Books is where quotes are actually

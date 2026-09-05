@@ -149,6 +149,8 @@ class StubTask:
         self.created_at = "2026-08-20T09:00:00Z"
         self.modified_at = "2026-09-02T11:30:00Z"
         self.web_url = "https://hamdaz1.sharepoint.com/Lists/Proposals/412"
+        self.has_attachments = False
+        self.attachments_url = None
         self.is_open = True
         self.deadline = "2026-09-30T00:00:00Z"
         self.__dict__.update(over)

@@ -42,7 +42,7 @@ def _task(task_id: str, title: str, *, lookup_id: str, bcd: str, status: str = "
         start_date=None, due_date=None, bid_closing_date=bcd, end_user="Adnoc",
         submission_status=None, current_type=None, order_status=None,
         negotiation=None, quote_no=None, remarks=None, working_notes=None,
-        created_at=None, modified_at=None, web_url=f"https://sp/{task_id}",
+        created_at=None, modified_at=None,
     )
 
 

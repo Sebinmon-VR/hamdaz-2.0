@@ -149,6 +149,37 @@ class StubGraph:
         return found
 
 
+class StubCalendar:
+    """Stands in for Graph's calendar in route tests.
+
+    Records the mailbox it was asked for, because "does this only ever read the
+    caller's own calendar" is the one thing the meetings router must get right
+    and the only place a test can observe it.
+    """
+
+    def __init__(self) -> None:
+        self.meetings: list = []
+        self.error: Exception | None = None
+        self.calls: list[dict] = []
+
+    async def list_meetings(self, user_id: str, *, start, end):
+        self.calls.append({"user_id": user_id, "start": start, "end": end})
+        if self.error:
+            raise self.error
+        return list(self.meetings)
+
+    async def get_meeting(self, user_id: str, event_id: str):
+        self.calls.append({"user_id": user_id, "event_id": event_id})
+        if self.error:
+            raise self.error
+        found = next((m for m in self.meetings if m.event_id == event_id), None)
+        if found is None:
+            from app.meetings.calendar import CalendarError
+
+            raise CalendarError("not found")
+        return found
+
+
 @pytest.fixture
 def oidc() -> StubOIDC:
     return StubOIDC()
@@ -160,11 +191,19 @@ def graph() -> StubGraph:
 
 
 @pytest.fixture
-async def client(engine, oidc: StubOIDC, graph: StubGraph) -> AsyncIterator[httpx.AsyncClient]:
+def calendar() -> StubCalendar:
+    return StubCalendar()
+
+
+@pytest.fixture
+async def client(
+    engine, oidc: StubOIDC, graph: StubGraph, calendar: StubCalendar
+) -> AsyncIterator[httpx.AsyncClient]:
     """An HTTP client wired to the real app, minus the network."""
     fastapi_app = create_app()
     fastapi_app.state.oidc = oidc
     fastapi_app.state.graph = graph
+    fastapi_app.state.calendar = calendar
 
     factory = async_sessionmaker(engine, expire_on_commit=False)
 

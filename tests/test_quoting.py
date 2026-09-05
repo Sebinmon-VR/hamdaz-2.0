@@ -602,6 +602,8 @@ class Task:
         self.remarks = "Budgetary only at this stage."
         self.working_notes = "Waiting on Fortinet pricing."
         self.web_url = "https://hamdaz1.sharepoint.com/Lists/Proposals/412"
+        self.has_attachments = False
+        self.attachments_url = None
         self.__dict__.update(over)
 
 

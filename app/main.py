@@ -28,6 +28,8 @@ from app.hr.router import router as hr_router
 from app.labels.router import router as labels_router
 from app.leave.mailer import LeaveMailer
 from app.leave.router import router as leave_router
+from app.meetings.calendar import GraphCalendar
+from app.meetings.router import router as meetings_router
 from app.profiles.router import router as profiles_router
 from app.proposals.analytics import WorkloadCache
 from app.proposals.oversight import TeamTasksCache
@@ -69,6 +71,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.team_tasks_cache = TeamTasksCache()
     # Sends as the requester. Disabled unless HR turns it on in leave settings.
     app.state.leave_mailer = LeaveMailer(settings, http)
+    # Reads the signed-in person's own calendar, and only theirs — the
+    # mailbox is never named by a request. See app/meetings/router.py.
+    app.state.calendar = GraphCalendar(settings, http)
     # Reads supplier quote documents. Holds no connection of its own; the
     # Anthropic SDK manages that, and an unset key fails at the endpoint rather
     # than at boot so the manual entry path keeps working without one.
@@ -115,6 +120,7 @@ def create_app() -> FastAPI:
     app.include_router(dashboards_router, prefix=settings.api_prefix)
     app.include_router(proposals_router, prefix=settings.api_prefix)
     app.include_router(leave_router, prefix=settings.api_prefix)
+    app.include_router(meetings_router, prefix=settings.api_prefix)
     app.include_router(zoho_router, prefix=settings.api_prefix)
     app.include_router(comparison_router, prefix=settings.api_prefix)
     app.include_router(labels_router, prefix=settings.api_prefix)

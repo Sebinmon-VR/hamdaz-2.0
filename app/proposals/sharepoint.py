@@ -16,14 +16,17 @@ to them", and it is the only mapping the filter is allowed to rest on.
 
 from __future__ import annotations
 
+import base64
+import json
 import time
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import Any, Final
+from urllib.parse import quote
 
 import httpx
 
-from app.core.config import Settings
+from app.core.config import Settings, get_settings
 
 GRAPH_BASE: Final = "https://graph.microsoft.com/v1.0"
 GRAPH_SCOPE: Final = "https://graph.microsoft.com/.default"
@@ -46,6 +49,17 @@ DONE_STATUSES: Final = frozenset({"completed"})
 #: Nothing is written back to SharePoint — the list is live and read-only from
 #: here. See ``ProposalTask.effective_status``.
 EXPIRED: Final = "Expired"
+
+
+class SharePointConsentError(Exception):
+    """The attachments API needs a consent this app registration does not have.
+
+    Raised *before* any REST call is made, from the token itself: Entra will
+    happily issue a SharePoint-audience token with an empty ``roles`` claim,
+    and SharePoint then answers 401 with an empty body — an error that names
+    nothing. Decoding the token instead lets the message say exactly what an
+    admin has to grant, which turns a dead endpoint into an instruction.
+    """
 
 
 class SharePointError(Exception):
@@ -75,7 +89,16 @@ class ProposalTask:
     working_notes: str | None
     created_at: str | None
     modified_at: str | None
-    web_url: str | None
+    #: Whether SharePoint holds files against this item.
+    #:
+    #: A boolean is all Graph will give. Classic list attachments are not drive
+    #: items, so ``/driveItem`` refuses them and every path under the site's
+    #: drive 404s — the file *names* are reachable only through the SharePoint
+    #: REST API, which needs an application permission on the SharePoint
+    #: resource that this app registration does not hold. Rather than ask for
+    #: that permission to display a filename, the links below send the person
+    #: to SharePoint, where their own access decides what they may open.
+    has_attachments: bool = False
 
     @property
     def effective_status(self) -> str:
@@ -197,8 +220,34 @@ class ProposalTask:
             working_notes=f.get("WorkingNotes"),
             created_at=f.get("Created"),
             modified_at=f.get("Modified"),
-            web_url=item.get("webUrl"),
+            has_attachments=bool(f.get("Attachments")),
         )
+
+    @property
+    def web_url(self) -> str:
+        """The task's display form — where a person reads it and its files.
+
+        Built from the configured list URL and this item's id, so it exists for
+        every task and never depends on what Graph chose to return.
+        """
+        return f"{_list_url()}/DispForm.aspx?ID={self.id}"
+
+    @property
+    def attachments_url(self) -> str | None:
+        """This item's attachment folder, or None when it has no files.
+
+        Nothing here widens access. The link carries no token; opening it uses
+        the person's own SharePoint session, so somebody without access to the
+        Proposals site gets SharePoint's sign-in page rather than a file.
+        """
+        if not self.has_attachments:
+            return None
+        return f"{_list_url()}/Attachments/{self.id}"
+
+
+def _list_url() -> str:
+    """Where the Proposals list lives, without a trailing slash."""
+    return get_settings().sharepoint_proposals_list_url.rstrip("/")
 
 
 #: The three columns an aggregate needs. Pulling the full field set for 1,291
@@ -214,7 +263,9 @@ _AGGREGATE_FIELDS: Final = "Status,AssignedToLookupId,BCD,Created"
 _FIELDS: Final = (
     "Title,Status,Priority,AssignedTo,AssignedToLookupId,StartDate,DueDate,BCD,"
     "EndUser,SubmissionStatus,CurrentType,OrderStatus,Negotiation,zohpquoteno,"
-    "Remarks,WorkingNotes,Created,Modified"
+    # Attachments is a boolean and nothing more: Graph will say whether an item
+    # has files, and will not say what they are called. See ProposalTask.
+    "Remarks,WorkingNotes,Created,Modified,Attachments"
 )
 
 
@@ -224,6 +275,12 @@ class SharePointProposals:
         self._http = http
         self._token: str | None = None
         self._expires_at = 0.0
+        #: A second token, for the SharePoint REST API. Graph cannot serve list
+        #: item attachments — not v1.0, not beta, not through any drive path —
+        #: so the attachment calls go to SharePoint's own API, which is a
+        #: different resource with its own audience and its own consent.
+        self._rest_token: str | None = None
+        self._rest_expires_at = 0.0
         self._users: dict[str, str] | None = None
         self._users_at = 0.0
         self._user_list_id: str | None = None
@@ -254,6 +311,178 @@ class SharePointProposals:
             - _TOKEN_REFRESH_BUFFER_SECONDS
         )
         return self._token
+
+    @property
+    def _host(self) -> str:
+        """``hamdaz1.sharepoint.com`` — the first segment of the composite site id."""
+        return self._settings.sharepoint_site_id.split(",")[0]
+
+    async def _sp_rest_token(self) -> str:
+        """A token whose audience is SharePoint itself, not Graph.
+
+        Checked for actual authority before it is used: an app with no
+        permissions on the SharePoint resource still gets a token, just one
+        with an empty ``roles`` claim that SharePoint meets with a bare 401.
+        Failing here, with the exact grant named, is the difference between an
+        admin fixing it in a minute and a support thread.
+        """
+        if self._rest_token and time.monotonic() < self._rest_expires_at:
+            return self._rest_token
+
+        response = await self._http.post(
+            f"{self._settings.authority}/oauth2/v2.0/token",
+            data={
+                "client_id": self._settings.azure_client_id,
+                "client_secret": self._settings.azure_client_secret,
+                "grant_type": "client_credentials",
+                "scope": f"https://{self._host}/.default",
+            },
+        )
+        if response.status_code != 200:
+            raise SharePointError(
+                f"SharePoint token request failed ({response.status_code})"
+            )
+        payload = response.json()
+        token = payload["access_token"]
+
+        claims_part = token.split(".")[1]
+        claims_part += "=" * (-len(claims_part) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(claims_part))
+        if not claims.get("roles"):
+            raise SharePointConsentError(
+                "Reading attachments needs a permission this app does not hold. "
+                "An admin must grant the app registration an *application* "
+                "permission on the 'Office 365 SharePoint Online' API — "
+                "Sites.Read.All to read attachments, Sites.ReadWrite.All to also "
+                "upload — and press 'Grant admin consent'. Graph permissions do "
+                "not cover this: it is a separate API with separate consent."
+            )
+
+        self._rest_token = token
+        self._rest_expires_at = (
+            time.monotonic() + int(payload.get("expires_in", 3600))
+            - _TOKEN_REFRESH_BUFFER_SECONDS
+        )
+        return token
+
+    def _rest_item(self, item_id: str) -> str:
+        list_id = self._settings.sharepoint_proposals_list_id
+        return (
+            f"https://{self._host}/_api/web/lists(guid'{list_id}')/items({int(item_id)})"
+        )
+
+    async def _rest(self, method: str, url: str, **kwargs) -> httpx.Response:
+        token = await self._sp_rest_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json;odata=nometadata",
+            **kwargs.pop("headers", {}),
+        }
+        response = await self._http.request(method, url, headers=headers, **kwargs)
+        if response.status_code == 401:
+            self._rest_token, self._rest_expires_at = None, 0.0
+            raise SharePointError("SharePoint rejected the application token")
+        return response
+
+    async def attachments_of(self, item_id: str) -> list[dict[str, str]]:
+        """The files on one task: ``[{"file_name": ..., "server_url": ...}]``.
+
+        SharePoint REST, not Graph — see the constructor comment for why.
+        """
+        response = await self._rest("GET", f"{self._rest_item(item_id)}/AttachmentFiles")
+        if response.status_code == 404:
+            raise SharePointError(f"No task {item_id!r} in the Proposals list")
+        if response.status_code != 200:
+            raise SharePointError(
+                f"SharePoint returned {response.status_code} for the attachment list"
+            )
+        return [
+            {
+                "file_name": entry.get("FileName") or "",
+                "server_url": entry.get("ServerRelativeUrl") or "",
+            }
+            for entry in response.json().get("value", [])
+            if entry.get("FileName")
+        ]
+
+    async def attachment_content(self, item_id: str, file_name: str) -> bytes:
+        """One attachment's bytes.
+
+        The name appears twice-escaped on purpose: once as an OData string
+        literal (single quotes double) and once as a URL path segment. A file
+        called ``O'Brien CV.pdf`` breaks whichever one is skipped.
+        """
+        literal = file_name.replace("'", "''")
+        url = (
+            f"{self._rest_item(item_id)}/AttachmentFiles('{quote(literal)}')/$value"
+        )
+        response = await self._rest("GET", url)
+        if response.status_code == 404:
+            raise SharePointError(f"No attachment {file_name!r} on task {item_id!r}")
+        if response.status_code != 200:
+            raise SharePointError(
+                f"SharePoint returned {response.status_code} for {file_name!r}"
+            )
+        return response.content
+
+    async def add_attachment(self, item_id: str, file_name: str, content: bytes) -> None:
+        """Attach a file to a task. Needs Sites.ReadWrite.All on SharePoint."""
+        literal = file_name.replace("'", "''")
+        url = f"{self._rest_item(item_id)}/AttachmentFiles/add(FileName='{quote(literal)}')"
+        response = await self._rest("POST", url, content=content)
+        if response.status_code not in (200, 201):
+            raise SharePointError(
+                f"SharePoint refused the upload ({response.status_code}): "
+                f"{response.text[:200]}"
+            )
+
+    async def delete_attachment(self, item_id: str, file_name: str) -> None:
+        literal = file_name.replace("'", "''")
+        url = f"{self._rest_item(item_id)}/AttachmentFiles('{quote(literal)}')"
+        response = await self._rest("DELETE", url, headers={"If-Match": "*"})
+        if response.status_code not in (200, 204):
+            raise SharePointError(
+                f"SharePoint refused the delete ({response.status_code})"
+            )
+
+    # ── writing task fields, which stays on Graph ──────────────────────
+
+    async def task(self, item_id: str) -> ProposalTask:
+        """One task by its id, with the full field set."""
+        payload = await self._get(
+            f"{self._site}/lists/{self._settings.sharepoint_proposals_list_id}"
+            f"/items/{int(item_id)}",
+            {"$expand": f"fields($select={_FIELDS})"},
+        )
+        return ProposalTask.from_item(payload)
+
+    async def update_task(self, item_id: str, fields: dict[str, Any]) -> ProposalTask:
+        """PATCH field values on one task and hand the row back re-read.
+
+        Graph, not REST: field writes are the one thing Graph does support on a
+        list item, and the app already holds Sites.ReadWrite.All there.
+
+        **The caller decides what may be written; this method only carries it.**
+        The whitelist lives in the router where the permission decision is made,
+        so that reading this file never gives false comfort about what the API
+        lets through.
+        """
+        token = await self._access_token()
+        url = (
+            f"{self._site}/lists/{self._settings.sharepoint_proposals_list_id}"
+            f"/items/{int(item_id)}/fields"
+        )
+        response = await self._http.patch(
+            url, json=fields, headers={"Authorization": f"Bearer {token}"}
+        )
+        if response.status_code == 404:
+            raise SharePointError(f"No task {item_id!r} in the Proposals list")
+        if response.status_code != 200:
+            raise SharePointError(
+                f"SharePoint refused the update ({response.status_code}): "
+                f"{response.text[:300]}"
+            )
+        return await self.task(item_id)
 
     async def _get(self, url: str, params: dict[str, str] | None = None, **extra) -> dict:
         token = await self._access_token()
