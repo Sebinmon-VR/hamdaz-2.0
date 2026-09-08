@@ -16,13 +16,21 @@ import pytest
 from app.assistant.agent import tool_payload
 from app.assistant.catalogue import (
     DEFAULT_MODEL,
+    DEFAULT_REALTIME_MODEL,
+    DEFAULT_SPEECH_MODEL,
     EVERYDAY_TOOLS,
     GROUPS,
+    GROUPS_BY_KEY,
     LIVE_TOOLS,
     MODELS,
+    REALTIME_MODELS,
+    SENSITIVE_WRITE_ROLES,
+    SPEECH_MODELS,
     TOOLS,
     TOOLS_BY_KEY,
     TOOLS_BY_NAME,
+    VOICE_MODELS,
+    VOICE_MODELS_BY_KEY,
     Param,
     ToolSpec,
 )
@@ -34,7 +42,10 @@ from app.assistant.policy import (
     cost_of,
     effective_confirm,
     effective_roles,
+    effective_write_roles,
+    realtime_cost_of,
     resolve_tools,
+    speech_cost_of,
     tool_enabled,
 )
 from app.models.assistant import (
@@ -42,10 +53,12 @@ from app.models.assistant import (
     AssistantModulePolicy,
     AssistantSettings,
     AssistantToolPolicy,
+    AssistantVoiceModel,
     AudienceMode,
     RuleEffect,
     SubjectType,
 )
+from app.roles.catalogue import SYSTEM_ROLES
 
 # ── fixtures for the pure half ─────────────────────────────────────────
 
@@ -84,6 +97,7 @@ def _module(key: str, **kw) -> AssistantModulePolicy:
     row.write_enabled = kw.get("write_enabled", False)
     row.confirm_writes = kw.get("confirm_writes")
     row.allowed_roles = kw.get("allowed_roles")
+    row.write_roles = kw.get("write_roles")
     return row
 
 
@@ -92,6 +106,22 @@ def _tool(key: str, module_key: str, **kw) -> AssistantToolPolicy:
     row.enabled = kw.get("enabled", True)
     row.confirm_override = kw.get("confirm_override")
     row.allowed_roles = kw.get("allowed_roles")
+    row.write_roles = kw.get("write_roles")
+    return row
+
+
+def _voice_model(kind: str, **kw) -> AssistantVoiceModel:
+    row = AssistantVoiceModel(key=kw.get("key", "v"), name="V", kind=kind, description="")
+    for field, default in (
+        ("char_price", "0"),
+        ("text_input_price", "0"),
+        ("cached_text_input_price", "0"),
+        ("audio_input_price", "0"),
+        ("cached_audio_input_price", "0"),
+        ("text_output_price", "0"),
+        ("audio_output_price", "0"),
+    ):
+        setattr(row, field, Decimal(str(kw.get(field, default))))
     return row
 
 
@@ -124,6 +154,29 @@ def test_schemas_satisfy_strict_mode(spec: ToolSpec) -> None:
     schema = spec.schema()
     assert schema["additionalProperties"] is False
     assert set(schema["required"]) == set(schema["properties"])
+
+
+def _nested_objects(schema: dict) -> list[dict]:
+    """Every object schema below the top level, however deeply nested."""
+    found: list[dict] = []
+    if schema.get("type") == "object":
+        found.append(schema)
+        for child in schema.get("properties", {}).values():
+            found += _nested_objects(child)
+    if "items" in schema:
+        found += _nested_objects(schema["items"])
+    return found
+
+
+@pytest.mark.parametrize("spec", TOOLS, ids=lambda s: s.key)
+def test_nested_objects_satisfy_strict_mode_too(spec: ToolSpec) -> None:
+    """Strict mode's rules apply at every level, not only the top one. An
+    object inside an array that forgets them fails the whole turn, and the
+    failure is an API error rather than a bad answer, so nothing recovers."""
+    for prop in spec.schema()["properties"].values():
+        for obj in _nested_objects(prop):
+            assert obj.get("additionalProperties") is False, spec.key
+            assert set(obj["required"]) == set(obj["properties"]), spec.key
 
 
 @pytest.mark.parametrize("spec", TOOLS, ids=lambda s: s.key)
@@ -601,3 +654,314 @@ def test_the_default_model_can_search() -> None:
     """Otherwise a fresh install pays for the whole catalogue on every turn."""
     by_key = {model.key: model for model in MODELS}
     assert by_key[DEFAULT_MODEL].supports_tool_search is True
+
+
+# ── who may write ──────────────────────────────────────────────────────
+#
+# The half of this change that says no. Writes are on for every module now, so
+# the only thing standing between an ordinary employee and "delete the Kuwait
+# team" is these rules — which makes them the ones worth testing hardest.
+
+
+def _write_spec() -> ToolSpec:
+    return TOOLS_BY_KEY["teams.delete"]
+
+
+def test_a_write_restriction_hides_the_write_from_everyone_else() -> None:
+    tools = resolve_tools(
+        _settings(),
+        {"teams": _module("teams", write_enabled=True, write_roles=["manager"])},
+        {},
+        _actor(access_modules={"teams"}),
+    )
+    assert not [t for t in tools if t.spec.is_write]
+
+
+def test_a_write_restriction_does_not_touch_the_reads() -> None:
+    """The whole reason it is a second column: look freely, change carefully."""
+    tools = resolve_tools(
+        _settings(),
+        {"teams": _module("teams", write_enabled=True, write_roles=["manager"])},
+        {},
+        _actor(access_modules={"teams"}),
+    )
+    reads = {t.key for t in tools if not t.spec.is_write}
+    assert "teams.list" in reads
+    assert "teams.members" in reads
+
+
+def test_a_manager_gets_the_writes_the_restriction_names() -> None:
+    tools = resolve_tools(
+        _settings(),
+        {"teams": _module("teams", write_enabled=True, write_roles=["manager"])},
+        {},
+        _actor(roles={"manager"}, access_modules={"teams"}),
+    )
+    assert "teams.delete" in {t.key for t in tools}
+
+
+def test_holding_one_of_several_named_roles_is_enough() -> None:
+    tools = resolve_tools(
+        _settings(),
+        {"teams": _module("teams", write_enabled=True, write_roles=list(SENSITIVE_WRITE_ROLES))},
+        {},
+        _actor(roles={"ceo"}, access_modules={"teams"}),
+    )
+    assert "teams.create" in {t.key for t in tools}
+
+
+def test_a_tool_restriction_narrows_the_module_one() -> None:
+    """Leave is anyone's to request and its rules are not anyone's to rewrite."""
+    tools = resolve_tools(
+        _settings(),
+        {"leave": _module("leave", write_enabled=True)},
+        {"leave.update_rules": _tool("leave.update_rules", "leave", write_roles=["manager"])},
+        _actor(),
+    )
+    keys = {t.key for t in tools}
+    assert "leave.request" in keys
+    assert "leave.update_rules" not in keys
+
+
+def test_a_tool_restriction_can_also_widen_the_module_one() -> None:
+    """The same lever both ways: one everyday write inside a guarded module."""
+    tools = resolve_tools(
+        _settings(),
+        {"leave": _module("leave", write_enabled=True, write_roles=["manager"])},
+        {"leave.request": _tool("leave.request", "leave", write_roles=["member"])},
+        _actor(roles={"member"}),
+    )
+    assert "leave.request" in {t.key for t in tools}
+
+
+def test_write_roles_are_ignored_when_the_module_writes_are_off() -> None:
+    """Off beats allowed. A permissive list must not switch writes back on."""
+    tools = resolve_tools(
+        _settings(),
+        {"teams": _module("teams", write_enabled=False, write_roles=["manager"])},
+        {},
+        _actor(roles={"manager"}, access_modules={"teams"}),
+    )
+    assert not [t for t in tools if t.spec.is_write]
+
+
+def test_allowed_roles_still_gates_the_whole_module() -> None:
+    """The two restrictions are independent, and the visibility one wins first."""
+    tools = resolve_tools(
+        _settings(),
+        {
+            "teams": _module(
+                "teams", write_enabled=True, allowed_roles=["ceo"], write_roles=["manager"]
+            )
+        },
+        {},
+        _actor(roles={"manager"}, access_modules={"teams"}),
+    )
+    assert not [t for t in tools if t.spec.module_key == "teams"]
+
+
+def test_effective_write_roles_prefers_the_tool_then_the_module() -> None:
+    module = _module("teams", write_roles=["manager"])
+    tool = _tool("teams.delete", "teams", write_roles=["super_admin"])
+    assert effective_write_roles(module, tool) == ["super_admin"]
+    assert effective_write_roles(module, None) == ["manager"]
+    assert effective_write_roles(None, None) is None
+
+
+def test_an_empty_write_role_list_is_no_restriction() -> None:
+    """Cleared, not "nobody" — a list nobody can match would be a trap."""
+    assert effective_write_roles(_module("teams", write_roles=[]), None) is None
+
+
+# ── the shipped write rules ────────────────────────────────────────────
+
+
+def test_the_company_wide_modules_ship_restricted() -> None:
+    for key in ("roles", "user_admin", "teams", "templates", "assignment", "finance", "quotes"):
+        assert GROUPS_BY_KEY[key].write_roles == SENSITIVE_WRITE_ROLES, key
+
+
+def test_everyday_modules_ship_unrestricted() -> None:
+    """Their writes are the work of the person doing them, and the route already
+    knows about HR team membership and record ownership in a way a list of
+    global roles cannot."""
+    for key in ("leave", "hr", "proposals", "quote_requests", "dashboard"):
+        assert GROUPS_BY_KEY[key].write_roles is None, key
+
+
+def test_every_shipped_write_role_is_a_real_global_role() -> None:
+    known = {r.key for r in SYSTEM_ROLES if r.scope == "global"}
+    for group in GROUPS:
+        for role in group.write_roles or ():
+            assert role in known, f"{group.key}: {role}"
+
+
+def test_the_restricted_roles_are_the_ones_asked_for() -> None:
+    assert set(SENSITIVE_WRITE_ROLES) == {"super_admin", "ceo", "manager"}
+
+
+def test_an_ordinary_person_gets_no_company_wide_write_under_the_shipped_rules() -> None:
+    """The whole change, end to end: writes on everywhere, and none of the
+    dangerous ones offered to somebody holding no global role."""
+    modules = {
+        group.key: _module(
+            group.key,
+            write_enabled=True,
+            write_roles=list(group.write_roles) if group.write_roles else None,
+        )
+        for group in GROUPS
+    }
+    actor = _actor(access_modules={g.key for g in GROUPS})
+    keys = {t.key for t in resolve_tools(_settings(), modules, {}, actor)}
+    assert not any(k.startswith(("teams.", "roles.", "access.")) and
+                   TOOLS_BY_KEY[k].is_write for k in keys)
+    # ...and the everyday writes are there, which is the point of turning them on.
+    assert "leave.request" in keys
+    assert "proposals.update_task" in keys
+
+
+def test_a_manager_gets_the_company_wide_writes_under_the_shipped_rules() -> None:
+    modules = {
+        group.key: _module(
+            group.key,
+            write_enabled=True,
+            write_roles=list(group.write_roles) if group.write_roles else None,
+        )
+        for group in GROUPS
+    }
+    actor = _actor(roles={"manager"}, access_modules={g.key for g in GROUPS})
+    keys = {t.key for t in resolve_tools(_settings(), modules, {}, actor)}
+    assert {"teams.create", "teams.delete", "roles.grant", "access.grant"} <= keys
+
+
+# ── the writes that were held back ─────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "proposals.update_task",
+        "quote_requests.create",
+        "quote_requests.submit",
+        "quote_requests.review",
+        "hr.move_candidate",
+    ],
+)
+def test_the_held_back_writes_are_live_and_fully_described(key: str) -> None:
+    """A live tool whose body is half described fails on every use, which is
+    worse than one that is honestly still planned."""
+    spec = TOOLS_BY_KEY[key]
+    assert spec.is_live
+    assert spec.is_write
+    assert spec.warning, f"{key} changes something and should say what"
+
+
+def test_creating_a_quote_asks_for_the_lines() -> None:
+    spec = TOOLS_BY_KEY["quote_requests.create"]
+    schema = spec.schema()
+    assert "items" in schema["properties"]
+    assert "team" in {p.name for p in spec.params if p.location == "query"}
+
+
+def test_a_null_inside_a_line_item_is_dropped_rather_than_sent() -> None:
+    """Strict mode makes the model send every key, so what it has nothing to
+    say about arrives as null. A line's quantity is a plain number with a
+    default on the route: an explicit null there is a 422, not a default."""
+    spec = TOOLS_BY_KEY["quote_requests.create"]
+    _, query, body = spec.split(
+        {
+            "team": "sales",
+            "title": "Pumps",
+            "customer_name": "Acme",
+            "items": [
+                {"name": "Pump", "quantity": 2, "rate": 500, "brand": None, "unit": None}
+            ],
+            "currency": None,
+            "notes": None,
+        }
+    )
+    assert query["team"] == "sales"
+    assert "currency" not in body and "notes" not in body
+    assert body["items"] == [{"name": "Pump", "quantity": 2, "rate": 500}]
+
+
+def test_a_review_and_a_stage_move_offer_only_real_choices() -> None:
+    """An enum the route would reject is a turn wasted and a person confused."""
+    review = TOOLS_BY_KEY["quote_requests.review"].schema()["properties"]["action"]
+    assert set(review["enum"]) == {"approve", "reject", "rework", "comment"}
+    stage = TOOLS_BY_KEY["hr.move_candidate"].schema()["properties"]["stage"]
+    assert "withdrawn" in stage["enum"] and "hired" in stage["enum"]
+
+
+# ── what the voice costs ───────────────────────────────────────────────
+
+
+def test_the_voice_catalogue_covers_every_model_that_can_be_chosen() -> None:
+    """A model an admin can pick and nobody priced would be used for free,
+    which is the exact way the voice went uncosted in the first place."""
+    assert set(SPEECH_MODELS) == {m.key for m in VOICE_MODELS if m.kind == "speech"}
+    assert set(REALTIME_MODELS) == {m.key for m in VOICE_MODELS if m.kind == "realtime"}
+
+
+def test_the_defaults_are_priced() -> None:
+    assert VOICE_MODELS_BY_KEY[DEFAULT_SPEECH_MODEL].char_price > 0
+    assert VOICE_MODELS_BY_KEY[DEFAULT_REALTIME_MODEL].audio_output_price > 0
+
+
+def test_voice_model_keys_are_unique() -> None:
+    keys = [m.key for m in VOICE_MODELS]
+    assert len(set(keys)) == len(keys)
+
+
+def test_every_voice_model_is_priced_in_its_own_unit_and_no_other() -> None:
+    for model in VOICE_MODELS:
+        if model.kind == "speech":
+            assert model.char_price > 0, model.key
+            assert model.audio_output_price == 0, model.key
+        else:
+            assert model.char_price == 0, model.key
+            assert model.audio_input_price > 0, model.key
+            assert model.audio_output_price > 0, model.key
+
+
+def test_speech_is_billed_on_the_characters_we_send() -> None:
+    model = _voice_model("speech", char_price="16.00")
+    assert speech_cost_of(model, characters=1_000_000) == Decimal("16.000000")
+    assert speech_cost_of(model, characters=250) == Decimal("0.004000")
+
+
+def test_reading_nothing_aloud_costs_nothing() -> None:
+    assert speech_cost_of(_voice_model("speech", char_price="16.00"), characters=0) == 0
+
+
+def test_realtime_prices_audio_apart_from_text() -> None:
+    model = _voice_model(
+        "realtime",
+        text_input_price="4.00",
+        audio_input_price="32.00",
+        audio_output_price="64.00",
+    )
+    cost = realtime_cost_of(
+        model,
+        text_input_tokens=1_000_000,
+        audio_input_tokens=1_000_000,
+        audio_output_tokens=1_000_000,
+    )
+    assert cost == Decimal("100.000000")
+
+
+def test_realtime_takes_the_cached_tokens_out_of_the_full_price() -> None:
+    """They arrive already counted in the input figure, exactly as the chat
+    model's do — and the two must agree or one of them is quietly wrong."""
+    model = _voice_model(
+        "realtime", audio_input_price="32.00", cached_audio_input_price="0.40"
+    )
+    cost = realtime_cost_of(
+        model, audio_input_tokens=1_000_000, cached_audio_input_tokens=1_000_000
+    )
+    assert cost == Decimal("0.400000")
+
+
+def test_a_silent_session_costs_nothing() -> None:
+    model = _voice_model("realtime", audio_input_price="32.00", audio_output_price="64.00")
+    assert realtime_cost_of(model) == 0

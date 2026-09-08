@@ -438,6 +438,162 @@ const ROUTES = [
   { g:"dashboards", m:"GET", p:"/api/v1/dashboards/me", t:"My teams' dashboards",
     auth:"session",
     query:[ {n:"local_only", l:"Skip Entra widgets", type:"check", checked:true} ] },
+  /* -- reports ---------------------------------------------------------- */
+  { g:"reports", m:"GET", p:"/api/v1/reports/form", t:"What my report will ask",
+    auth:"session",
+    query:[ {n:"team", l:"Team handle", from:"team"},
+            {n:"cadence", l:"daily | weekly | monthly | ad_hoc", def:"daily"},
+            {n:"on", l:"A day inside the period (YYYY-MM-DD)"} ],
+    rows:(d) => d.fields,
+    cols:[ {k:"section", l:"Section"}, {k:"key", l:"Field", mono:true},
+           {k:"label", l:"Label"}, {k:"type", l:"Type"},
+           {k:(r) => r.required ? "yes" : "", l:"Required"} ],
+    note:"The six sections are fixed — overview, tasks, issues, remarks, metrics, " +
+         "summary — because a manager reading four teams' reports should find the " +
+         "issues in the same place each time. The fields listed here are what THIS " +
+         "team is asked on top, and come from the template a super admin scheduled. " +
+         "A team with no schedule gets the generic template and no extra fields." },
+  { g:"reports", m:"POST", p:"/api/v1/reports", t:"Start a report", auth:"session",
+    body:[ {n:"team_id", l:"Team id"},
+           {n:"cadence", l:"daily | weekly | monthly | ad_hoc"},
+           {n:"on", l:"A day inside the period (blank = today)"},
+           {n:"prefill_tasks", l:"Pull in my Proposals tasks", type:"check"},
+           {n:"include_closed", l:"Include finished tasks", type:"check"} ],
+    note:"Opens a draft, prefilled with YOUR Proposals tasks — title, status, " +
+         "deadline, the SharePoint link and its attachments. Whose tasks is taken " +
+         "from your session; no parameter changes it. Nothing goes to anybody " +
+         "until you submit. If SharePoint is down the draft still opens, empty." },
+  { g:"reports", m:"PATCH", p:"/api/v1/reports/{report_id}", t:"Fill in a draft",
+    auth:"session", params:[ {n:"report_id", l:"Report id"} ],
+    body:[ {n:"overview", l:"Overview", type:"area"},
+           {n:"remarks", l:"Remarks", type:"area"},
+           {n:"summary", l:"Summary", type:"area"} ],
+    note:"Only its author, and only while it is a draft. A list sent at all " +
+         "replaces that whole section — send every task row you want kept, not " +
+         "just the new one. Metrics recompute from the tasks on every save, but a " +
+         "figure you corrected stays corrected." },
+  { g:"reports", m:"POST", p:"/api/v1/reports/{report_id}/submit", t:"File it",
+    auth:"session", params:[ {n:"report_id", l:"Report id"} ],
+    note:"Irreversible. After this nobody can edit it, and it is emailed to the " +
+         "team's managers and leads, the CEO, any global manager and the super " +
+         "admins — from your own mailbox, so a reply reaches you. A failure to " +
+         "send never fails the filing; what went wrong is kept on the report." },
+  { g:"reports", m:"GET", p:"/api/v1/reports", t:"Reports I can see", auth:"session",
+    query:[ {n:"team", l:"Team handle", from:"team"},
+            {n:"mine", l:"Only my own", type:"check"},
+            {n:"cadence", l:"daily | weekly | monthly | ad_hoc"},
+            {n:"status", l:"draft | submitted"},
+            {n:"since", l:"From (YYYY-MM-DD)"}, {n:"until", l:"To (YYYY-MM-DD)"} ],
+    rows:(d) => d.reports,
+    cols:[ {k:"period_label", l:"Period"}, {k:"author_name", l:"Who"},
+           {k:"team", l:"Team"}, {k:"cadence", l:"Cadence"},
+           {k:"task_count", l:"Tasks"}, {k:"open_issue_count", l:"Issues"} ],
+    tags:(r) => [ r.status === "draft" && "draft" ],
+    note:"You see your own, your team's if you run it, and everyone's if you run " +
+         "the company. A colleague on the same team sees NONE of yours — being on " +
+         "presales does not make a teammate's report yours to read. Asking for a " +
+         "team you cannot read returns an empty list, not an error." },
+  { g:"reports", m:"GET", p:"/api/v1/reports/overview", t:"What the reports say together",
+    auth:"session",
+    query:[ {n:"team", l:"Team handle", from:"team"},
+            {n:"since", l:"From (YYYY-MM-DD)"}, {n:"until", l:"To (YYYY-MM-DD)"} ],
+    rows:(d) => d.open_issues,
+    cols:[ {k:"severity", l:"Severity"}, {k:"title", l:"Issue"},
+           {k:(r) => r.waiting_on || "—", l:"Waiting on"},
+           {k:"team", l:"Team"}, {k:"raised_by", l:"Raised by"} ],
+    note:"The question a CEO actually asks: how did presales do last month, what " +
+         "is blocking us. Blocked issues lead, then worst first. Narrowed by the " +
+         "same rule as everything else — an ordinary person asking this gets their " +
+         "own reports summarised and nobody else's." },
+  { g:"reports", m:"GET", p:"/api/v1/reports/{report_id}", t:"One report in full",
+    auth:"session", params:[ {n:"report_id", l:"Report id"} ],
+    rows:(d) => d.tasks,
+    cols:[ {k:"title", l:"Task"}, {k:"completion", l:"How far"},
+           {k:(r) => r.deadline || "—", l:"Deadline"},
+           {k:(r) => r.has_attachments ? "yes" : "", l:"Files"} ],
+    note:"A report you may not read comes back 404, not 403 — a refusal would " +
+         "confirm a report exists for that team on that day. Reading somebody " +
+         "else's submitted report records that you read it, which is how 'nobody " +
+         "reads these' gets answered with a fact." },
+  { g:"reports", m:"POST", p:"/api/v1/reports/{report_id}/comments",
+    t:"Comment on a report", auth:"session",
+    params:[ {n:"report_id", l:"Report id"} ],
+    body:[ {n:"body", l:"What to say", type:"area"} ],
+    note:"A reader's remark. Decides nothing and changes nothing about the " +
+         "report. The author cannot comment on their own — what they have to add " +
+         "belongs in the next report, or the report stops being a record of what " +
+         "was said at the time." },
+  { g:"reports admin", m:"GET", p:"/api/v1/reports/admin/settings",
+    t:"Who filed reports are sent to", auth:"super_admin",
+    note:"Super admin only — a CEO reads every report and still cannot change " +
+         "who they are mailed to. None of this widens who may READ a report: " +
+         "an extra recipient gets a summary in their inbox, and the link in it " +
+         "refuses them like anybody else who may not open it." },
+  { g:"reports admin", m:"PATCH", p:"/api/v1/reports/admin/settings",
+    t:"Change who they go to", auth:"super_admin",
+    body:[ {n:"notify_on_submit", l:"Email a report when it is filed", type:"check"},
+           {n:"notify_team_oversight", l:"To the team's managers and leads", type:"check"},
+           {n:"notify_company_wide", l:"To the company-wide roles below", type:"check"},
+           {n:"company_roles", l:"Which roles count as company-wide",
+            type:"roles", multi:true},
+           {n:"extra_recipients", l:"Always copy (comma-separated addresses)"},
+           {n:"copy_author", l:"Send the author their own report back", type:"check"},
+           {n:"notify_cadences", l:"Cadences to email: daily, weekly, monthly, ad_hoc"},
+           {n:"max_tasks_in_email", l:"Tasks shown in the message", def:"8"},
+           {n:"include_task_list", l:"Include the task list", type:"check"},
+           {n:"include_issue_list", l:"Include the issues", type:"check"},
+           {n:"log_retention_days", l:"Delivery log window (days)", def:"90"} ],
+    note:"Only the fields you fill in change. The common change is taking " +
+         "'daily' out of the cadences and leaving weekly on — a manager of six " +
+         "people otherwise gets thirty messages a week and reads none of them. " +
+         "A role key that does not exist is refused rather than silently " +
+         "mailing nobody. An address without an '@' is dropped and the rest kept." },
+  { g:"reports admin", m:"GET", p:"/api/v1/reports/admin/deliveries",
+    t:"What was emailed, and what failed", auth:"super_admin",
+    query:[ {n:"since", l:"From (YYYY-MM-DD)"},
+            {n:"status", l:"sent | failed | skipped"},
+            {n:"limit", l:"Limit", def:"100"} ],
+    rows:(d) => d.deliveries,
+    cols:[ {k:(r) => (r.created_at || "").slice(0,16).replace("T"," "), l:"When"},
+           {k:"status", l:"Status"}, {k:"author_name", l:"Whose report"},
+           {k:"team_name", l:"Team"}, {k:"cadence", l:"Cadence"},
+           {k:(r) => (r.recipients || []).length, l:"Sent to"},
+           {k:(r) => r.detail || "—", l:"Why not"} ],
+    tags:(r) => [ r.status === "failed" && "failed" ],
+    note:"Super admin only: who was mailed about whom is a map of the " +
+         "reporting lines. 'skipped' is recorded on purpose — 'why did my " +
+         "manager not get it' is the question this log exists to answer, and a " +
+         "missing row answers it with a shrug. Records outlive the report they " +
+         "were about, which is exactly the one somebody looks up." },
+  { g:"reports admin", m:"GET", p:"/api/v1/reports/admin/templates",
+    t:"Report templates", auth:"super_admin", rows:(d) => d,
+    cols:[ {k:"key", l:"Key", mono:true}, {k:"name", l:"Name"},
+           {k:"version", l:"v"}, {k:"field_count", l:"Extra fields"} ],
+    note:"Report templates are ordinary form templates with kind=team_report, so " +
+         "the existing template editor edits them. The six sections come from " +
+         "code; these hold what each team is asked on top." },
+  { g:"reports admin", m:"GET", p:"/api/v1/reports/admin/schedules",
+    t:"Which template each team files", auth:"super_admin", rows:(d) => d,
+    cols:[ {k:"team", l:"Team"}, {k:"cadence", l:"Cadence"},
+           {k:"template_name", l:"Template"},
+           {k:(r) => r.enabled ? "on" : "off", l:"Enabled"} ] },
+  { g:"reports admin", m:"PUT", p:"/api/v1/reports/admin/schedules",
+    t:"Point a team's cadence at a template", auth:"super_admin",
+    body:[ {n:"team_id", l:"Team id"},
+           {n:"cadence", l:"daily | weekly | monthly | ad_hoc"},
+           {n:"template_id", l:"Report template id"},
+           {n:"enabled", l:"Enabled", type:"check"},
+           {n:"due_hour", l:"Expected by (hour, 0-23)", def:"18"},
+           {n:"due_weekday", l:"Weekly only: 0=Monday"},
+           {n:"notify", l:"Email this team's reports (blank = follow settings)",
+            type:"check"},
+           {n:"extra_recipients", l:"Also copy, for this team only"} ],
+    note:"This is what makes each team's report different from the next team's. " +
+         "Super admin only — what the business records is not something a team " +
+         "quietly changes for itself. Leave 'notify' blank to follow the global " +
+         "setting; setting it false silences just this team and cadence, and " +
+         "stays silenced if the global switch is turned on later." },
+
   { g:"proposals", m:"GET", p:"/api/v1/proposals/my-tasks", t:"My proposal tasks",
     auth:"session",
     query:[ {n:"open_only", l:"Hide completed — off shows ALL your tasks", type:"check"},
@@ -1425,31 +1581,63 @@ const ROUTES = [
            {n:"input_price", l:"Input $/M"}, {n:"cached_input_price", l:"Cached $/M"},
            {n:"output_price", l:"Output $/M"} ],
     note:"The active model cannot be disabled - choose another in settings first." },
+  { g:"assistant admin", m:"GET", p:"/api/v1/assistant/admin/voice-models",
+    t:"What the voice costs", auth:"super_admin", rows:(d) => d,
+    cols:[ {k:"key", l:"Model", mono:true}, {k:"kind", l:"Kind"},
+           {k:(r) => r.kind === "speech" ? r.char_price : "-", l:"$/M chars"},
+           {k:(r) => r.kind === "realtime" ? r.audio_input_price : "-", l:"Audio in $/M"},
+           {k:(r) => r.kind === "realtime" ? r.audio_output_price : "-", l:"Audio out $/M"} ],
+    tags:(r) => [ r.active && "active", !r.enabled && "disabled" ],
+    note:"Kept apart from the chat models because they are not billed in the same " +
+         "unit: speech per character of text, a spoken conversation per token with " +
+         "audio far dearer than text." },
+  { g:"assistant admin", m:"PATCH", p:"/api/v1/assistant/admin/voice-models/{key}",
+    t:"Enable, disable or reprice a voice model", auth:"super_admin",
+    params:[ {n:"key", l:"Voice model key, e.g. gpt-4o-mini-tts"} ],
+    body:[ {n:"enabled", l:"Enabled", type:"check"},
+           {n:"char_price", l:"Speech: $/M characters"},
+           {n:"text_input_price", l:"Realtime: text in $/M"},
+           {n:"cached_text_input_price", l:"Realtime: cached text in $/M"},
+           {n:"audio_input_price", l:"Realtime: audio in $/M"},
+           {n:"cached_audio_input_price", l:"Realtime: cached audio in $/M"},
+           {n:"text_output_price", l:"Realtime: text out $/M"},
+           {n:"audio_output_price", l:"Realtime: audio out $/M"} ],
+    note:"Prices for the other kind are ignored, so you can send the whole form. " +
+         "The voice in use cannot be disabled - pick another in settings first." },
   { g:"assistant admin", m:"GET", p:"/api/v1/assistant/admin/policies",
     t:"What it may read and write", auth:"super_admin", rows:(d) => d,
     cols:[ {k:"module_key", l:"Module", mono:true}, {k:"gate", l:"Shown to"},
            {k:(r) => r.read_enabled ? "yes" : "no", l:"Reads"},
            {k:(r) => r.write_enabled ? "yes" : "no", l:"Writes"},
            {k:(r) => r.tools.length, l:"Tools"},
-           {k:(r) => (r.allowed_roles || []).join(", ") || "anyone", l:"Roles"} ],
-    note:"Every module with its tools. effective_enabled and effective_confirm are " +
-         "what a turn actually sees once the module and the global default are " +
-         "folded in - the columns that matter." },
+           {k:(r) => (r.allowed_roles || []).join(", ") || "anyone", l:"Sees it"},
+           {k:(r) => !r.has_writes ? "-"
+                   : (r.write_roles || []).join(", ") || "anyone", l:"May write"} ],
+    note:"Every module with its tools. 'Sees it' and 'May write' are two separate " +
+         "questions: everyone reads the team list, managers change it. " +
+         "effective_enabled, effective_confirm and effective_write_roles are what a " +
+         "turn actually sees once the module and the global default are folded in." },
   { g:"assistant admin", m:"PATCH", p:"/api/v1/assistant/admin/policies/modules/{module_key}",
     t:"Change a module's permissions", auth:"super_admin",
     params:[ {n:"module_key", l:"Module key, e.g. leave"} ],
     body:[ {n:"read_enabled", l:"Allow reads", type:"check"},
            {n:"write_enabled", l:"Allow writes", type:"check"},
            {n:"confirm_writes", l:"Ask before writes", type:"check"},
-           {n:"allowed_roles", l:"Limit to roles", type:"roles", multi:true} ],
-    note:"Writes ship off for every module. Turning them on here is what lets the " +
-         "assistant act rather than only answer." },
+           {n:"allowed_roles", l:"Who may use the module", type:"roles", multi:true},
+           {n:"write_roles", l:"Who may write here", type:"roles", multi:true} ],
+    note:"Writes are on for every module. What holds the sharp ones is 'who may " +
+         "write here' - roles, user administration, teams, templates, assignment, " +
+         "finance and Zoho quotes ship limited to super admin, CEO and manager. " +
+         "Leave it empty and whoever the route already allows may write." },
   { g:"assistant admin", m:"PATCH", p:"/api/v1/assistant/admin/policies/tools/{tool_key}",
     t:"Change one tool", auth:"super_admin",
     params:[ {n:"tool_key", l:"Tool key, e.g. leave.request"} ],
     body:[ {n:"enabled", l:"Enabled", type:"check"},
            {n:"confirm_override", l:"Ask before this one", type:"check"},
-           {n:"allowed_roles", l:"Limit to roles", type:"roles", multi:true} ] },
+           {n:"allowed_roles", l:"Who may use this tool", type:"roles", multi:true},
+           {n:"write_roles", l:"Who may run this write", type:"roles", multi:true} ],
+    note:"Narrows or widens the module for one tool, both ways: leave is anyone's " +
+         "to request and its rules are not anyone's to rewrite." },
   { g:"assistant admin", m:"GET", p:"/api/v1/assistant/admin/rules", t:"Access rules",
     auth:"super_admin", rows:(d) => d,
     cols:[ {k:"effect", l:"Effect"}, {k:"subject_type", l:"Kind"},
@@ -1493,7 +1681,11 @@ const ROUTES = [
     t:"Usage and cost", auth:"super_admin",
     query:[ {n:"since", l:"From (YYYY-MM-DD)"}, {n:"until", l:"To (YYYY-MM-DD)"} ],
     note:"Totals plus breakdowns by day, person, team, model and tool. Somebody on " +
-         "two teams counts for both, so team rows add to more than the total." },
+         "two teams counts for both, so team rows add to more than the total. " +
+         "cost_usd is the chat bill; voice.speech is what reading answers aloud " +
+         "cost; total_cost_usd is the two together. voice.realtime is a report " +
+         "from the browser, not a bill - a session that ended in a closed tab is " +
+         "missing from it, so read it as a floor." },
   { g:"assistant admin", m:"GET", p:"/api/v1/assistant/admin/catalogue",
     t:"Every tool it knows", auth:"super_admin",
     note:"The code catalogue before any policy is applied." },

@@ -1,0 +1,878 @@
+"""Reports over HTTP.
+
+One surface for two callers. A person clicking through the page and the
+assistant acting on somebody's behalf hit exactly these routes, with that
+person's own session, and are refused by exactly the same code. That is what
+makes "ask the AI to file my report" a question about who is asking rather than
+about what the assistant is allowed to be.
+
+Every gate is in ``app.reports.access`` and every rule in ``app.reports.service``.
+Nothing here decides anything on its own; it translates HTTP into those and
+their refusals back into status codes. A reader wanting to know who can see
+what should read ``access.py`` and be done.
+
+One thing worth naming: a report somebody may not read comes back **404, not
+403**. A 403 on a report id confirms that a report exists for that team on that
+day, which is itself something they are not entitled to know.
+"""
+
+from __future__ import annotations
+
+import uuid
+from datetime import UTC, date, datetime, timedelta
+from typing import Annotated, Any
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.access import service as access_service
+from app.auth.deps import CurrentUser
+from app.core.config import Settings, get_settings
+from app.core.db import get_session
+from app.core.mail import MailError
+from app.models.report import DeliveryStatus, Report, ReportStatus
+from app.models.templates import FormTemplate
+from app.models.user import User
+from app.proposals.sharepoint import (
+    SharePointConsentError,
+    SharePointError,
+    SharePointProposals,
+)
+from app.reports import service
+from app.reports.access import (
+    Viewer,
+    may_comment,
+    may_delete,
+    may_edit,
+    may_file_for,
+)
+from app.reports.catalogue import COMPLETIONS, SECTIONS, period_for, period_label
+from app.reports.mailer import ReportMailer
+from app.reports.schemas import (
+    CommentIn,
+    CommentOut,
+    DeliveryOut,
+    DeliveryPage,
+    IssueOut,
+    MetricOut,
+    OverviewOut,
+    ReportEditIn,
+    ReportFieldOut,
+    ReportFormOut,
+    ReportOut,
+    ReportPage,
+    ReportSettingsIn,
+    ReportSettingsOut,
+    ReportStartIn,
+    ReportSummaryOut,
+    ScheduleIn,
+    ScheduleOut,
+    SectionOut,
+    TaskLineOut,
+    TemplateChoiceOut,
+)
+from app.reports.service import (
+    IssueInput,
+    ReportConflictError,
+    ReportError,
+    ReportNotFoundError,
+    ReportPermissionError,
+    TaskInput,
+)
+from app.roles.catalogue import SUPER_ADMIN
+from app.roles.deps import CurrentRoles
+from app.teams import service as teams_service
+from app.teams.service import TeamError
+
+router = APIRouter(prefix="/reports", tags=["reports"])
+#: Setting reports up is a separate surface from filing them, and separate for
+#: the same reason the assistant's is: deciding what every team must report is a
+#: narrower question than running a team. Registered ahead of ``router`` so
+#: ``/reports/admin/...`` is matched before ``/reports/{report_id}``.
+admin_router = APIRouter(prefix="/reports/admin", tags=["reports admin"])
+
+Session = Annotated[AsyncSession, Depends(get_session)]
+
+MODULE_KEY = "reports"
+
+
+def get_sharepoint(request: Request) -> SharePointProposals:
+    return request.app.state.sharepoint
+
+
+def get_mailer(request: Request) -> ReportMailer:
+    return request.app.state.report_mailer
+
+
+Mailer = Annotated[ReportMailer, Depends(get_mailer)]
+Config = Annotated[Settings, Depends(get_settings)]
+
+
+async def require_super_admin(user: CurrentUser, roles: CurrentRoles) -> User:
+    """Only a super admin decides what a team is asked to report.
+
+    Deliberately narrower than the admin role used elsewhere: a manager reads
+    every report, which is a different power from rewriting the questions
+    everybody answers.
+    """
+    if SUPER_ADMIN not in roles:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only a super admin can set up report templates and schedules.",
+        )
+    return user
+
+
+SuperAdmin = Annotated[User, Depends(require_super_admin)]
+
+
+def _translate(exc: ReportError) -> HTTPException:
+    if isinstance(exc, ReportNotFoundError):
+        return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    if isinstance(exc, ReportPermissionError):
+        return HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
+    if isinstance(exc, ReportConflictError):
+        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+async def require_module(user: CurrentUser, roles: CurrentRoles, session: Session) -> None:
+    """The caller's team must have been granted the reports module."""
+    if not await access_service.can_reach(
+        session, user_id=user.id, global_roles=roles, module_key=MODULE_KEY
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Your team does not have the Reports module. "
+                "A super admin can grant it."
+            ),
+        )
+
+
+async def current_viewer(user: CurrentUser, session: Session) -> Viewer:
+    return await service.build_viewer(session, user)
+
+
+CurrentViewer = Annotated[Viewer, Depends(current_viewer)]
+ModuleGate = Annotated[None, Depends(require_module)]
+
+
+# ── rendering ──────────────────────────────────────────────────────────
+
+
+def _sections() -> list[SectionOut]:
+    return [
+        SectionOut(key=s.key, name=s.name, description=s.description, kind=s.kind)
+        for s in SECTIONS
+    ]
+
+
+def _fields(template: FormTemplate) -> list[ReportFieldOut]:
+    return [
+        ReportFieldOut(
+            key=f.get("key", ""),
+            label=f.get("label", ""),
+            type=f.get("type", "text"),
+            section=f.get("section", "metrics"),
+            required=bool(f.get("required")),
+            help=f.get("help"),
+            options=f.get("options"),
+        )
+        for f in (template.fields or [])
+        if isinstance(f, dict) and f.get("key")
+    ]
+
+
+def _summary_out(report: Report, viewer: Viewer, *, read: bool = False) -> ReportSummaryOut:
+    return ReportSummaryOut(
+        id=report.id,
+        team_id=report.team_id,
+        team=report.team.name,
+        author_id=report.author_id,
+        author_name=report.author.display_name,
+        cadence=report.cadence,
+        period_start=report.period_start,
+        period_end=report.period_end,
+        period_label=period_label(report.cadence, report.period_start, report.period_end),
+        status=report.status,
+        submitted_at=report.submitted_at,
+        task_count=len(report.tasks),
+        open_issue_count=sum(1 for i in report.issues if not i.resolved),
+        read_by_me=read,
+    )
+
+
+def _report_out(
+    report: Report,
+    viewer: Viewer,
+    template: FormTemplate,
+    comments: list[Any],
+    *, read: bool = False,
+) -> ReportOut:
+    base = _summary_out(report, viewer, read=read)
+    return ReportOut(
+        **base.model_dump(),
+        template_id=report.template_id,
+        template_name=template.name,
+        template_version=report.template_version,
+        overview=report.overview,
+        remarks=report.remarks,
+        summary=report.summary,
+        answers=report.answers or {},
+        sections=_sections(),
+        fields=_fields(template),
+        tasks=[TaskLineOut.model_validate(t) for t in report.tasks],
+        issues=[IssueOut.model_validate(i) for i in report.issues],
+        metrics=[
+            MetricOut(
+                key=m.key, label=m.label, unit=m.unit, computed=m.computed,
+                value=m.value, target=m.target, effective=m.effective, edited=m.edited,
+            )
+            for m in report.metrics
+        ],
+        comments=[
+            CommentOut(
+                id=c.id,
+                author_id=c.author_id,
+                author_name=c.author.display_name,
+                body=c.body,
+                created_at=c.created_at,
+            )
+            for c in comments
+        ],
+        can_edit=may_edit(report, viewer),
+        can_submit=may_edit(report, viewer),
+        can_comment=may_comment(report, viewer),
+        can_delete=may_delete(report, viewer),
+    )
+
+
+# ── what will be asked ─────────────────────────────────────────────────
+
+
+@router.get(
+    "/form",
+    response_model=ReportFormOut,
+    summary="What this team's report asks, before filling one in",
+)
+async def report_form(
+    user: CurrentUser,
+    session: Session,
+    viewer: CurrentViewer,
+    _: ModuleGate,
+    team: Annotated[str, Query(description="Team handle (slug) or id")],
+    cadence: Annotated[str, Query(description="daily, weekly, monthly or ad_hoc")] = "daily",
+    on: Annotated[date | None, Query(description="A day inside the period.")] = None,
+) -> ReportFormOut:
+    """The sections and the team's own questions, before anybody starts typing.
+
+    Served separately from starting a draft so a page can show what is coming —
+    and so the assistant can tell somebody what it is about to ask them.
+    """
+    try:
+        found = await teams_service.get_team(session, team)
+    except TeamError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="No such team"
+        ) from exc
+    if not may_file_for(found.id, viewer):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You are not on that team.",
+        )
+    try:
+        template = await service.template_for(session, team_id=found.id, cadence=cadence)
+    except ReportError as exc:
+        raise _translate(exc) from exc
+
+    start, end = period_for(cadence, on or datetime.now(UTC).date())
+    return ReportFormOut(
+        team_id=found.id,
+        team=found.name,
+        cadence=cadence,
+        template_id=template.id,
+        template_name=template.name,
+        template_version=template.version,
+        sections=_sections(),
+        fields=_fields(template),
+        completions=list(COMPLETIONS),
+        period_start=start,
+        period_end=end,
+        period_label=period_label(cadence, start, end),
+    )
+
+
+# ── writing one ────────────────────────────────────────────────────────
+
+
+@router.post(
+    "",
+    response_model=ReportOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="Start a report",
+)
+async def start_report(
+    body: ReportStartIn,
+    request: Request,
+    user: CurrentUser,
+    session: Session,
+    viewer: CurrentViewer,
+    _: ModuleGate,
+) -> ReportOut:
+    """Open a draft, prefilled with the caller's own Proposals tasks.
+
+    The tasks pulled in are **theirs**, derived from their session through the
+    SharePoint lookup — there is no parameter that changes whose work ends up on
+    somebody's report. If the Proposals list cannot be reached the draft is still
+    created, empty: a reporting tool that refuses to open because another system
+    is down is a reporting tool people stop using.
+    """
+    if not may_file_for(body.team_id, viewer):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only file a report for a team you are on.",
+        )
+
+    prefill: list[TaskInput] = []
+    if body.prefill_tasks:
+        prefill = await _own_tasks(
+            get_sharepoint(request), user.email, include_closed=body.include_closed
+        )
+
+    try:
+        report = await service.start(
+            session,
+            author=user,
+            team_id=body.team_id,
+            cadence=body.cadence,
+            on=body.on,
+            period_start=body.period_start,
+            period_end=body.period_end,
+            prefill=prefill,
+        )
+    except ReportError as exc:
+        raise _translate(exc) from exc
+    await session.commit()
+
+    report = await service.get(session, report.id)
+    template = await session.get(FormTemplate, report.template_id)
+    return _report_out(report, viewer, template, [])
+
+
+async def _own_tasks(
+    sharepoint: SharePointProposals, email: str, *, include_closed: bool
+) -> list[TaskInput]:
+    """The caller's Proposals rows, as report task lines.
+
+    Whose rows these are is derived from the session, never from the request.
+    A failure to reach SharePoint returns nothing rather than raising: the draft
+    is worth having without them, and the author can type what they need.
+    """
+    try:
+        lookup_id = await sharepoint.lookup_id_for(email)
+        if lookup_id is None:
+            return []
+        tasks = await sharepoint.tasks_assigned_to(lookup_id, limit=200)
+    except (SharePointError, SharePointConsentError):
+        return []
+    if not include_closed:
+        tasks = [t for t in tasks if t.is_open]
+    tasks = sorted(tasks, key=lambda t: (t.deadline is None, t.deadline or ""))
+    return service.tasks_from_proposals(tasks)
+
+
+@router.patch("/{report_id}", response_model=ReportOut, summary="Fill in a draft")
+async def edit_report(
+    report_id: uuid.UUID,
+    body: ReportEditIn,
+    user: CurrentUser,
+    session: Session,
+    viewer: CurrentViewer,
+    _: ModuleGate,
+) -> ReportOut:
+    """Only the fields sent change. A list sent at all replaces that section."""
+    try:
+        report = await service.get_for(session, report_id, viewer)
+    except ReportError as exc:
+        raise _translate(exc) from exc
+    if not may_edit(report, viewer):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Only its author can change a report, and only before it is "
+                "submitted."
+            ),
+        )
+    try:
+        await service.edit(
+            session,
+            report,
+            overview=body.overview,
+            remarks=body.remarks,
+            summary=body.summary,
+            answers=body.answers,
+            tasks=(
+                [TaskInput(**row.model_dump()) for row in body.tasks]
+                if body.tasks is not None
+                else None
+            ),
+            issues=(
+                [IssueInput(**row.model_dump()) for row in body.issues]
+                if body.issues is not None
+                else None
+            ),
+            metrics=body.metrics,
+        )
+    except ReportError as exc:
+        raise _translate(exc) from exc
+    await session.commit()
+
+    report = await service.get(session, report_id)
+    template = await session.get(FormTemplate, report.template_id)
+    return _report_out(report, viewer, template, [])
+
+
+@router.post(
+    "/{report_id}/submit", response_model=ReportOut, summary="File it"
+)
+async def submit_report(
+    report_id: uuid.UUID,
+    user: CurrentUser,
+    session: Session,
+    viewer: CurrentViewer,
+    mailer: Mailer,
+    settings: Config,
+    _: ModuleGate,
+) -> ReportOut:
+    """After this it is read-only, and the people it goes to can see it.
+
+    Who that is: the team's managers and leads, plus the CEO, any global
+    manager, and super admins. Nothing is sent anywhere — they read it where it
+    lives, which is why there is no notification to fail silently.
+    """
+    try:
+        report = await service.get_for(session, report_id, viewer)
+    except ReportError as exc:
+        raise _translate(exc) from exc
+    if not may_edit(report, viewer):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only its author can submit a report.",
+        )
+    try:
+        await service.submit(session, report)
+    except ReportError as exc:
+        raise _translate(exc) from exc
+    await session.commit()
+
+    await _notify(session, report, mailer, settings)
+
+    report = await service.get(session, report_id)
+    template = await session.get(FormTemplate, report.template_id)
+    return _report_out(report, viewer, template, [])
+
+
+def _report_link(report: Report, settings: Settings) -> str:
+    return f"{settings.frontend_url.rstrip('/')}/reports/{report.id}"
+
+
+async def _notify(
+    session: AsyncSession,
+    report: Report,
+    mailer: ReportMailer,
+    settings: Settings,
+) -> None:
+    """Mail the filed report to the people it goes to. **Never fails the filing.**
+
+    A report that is submitted is submitted whether or not the mail went. But a
+    silent failure hides the one fact that matters — that nobody was told — so
+    what went wrong is kept on the report itself, where somebody can find it
+    while asking about that particular report.
+    """
+    if not settings.notify_by_email:
+        return
+
+    rules = await service.get_settings(session)
+    plan = await service.plan_delivery(session, report, rules)
+    if plan.skipped is not None:
+        # Recorded rather than left blank. "Why did my manager not get it" is
+        # the question this log exists to answer, and a missing row answers it
+        # with a shrug.
+        await service.record_delivery(
+            session, report,
+            status=DeliveryStatus.SKIPPED, addresses=[], detail=plan.skipped,
+        )
+        await session.commit()
+        return
+
+    try:
+        await mailer.send_submitted(
+            report, plan.addresses, link=_report_link(report, settings), rules=rules
+        )
+    except MailError as exc:
+        await service.record_delivery(
+            session, report,
+            status=DeliveryStatus.FAILED, addresses=plan.addresses, detail=str(exc),
+        )
+    except Exception as exc:  # noqa: BLE001 - a notification never fails the filing
+        await service.record_delivery(
+            session, report,
+            status=DeliveryStatus.FAILED,
+            addresses=plan.addresses,
+            detail=f"{type(exc).__name__}: {exc}",
+        )
+    else:
+        await service.record_delivery(
+            session, report,
+            status=DeliveryStatus.SENT, addresses=plan.addresses, detail=None,
+        )
+    await session.commit()
+
+
+@router.delete(
+    "/{report_id}", status_code=status.HTTP_204_NO_CONTENT, summary="Delete a report"
+)
+async def delete_report(
+    report_id: uuid.UUID,
+    user: CurrentUser,
+    session: Session,
+    viewer: CurrentViewer,
+    _: ModuleGate,
+) -> None:
+    try:
+        report = await service.get_for(session, report_id, viewer)
+    except ReportError as exc:
+        raise _translate(exc) from exc
+    if not may_delete(report, viewer):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="A submitted report can only be removed by a super admin.",
+        )
+    await service.delete(session, report)
+    await session.commit()
+
+
+# ── reading them ───────────────────────────────────────────────────────
+
+
+@router.get("", response_model=ReportPage, summary="Reports I can see")
+async def list_reports(
+    user: CurrentUser,
+    session: Session,
+    viewer: CurrentViewer,
+    _: ModuleGate,
+    team: Annotated[str | None, Query(description="Team handle or id")] = None,
+    author_id: Annotated[uuid.UUID | None, Query()] = None,
+    cadence: Annotated[str | None, Query()] = None,
+    status_filter: Annotated[str | None, Query(alias="status")] = None,
+    since: Annotated[date | None, Query()] = None,
+    until: Annotated[date | None, Query()] = None,
+    mine: Annotated[bool, Query(description="Only my own.")] = False,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> ReportPage:
+    """Newest period first, narrowed to what this person may read.
+
+    Every filter narrows; none of them widens. Somebody asking for a team whose
+    reports they cannot read gets an empty list rather than a refusal, because
+    the honest answer is that there are none they can see.
+    """
+    team_id = None
+    if team is not None:
+        try:
+            team_id = (await teams_service.get_team(session, team)).id
+        except TeamError:
+            return ReportPage(reports=[], total=0)
+
+    rows, total = await service.listing(
+        session,
+        viewer,
+        team_id=team_id,
+        author_id=author_id,
+        cadence=cadence,
+        status=status_filter,
+        since=since,
+        until=until,
+        mine_only=mine,
+        limit=limit,
+        offset=offset,
+    )
+    return ReportPage(
+        reports=[_summary_out(r, viewer) for r in rows], total=total
+    )
+
+
+@router.get("/overview", response_model=OverviewOut, summary="What the reports say together")
+async def reports_overview(
+    user: CurrentUser,
+    session: Session,
+    viewer: CurrentViewer,
+    _: ModuleGate,
+    team: Annotated[str | None, Query(description="Team handle or id")] = None,
+    since: Annotated[date | None, Query(description="Defaults to 30 days ago.")] = None,
+    until: Annotated[date | None, Query(description="Defaults to today.")] = None,
+) -> OverviewOut:
+    """The figures and the open issues across every report the caller may read.
+
+    This is the route a CEO or a manager asks the assistant for — "how did
+    presales do last month", "what is blocking us". It is narrowed by the same
+    rule as everything else, so an ordinary person asking gets their own
+    reports summarised and nobody else's.
+    """
+    today = datetime.now(UTC).date()
+    end = until or today
+    start = since or (end - timedelta(days=29))
+    if start > end:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="'since' must not be after 'until'",
+        )
+    team_id = None
+    if team is not None:
+        try:
+            team_id = (await teams_service.get_team(session, team)).id
+        except TeamError:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="No such team"
+            ) from None
+    return OverviewOut.model_validate(
+        await service.overview(session, viewer, since=start, until=end, team_id=team_id)
+    )
+
+
+@router.get("/{report_id}", response_model=ReportOut, summary="One report in full")
+async def read_report(
+    report_id: uuid.UUID,
+    user: CurrentUser,
+    session: Session,
+    viewer: CurrentViewer,
+    _: ModuleGate,
+) -> ReportOut:
+    """Reading somebody else's submitted report records that you read it.
+
+    Recorded because the complaint reports always attract is the same one —
+    "nobody reads them" — and this is how that gets answered with a fact rather
+    than an impression. Reading your own is not recorded; it would mean nothing.
+    """
+    try:
+        report = await service.get_for(session, report_id, viewer)
+    except ReportError as exc:
+        raise _translate(exc) from exc
+
+    read = False
+    if report.author_id != viewer.user_id and report.status == ReportStatus.SUBMITTED:
+        await service.mark_read(session, report=report, user_id=viewer.user_id)
+        await session.commit()
+        read = True
+
+    template = await session.get(FormTemplate, report.template_id)
+    comments = await service.comments(session, report.id)
+    return _report_out(report, viewer, template, comments, read=read)
+
+
+@router.post(
+    "/{report_id}/comments",
+    response_model=CommentOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="Comment on a report",
+)
+async def comment_on_report(
+    report_id: uuid.UUID,
+    body: CommentIn,
+    user: CurrentUser,
+    session: Session,
+    viewer: CurrentViewer,
+    _: ModuleGate,
+) -> CommentOut:
+    """A reader's remark. It decides nothing and changes nothing about the report.
+
+    The author cannot comment on their own: what they have to add belongs in the
+    remarks section, or in the next report. Letting them append after filing
+    would make "what did they report on Tuesday" unanswerable.
+    """
+    try:
+        report = await service.get_for(session, report_id, viewer)
+    except ReportError as exc:
+        raise _translate(exc) from exc
+    if not may_comment(report, viewer):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Only a reader of a submitted report can comment on it. "
+                "Its author has the remarks section."
+            ),
+        )
+    try:
+        comment = await service.add_comment(
+            session, report=report, author=user, body=body.body
+        )
+    except ReportError as exc:
+        raise _translate(exc) from exc
+    await session.commit()
+    return CommentOut(
+        id=comment.id,
+        author_id=comment.author_id,
+        author_name=user.display_name,
+        body=comment.body,
+        created_at=comment.created_at,
+    )
+
+
+# ── setting them up ────────────────────────────────────────────────────
+
+
+@admin_router.get(
+    "/settings",
+    response_model=ReportSettingsOut,
+    summary="Who filed reports are sent to",
+)
+async def read_settings(admin: SuperAdmin, session: Session) -> ReportSettingsOut:
+    """The delivery rules. Super admin only, like every other one here.
+
+    Note what these do not control: who may *read* a report. Delivery and
+    visibility are separate questions, and only the first is configurable.
+    Adding an address below mails them a summary; the link in it refuses them
+    exactly as it would anybody else who may not read that report.
+    """
+    return ReportSettingsOut.model_validate(await service.get_settings(session))
+
+
+@admin_router.patch(
+    "/settings", response_model=ReportSettingsOut, summary="Change who they go to"
+)
+async def update_settings(
+    body: ReportSettingsIn, admin: SuperAdmin, session: Session
+) -> ReportSettingsOut:
+    """Only the fields sent change.
+
+    The common change is turning dailies off and leaving weeklies on: a manager
+    of six people otherwise gets thirty messages a week and reads none of them.
+    """
+    try:
+        row = await service.update_settings(
+            session, actor_id=admin.id, changes=body.model_dump(exclude_unset=True)
+        )
+    except ReportError as exc:
+        raise _translate(exc) from exc
+    await session.commit()
+    return ReportSettingsOut.model_validate(row)
+
+
+@admin_router.get(
+    "/deliveries",
+    response_model=DeliveryPage,
+    summary="What was emailed, to whom, and what failed",
+)
+async def delivery_log(
+    admin: SuperAdmin,
+    session: Session,
+    since: Annotated[
+        date | None, Query(description="Defaults to the retention window in settings.")
+    ] = None,
+    status_filter: Annotated[
+        str | None, Query(alias="status", description="sent, failed or skipped")
+    ] = None,
+    limit: Annotated[int, Query(ge=1, le=500)] = 100,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> DeliveryPage:
+    """The delivery log, newest first. Super admin and nobody else.
+
+    Restricted because of what it holds rather than what it does: who was
+    mailed about whom is a map of the organisation's reporting lines, and an
+    ordinary person has no business reading it. The counts come back alongside
+    so a screen can say "3 failed this week" without paging through rows.
+    """
+    rules = await service.get_settings(session)
+    window = since or (
+        datetime.now(UTC).date() - timedelta(days=rules.log_retention_days)
+    )
+    start = datetime.combine(window, datetime.min.time(), tzinfo=UTC)
+    rows, total = await service.deliveries(
+        session, since=start, status=status_filter, limit=limit, offset=offset
+    )
+    return DeliveryPage(
+        deliveries=[DeliveryOut.model_validate(r) for r in rows],
+        total=total,
+        counts=await service.delivery_counts(session, since=start),
+    )
+
+
+@admin_router.get(
+    "/templates",
+    response_model=list[TemplateChoiceOut],
+    summary="Report templates a team can be pointed at",
+)
+async def list_report_templates(
+    admin: SuperAdmin, session: Session
+) -> list[TemplateChoiceOut]:
+    return [
+        TemplateChoiceOut(
+            id=t.id,
+            key=t.key,
+            name=t.name,
+            description=t.description,
+            version=t.version,
+            field_count=len(t.fields or []),
+        )
+        for t in await service.report_templates(session)
+    ]
+
+
+@admin_router.get(
+    "/schedules",
+    response_model=list[ScheduleOut],
+    summary="Which template each team files",
+)
+async def list_schedules(admin: SuperAdmin, session: Session) -> list[ScheduleOut]:
+    return [_schedule_out(s) for s in await service.schedules(session)]
+
+
+def _schedule_out(row: Any) -> ScheduleOut:
+    return ScheduleOut(
+        id=row.id,
+        team_id=row.team_id,
+        team=row.team.name,
+        cadence=row.cadence,
+        template_id=row.template_id,
+        template_name=row.template.name,
+        enabled=row.enabled,
+        due_hour=row.due_hour,
+        due_weekday=row.due_weekday,
+        note=row.note,
+        notify=row.notify,
+        extra_recipients=list(row.extra_recipients or []),
+    )
+
+
+@admin_router.put(
+    "/schedules",
+    response_model=ScheduleOut,
+    summary="Point one team's cadence at one template",
+)
+async def put_schedule(
+    body: ScheduleIn, admin: SuperAdmin, session: Session
+) -> ScheduleOut:
+    """This is what makes each team's report different from the next team's.
+
+    Super admin only, like every other template decision: what the business
+    records is not something a team quietly changes for itself.
+    """
+    try:
+        row = await service.set_schedule(
+            session,
+            team_id=body.team_id,
+            cadence=body.cadence,
+            template_id=body.template_id,
+            actor_id=admin.id,
+            enabled=body.enabled,
+            due_hour=body.due_hour,
+            due_weekday=body.due_weekday,
+            note=body.note,
+            notify=body.notify,
+            extra_recipients=body.extra_recipients,
+        )
+    except ReportError as exc:
+        raise _translate(exc) from exc
+    await session.commit()
+    return _schedule_out(row)

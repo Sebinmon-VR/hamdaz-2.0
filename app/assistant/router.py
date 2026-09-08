@@ -67,6 +67,7 @@ from app.assistant.schemas import (
     RealtimeCallOut,
     RealtimeSessionOut,
     RealtimeToolOut,
+    RealtimeUsageIn,
     RunDetailOut,
     RunOut,
     RunPage,
@@ -77,6 +78,8 @@ from app.assistant.schemas import (
     StatusOut,
     ToolCapabilityOut,
     ToolPolicyIn,
+    VoiceModelIn,
+    VoiceModelOut,
     VoiceOptionsOut,
     VoiceOut,
 )
@@ -565,6 +568,20 @@ async def speech(
             )
         voice = body.voice
 
+    # Billed before a byte is sent, and that is not an oversight. OpenAI reports
+    # nothing back on a speech call, the audio streams straight past us to the
+    # browser, and a listener who closes the tab mid-clip has still been charged
+    # for the whole of it. The text we are about to send is therefore the last
+    # moment the figure is both knowable and right.
+    await service.record_speech_usage(
+        session,
+        user_id=user.id,
+        model_key=model,
+        voice=voice,
+        characters=len(body.text),
+    )
+    await session.commit()
+
     audio = agent.speak(body.text, model=model, voice=voice, instructions=instructions)
     return StreamingResponse(
         audio,
@@ -830,21 +847,58 @@ async def realtime_call(
 @router.post(
     "/realtime/session/{run_id}/end",
     status_code=status.HTTP_204_NO_CONTENT,
-    summary="Close a spoken conversation",
+    summary="Close a spoken conversation, and report what it used",
 )
 async def realtime_end(
-    run_id: uuid.UUID, user: CurrentUser, session: Session
+    run_id: uuid.UUID,
+    user: CurrentUser,
+    session: Session,
+    usage: RealtimeUsageIn | None = None,
 ) -> None:
-    """Mark the conversation finished, so it stops showing as live."""
+    """Mark the conversation finished, and record what OpenAI charged for it.
+
+    The usage body is how a spoken conversation gets a cost at all. OpenAI runs
+    the realtime loop and bills it directly, so the tokens never pass through
+    this process; the only place they exist on our side is the ``response.done``
+    events the browser receives. The client adds them up and sends the totals
+    here, once, as the session closes.
+
+    That makes the figure a report rather than a measurement, and it is stored
+    as one — see ``AssistantVoiceUsage.source``. A session whose tab was closed
+    sends nothing and costs nothing on the screen, which is the honest failure:
+    the alternative, guessing from wall-clock seconds, would put a number there
+    that looks exact and is not.
+
+    The body is optional so that a client that only wants to close the run, or
+    an older one that does not know about this, still can.
+    """
     try:
         run = await service.get_run(session, run_id)
     except AssistantError as exc:
         raise _translate(exc) from exc
     if run.user_id != user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such run")
+
+    changed = False
+    if usage is not None and not run.voice_usage_reported:
+        settings = await service.get_settings(session)
+        await service.record_realtime_usage(
+            session,
+            user_id=user.id,
+            run=run,
+            model_key=run.model_key,
+            voice=settings.voice,
+            usage=usage.model_dump(),
+        )
+        # Once, per run. A client that retries the close — or one that is left
+        # open in two tabs — must not bill the same session twice.
+        run.voice_usage_reported = True
+        changed = True
     if run.is_open:
         run.status = RunStatus.COMPLETED
         run.finished_at = datetime.now(UTC)
+        changed = True
+    if changed:
         await session.commit()
 
 
@@ -912,6 +966,59 @@ async def update_model(
     out = ModelOut.model_validate(model)
     out.active = model.key == current.model_key
     return out
+
+
+def _voice_model_out(model: Any, settings: Any) -> VoiceModelOut:
+    out = VoiceModelOut.model_validate(model)
+    out.active = model.key == (
+        settings.voice_model if model.kind == "speech" else settings.realtime_model
+    )
+    return out
+
+
+@admin_router.get(
+    "/voice-models",
+    response_model=list[VoiceModelOut],
+    summary="What the voice costs, per model",
+)
+async def list_voice_models(admin: SuperAdmin, session: Session) -> list[VoiceModelOut]:
+    """The speech and realtime models, with the prices their cost is worked out from.
+
+    Kept apart from ``/models`` because they are not billed in the same unit:
+    speech is charged per character of text, a spoken conversation per token
+    with audio dearer than text by an order of magnitude. One list showing
+    both under one set of column headings would be a list where most of the
+    numbers meant nothing.
+    """
+    current = await service.get_settings(session)
+    return [
+        _voice_model_out(model, current) for model in await service.list_voice_models(session)
+    ]
+
+
+@admin_router.patch(
+    "/voice-models/{key}",
+    response_model=VoiceModelOut,
+    summary="Enable, disable or reprice a voice model",
+)
+async def update_voice_model(
+    key: str, body: VoiceModelIn, request: Request, admin: SuperAdmin, session: Session
+) -> VoiceModelOut:
+    """Change what a voice model is reckoned to cost.
+
+    Editable for the same reason the chat model's prices are: OpenAI moves them,
+    and a stale price does not fail — it quietly makes every figure on the cost
+    screen wrong. Prices belonging to the other kind are ignored rather than
+    refused, so a screen may send the whole form back without pruning it.
+    """
+    try:
+        model = await service.update_voice_model(
+            session, key, actor_id=admin.id, changes=body.model_dump(exclude_unset=True)
+        )
+    except AssistantError as exc:
+        raise _translate(exc) from exc
+    _forget(request)
+    return _voice_model_out(model, await service.get_settings(session))
 
 
 # ── administration: what it may do ─────────────────────────────────────
@@ -1204,6 +1311,11 @@ async def catalogue(admin: SuperAdmin) -> dict[str, Any]:
                 "name": group.name,
                 "gate": group.gate,
                 "description": group.description,
+                #: The write restriction the module ships with, before any
+                #: super admin edit. What ``/policies`` would go back to.
+                "default_write_roles": (
+                    list(group.write_roles) if group.write_roles else None
+                ),
                 "tools": [
                     {
                         "key": spec.key,

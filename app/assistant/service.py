@@ -15,6 +15,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import Date, cast, delete, func, select
@@ -32,6 +33,7 @@ from app.assistant.catalogue import (
     SPEECH_MODELS,
     TOOLS,
     TOOLS_BY_KEY,
+    VOICE_MODELS,
     VOICES,
 )
 from app.assistant.policy import (
@@ -40,6 +42,9 @@ from app.assistant.policy import (
     admit,
     effective_confirm,
     effective_roles,
+    effective_write_roles,
+    realtime_cost_of,
+    speech_cost_of,
     tool_enabled,
 )
 from app.models.assistant import (
@@ -52,11 +57,15 @@ from app.models.assistant import (
     AssistantRunEvent,
     AssistantSettings,
     AssistantToolPolicy,
+    AssistantVoiceModel,
+    AssistantVoiceUsage,
     AudienceMode,
     EventKind,
     RuleEffect,
     RunStatus,
     SubjectType,
+    UsageSource,
+    VoiceKind,
 )
 from app.models.role import Role
 from app.models.team import Team, TeamMembership
@@ -233,22 +242,233 @@ async def update_model(
     return model
 
 
+# ── voice models, and what they cost ───────────────────────────────────
+
+#: The price columns a voice model has, by kind. Used by both the seeder and
+#: the editor so that neither can quietly write a price the other ignores.
+VOICE_PRICE_FIELDS: dict[str, tuple[str, ...]] = {
+    VoiceKind.SPEECH: ("char_price",),
+    VoiceKind.REALTIME: (
+        "text_input_price",
+        "cached_text_input_price",
+        "audio_input_price",
+        "cached_audio_input_price",
+        "text_output_price",
+        "audio_output_price",
+    ),
+}
+
+
+async def seed_voice_models(session: AsyncSession) -> list[AssistantVoiceModel]:
+    """Bring the voice models table in line with the catalogue.
+
+    Same rule as ``seed_models``: prices are written once, when a model is first
+    seen, and never again. OpenAI moves them and a super admin corrects them;
+    a deploy that reset those corrections would make the cost screen wrong in
+    the one way nobody would notice — quietly, and only in the totals.
+    """
+    existing = {
+        m.key: m for m in (await session.scalars(select(AssistantVoiceModel))).all()
+    }
+    seeded: list[AssistantVoiceModel] = []
+    for order, spec in enumerate(VOICE_MODELS):
+        model = existing.get(spec.key)
+        if model is None:
+            model = AssistantVoiceModel(
+                key=spec.key,
+                name=spec.name,
+                kind=spec.kind,
+                description=spec.description,
+                char_price=spec.char_price,
+                text_input_price=spec.text_input_price,
+                cached_text_input_price=spec.cached_text_input_price,
+                audio_input_price=spec.audio_input_price,
+                cached_audio_input_price=spec.cached_audio_input_price,
+                text_output_price=spec.text_output_price,
+                audio_output_price=spec.audio_output_price,
+            )
+            session.add(model)
+        model.name = spec.name
+        model.kind = spec.kind
+        model.description = spec.description
+        model.sort_order = order
+        seeded.append(model)
+    await session.flush()
+    return seeded
+
+
+async def list_voice_models(session: AsyncSession) -> list[AssistantVoiceModel]:
+    return list(
+        (
+            await session.scalars(
+                select(AssistantVoiceModel).order_by(AssistantVoiceModel.sort_order)
+            )
+        ).all()
+    )
+
+
+async def get_voice_model(session: AsyncSession, key: str) -> AssistantVoiceModel:
+    model = await session.get(AssistantVoiceModel, key)
+    if model is None:
+        raise AssistantNotFoundError(f"No voice model named {key!r}")
+    return model
+
+
+async def update_voice_model(
+    session: AsyncSession, key: str, *, actor_id: uuid.UUID | None, changes: dict[str, Any]
+) -> AssistantVoiceModel:
+    """Reprice or disable one voice model.
+
+    A model in use cannot be disabled, for the same reason the chat model
+    cannot: the setting would point at something switched off and the failure
+    would surface as an OpenAI error in somebody's ear rather than as a message
+    on the screen of the person who caused it.
+    """
+    model = await get_voice_model(session, key)
+    if changes.get("enabled") is False:
+        settings = await get_settings(session)
+        in_use = (
+            settings.voice_model == key
+            if model.kind == VoiceKind.SPEECH
+            else settings.realtime_model == key
+        )
+        if in_use:
+            raise AssistantConflictError(
+                f"{model.name} is the voice in use; pick another in settings first"
+            )
+    for field in ("enabled", *VOICE_PRICE_FIELDS.get(model.kind, ())):
+        if changes.get(field) is not None:
+            setattr(model, field, changes[field])
+    model.updated_by_id = actor_id
+    await session.flush()
+    return model
+
+
+async def record_speech_usage(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    model_key: str,
+    voice: str,
+    characters: int,
+) -> AssistantVoiceUsage:
+    """Bill one clip read aloud, from the text we were about to send.
+
+    Counted here rather than after the stream finishes because this is the last
+    moment the figure is knowable and certain: the audio goes straight to the
+    browser, OpenAI reports nothing back on a speech call, and a listener who
+    closes the tab halfway through has still been charged for the whole clip.
+
+    An unpriced model — one somebody set by hand, or one seeded after this row's
+    price was removed — records the characters at zero cost rather than refusing
+    to record. Losing the audit trail is a worse outcome than a cost of zero
+    that an administrator can see is wrong.
+    """
+    model = await session.get(AssistantVoiceModel, model_key)
+    row = AssistantVoiceUsage(
+        user_id=user_id,
+        kind=VoiceKind.SPEECH,
+        model_key=model_key,
+        voice=voice,
+        source=UsageSource.SERVER,
+        characters=characters,
+        cost_usd=(
+            speech_cost_of(model, characters=characters) if model is not None else Decimal(0)
+        ),
+    )
+    session.add(row)
+    await session.flush()
+    return row
+
+
+async def record_realtime_usage(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    run: AssistantRun,
+    model_key: str,
+    voice: str | None,
+    usage: dict[str, int],
+) -> AssistantVoiceUsage:
+    """Bill one spoken conversation, from what the browser heard OpenAI report.
+
+    This is a report, not a measurement. OpenAI bills the realtime session
+    directly and the tokens never pass through this process, so the only place
+    the figures exist on our side is the ``response.done`` events the browser
+    receives. A session whose tab was closed mid-sentence reports nothing.
+    That makes these totals a floor, which is why the row is marked
+    ``client`` — a reader who does not know that would take a floor for a bill.
+
+    The cost also lands on the run, so a spoken conversation costs something in
+    the runs list rather than showing as free next to the typed turns.
+    """
+    model = await session.get(AssistantVoiceModel, model_key)
+    row = AssistantVoiceUsage(
+        user_id=user_id,
+        run_id=run.id,
+        kind=VoiceKind.REALTIME,
+        model_key=model_key,
+        voice=voice,
+        source=UsageSource.CLIENT,
+        text_input_tokens=usage.get("text_input_tokens", 0),
+        cached_text_input_tokens=usage.get("cached_text_input_tokens", 0),
+        audio_input_tokens=usage.get("audio_input_tokens", 0),
+        cached_audio_input_tokens=usage.get("cached_audio_input_tokens", 0),
+        text_output_tokens=usage.get("text_output_tokens", 0),
+        audio_output_tokens=usage.get("audio_output_tokens", 0),
+        seconds=usage.get("seconds", 0),
+        cost_usd=(
+            realtime_cost_of(
+                model,
+                text_input_tokens=usage.get("text_input_tokens", 0),
+                cached_text_input_tokens=usage.get("cached_text_input_tokens", 0),
+                audio_input_tokens=usage.get("audio_input_tokens", 0),
+                cached_audio_input_tokens=usage.get("cached_audio_input_tokens", 0),
+                text_output_tokens=usage.get("text_output_tokens", 0),
+                audio_output_tokens=usage.get("audio_output_tokens", 0),
+            )
+            if model is not None
+            else Decimal(0)
+        ),
+    )
+    session.add(row)
+    run.cost_usd = Decimal(run.cost_usd or 0) + row.cost_usd
+    run.input_tokens = (run.input_tokens or 0) + row.text_input_tokens + row.audio_input_tokens
+    run.cached_input_tokens = (
+        (run.cached_input_tokens or 0)
+        + row.cached_text_input_tokens
+        + row.cached_audio_input_tokens
+    )
+    run.output_tokens = (
+        (run.output_tokens or 0) + row.text_output_tokens + row.audio_output_tokens
+    )
+    await session.flush()
+    return row
+
+
 # ── policies ───────────────────────────────────────────────────────────
 
 
 async def seed_policies(session: AsyncSession) -> tuple[int, int]:
     """Create a policy row for every module and tool that lacks one.
 
-    Existing rows are left exactly as the super admin set them. A tool that has
-    gone from the catalogue loses its row — there is nothing left to switch.
-    Returns (modules, tools) present afterwards.
+    Existing rows are left exactly as the super admin set them, including their
+    ``write_roles``: the catalogue's restriction is what a module *ships* with,
+    not what it is held to for ever. A tool that has gone from the catalogue
+    loses its row — there is nothing left to switch. Returns (modules, tools)
+    present afterwards.
     """
     modules = {
         p.module_key: p for p in (await session.scalars(select(AssistantModulePolicy))).all()
     }
     for group in GROUPS:
         if group.key not in modules:
-            session.add(AssistantModulePolicy(module_key=group.key))
+            session.add(
+                AssistantModulePolicy(
+                    module_key=group.key,
+                    write_roles=list(group.write_roles) if group.write_roles else None,
+                )
+            )
 
     tools = {p.tool_key: p for p in (await session.scalars(select(AssistantToolPolicy))).all()}
     # Only live tools get a policy row. A planned one has nothing to
@@ -301,8 +521,9 @@ async def update_module_policy(
             setattr(policy, field, changes[field])
     if "confirm_writes" in changes:
         policy.confirm_writes = changes["confirm_writes"]
-    if "allowed_roles" in changes:
-        policy.allowed_roles = _check_roles(changes["allowed_roles"])
+    for field in ("allowed_roles", "write_roles"):
+        if field in changes:
+            setattr(policy, field, _check_roles(changes[field]))
     policy.updated_by_id = actor_id
     await session.flush()
     return policy
@@ -322,8 +543,9 @@ async def update_tool_policy(
         policy.enabled = changes["enabled"]
     if "confirm_override" in changes:
         policy.confirm_override = changes["confirm_override"]
-    if "allowed_roles" in changes:
-        policy.allowed_roles = _check_roles(changes["allowed_roles"])
+    for field in ("allowed_roles", "write_roles"):
+        if field in changes:
+            setattr(policy, field, _check_roles(changes[field]))
     policy.updated_by_id = actor_id
     await session.flush()
     return policy
@@ -362,11 +584,20 @@ def policy_matrix(
                     "allowed_roles": (
                         list(tool.allowed_roles) if tool and tool.allowed_roles else None
                     ),
+                    "write_roles": (
+                        list(tool.write_roles) if tool and tool.write_roles else None
+                    ),
                     "effective_enabled": spec.is_live and tool_enabled(spec, module, tool),
                     "effective_confirm": (
                         spec.is_write and effective_confirm(settings, module, tool)
                     ),
                     "effective_roles": effective_roles(module, tool),
+                    #: Null on a read, always: a write restriction never holds a
+                    #: read back, and showing one against a read would read as
+                    #: though it did.
+                    "effective_write_roles": (
+                        effective_write_roles(module, tool) if spec.is_write else None
+                    ),
                 }
             )
         out.append(
@@ -380,6 +611,18 @@ def policy_matrix(
                 "confirm_writes": module.confirm_writes if module else None,
                 "allowed_roles": (
                     list(module.allowed_roles) if module and module.allowed_roles else None
+                ),
+                "write_roles": (
+                    list(module.write_roles) if module and module.write_roles else None
+                ),
+                #: What the module ships with, so the screen can show that an
+                #: edit has moved away from it — and what it would go back to.
+                "default_write_roles": (
+                    list(group.write_roles) if group.write_roles else None
+                ),
+                "has_writes": any(
+                    spec.module_key == group.key and spec.is_write and spec.is_live
+                    for spec in TOOLS
                 ),
                 "effective_confirm": effective_confirm(settings, module, None),
                 "tools": rows,
@@ -539,6 +782,34 @@ def _today_start() -> datetime:
     return now.replace(hour=0, minute=0, second=0, microsecond=0)
 
 
+async def spent_today(
+    session: AsyncSession, *, user_id: uuid.UUID | None = None
+) -> Decimal:
+    """What the assistant has cost today, chat and voice together.
+
+    Voice is counted here because a cap that ignored it would not be a cap:
+    reading long answers aloud all afternoon is real money, and before this it
+    was money that no limit could see. A realtime session's cost is already
+    added onto its run, so it is excluded from the voice half to avoid counting
+    it twice.
+    """
+    start = _today_start()
+    chat = await session.scalar(
+        select(func.coalesce(func.sum(AssistantRun.cost_usd), 0)).where(
+            AssistantRun.started_at >= start,
+            *([AssistantRun.user_id == user_id] if user_id else []),
+        )
+    )
+    voice = await session.scalar(
+        select(func.coalesce(func.sum(AssistantVoiceUsage.cost_usd), 0)).where(
+            AssistantVoiceUsage.created_at >= start,
+            AssistantVoiceUsage.kind == VoiceKind.SPEECH,
+            *([AssistantVoiceUsage.user_id == user_id] if user_id else []),
+        )
+    )
+    return Decimal(chat or 0) + Decimal(voice or 0)
+
+
 async def check_limits(
     session: AsyncSession, settings: AssistantSettings, user_id: uuid.UUID
 ) -> Admission:
@@ -555,22 +826,12 @@ async def check_limits(
             False, "rate_limited", "You have sent a lot of messages in the last hour. Try later."
         )
     if settings.daily_cost_cap_user_usd is not None:
-        spent = await session.scalar(
-            select(func.coalesce(func.sum(AssistantRun.cost_usd), 0)).where(
-                AssistantRun.user_id == user_id, AssistantRun.started_at >= _today_start()
-            )
-        )
-        if Decimal(spent or 0) >= settings.daily_cost_cap_user_usd:
+        if await spent_today(session, user_id=user_id) >= settings.daily_cost_cap_user_usd:
             return Admission(
                 False, "cost_cap_user", "You have reached today's usage limit for the assistant."
             )
     if settings.daily_cost_cap_total_usd is not None:
-        spent = await session.scalar(
-            select(func.coalesce(func.sum(AssistantRun.cost_usd), 0)).where(
-                AssistantRun.started_at >= _today_start()
-            )
-        )
-        if Decimal(spent or 0) >= settings.daily_cost_cap_total_usd:
+        if await spent_today(session) >= settings.daily_cost_cap_total_usd:
             return Admission(
                 False, "cost_cap_total", "The assistant has reached today's usage limit."
             )
@@ -826,6 +1087,123 @@ def _bucket(key: str, label: str, row: Any) -> dict[str, Any]:
     }
 
 
+_VOICE_SUMS = (
+    func.count().label("uses"),
+    func.coalesce(func.sum(AssistantVoiceUsage.characters), 0).label("characters"),
+    func.coalesce(func.sum(AssistantVoiceUsage.audio_input_tokens), 0).label("audio_in"),
+    func.coalesce(func.sum(AssistantVoiceUsage.audio_output_tokens), 0).label("audio_out"),
+    func.coalesce(func.sum(AssistantVoiceUsage.text_input_tokens), 0).label("text_in"),
+    func.coalesce(func.sum(AssistantVoiceUsage.text_output_tokens), 0).label("text_out"),
+    func.coalesce(func.sum(AssistantVoiceUsage.seconds), 0).label("seconds"),
+    func.coalesce(func.sum(AssistantVoiceUsage.cost_usd), 0).label("cost_usd"),
+)
+
+
+def _voice_bucket(key: str, label: str, row: Any) -> dict[str, Any]:
+    return {
+        "key": key,
+        "label": label,
+        "uses": int(row.uses or 0),
+        "characters": int(row.characters or 0),
+        "audio_input_tokens": int(row.audio_in or 0),
+        "audio_output_tokens": int(row.audio_out or 0),
+        "text_input_tokens": int(row.text_in or 0),
+        "text_output_tokens": int(row.text_out or 0),
+        "seconds": int(row.seconds or 0),
+        "cost_usd": Decimal(row.cost_usd or 0),
+    }
+
+
+#: Stands in for a kind nobody used, so a quiet window returns zeroes in the
+#: shape the screen already knows how to draw rather than a missing key.
+_EMPTY_VOICE_ROW = SimpleNamespace(
+    uses=0, characters=0, audio_in=0, audio_out=0,
+    text_in=0, text_out=0, seconds=0, cost_usd=Decimal(0),
+)
+
+
+async def voice_analytics(
+    session: AsyncSession, *, start: datetime, end: datetime
+) -> dict[str, Any]:
+    """What the voice was used for and what it cost, over the same window.
+
+    Split by kind rather than added up, because the two halves are not
+    comparable and adding them would invite the wrong question. Speech is
+    exact, counted here from text we sent. Realtime is what the browser
+    reported at the end of a session, so it undercounts by however many
+    sessions ended in a closed tab — the ``client`` source on those rows is how
+    that shows on the screen rather than only in this docstring.
+    """
+    in_range = (
+        AssistantVoiceUsage.created_at >= start,
+        AssistantVoiceUsage.created_at < end,
+    )
+
+    by_kind = {
+        row.kind: row
+        for row in (
+            await session.execute(
+                select(AssistantVoiceUsage.kind, *_VOICE_SUMS)
+                .where(*in_range)
+                .group_by(AssistantVoiceUsage.kind)
+            )
+        ).all()
+    }
+
+    def kind_totals(kind: str) -> dict[str, Any]:
+        return _voice_bucket(kind, kind, by_kind.get(kind) or _EMPTY_VOICE_ROW)
+
+    by_day = [
+        _voice_bucket(row.day.isoformat(), row.day.isoformat(), row)
+        for row in (
+            await session.execute(
+                select(cast(AssistantVoiceUsage.created_at, Date).label("day"), *_VOICE_SUMS)
+                .where(*in_range)
+                .group_by("day")
+                .order_by("day")
+            )
+        ).all()
+    ]
+
+    by_user = [
+        _voice_bucket(str(row.user_id), f"{row.display_name} <{row.email}>", row)
+        for row in (
+            await session.execute(
+                select(
+                    AssistantVoiceUsage.user_id, User.display_name, User.email, *_VOICE_SUMS
+                )
+                .join(User, User.id == AssistantVoiceUsage.user_id)
+                .where(*in_range)
+                .group_by(AssistantVoiceUsage.user_id, User.display_name, User.email)
+                .order_by(func.sum(AssistantVoiceUsage.cost_usd).desc())
+            )
+        ).all()
+    ]
+
+    by_model = [
+        _voice_bucket(row.model_key, row.model_key, row)
+        for row in (
+            await session.execute(
+                select(AssistantVoiceUsage.model_key, *_VOICE_SUMS)
+                .where(*in_range)
+                .group_by(AssistantVoiceUsage.model_key)
+                .order_by(func.sum(AssistantVoiceUsage.cost_usd).desc())
+            )
+        ).all()
+    ]
+
+    speech = kind_totals(VoiceKind.SPEECH)
+    realtime = kind_totals(VoiceKind.REALTIME)
+    return {
+        "speech": speech,
+        "realtime": realtime,
+        "cost_usd": speech["cost_usd"] + realtime["cost_usd"],
+        "by_day": by_day,
+        "by_user": by_user,
+        "by_model": by_model,
+    }
+
+
 async def analytics(session: AsyncSession, *, since: date, until: date) -> dict[str, Any]:
     """Totals and breakdowns over ``[since, until]`` inclusive, by day."""
     start = datetime.combine(since, datetime.min.time(), tzinfo=UTC)
@@ -952,9 +1330,12 @@ async def analytics(session: AsyncSession, *, since: date, until: date) -> dict[
             }
         )
 
+    voice = await voice_analytics(session, start=start, end=end)
+
     return {
         "since": since,
         "until": until,
+        "voice": voice,
         "totals": {
             "runs": int(totals_row.runs or 0),
             "completed": by_status.get(RunStatus.COMPLETED, 0),
@@ -974,6 +1355,22 @@ async def analytics(session: AsyncSession, *, since: date, until: date) -> dict[
             "confirmations_approved": event_counts.get(EventKind.CONFIRMED, 0),
             "confirmations_declined": event_counts.get(EventKind.DECLINED, 0),
             "refused_by_policy": event_counts.get(EventKind.BLOCKED_BY_POLICY, 0),
+            #: The chat bill and the voice bill, and the two added up.
+            #:
+            #: ``cost_usd`` keeps meaning exactly what it always meant — what
+            #: the runs cost — because a number on a screen that quietly starts
+            #: including something new is worse than a number that is missing
+            #: one. What the voice cost is its own figure beside it, and
+            #: ``total_cost_usd`` is the one to quote when somebody asks what
+            #: the assistant costs.
+            #:
+            #: A spoken conversation's cost is on its run *and* in the voice
+            #: table, so it is left out of ``voice_cost_usd`` here to keep the
+            #: two halves from double-counting it; ``realtime`` below is where
+            #: to read what the spoken half came to.
+            "voice_cost_usd": voice["speech"]["cost_usd"],
+            "total_cost_usd": Decimal(totals_row.cost_usd or 0)
+            + voice["speech"]["cost_usd"],
         },
         "by_day": by_day,
         "by_user": by_user,

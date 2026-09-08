@@ -101,6 +101,24 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         ),
     ),
     ModuleSpec(
+        key="reports",
+        name="Reports",
+        description=(
+            "What each team files — daily, weekly or monthly — and what those "
+            "reports say together. Everyone files their own; managers and leads "
+            "read their team's; the CEO and super admins read all of them. Who "
+            "sees whose is decided in app/reports/access.py and not by this "
+            "grant, which only decides who can reach the module at all."
+        ),
+        pages=(
+            PageSpec("mine", "My reports", "/reports"),
+            PageSpec("new", "File a report", "/reports/new"),
+            PageSpec("detail", "Report", "/reports/[id]"),
+            PageSpec("team", "Team reports", "/teams/[slug]/reports", team_scoped=True),
+            PageSpec("overview", "Reporting overview", "/reports/overview"),
+        ),
+    ),
+    ModuleSpec(
         key="quotes",
         name="Quotes",
         description=(

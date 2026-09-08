@@ -86,6 +86,11 @@ async def db(engine) -> AsyncIterator[AsyncSession]:
                 # a template it could not replace.
                 "job_openings, job_applications, employee_documents, "
                 "review_cycles, "
+                # Same reason as the HR tables above: reports and their
+                # schedules hold form_templates by a RESTRICT foreign key, so a
+                # test that leaked one would make the next test's template seed
+                # fail on a row it could not replace.
+                "reports, report_schedules, report_settings, report_deliveries, "
                 "assistant_settings, assistant_models, assistant_module_policies, "
                 "assistant_tool_policies, assistant_access_rules, "
                 "assistant_conversations cascade"

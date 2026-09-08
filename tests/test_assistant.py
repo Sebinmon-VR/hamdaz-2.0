@@ -59,6 +59,53 @@ async def test_seeding_is_idempotent(db, seeded) -> None:
     assert len(await service.tool_policies(db)) == len(LIVE_TOOLS)
 
 
+async def test_seeding_ships_the_write_rules_the_catalogue_declares(db, seeded) -> None:
+    """Writes on everywhere, and the company-wide ones held to the named roles.
+    This is the state a fresh install starts in, so it is worth pinning."""
+    modules = await service.module_policies(db)
+    assert all(policy.write_enabled for policy in modules.values())
+    for key in ("roles", "user_admin", "teams", "templates", "assignment", "finance", "quotes"):
+        assert set(modules[key].write_roles) == {"super_admin", "ceo", "manager"}, key
+    for key in ("leave", "hr", "proposals", "quote_requests", "dashboard"):
+        assert modules[key].write_roles is None, key
+
+
+async def test_seeding_does_not_reimpose_a_write_rule_that_was_lifted(db, seeded) -> None:
+    """The catalogue's restriction is what a module ships with, not what it is
+    held to for ever — otherwise every deploy would undo the decision."""
+    await service.update_module_policy(
+        db, "teams", actor_id=None, changes={"write_roles": []}
+    )
+    await db.commit()
+
+    await service.seed_policies(db)
+    await db.commit()
+    assert (await service.module_policies(db))["teams"].write_roles is None
+
+
+async def test_the_voice_models_are_seeded_with_prices(db, seeded) -> None:
+    models = {m.key: m for m in await service.seed_voice_models(db)}
+    await db.commit()
+    assert models["gpt-4o-mini-tts"].char_price > 0
+    assert models["gpt-realtime-2.1"].audio_output_price > 0
+    # Speech is billed per character and realtime per token; neither borrows
+    # the other's unit, which is why they are two kinds rather than one table.
+    assert models["gpt-4o-mini-tts"].audio_output_price == 0
+    assert models["gpt-realtime-2.1"].char_price == 0
+
+
+async def test_seeding_voice_models_does_not_undo_a_corrected_price(db, seeded) -> None:
+    await service.seed_voice_models(db)
+    await service.update_voice_model(
+        db, "gpt-4o-mini-tts", actor_id=None, changes={"char_price": Decimal("99")}
+    )
+    await db.commit()
+
+    await service.seed_voice_models(db)
+    await db.commit()
+    assert (await service.get_voice_model(db, "gpt-4o-mini-tts")).char_price == Decimal("99")
+
+
 async def test_seeding_does_not_undo_an_administrators_decision(db, seeded) -> None:
     """The whole point of seeding this way: a deploy must not re-open a write."""
     await service.update_module_policy(

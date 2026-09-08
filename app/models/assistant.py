@@ -182,6 +182,151 @@ class AssistantModel(Base, Timestamped):
         return f"<AssistantModel {self.key}>"
 
 
+class VoiceKind(StrEnum):
+    #: Reads a written answer aloud. Billed on the characters we send.
+    SPEECH = "speech"
+    #: A spoken conversation. Billed on tokens, and audio tokens are the dear ones.
+    REALTIME = "realtime"
+
+
+class AssistantVoiceModel(Base, Timestamped):
+    """A priced voice model — a speech engine or a spoken-conversation model.
+
+    Kept apart from ``AssistantModel`` rather than folded into it because the
+    two are not billed in the same unit. The chat model is tokens in, tokens
+    out. Speech is charged per character of the text handed to it, and a
+    realtime session is charged per token with audio costing many times what
+    text does. One table with one set of price columns could hold both only by
+    calling a character a token, and then every figure downstream would be a
+    guess wearing a decimal point.
+
+    Prices unused by a row's ``kind`` are zero, and the cost functions in
+    ``policy`` never read them.
+    """
+
+    __tablename__ = "assistant_voice_models"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(80), nullable=False)
+    #: ``speech`` or ``realtime``.
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+
+    #: speech: USD per one million characters of input text.
+    char_price: Mapped[Decimal] = mapped_column(
+        Numeric(10, 4), default=Decimal(0), server_default=text("0"), nullable=False
+    )
+    #: realtime: USD per one million tokens, by sort.
+    text_input_price: Mapped[Decimal] = mapped_column(
+        Numeric(10, 4), default=Decimal(0), server_default=text("0"), nullable=False
+    )
+    cached_text_input_price: Mapped[Decimal] = mapped_column(
+        Numeric(10, 4), default=Decimal(0), server_default=text("0"), nullable=False
+    )
+    audio_input_price: Mapped[Decimal] = mapped_column(
+        Numeric(10, 4), default=Decimal(0), server_default=text("0"), nullable=False
+    )
+    cached_audio_input_price: Mapped[Decimal] = mapped_column(
+        Numeric(10, 4), default=Decimal(0), server_default=text("0"), nullable=False
+    )
+    text_output_price: Mapped[Decimal] = mapped_column(
+        Numeric(10, 4), default=Decimal(0), server_default=text("0"), nullable=False
+    )
+    audio_output_price: Mapped[Decimal] = mapped_column(
+        Numeric(10, 4), default=Decimal(0), server_default=text("0"), nullable=False
+    )
+
+    enabled: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=text("true"), nullable=False
+    )
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    updated_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+
+    def __repr__(self) -> str:
+        return f"<AssistantVoiceModel {self.key} {self.kind}>"
+
+
+class UsageSource(StrEnum):
+    #: We counted it ourselves, before the request left. Exact.
+    SERVER = "server"
+    #: The browser told us what OpenAI reported to it. See the note below.
+    CLIENT = "client"
+
+
+class AssistantVoiceUsage(Base, UUIDPrimaryKey, Timestamped):
+    """One billable piece of voice: a clip read aloud, or a spoken session.
+
+    Voice does not fit on a run, and pretending it did is why it went uncosted.
+    Reading an answer back is not a turn — it is often asked for twice on the
+    same text and has no tools and no model round. A spoken conversation is the
+    opposite problem: it is one run, but OpenAI's loop, so the tokens never pass
+    through this process at all.
+
+    Hence a table of its own, and hence ``source``. A speech row is counted here
+    from the text we were about to send, before the request leaves, and is
+    exact. A realtime row is what the browser heard OpenAI report at the end of
+    the session, which makes it a report rather than a bill: a session whose tab
+    was closed reports nothing, so these figures are a floor, not a ceiling. The
+    column exists so that whoever reads the cost screen knows which they are
+    looking at instead of having to know this paragraph.
+    """
+
+    __tablename__ = "assistant_voice_usage"
+    __table_args__ = (
+        Index("ix_assistant_voice_usage_user_created", "user_id", "created_at"),
+        Index("ix_assistant_voice_usage_kind", "kind"),
+    )
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    #: The spoken conversation this belongs to, when there is one. Null for a
+    #: clip read aloud, which is deliberately not part of any run.
+    run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("assistant_runs.id", ondelete="SET NULL")
+    )
+    #: ``speech`` or ``realtime``.
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    model_key: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    voice: Mapped[str | None] = mapped_column(String(24))
+    source: Mapped[str] = mapped_column(
+        String(8), default=UsageSource.SERVER, server_default=text("'server'"), nullable=False
+    )
+
+    #: speech: characters of text handed to the model.
+    characters: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    #: realtime: tokens, by sort. ``cached_*`` are already counted in their
+    #: matching input figure and are subtracted before the full price applies,
+    #: exactly as the chat model's cached tokens are.
+    text_input_tokens: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    cached_text_input_tokens: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0")
+    )
+    audio_input_tokens: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    cached_audio_input_tokens: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0")
+    )
+    text_output_tokens: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    audio_output_tokens: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0")
+    )
+    #: How long the spoken conversation lasted, when the client reports it.
+    #: Not what it is billed on — that is the tokens — but the number a person
+    #: recognises when they are asked why the bill looks like that.
+    seconds: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+
+    cost_usd: Mapped[Decimal] = mapped_column(
+        Numeric(12, 6), default=Decimal(0), server_default=text("0"), nullable=False
+    )
+
+    user: Mapped[User] = relationship(foreign_keys=[user_id], lazy="joined")
+
+    def __repr__(self) -> str:
+        return f"<AssistantVoiceUsage {self.kind} {self.model_key} ${self.cost_usd}>"
+
+
 class AssistantModulePolicy(Base, Timestamped):
     """What the assistant may do within one module, for everyone."""
 
@@ -191,15 +336,31 @@ class AssistantModulePolicy(Base, Timestamped):
     read_enabled: Mapped[bool] = mapped_column(
         Boolean, default=True, server_default=text("true"), nullable=False
     )
-    #: Off until a super admin turns it on. Reading is recoverable; writing is not.
+    #: On. It was off, and off it made the assistant an oracle that could tell
+    #: you your leave balance and not book a day of it. What replaced the master
+    #: off switch is not nothing: it is ``write_roles`` below, which says *who*
+    #: may write here rather than *whether* anybody may, and the confirmation
+    #: pause, which still puts the action in front of a person before it runs.
+    #: A super admin who wants a module read-only again sets this false.
     write_enabled: Mapped[bool] = mapped_column(
-        Boolean, default=False, server_default=text("false"), nullable=False
+        Boolean, default=True, server_default=text("true"), nullable=False
     )
     #: Null follows ``AssistantSettings.confirm_writes_default``.
     confirm_writes: Mapped[bool | None] = mapped_column(Boolean)
     #: Global role keys. Null or empty means no extra restriction — the route's
     #: own guard still applies, as it always does.
     allowed_roles: Mapped[list[str] | None] = mapped_column(ARRAY(String(40)))
+    #: Global role keys that may have the assistant *write* in this module,
+    #: where ``allowed_roles`` governs seeing it at all. Null means no extra
+    #: restriction beyond the route's.
+    #:
+    #: Two columns rather than one because the two questions have different
+    #: answers for the same person. An ordinary employee should read the team
+    #: list and should not be able to say "delete the Kuwait team" — and if the
+    #: only lever were ``allowed_roles``, buying the second would cost the
+    #: first. Seeded from the module catalogue's shipped default; a super
+    #: admin's edit is never overwritten by a later seed.
+    write_roles: Mapped[list[str] | None] = mapped_column(ARRAY(String(40)))
     updated_by_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )
@@ -220,6 +381,11 @@ class AssistantToolPolicy(Base, Timestamped):
     )
     confirm_override: Mapped[bool | None] = mapped_column(Boolean)
     allowed_roles: Mapped[list[str] | None] = mapped_column(ARRAY(String(40)))
+    #: Narrows — or widens — the module's ``write_roles`` for this one tool.
+    #: The lever for a module where most writes are everyday work and one is
+    #: not: leave is anyone's to request and the rules are not anyone's to
+    #: rewrite, and that is one column, not a new module.
+    write_roles: Mapped[list[str] | None] = mapped_column(ARRAY(String(40)))
     updated_by_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )
@@ -351,6 +517,13 @@ class AssistantRun(Base, UUIDPrimaryKey, Timestamped):
 
     #: Set by a super admin; the loop reads it between rounds and stops.
     cancel_requested: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
+    )
+    #: A spoken conversation has had its usage reported by the browser. Set once
+    #: and checked before recording, because the client sends this figure and a
+    #: client can send it twice: a retried close, or the same session left open
+    #: in a second tab, would otherwise bill the conversation over again.
+    voice_usage_reported: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default=text("false"), nullable=False
     )
     #: The model's own items for this turn, in order, so a paused turn can be

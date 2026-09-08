@@ -14,8 +14,9 @@ here say when to use it, what identifiers it accepts, and what it will not do.
 Two kinds of tool, told apart by ``kind``:
 
 * ``read`` — GET. Runs as soon as the model asks.
-* ``write`` — anything else. Off until a super admin enables the module's writes,
-  and paused for the person's confirmation unless policy says otherwise.
+* ``write`` — anything else. Available, but only to the roles the module's
+  ``write_roles`` names, and paused for the person's confirmation unless policy
+  says otherwise.
 
 Adding a tool means adding one entry here and running the seed, which creates
 its policy row. Nothing else needs to know.
@@ -296,7 +297,158 @@ REALTIME_INSTRUCTIONS: Final = (
 VOICE_MAX_CHARS: Final = 4000
 
 
+# -- what the voice costs -----------------------------------------------
+#
+# Speech and spoken conversation are billed by OpenAI on their own meters,
+# separately from the chat model, and neither meter is tokens-in-tokens-out.
+# Until this was written the voice was simply not costed: the analytics screen
+# showed the chat bill and called it the bill, which understated it by however
+# much the voice was used. These prices are what make the voice appear on it.
+#
+# Two units, because OpenAI charges in two:
+#
+# * **speech** is priced per million *characters* of the text handed to it.
+#   Characters rather than tokens because that is the only quantity we can
+#   count exactly, on our own side, before the request is even sent - the
+#   audio is streamed straight through to the browser and never measured here.
+# * **realtime** is priced per million *tokens*, and audio tokens are dearer
+#   than text ones by an order of magnitude, so they are kept apart rather
+#   than averaged into one number that would be wrong for every session.
+#
+# As with the chat models these are seeded, not hardcoded: a super admin edits
+# them in the settings screen when OpenAI moves a price, because a stale price
+# does not fail loudly, it quietly makes every figure on the cost screen wrong.
+
+VoiceKind = Literal["speech", "realtime"]
+
+
+@dataclass(frozen=True, slots=True)
+class VoiceModelSpec:
+    """One priced voice model. Unused prices for its kind are zero."""
+
+    key: str
+    name: str
+    kind: VoiceKind
+    description: str
+    #: speech only: USD per one million characters of input text.
+    char_price: Decimal = Decimal(0)
+    #: realtime only: USD per one million tokens, by sort.
+    text_input_price: Decimal = Decimal(0)
+    cached_text_input_price: Decimal = Decimal(0)
+    audio_input_price: Decimal = Decimal(0)
+    cached_audio_input_price: Decimal = Decimal(0)
+    text_output_price: Decimal = Decimal(0)
+    audio_output_price: Decimal = Decimal(0)
+
+
+def _speech(key: str, name: str, description: str, chars: str) -> VoiceModelSpec:
+    return VoiceModelSpec(key, name, "speech", description, char_price=Decimal(chars))
+
+
+def _realtime(
+    key: str,
+    name: str,
+    description: str,
+    text_in: str,
+    cached_text_in: str,
+    audio_in: str,
+    cached_audio_in: str,
+    text_out: str,
+    audio_out: str,
+) -> VoiceModelSpec:
+    return VoiceModelSpec(
+        key,
+        name,
+        "realtime",
+        description,
+        text_input_price=Decimal(text_in),
+        cached_text_input_price=Decimal(cached_text_in),
+        audio_input_price=Decimal(audio_in),
+        cached_audio_input_price=Decimal(cached_audio_in),
+        text_output_price=Decimal(text_out),
+        audio_output_price=Decimal(audio_out),
+    )
+
+
+VOICE_MODELS: Final[tuple[VoiceModelSpec, ...]] = (
+    _speech(
+        "gpt-4o-mini-tts",
+        "GPT-4o Mini TTS",
+        "The steerable speech model and the default. Dearer per character than "
+        "the tts-1 pair, and the only one that acts on the voice instructions, "
+        "which is most of the difference between a reading and a person talking.",
+        "16.00",
+    ),
+    _speech(
+        "tts-1",
+        "TTS-1",
+        "The older, cheaper engine. Ignores the voice instructions rather than "
+        "failing on them.",
+        "15.00",
+    ),
+    _speech(
+        "tts-1-hd",
+        "TTS-1 HD",
+        "The higher-fidelity older engine, at twice the price of tts-1 and with "
+        "the same indifference to the instructions.",
+        "30.00",
+    ),
+    _realtime(
+        "gpt-realtime-2.1",
+        "GPT Realtime 2.1",
+        "The current full-size spoken model. Audio in and out is where the money "
+        "goes; the text figures barely register beside it.",
+        "4.00", "0.40", "32.00", "0.40", "16.00", "64.00",
+    ),
+    _realtime(
+        "gpt-realtime-2.1-mini",
+        "GPT Realtime 2.1 Mini",
+        "About a third the price of the full model and quicker to answer. The "
+        "sensible default once a spoken assistant is used by more than a few people.",
+        "0.60", "0.06", "10.00", "0.30", "2.40", "20.00",
+    ),
+    _realtime(
+        "gpt-realtime-2",
+        "GPT Realtime 2",
+        "The previous generation of the spoken model.",
+        "4.00", "0.40", "32.00", "0.40", "16.00", "64.00",
+    ),
+    _realtime(
+        "gpt-realtime",
+        "GPT Realtime",
+        "The original spoken model.",
+        "4.00", "0.40", "40.00", "2.50", "16.00", "80.00",
+    ),
+    _realtime(
+        "gpt-realtime-mini",
+        "GPT Realtime Mini",
+        "The original small spoken model.",
+        "0.60", "0.06", "10.00", "0.30", "2.40", "20.00",
+    ),
+)
+
+VOICE_MODELS_BY_KEY: Final[dict[str, VoiceModelSpec]] = {m.key: m for m in VOICE_MODELS}
+
+
 # ── module groups ──────────────────────────────────────────────────────
+
+
+#: Who may have the assistant *write* in a module that carries company-wide
+#: consequences. Straight from the brief: managers, CEOs and super admins.
+#:
+#: This is a separate question from ``gate``, and keeping the two apart is the
+#: point of it. ``gate`` decides who can see the module at all — an ordinary
+#: person still reads the teams list, still sees a quote. This decides who can
+#: have the assistant *change* it. Folding the two together would mean the only
+#: way to stop somebody having the assistant delete a team was to stop them
+#: looking at teams, which is not a trade anybody would accept.
+#:
+#: Note what it does *not* cover: the modules whose writes are everyday work
+#: for the person doing them — requesting leave, raising a quote request,
+#: updating one's own proposal task. Those stay open here and are decided where
+#: they have always been decided, by the route, which knows about HR team
+#: membership and record ownership in a way a list of global roles cannot.
+SENSITIVE_WRITE_ROLES: Final[tuple[str, ...]] = ("super_admin", "ceo", "manager")
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,12 +461,19 @@ class ModuleGroup:
     * ``open`` — everyone signed in, like leave and quotes
     * ``access`` — only if the person's effective access includes the module
     * ``admin`` — only holders of a global admin role
+
+    ``write_roles`` is the restriction this module *ships* with: the global
+    roles that may have the assistant write here, or ``None`` for "whoever the
+    route already allows". It is seeded into the module's policy row and is a
+    starting point, not a rule — a super admin edits it in the settings screen
+    and their edit is never overwritten by a later seed.
     """
 
     key: str
     name: str
     gate: Gate
     description: str
+    write_roles: tuple[str, ...] | None = None
 
 
 GROUPS: Final[tuple[ModuleGroup, ...]] = (
@@ -322,7 +481,10 @@ GROUPS: Final[tuple[ModuleGroup, ...]] = (
         "quote_requests",
         "Quote Requests",
         "access",
-        "Customer quotes being raised, and their approvals.",
+        "Customer quotes being raised, and their approvals. Writes are left "
+        "open: raising and submitting a quote is the everyday work of the "
+        "people in this module, and who may approve one is a question the "
+        "route answers from the approver list, not from a global role.",
     ),
     ModuleGroup(
         "quote_comparison",
@@ -342,33 +504,89 @@ GROUPS: Final[tuple[ModuleGroup, ...]] = (
         "finance",
         "Finance",
         "admin",
-        "Profit and loss from the Zoho Books ledger. Read by super admin, CEO, "
-        "manager or accountant, and by nobody else.",
+        "Profit and loss from the Zoho Books ledger, and the Zoho endpoints "
+        "behind it. Read by super admin, CEO, manager or accountant, and by "
+        "nobody else. Nothing here writes today; the restriction is set anyway "
+        "so that the day something does, it arrives already restricted rather "
+        "than open until somebody notices.",
+        write_roles=SENSITIVE_WRITE_ROLES,
     ),
     ModuleGroup(
         "assignment",
         "Work Assignment",
         "access",
         "How work is shared out: labels, capacity, the policy behind it, and "
-        "the ranking that decides who gets the next job.",
+        "the ranking that decides who gets the next job. Changing that policy "
+        "changes who gets given work across the company, so it is held to the "
+        "same roles as the other company-wide settings.",
+        write_roles=SENSITIVE_WRITE_ROLES,
     ),
     ModuleGroup(
         "templates",
         "Form Templates",
         "admin",
-        "What the forms ask for, as data rather than code.",
+        "What the forms ask for, as data rather than code. A template edit "
+        "changes what every future form collects.",
+        write_roles=SENSITIVE_WRITE_ROLES,
+    ),
+    ModuleGroup(
+        "reports",
+        "Reports",
+        "access",
+        "Daily, weekly and monthly team reports. Writes are left open: filing "
+        "your own report is the everyday work of everybody who has one to file. "
+        "What stops somebody reading a colleague's is not this — it is that the "
+        "routes only ever return what the caller may see, so the same tool "
+        "answers a manager and an ordinary person differently.",
     ),
     ModuleGroup("me", "About me", "open", "The signed-in person's own roles, teams and access."),
-    ModuleGroup("dashboard", "Dashboard", "access", "Team dashboards and their arrangement."),
+    ModuleGroup(
+        "dashboard",
+        "Dashboard",
+        "access",
+        "Team dashboards and their arrangement. Arranging one is team work "
+        "rather than administration, and the route already asks whether the "
+        "person is on the team.",
+    ),
     ModuleGroup("directory", "People Directory", "access", "Everyone in the organisation."),
-    ModuleGroup("teams", "Teams", "access", "Teams, their members and their roles."),
+    ModuleGroup(
+        "teams",
+        "Teams",
+        "access",
+        "Teams, their members and their roles. Everyone reads this; creating, "
+        "archiving and deleting teams, and moving people between them, is "
+        "administration.",
+        write_roles=SENSITIVE_WRITE_ROLES,
+    ),
     ModuleGroup("leave", "Leave", "open", "Requesting and deciding time off."),
     ModuleGroup("proposals", "Proposals", "access", "Proposal tasks from SharePoint."),
-    ModuleGroup("quotes", "Quotes", "open", "Customer quotes read from Zoho Books."),
-    ModuleGroup("meetings", "Meetings", "open", "The person's own Outlook calendar."),
-    ModuleGroup("roles", "Roles & Permissions", "admin", "Global roles and who holds them."),
     ModuleGroup(
-        "user_admin", "User Administration", "admin", "User profiles and team module access."
+        "quotes",
+        "Quotes",
+        "open",
+        "Customer quotes read from Zoho Books. Read by anyone signed in; "
+        "anything that would write back to Zoho is administration, and is "
+        "restricted here before such a tool exists rather than after.",
+        write_roles=SENSITIVE_WRITE_ROLES,
+    ),
+    ModuleGroup("meetings", "Meetings", "open", "The person's own Outlook calendar."),
+    ModuleGroup(
+        "roles",
+        "Roles & Permissions",
+        "admin",
+        "Global roles and who holds them. The sharpest thing the assistant can "
+        "touch: a granted role changes what somebody may do everywhere. "
+        "Granting super admin needs super admin, which the route enforces "
+        "whatever is set here.",
+        write_roles=SENSITIVE_WRITE_ROLES,
+    ),
+    ModuleGroup(
+        "user_admin",
+        "User Administration",
+        "admin",
+        "User profiles and team module access. Granting a team a module is "
+        "granting everyone on it a part of the system.",
+        write_roles=SENSITIVE_WRITE_ROLES,
     ),
 )
 
@@ -513,7 +731,7 @@ class ToolSpec:
             elif p.location == "query":
                 query[p.name] = value
             else:
-                body[p.name] = value
+                body[p.name] = _without_nulls(value)
         return path, query, body
 
 
@@ -555,6 +773,48 @@ INT: Final = _s("integer")
 BOOL: Final = _s("boolean")
 DATE: Final = _s("string", description="YYYY-MM-DD")
 STR_LIST: Final = _s("array", items={"type": "string"})
+
+
+def _without_nulls(value: Any) -> Any:
+    """Drop nulls from a body value, at every level.
+
+    Strict mode forces the model to send a key for every property, so an
+    argument it has nothing to say about arrives as ``null``. A top-level null
+    has always been read as "not supplied" and dropped — see ``split``. This
+    does the same inside a nested object, and it has to: a line item's
+    ``quantity`` is a plain number with a default on the route, so an explicit
+    ``null`` is not "use the default", it is a validation error and a failed
+    call. Nothing in the catalogue uses null to mean "clear this", so reading it
+    as "not supplied" everywhere is both consistent and safe.
+    """
+    if isinstance(value, dict):
+        return {k: _without_nulls(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_without_nulls(v) for v in value]
+    return value
+
+
+def _object(properties: dict[str, Any], *, required: tuple[str, ...]) -> dict[str, Any]:
+    """A nested object in strict form.
+
+    Strict mode's rules apply at *every* level, not only the top one: an object
+    inside an array must list every property in ``required`` and forbid extras,
+    or the API rejects the whole tool and the turn fails. ``ToolSpec.schema``
+    does this for a tool's own arguments; anything nested is built here so the
+    two cannot drift, and so nobody has to remember the rule twice.
+
+    An optional property is expressed as nullable rather than omitted, exactly
+    as it is at the top level.
+    """
+    return {
+        "type": "object",
+        "properties": {
+            name: schema if name in required else {**schema, "type": [schema["type"], "null"]}
+            for name, schema in properties.items()
+        },
+        "required": list(properties),
+        "additionalProperties": False,
+    }
 
 
 def _path(name: str, description: str, schema: dict[str, Any] = STR) -> Param:
@@ -1384,51 +1644,353 @@ TOOLS: Final[tuple[ToolSpec, ...]] = (
         "The forms the signed-in person may actually use.",
         (_query("kind", "Only this kind of form."),),
     ),
+    # ── reports ────────────────────────────────────────────────────────
+    #
+    # The same routes the page uses, so what comes back is already narrowed to
+    # what the caller may see. That is the whole of the access model here: a
+    # manager asking reports.list gets their team's, an ordinary person asking
+    # the identical tool gets their own, and neither the model nor a tampered
+    # argument can change which.
+    ToolSpec(
+        "reports.mine", "reports", _READ, "GET", "/reports",
+        "My reports",
+        "The signed-in person's own reports, newest period first. Pass mine=true "
+        "for only theirs; leave it off to include anything they are entitled to "
+        "read from teams they run.",
+        (
+            _query("mine", "Only the caller's own.", BOOL),
+            _query("cadence", "daily, weekly, monthly or ad_hoc."),
+            _query("status", "draft or submitted."),
+            _query("since", "Reports whose period ends on or after this.", DATE),
+            _query("until", "Reports whose period starts on or before this.", DATE),
+            _query("limit", "How many. Up to 200.", INT),
+        ),
+    ),
+    ToolSpec(
+        "reports.list", "reports", _READ, "GET", "/reports",
+        "Reports for a team",
+        "Reports for one team, for somebody who may read them — a team manager "
+        "or lead, or a CEO, manager or super admin. Anybody else gets an empty "
+        "list rather than an error, because the honest answer to 'show me "
+        "presales' reports' from somebody who cannot read them is that there "
+        "are none they can see.",
+        (
+            _query("team", "Team handle (slug) or id."),
+            _query("author_id", "One person's, by ERP user id."),
+            _query("cadence", "daily, weekly, monthly or ad_hoc."),
+            _query("since", "Reports whose period ends on or after this.", DATE),
+            _query("until", "Reports whose period starts on or before this.", DATE),
+            _query("limit", "How many. Up to 200.", INT),
+        ),
+    ),
+    ToolSpec(
+        "reports.get", "reports", _READ, "GET", "/reports/{report_id}",
+        "One report in full",
+        "The whole report: overview, every task with its status and links, the "
+        "issues, the metrics, the remarks and the summary. Use it before "
+        "summarising or analysing one — the list gives counts, this gives what "
+        "was actually written.",
+        (_path("report_id", "The report id."),),
+    ),
+    ToolSpec(
+        "reports.form", "reports", _READ, "GET", "/reports/form",
+        "What a report will ask",
+        "The sections and this team's own questions, before one is started. Use "
+        "it to tell somebody what they are about to be asked, and to learn which "
+        "extra fields this particular team's report has.",
+        (
+            _query("team", "Team handle (slug) or id."),
+            _query("cadence", "daily, weekly, monthly or ad_hoc."),
+            _query("on", "A day inside the period. Defaults to today.", DATE),
+        ),
+    ),
+    ToolSpec(
+        "reports.overview", "reports", _READ, "GET", "/reports/overview",
+        "What the reports say together",
+        "Figures and open issues across every report the caller may read, over a "
+        "period. This is the tool for 'how did presales do last month' and 'what "
+        "is blocking us'. Narrowed to what they are entitled to see, so an "
+        "ordinary person gets their own reports summarised and nobody else's.",
+        (
+            _query("team", "Team handle or id. Leave off for every team they can read."),
+            _query("since", "From this day. Defaults to 30 days ago.", DATE),
+            _query("until", "To this day. Defaults to today.", DATE),
+        ),
+    ),
+    ToolSpec(
+        "reports.start", "reports", _WRITE, "POST", "/reports",
+        "Start a report",
+        "Open a draft for a period, prefilled with the person's own Proposals "
+        "tasks — which brings each bid's title, status, deadline, its link and "
+        "its attachments. Nothing is filed yet. Follow it with reports.fill to "
+        "put the words in and reports.submit to send it.",
+        (
+            _body("team_id", "The team's id. Use me.teams to find it.", required=True),
+            _body(
+                "cadence",
+                "daily, weekly, monthly or ad_hoc.",
+                _s("string", enum=["daily", "weekly", "monthly", "ad_hoc"]),
+                required=True,
+            ),
+            _body("on", "A day inside the period. Defaults to today.", DATE),
+            _body("period_start", "Ad-hoc only: when the period starts.", DATE),
+            _body("period_end", "Ad-hoc only: when it ends.", DATE),
+            _body("prefill_tasks", "Pull their Proposals tasks in. Default true.", BOOL),
+            _body("include_closed", "Include finished tasks. Default false.", BOOL),
+        ),
+        warning="Opens a draft. Nothing is sent to anybody until it is submitted.",
+    ),
+    ToolSpec(
+        "reports.fill", "reports", _WRITE, "PATCH", "/reports/{report_id}",
+        "Fill in a draft report",
+        "Write into a draft. Only the parts given change — but a list given at "
+        "all replaces that whole section, so send every task row you want kept, "
+        "not just the new one. Read the report back first if you did not just "
+        "create it. Never invent a figure or a status the person did not give "
+        "you: an overview you wrote for them is still filed under their name.",
+        (
+            _path("report_id", "The report id."),
+            _body("overview", "What the period was about, in a few lines."),
+            _body("remarks", "Anything worth saying that is not a task or a blocker."),
+            _body("summary", "What the reader should take away, and what is next."),
+            _body(
+                "tasks",
+                "The whole tasks section, replacing what is there.",
+                _s("array", items=_object(
+                    {
+                        "title": STR,
+                        "completion": _s(
+                            "string",
+                            enum=["not_started", "in_progress", "blocked", "done", "dropped"],
+                        ),
+                        "external_id": _s(
+                            "string", description="The Proposals task id, for a pulled row."
+                        ),
+                        "status": STR,
+                        "note": STR,
+                        "link": STR,
+                        "deadline": DATE,
+                        "percent_complete": INT,
+                    },
+                    required=("title", "completion"),
+                )),
+            ),
+            _body(
+                "issues",
+                "The whole issues section, replacing what is there.",
+                _s("array", items=_object(
+                    {
+                        "title": STR,
+                        "detail": STR,
+                        "severity": _s(
+                            "string", enum=["low", "medium", "high", "blocked"]
+                        ),
+                        "waiting_on": _s(
+                            "string",
+                            description="Who or what it waits on — often outside this system.",
+                        ),
+                        "resolved": BOOL,
+                    },
+                    required=("title", "severity"),
+                )),
+            ),
+            # Pairs rather than an object keyed by metric, and not by choice:
+            # strict mode has no way to express "an object whose keys I do not
+            # know in advance" — an open object is rejected outright, and the
+            # keys here are whatever this team's template asks for. The route
+            # accepts either shape; see ReportEditIn.
+            _body(
+                "metrics",
+                "Figures, as key/value pairs. The task counts are worked out "
+                "already and only need sending to correct one; the team's own "
+                "metrics — see reports.form for which — are typed in.",
+                _s("array", items=_object(
+                    {"key": STR, "value": _s("number")},
+                    required=("key", "value"),
+                )),
+            ),
+            _body(
+                "answers",
+                "This team's own questions, as key/value pairs. reports.form "
+                "lists which keys this team's report has. Merged into what is "
+                "already there, so you can send one answer at a time as you "
+                "learn it; send a key with nothing in it to clear one.",
+                _s("array", items=_object(
+                    {
+                        "key": STR,
+                        "value": _s(["string", "number", "boolean"]),
+                    },
+                    required=("key", "value"),
+                )),
+            ),
+        ),
+        warning="Changes the draft. Anything sent as a list replaces that whole "
+                "section.",
+    ),
+    ToolSpec(
+        "reports.submit", "reports", _WRITE, "POST", "/reports/{report_id}/submit",
+        "File a report",
+        "Submit the draft. After this it cannot be changed by anybody, and it is "
+        "emailed to the team's managers and leads, the CEO and the super admins. "
+        "Read the report back to the person and get their agreement before "
+        "calling this — it is not undoable and it goes to their management.",
+        (_path("report_id", "The report id."),),
+        warning="Files the report and emails it to the team's managers, the CEO "
+                "and the super admins. It cannot be edited afterwards.",
+    ),
+    ToolSpec(
+        "reports.comment", "reports", _WRITE, "POST", "/reports/{report_id}/comments",
+        "Comment on a report",
+        "A reader's remark on somebody else's submitted report. Decides nothing "
+        "and changes nothing about the report. An author cannot comment on their "
+        "own — what they have to add belongs in the next report.",
+        (
+            _path("report_id", "The report id."),
+            _body("body", "What to say.", required=True),
+        ),
+        warning="The author of the report will see this.",
+    ),
+    # ── the writes that were held back ─────────────────────────────────
+    #
+    # These five were written down and left ``planned`` while the assistant was
+    # only being read from. They are live now, with the arguments filled in that
+    # a real call needs — a live tool whose body is half described is a tool
+    # that fails on every use, which is worse than one that is honestly absent.
+    #
+    # Each of them still goes through its own route with the caller's session,
+    # so "may this person do this" is answered where it always was: by the
+    # Proposals list's ownership check, by the quote's approver list, by HR team
+    # membership. What is decided here is only whether the assistant may ask.
+    ToolSpec(
+        "proposals.update_task", "proposals", _WRITE, "PATCH", "/proposals/tasks/{task_id}",
+        "Update one of my proposal tasks",
+        "Change the status, dates or notes on one of the signed-in person's own "
+        "proposal tasks. Only the fields given change; everything else is left "
+        "alone. Reassigning a task is not possible here. Dates are SharePoint's "
+        "own format, e.g. 2026-09-30T00:00:00Z. Look the task up with "
+        "proposals.my_tasks first and use the id it gives you.",
+        (
+            _path("task_id", "The SharePoint task id, from proposals.my_tasks."),
+            _body("status", "New status, worded as the Proposals list words it."),
+            _body("priority", "New priority, as the list words it."),
+            _body("due_date", "New due date, ISO 8601 with a time."),
+            _body("bid_closing_date", "New bid closing date, ISO 8601 with a time."),
+            _body("submission_status", "New submission status."),
+            _body("quote_no", "The quote number to record against the task."),
+            _body("remarks", "Remarks, replacing what is there."),
+            _body("working_notes", "Working notes, replacing what is there."),
+        ),
+        warning="This writes to the live Proposals list the team works in.",
+    ),
+    ToolSpec(
+        "quote_requests.create", "quote_requests", _WRITE, "POST", "/quote-requests",
+        "Raise a quote request",
+        "Start a new customer quote for a team, with its priced lines. Read the "
+        "customer, the currency and every line back to the person before calling "
+        "this: a quote raised from a misheard figure is worse than no quote at "
+        "all. Rates are per unit and the totals are worked out for you. Leave "
+        "the dates out and the system uses its own.",
+        (
+            _query("team", "The team's handle (slug) or id. Required."),
+            _body("title", "What the quote is for.", required=True),
+            _body("customer_name", "The customer, as they should appear.", required=True),
+            _body(
+                "items",
+                "The priced lines. Each needs a name; quantity defaults to 1 and "
+                "rate to 0, so say both back before saving.",
+                _s("array", items=_object(
+                    {
+                        "name": STR,
+                        "description": STR,
+                        "item_code": STR,
+                        "brand": STR,
+                        "unit": STR,
+                        "quantity": _s("number"),
+                        "rate": _s("number", description="Unit price."),
+                    },
+                    required=("name",),
+                )),
+                required=True,
+            ),
+            _body("currency", "Three-letter code. Defaults to AED."),
+            _body("customer_id", "The customer's Zoho id, when it is known."),
+            _body("contact_person", "Who at the customer asked."),
+            _body("reference_number", "The customer's own PO or enquiry number."),
+            _body("quote_date", "Quote date.", DATE),
+            _body("expiry_date", "When the quote lapses.", DATE),
+            _body("payment_terms", "Payment terms, in words."),
+            _body("delivery_terms", "Delivery terms, in words."),
+            _body("subject", "Subject line for the quote."),
+            _body("notes", "Notes for the customer."),
+        ),
+        warning="This raises a real quote request that the approvers will see.",
+    ),
+    ToolSpec(
+        "quote_requests.submit", "quote_requests", _WRITE, "POST",
+        "/quote-requests/{request_id}/submit", "Send a quote for approval",
+        "Hand a drafted quote to its approvers. They are emailed a link to it "
+        "immediately, so this is not undone by doing nothing. The route refuses "
+        "a quote that is not ready, or not the caller's to send.",
+        (_path("request_id", "The quote request id."),),
+        warning="The approvers are emailed the moment this is sent.",
+    ),
+    ToolSpec(
+        "quote_requests.review", "quote_requests", _WRITE, "POST",
+        "/quote-requests/{request_id}/reviews", "Approve, reject or send back a quote",
+        "An approver's decision on a quote request. 'approve' releases it, "
+        "'reject' refuses it, 'rework' sends it back to whoever raised it, and "
+        "'comment' decides nothing and leaves it where it is. A rejection or a "
+        "rework needs a note saying why. Approving a quote that carries several "
+        "supplier offers means naming the one that won.",
+        (
+            _path("request_id", "The quote request id."),
+            _body(
+                "action",
+                "One of approve, reject, rework, comment.",
+                _s("string", enum=["approve", "reject", "rework", "comment"]),
+                required=True,
+            ),
+            _body("note", "Why. Required for a rejection or a rework."),
+            _body(
+                "selected_supplier_quote_id",
+                "Which supplier quote won. Required when approving one that has "
+                "several.",
+            ),
+        ),
+        warning="An approval releases the quote to be created in Zoho, and the "
+                "decision is emailed to the requester.",
+    ),
+    ToolSpec(
+        "hr.move_candidate", "hr", _WRITE, "POST", "/hr/applications/{application_id}/stage",
+        "Move a candidate along",
+        "Shortlist, interview, offer, hire or reject a candidate. 'withdrawn' is "
+        "for somebody who pulled out themselves and is kept apart from "
+        "'rejected' on purpose — the distinction matters if they apply again. "
+        "Only the HR team may do this; the route refuses anybody else.",
+        (
+            _path("application_id", "The application id."),
+            _body(
+                "stage",
+                "The stage to move them to.",
+                _s(
+                    "string",
+                    enum=[
+                        "new", "shortlisted", "interviewed", "offered",
+                        "hired", "rejected", "withdrawn",
+                    ],
+                ),
+                required=True,
+            ),
+            _body("note", "Why, for the record."),
+        ),
+        warning="Candidates may be told about stage changes.",
+    ),
     # ── written down, not built ────────────────────────────────────────
     #
     # Listed so the administration screen shows what is coming as well as what
     # is here. ``planned`` tools are filtered out of every list the model sees,
     # so nothing below can be called; they are a roadmap kept next to the code
     # rather than in somebody's head.
-    ToolSpec(
-        "proposals.update_task", "proposals", _WRITE, "PATCH", "/proposals/tasks/{task_id}",
-        "Update one of my proposal tasks",
-        "Change the status, notes or dates on one of the signed-in person's own "
-        "proposal tasks. Writes to the live SharePoint list.",
-        (_path("task_id", "The SharePoint task id."), _body("status", "New status.")),
-        warning="This writes to the live Proposals list the team works in.",
-        status="planned",
-    ),
-    ToolSpec(
-        "quote_requests.create", "quote_requests", _WRITE, "POST", "/quote-requests",
-        "Raise a quote request",
-        "Start a new customer quote. Planned: raising a quote by voice needs the "
-        "line items to be readable back before anything is saved.",
-        status="planned",
-    ),
-    ToolSpec(
-        "quote_requests.submit", "quote_requests", _WRITE, "POST",
-        "/quote-requests/{request_id}/submit", "Send a quote for approval",
-        "Send a drafted quote to its approvers.",
-        (_path("request_id", "The quote request id."),),
-        status="planned",
-    ),
-    ToolSpec(
-        "quote_requests.review", "quote_requests", _WRITE, "POST",
-        "/quote-requests/{request_id}/reviews", "Approve or reject a quote",
-        "Approve, reject or send back a quote request.",
-        (_path("request_id", "The quote request id."),),
-        warning="An approval releases the quote to be created in Zoho.",
-        status="planned",
-    ),
-    ToolSpec(
-        "hr.move_candidate", "hr", _WRITE, "POST", "/hr/applications/{application_id}/stage",
-        "Move a candidate along",
-        "Shortlist, interview, offer or reject a candidate.",
-        (_path("application_id", "The application id."),),
-        warning="Candidates may be told about stage changes.",
-        status="planned",
-    ),
     ToolSpec(
         "zoho.read", "finance", _READ, "GET", "/finance/zoho/{endpoint_key}",
         "Read a Zoho endpoint directly",

@@ -317,12 +317,22 @@ async def test_releasing_a_person_lets_them_in(client, db, person) -> None:
 
 
 async def test_status_lists_only_the_tools_this_person_gets(client, person) -> None:
+    """Reads, plus the writes that are their own work to do, and nothing that
+    reaches across the company. This assertion used to be "reads only", which
+    held while module writes shipped off; what holds now is the write
+    restriction, and that is the stronger property because it survives the
+    writes being on."""
     body = (await _as(client, person).get("/api/v1/assistant/status")).json()
     modules = {m["key"] for m in body["modules"]}
     assert "leave" in modules  # open to everyone
     assert "roles" not in modules  # needs an admin role
-    every_tool = [t for m in body["modules"] for t in m["tools"]]
-    assert every_tool and all(t["kind"] == "read" for t in every_tool)
+
+    every_tool = {t["key"]: t for m in body["modules"] for t in m["tools"]}
+    assert every_tool
+    assert "leave.mine" in every_tool
+    assert "leave.request" in every_tool, "requesting leave is their own to do"
+    assert every_tool["leave.request"]["requires_confirmation"] is True
+    assert not any(k.startswith(("roles.", "access.", "teams.")) for k in every_tool)
 
 
 async def test_a_blocked_person_cannot_start_a_chat(client, db, person) -> None:
@@ -732,26 +742,116 @@ async def test_the_policy_matrix_shows_every_module_and_tool(client, boss) -> No
     keys = {m["module_key"] for m in matrix}
     assert {"leave", "teams", "roles"} <= keys
     leave = next(m for m in matrix if m["module_key"] == "leave")
-    assert leave["write_enabled"] is False
+    assert leave["write_enabled"] is True
     request = next(t for t in leave["tools"] if t["tool_key"] == "leave.request")
     assert request["kind"] == "write"
-    assert request["effective_enabled"] is False
+    assert request["effective_enabled"] is True
 
 
-async def test_turning_on_writes_shows_in_the_matrix_and_in_the_chat(
+async def test_the_matrix_shows_who_may_write_apart_from_who_may_look(
+    client, boss
+) -> None:
+    """The two columns the whole change turns on. Everyone sees the team list;
+    only the named roles may have the assistant change it."""
+    matrix = (await _as(client, boss).get("/api/v1/assistant/admin/policies")).json()
+    teams = next(m for m in matrix if m["module_key"] == "teams")
+    assert teams["allowed_roles"] is None
+    assert set(teams["write_roles"]) == {"super_admin", "ceo", "manager"}
+    assert teams["default_write_roles"] == teams["write_roles"]
+    assert teams["has_writes"] is True
+
+    delete = next(t for t in teams["tools"] if t["tool_key"] == "teams.delete")
+    assert set(delete["effective_write_roles"]) == {"super_admin", "ceo", "manager"}
+    listing = next(t for t in teams["tools"] if t["tool_key"] == "teams.list")
+    assert listing["effective_write_roles"] is None, "a read is never held back by it"
+
+
+async def test_finance_ships_restricted_even_though_it_cannot_write_yet(
+    client, boss
+) -> None:
+    """Set now so that the day a write lands there it arrives already
+    restricted, rather than open until somebody notices."""
+    matrix = (await _as(client, boss).get("/api/v1/assistant/admin/policies")).json()
+    finance = next(m for m in matrix if m["module_key"] == "finance")
+    assert set(finance["write_roles"]) == {"super_admin", "ceo", "manager"}
+    assert finance["has_writes"] is False
+
+
+async def test_an_ordinary_person_is_offered_the_everyday_writes(client, person) -> None:
+    status = (await _as(client, person).get("/api/v1/assistant/status")).json()
+    tools = {t["key"]: t for m in status["modules"] for t in m["tools"]}
+    assert "leave.request" in tools
+    assert tools["leave.request"]["requires_confirmation"] is True
+
+
+async def test_an_ordinary_person_is_not_offered_the_company_wide_writes(
+    client, person
+) -> None:
+    status = (await _as(client, person).get("/api/v1/assistant/status")).json()
+    tools = {t["key"] for m in status["modules"] for t in m["tools"]}
+    assert "roles.grant" not in tools
+
+
+async def test_a_manager_is_offered_them(client, manager) -> None:
+    """``roles`` is the sharpest of them and is gated on being an admin, so it
+    is the one module whose writes turn purely on the role — which makes it the
+    honest test of the restriction rather than of module access."""
+    status = (await _as(client, manager).get("/api/v1/assistant/status")).json()
+    tools = {t["key"] for m in status["modules"] for t in m["tools"]}
+    assert "roles.grant" in tools
+    assert "roles.revoke" in tools
+
+
+async def test_a_write_restriction_can_be_changed_and_shows_straight_away(
+    client, boss, person
+) -> None:
+    """What the settings screen does, end to end: set it, and the person's own
+    tool list changes on the next question."""
+    before = (await _as(client, person).get("/api/v1/assistant/status")).json()
+    assert "leave.request" in {t["key"] for m in before["modules"] for t in m["tools"]}
+
+    response = await _as(client, boss).patch(
+        "/api/v1/assistant/admin/policies/modules/leave",
+        json={"write_roles": ["manager"]},
+    )
+    assert response.status_code == 200
+    leave = next(m for m in response.json() if m["module_key"] == "leave")
+    assert leave["write_roles"] == ["manager"]
+
+    after = (await _as(client, person).get("/api/v1/assistant/status")).json()
+    tools = {t["key"] for m in after["modules"] for t in m["tools"]}
+    assert "leave.request" not in tools
+    assert "leave.mine" in tools, "the reads are untouched"
+
+
+async def test_one_tool_can_be_held_back_inside_an_open_module(
+    client, boss, person
+) -> None:
+    await _as(client, boss).patch(
+        "/api/v1/assistant/admin/policies/tools/leave.update_rules",
+        json={"write_roles": ["manager"]},
+    )
+    status = (await _as(client, person).get("/api/v1/assistant/status")).json()
+    tools = {t["key"] for m in status["modules"] for t in m["tools"]}
+    assert "leave.update_rules" not in tools
+    assert "leave.request" in tools
+
+
+async def test_turning_off_writes_shows_in_the_matrix_and_in_the_chat(
     client, boss, wired
 ) -> None:
+    """The master switch still works the other way — off beats every role."""
     response = await _as(client, boss).patch(
-        "/api/v1/assistant/admin/policies/modules/leave", json={"write_enabled": True}
+        "/api/v1/assistant/admin/policies/modules/leave", json={"write_enabled": False}
     )
     assert response.status_code == 200
     leave = next(m for m in response.json() if m["module_key"] == "leave")
     request = next(t for t in leave["tools"] if t["tool_key"] == "leave.request")
-    assert request["effective_enabled"] is True and request["effective_confirm"] is True
+    assert request["effective_enabled"] is False
 
     status = (await client.get("/api/v1/assistant/status")).json()
     tools = [t for m in status["modules"] if m["key"] == "leave" for t in m["tools"]]
-    assert any(t["key"] == "leave.request" and t["requires_confirmation"] for t in tools)
+    assert not any(t["key"] == "leave.request" for t in tools)
 
 
 async def test_turning_off_one_tool_removes_it_from_the_chat(client, boss) -> None:
@@ -1265,3 +1365,177 @@ async def test_a_realtime_model_that_does_not_exist_is_refused(client, boss) -> 
         "/api/v1/assistant/admin/settings", json={"realtime_model": "gpt-telepathy"}
     )
     assert response.status_code == 400
+
+
+# ── what the voice costs ───────────────────────────────────────────────
+#
+# Before this the analytics screen showed the chat bill and called it the bill,
+# which understated it by however much the voice was used. These are the tests
+# that the voice now appears on it.
+
+
+@pytest.fixture
+async def priced_voice(db, setup):
+    await service.seed_voice_models(db)
+    await db.commit()
+
+
+async def test_the_voice_prices_are_listed_for_a_super_admin(
+    client, boss, priced_voice
+) -> None:
+    body = (await _as(client, boss).get("/api/v1/assistant/admin/voice-models")).json()
+    by_key = {m["key"]: m for m in body}
+    assert by_key[DEFAULT_SPEECH_MODEL]["kind"] == "speech"
+    assert Decimal(by_key[DEFAULT_SPEECH_MODEL]["char_price"]) > 0
+    assert by_key[DEFAULT_SPEECH_MODEL]["active"] is True
+    realtime = by_key["gpt-realtime-2.1"]
+    assert realtime["kind"] == "realtime"
+    assert Decimal(realtime["audio_output_price"]) > 0
+
+
+async def test_the_voice_prices_are_super_admin_only(client, person, priced_voice) -> None:
+    response = await _as(client, person).get("/api/v1/assistant/admin/voice-models")
+    assert response.status_code == 403
+
+
+async def test_a_voice_price_can_be_corrected(client, boss, priced_voice) -> None:
+    response = await _as(client, boss).patch(
+        f"/api/v1/assistant/admin/voice-models/{DEFAULT_SPEECH_MODEL}",
+        json={"char_price": "20.0000"},
+    )
+    assert response.status_code == 200
+    assert Decimal(response.json()["char_price"]) == Decimal("20")
+
+
+async def test_the_voice_in_use_cannot_be_switched_off(client, boss, priced_voice) -> None:
+    """Otherwise the setting points at something disabled and the failure
+    surfaces as an OpenAI error in somebody's ear."""
+    response = await _as(client, boss).patch(
+        f"/api/v1/assistant/admin/voice-models/{DEFAULT_SPEECH_MODEL}",
+        json={"enabled": False},
+    )
+    assert response.status_code == 409
+
+
+async def test_reading_an_answer_aloud_is_billed(
+    client, boss, voice_on, priced_voice, wired
+) -> None:
+    text = "Twelve days of annual leave remain."
+    response = await _as(client, boss).post(
+        "/api/v1/assistant/speech", json={"text": text}
+    )
+    assert response.status_code == 200
+
+    figures = (await client.get("/api/v1/assistant/admin/analytics")).json()
+    speech = figures["voice"]["speech"]
+    assert speech["uses"] == 1
+    assert speech["characters"] == len(text)
+    assert Decimal(speech["cost_usd"]) > 0
+    assert Decimal(figures["totals"]["voice_cost_usd"]) == Decimal(speech["cost_usd"])
+    assert Decimal(figures["totals"]["total_cost_usd"]) == Decimal(
+        figures["totals"]["cost_usd"]
+    ) + Decimal(speech["cost_usd"])
+
+
+async def test_the_voice_bill_is_broken_down_by_person_and_model(
+    client, boss, voice_on, priced_voice, wired
+) -> None:
+    await _as(client, boss).post("/api/v1/assistant/speech", json={"text": "Hello."})
+
+    figures = (await client.get("/api/v1/assistant/admin/analytics")).json()
+    assert [row["key"] for row in figures["voice"]["by_model"]] == [DEFAULT_SPEECH_MODEL]
+    assert figures["voice"]["by_user"][0]["key"] == str(boss.id)
+    assert figures["voice"]["by_day"][0]["characters"] == len("Hello.")
+
+
+async def test_a_quiet_window_reports_zero_rather_than_nothing(
+    client, boss, priced_voice
+) -> None:
+    figures = (await _as(client, boss).get("/api/v1/assistant/admin/analytics")).json()
+    assert figures["voice"]["speech"]["uses"] == 0
+    assert Decimal(figures["voice"]["cost_usd"]) == 0
+
+
+async def test_a_spoken_conversation_reports_what_it_used(
+    client, boss, realtime_on, priced_voice, wired
+) -> None:
+    started = (await _as(client, boss).post("/api/v1/assistant/realtime/session")).json()
+    response = await client.post(
+        f"/api/v1/assistant/realtime/session/{started['run_id']}/end",
+        json={
+            "audio_input_tokens": 20_000,
+            "audio_output_tokens": 40_000,
+            "text_input_tokens": 5_000,
+            "seconds": 95,
+        },
+    )
+    assert response.status_code == 204
+
+    figures = (await client.get("/api/v1/assistant/admin/analytics")).json()
+    realtime = figures["voice"]["realtime"]
+    assert realtime["uses"] == 1
+    assert realtime["audio_output_tokens"] == 40_000
+    assert realtime["seconds"] == 95
+    assert Decimal(realtime["cost_usd"]) > 0
+
+    # And it lands on the run, so a spoken turn is not free next to a typed one.
+    run = (await client.get(f"/api/v1/assistant/admin/runs/{started['run_id']}")).json()
+    assert Decimal(run["cost_usd"]) == Decimal(realtime["cost_usd"])
+
+
+async def test_a_spoken_conversation_is_only_billed_once(
+    client, boss, realtime_on, priced_voice, wired
+) -> None:
+    """The client sends this figure, and a client can send it twice — a retried
+    close, or the same session left open in a second tab."""
+    started = (await _as(client, boss).post("/api/v1/assistant/realtime/session")).json()
+    usage = {"audio_input_tokens": 10_000, "audio_output_tokens": 10_000}
+    for _ in range(3):
+        await client.post(
+            f"/api/v1/assistant/realtime/session/{started['run_id']}/end", json=usage
+        )
+
+    figures = (await client.get("/api/v1/assistant/admin/analytics")).json()
+    assert figures["voice"]["realtime"]["uses"] == 1
+
+
+async def test_closing_a_spoken_conversation_without_usage_still_works(
+    client, boss, realtime_on, priced_voice, wired
+) -> None:
+    """A client that only wants to close the run, or an older one that does not
+    know about the usage body, must not be broken by it."""
+    started = (await _as(client, boss).post("/api/v1/assistant/realtime/session")).json()
+    response = await client.post(
+        f"/api/v1/assistant/realtime/session/{started['run_id']}/end"
+    )
+    assert response.status_code == 204
+    run = (await client.get(f"/api/v1/assistant/admin/runs/{started['run_id']}")).json()
+    assert run["status"] == RunStatus.COMPLETED
+
+
+async def test_somebody_elses_spoken_run_cannot_be_billed(
+    client, db, person, realtime_on, priced_voice, wired
+) -> None:
+    started = (await _as(client, person).post("/api/v1/assistant/realtime/session")).json()
+    other = await _make(db, "hana@hamdaz.com")
+    response = await _as(client, other).post(
+        f"/api/v1/assistant/realtime/session/{started['run_id']}/end",
+        json={"audio_output_tokens": 1_000_000},
+    )
+    assert response.status_code == 404
+
+
+async def test_the_voice_counts_towards_the_daily_cost_cap(
+    client, db, boss, voice_on, priced_voice, wired
+) -> None:
+    """A cap that ignored the voice would not be a cap: reading long answers
+    aloud all afternoon is real money."""
+    await _as(client, boss).post("/api/v1/assistant/speech", json={"text": "x" * 3000})
+    await service.update_settings(
+        db, actor_id=None, changes={"daily_cost_cap_total_usd": Decimal("0.00001")}
+    )
+    await db.commit()
+
+    status = (await client.get("/api/v1/assistant/status")).json()
+    assert status["admitted"] is False
+    assert status["code"] == "cost_cap_total"

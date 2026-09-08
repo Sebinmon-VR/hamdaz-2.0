@@ -44,6 +44,9 @@ from app.proposals.oversight import TeamTasksCache
 from app.proposals.router import router as proposals_router
 from app.proposals.sharepoint import SharePointProposals
 from app.quoting.mailer import QuoteMailer
+from app.reports.mailer import ReportMailer
+from app.reports.router import admin_router as reports_admin_router
+from app.reports.router import router as reports_router
 from app.quoting.probability import WinRates
 from app.quoting.router import router as quoting_router
 from app.roles.router import router as roles_router
@@ -100,6 +103,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.win_rates = WinRates()
     # Approvers are told a quote is waiting, from the requester's own mailbox.
     app.state.quote_mailer = QuoteMailer(settings, http)
+    # A filed report is mailed to whoever it goes to, from its author's mailbox.
+    # A failure to send never fails the filing — see app/reports/router.py.
+    app.state.report_mailer = ReportMailer(settings, http)
     # The assistant. It reaches every module by calling this very app's routes
     # in-process, carrying the caller's own session cookie — so each route's
     # existing guard is the assistant's permission model too, and there is no
@@ -166,6 +172,10 @@ def create_app() -> FastAPI:
     app.include_router(templates_router, prefix=settings.api_prefix)
     app.include_router(hr_router, prefix=settings.api_prefix)
     app.include_router(finance_router, prefix=settings.api_prefix)
+    # Admin first: /reports/admin/... must be matched before /reports/{id},
+    # which would otherwise try to read "admin" as a report id.
+    app.include_router(reports_admin_router, prefix=settings.api_prefix)
+    app.include_router(reports_router, prefix=settings.api_prefix)
     app.include_router(assistant_router, prefix=settings.api_prefix)
     app.include_router(assistant_admin_router, prefix=settings.api_prefix)
 

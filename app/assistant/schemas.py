@@ -315,10 +315,16 @@ class ToolPolicyOut(BaseModel):
     enabled: bool
     confirm_override: bool | None
     allowed_roles: list[str] | None
+    #: Narrows or widens the module's write restriction for this one tool.
+    write_roles: list[str] | None
     #: After the module policy and the global default are applied.
     effective_enabled: bool
     effective_confirm: bool
     effective_roles: list[str] | None
+    #: Who may actually have the assistant run this write. Null on a read —
+    #: a write restriction never holds a read back, and showing one against a
+    #: read would suggest it did.
+    effective_write_roles: list[str] | None
 
 
 class ModulePolicyOut(BaseModel):
@@ -329,7 +335,17 @@ class ModulePolicyOut(BaseModel):
     read_enabled: bool
     write_enabled: bool
     confirm_writes: bool | None
+    #: Who may use this module through the assistant at all.
     allowed_roles: list[str] | None
+    #: Who may have it *write* here. Null means whoever the route already
+    #: allows — the restriction is an extra gate, never a grant.
+    write_roles: list[str] | None
+    #: What the module ships with, so the screen can show when an edit has
+    #: moved away from it and what it would go back to.
+    default_write_roles: list[str] | None
+    #: Whether this module has any live write at all. False means the
+    #: restriction is set for the day one arrives, and changes nothing today.
+    has_writes: bool
     effective_confirm: bool
     tools: list[ToolPolicyOut]
 
@@ -339,12 +355,16 @@ class ModulePolicyIn(BaseModel):
     write_enabled: bool | None = None
     confirm_writes: bool | None = None
     allowed_roles: list[str] | None = None
+    #: An empty list clears the restriction; leaving the field out changes
+    #: nothing, which is what lets a screen send one switch at a time.
+    write_roles: list[str] | None = None
 
 
 class ToolPolicyIn(BaseModel):
     enabled: bool | None = None
     confirm_override: bool | None = None
     allowed_roles: list[str] | None = None
+    write_roles: list[str] | None = None
 
 
 class PoliciesBulkIn(BaseModel):
@@ -404,19 +424,128 @@ class AnalyticsTotals(BaseModel):
     cached_input_tokens: int
     output_tokens: int
     reasoning_tokens: int
+    #: What the runs cost. Unchanged in meaning, deliberately: a figure that
+    #: quietly starts including something new is worse than one that is
+    #: honestly missing a part.
     cost_usd: Decimal
+    #: What reading answers aloud cost over the same window. A spoken
+    #: conversation is not in here — its cost is already on its run — so read
+    #: ``voice.realtime`` for that half.
+    voice_cost_usd: Decimal
+    #: The two above added up. The figure to quote when somebody asks what the
+    #: assistant costs.
+    total_cost_usd: Decimal
     confirmations_requested: int
     confirmations_approved: int
     confirmations_declined: int
     refused_by_policy: int
 
 
+class VoiceBucket(BaseModel):
+    key: str
+    label: str
+    #: Clips read aloud, or spoken conversations.
+    uses: int
+    #: Speech only: characters of text handed to the model, which is what it
+    #: is billed on.
+    characters: int
+    audio_input_tokens: int
+    audio_output_tokens: int
+    text_input_tokens: int
+    text_output_tokens: int
+    #: Realtime only, and only when the browser reported it. Not what the
+    #: session is billed on — that is the tokens — but the number a person
+    #: recognises when they ask why the bill looks like that.
+    seconds: int
+    cost_usd: Decimal
+
+
+class VoiceAnalyticsOut(BaseModel):
+    """The voice bill, split by kind because the two halves are not alike.
+
+    ``speech`` is exact: it is counted server-side from the text we were about
+    to send. ``realtime`` is what the browser reported OpenAI charging at the
+    end of a session, so a session that ended in a closed tab is missing from
+    it — the figure is a floor rather than a bill.
+    """
+
+    speech: VoiceBucket
+    realtime: VoiceBucket
+    #: Both halves added up.
+    cost_usd: Decimal
+    by_day: list[VoiceBucket]
+    by_user: list[VoiceBucket]
+    by_model: list[VoiceBucket]
+
+
 class AnalyticsOut(BaseModel):
     since: date
     until: date
     totals: AnalyticsTotals
+    voice: VoiceAnalyticsOut
     by_day: list[AnalyticsBucket]
     by_user: list[AnalyticsBucket]
     by_team: list[AnalyticsBucket]
     by_model: list[AnalyticsBucket]
     by_tool: list[AnalyticsBucket]
+
+
+class VoiceModelOut(BaseModel):
+    """One priced voice model, for the settings screen."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    key: str
+    name: str
+    #: "speech" or "realtime". Decides which prices below mean anything.
+    kind: Literal["speech", "realtime"]
+    description: str
+    #: speech: USD per one million characters of text.
+    char_price: Decimal
+    #: realtime: USD per one million tokens, by sort.
+    text_input_price: Decimal
+    cached_text_input_price: Decimal
+    audio_input_price: Decimal
+    cached_audio_input_price: Decimal
+    text_output_price: Decimal
+    audio_output_price: Decimal
+    enabled: bool
+    #: The one the settings currently point at, for its kind.
+    active: bool = False
+
+
+class VoiceModelIn(BaseModel):
+    """Only the fields given change. Prices for the other kind are ignored."""
+
+    enabled: bool | None = None
+    char_price: Decimal | None = Field(default=None, ge=0)
+    text_input_price: Decimal | None = Field(default=None, ge=0)
+    cached_text_input_price: Decimal | None = Field(default=None, ge=0)
+    audio_input_price: Decimal | None = Field(default=None, ge=0)
+    cached_audio_input_price: Decimal | None = Field(default=None, ge=0)
+    text_output_price: Decimal | None = Field(default=None, ge=0)
+    audio_output_price: Decimal | None = Field(default=None, ge=0)
+
+
+class RealtimeUsageIn(BaseModel):
+    """What the browser heard OpenAI report over one spoken conversation.
+
+    Sent when the conversation ends, because OpenAI bills the session directly
+    and the tokens never reach this process — the ``response.done`` events the
+    browser receives are the only place these figures exist on our side. The
+    client is asked to add them up over the session and send the totals once.
+
+    Untrusted, and it does not need to be trusted: nothing is authorised on the
+    strength of it and it only ever adds to a cost figure. It is recorded as a
+    ``client`` report so that whoever reads the number knows what it is.
+    """
+
+    text_input_tokens: int = Field(default=0, ge=0)
+    cached_text_input_tokens: int = Field(default=0, ge=0)
+    audio_input_tokens: int = Field(default=0, ge=0)
+    cached_audio_input_tokens: int = Field(default=0, ge=0)
+    text_output_tokens: int = Field(default=0, ge=0)
+    audio_output_tokens: int = Field(default=0, ge=0)
+    #: How long it lasted, for the screen. Capped at a day to keep a
+    #: mistyped figure from making a chart unreadable.
+    seconds: int = Field(default=0, ge=0, le=86_400)
