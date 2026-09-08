@@ -30,6 +30,17 @@ class Settings(BaseSettings):
     # ── database ───────────────────────────────────────────────────────
     #: Azure Postgres requires TLS, so keep ``?sslmode=require`` on the URL.
     database_url: str = "postgresql+psycopg://postgres:postgres@localhost:5432/postgres"
+    #: Throw a pooled connection away once it is this old, rather than waiting
+    #: to find out it is dead.
+    #:
+    #: ``pool_pre_ping`` alone is not enough. It checks a connection when the
+    #: pool hands it out, which catches one that died while idle — but not one
+    #: the gateway drops in the seconds between that check and the query, and
+    #: that is exactly what a long-lived pool against Azure produces: a 500
+    #: reading "server closed the connection unexpectedly" on a request that
+    #: did nothing wrong. Azure's gateway cuts idle connections at around five
+    #: minutes, so this stays comfortably under it.
+    db_pool_recycle_seconds: int = 240
 
     # ── Entra ID (Microsoft) ───────────────────────────────────────────
     azure_tenant_id: str = ""
@@ -139,6 +150,28 @@ class Settings(BaseSettings):
     @property
     def claude_configured(self) -> bool:
         return bool(self.anthropic_api_key)
+
+    # ── OpenAI (the assistant) ─────────────────────────────────────────
+    #: The assistant's chat agent runs on the OpenAI API; Claude above is used
+    #: only for reading supplier quotes. Create the key at platform.openai.com.
+    #: Everything else about the assistant — model, effort, who may use it —
+    #: is set by a super admin at runtime, not here.
+    openai_api_key: str = ""
+    #: Left empty the SDK talks to api.openai.com. Set for a proxy or a
+    #: compatible gateway; not needed for direct use.
+    openai_base_url: str = ""
+    #: One model call, including streaming. Tool calls have their own budget.
+    openai_timeout_seconds: float = 120.0
+    #: A single tool call — one request to one of this app's own routes.
+    #: Generous because SharePoint, Zoho and Graph are behind some of them.
+    assistant_tool_timeout_seconds: float = 60.0
+    #: A tool result longer than this is cut before the model sees it, so a
+    #: full quote list cannot fill the context window in one call.
+    assistant_tool_result_max_chars: int = 12_000
+
+    @property
+    def openai_configured(self) -> bool:
+        return bool(self.openai_api_key)
 
     # ── careers (the public application links) ─────────────────────────
     #: The origin this API is reached at from outside, used to build the share

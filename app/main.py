@@ -13,6 +13,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.access.router import router as access_router
 from app.analytics.router import router as analytics_router
 from app.assignment.router import router as assignment_router
+from app.assistant.agent import Assistant
+from app.assistant.cache import ActorCache, ConfigCache
+from app.assistant.executor import ToolExecutor
+from app.assistant.llm import OpenAIChat
+from app.assistant.router import admin_router as assistant_admin_router
+from app.assistant.router import router as assistant_router
 from app.auth.oidc import EntraOIDC
 from app.auth.router import router as auth_router
 from app.comparison.extraction import QuoteExtractor
@@ -22,6 +28,8 @@ from app.core.db import dispose_engine, get_session_factory, init_engine
 from app.dashboards.router import router as dashboards_router
 from app.directory.graph import GraphDirectory
 from app.directory.router import router as directory_router
+from app.finance.cache import PnlCache
+from app.finance.router import router as finance_router
 from app.forms.router import router as templates_router
 from app.hr.public import router as careers_router
 from app.hr.router import router as hr_router
@@ -83,11 +91,39 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.zoho = ZohoBooks(settings, http, get_session_factory())
     # The quotes list is the same for everyone, so one cache serves all callers.
     app.state.quote_cache = QuoteCache()
+    # The ledger sweep behind a profit and loss is the most expensive thing this
+    # app asks of Zoho, and the figures are identical for every viewer — so one
+    # cache serves everyone who is allowed to see them. See app/finance/cache.py.
+    app.state.pnl_cache = PnlCache()
     # Win rates over the estimate history. One sweep serves every draft, and
     # it is a read of Zoho only — nothing is written there.
     app.state.win_rates = WinRates()
     # Approvers are told a quote is waiting, from the requester's own mailbox.
     app.state.quote_mailer = QuoteMailer(settings, http)
+    # The assistant. It reaches every module by calling this very app's routes
+    # in-process, carrying the caller's own session cookie — so each route's
+    # existing guard is the assistant's permission model too, and there is no
+    # second copy of it to keep in step. See app/assistant/executor.py.
+    #
+    # Holds no connection at boot: an unset OpenAI key fails at the first turn
+    # with a message a super admin can act on, rather than stopping the app for
+    # everyone who never opens the chat.
+    # Both stand in front of a database a third of a second away, and both
+    # are dropped by the admin routes that change what they hold. See
+    # app/assistant/cache.py for why the permission one may be stale.
+    app.state.assistant_config = ConfigCache()
+    app.state.assistant_actors = ActorCache()
+    app.state.assistant = Assistant(
+        OpenAIChat(settings),
+        ToolExecutor(
+            app,
+            api_prefix=settings.api_prefix,
+            cookie_name=settings.session_cookie_name,
+            max_chars=settings.assistant_tool_result_max_chars,
+            timeout=settings.assistant_tool_timeout_seconds,
+        ),
+        get_session_factory(),
+    )
     logger.info("started environment=%s", settings.environment)
 
     try:
@@ -129,6 +165,9 @@ def create_app() -> FastAPI:
     app.include_router(quoting_router, prefix=settings.api_prefix)
     app.include_router(templates_router, prefix=settings.api_prefix)
     app.include_router(hr_router, prefix=settings.api_prefix)
+    app.include_router(finance_router, prefix=settings.api_prefix)
+    app.include_router(assistant_router, prefix=settings.api_prefix)
+    app.include_router(assistant_admin_router, prefix=settings.api_prefix)
 
     # Mounted at the root, NOT under the API prefix, and holding no
     # authentication dependency of any kind. That separation is the whole

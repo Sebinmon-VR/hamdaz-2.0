@@ -33,8 +33,14 @@ def init_engine(settings: Settings | None = None) -> AsyncEngine:
     _engine = create_async_engine(
         settings.database_url,
         echo=False,
-        pool_pre_ping=True,  # Azure reaps idle connections; without this the first
-        # query after an idle period fails instead of reconnecting.
+        # Two defences, because they cover different failures. pre_ping tests a
+        # connection as the pool hands it out, so one that died while idle is
+        # replaced rather than used. recycle throws a connection away once it is
+        # old enough that Azure's gateway might cut it at any moment — which is
+        # the case pre_ping cannot catch, because the cut lands between the
+        # check and the query.
+        pool_pre_ping=True,
+        pool_recycle=settings.db_pool_recycle_seconds,
         pool_size=5,
         max_overflow=10,
     )

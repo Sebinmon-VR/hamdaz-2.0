@@ -151,6 +151,28 @@
   .banner { margin:12px 14px 0; padding:10px 12px; border-radius:7px; font-size:12.5px;
             border:1px solid var(--bad);
             background:color-mix(in srgb, var(--bad) 10%, transparent); }
+
+  /* -- assistant chat ------------------------------------------------- */
+  .chat { display:flex; flex-direction:column; gap:10px; padding:12px 14px; }
+  .chatbar { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .chatlog { display:flex; flex-direction:column; gap:8px; }
+  .msg { max-width:88%; padding:8px 11px; border-radius:9px; font-size:12.5px;
+         white-space:pre-wrap; overflow-wrap:anywhere; border:1px solid var(--line); }
+  .msg.user { align-self:flex-end; background:var(--sunk); }
+  .msg.assistant { align-self:flex-start; background:var(--panel); }
+  .msg.note { align-self:center; background:transparent; border:0; color:var(--muted);
+              font-style:italic; font-size:11.5px; }
+  .msg.bad { align-self:flex-start; border-color:var(--bad); color:var(--bad); }
+  .tool { align-self:flex-start; font:11px var(--mono); color:var(--muted);
+          border-left:2px solid var(--line); padding:2px 0 2px 8px; max-width:88%;
+          overflow-wrap:anywhere; }
+  .tool.good { border-left-color:var(--ok); }
+  .tool.bad { border-left-color:var(--bad); color:var(--bad); }
+  .askbox { align-self:stretch; border:1px solid var(--warn); border-radius:8px;
+            padding:10px 12px; background:color-mix(in srgb, var(--warn) 12%, transparent); }
+  .askbox h4 { margin:0 0 6px; font-size:12px; }
+  .askbox pre { padding:6px 0 8px; font-size:11px; }
+  .askbox .warn { color:var(--warn); font-size:11.5px; margin:0 0 8px; }
 </style>
 </head>
 <body>
@@ -928,6 +950,122 @@ const ROUTES = [
          "estimates but not invoices, so only the ids and totals the quote itself " +
          "carries are available. Every branch costs upstream calls — ask for " +
          "what a screen actually shows." },
+  { g:"finance", m:"GET", p:"/api/v1/finance/profit-and-loss", t:"Profit and loss",
+    auth:"finance",
+    query:[ {n:"period", l:"this_month / last_month / this_quarter / last_quarter / this_year / last_year / last_12_months"},
+            {n:"start", l:"From (YYYY-MM-DD) - with end, overrides period"},
+            {n:"end", l:"To (YYYY-MM-DD)"},
+            {n:"refresh", l:"Re-read Zoho instead of the 5min cache", type:"check"} ],
+    rows:(d) => d.sections.flatMap((s) => s.accounts.map((a) => ({...a, section:s.label}))),
+    cols:[ {k:"section", l:"Section"},
+           {k:(r) => r.code || "\u2014", l:"Code", mono:true},
+           {k:"name", l:"Account"},
+           {k:(r) => r.amount.toLocaleString(), l:"Amount"},
+           {k:"postings", l:"Postings"},
+           {k:(r) => r.sources.join(", "), l:"From"} ],
+    note:"Computed from the ledger, not from Zoho own report - invoices, credit " +
+         "notes, bills, vendor credits, expenses and published manual journals, " +
+         "accrual basis, drafts and voids excluded. The table is the account " +
+         "detail; the subtotals (gross profit, operating profit, net profit, " +
+         "margins) are in the JSON. READ integrity FIRST: complete:false means a " +
+         "source was refused and the figures are a floor, not the answer. " +
+         "unallocated is the tax, shipping and rounding that sits outside the " +
+         "P&L - it is expected to be non-zero and it explains any gap against " +
+         "Zoho. Needs a token scoped well beyond estimates: see the diagnostics " +
+         "route below." },
+  { g:"finance", m:"GET", p:"/api/v1/finance/profit-and-loss/comparison",
+    t:"This period against the last", auth:"finance",
+    query:[ {n:"period", l:"Preset - blank for this_month"},
+            {n:"start", l:"From (YYYY-MM-DD)"}, {n:"end", l:"To (YYYY-MM-DD)"},
+            {n:"refresh", l:"Re-read Zoho", type:"check"} ],
+    rows:(d) => d.movements,
+    cols:[ {k:"label", l:"Figure"},
+           {k:(r) => r.current.toLocaleString(), l:"This period"},
+           {k:(r) => r.previous.toLocaleString(), l:"Previous"},
+           {k:(r) => r.change.toLocaleString(), l:"Change"},
+           {k:(r) => r.change_percent === null ? "\u2014" : r.change_percent + "%", l:"Change %"} ],
+    note:"The comparison period is the same NUMBER OF DAYS immediately before, " +
+         "not the previous calendar month - otherwise a 31-day month is compared " +
+         "against a 28-day one and the difference reads as growth. Change % is " +
+         "null, shown as a dash, when the previous figure was zero: growth from " +
+         "nothing has no percentage." },
+  { g:"finance", m:"GET", p:"/api/v1/finance/profit-and-loss/trend", t:"Monthly trend",
+    auth:"finance",
+    query:[ {n:"period", l:"Preset - blank for last_12_months"},
+            {n:"start", l:"From (YYYY-MM-DD)"}, {n:"end", l:"To (YYYY-MM-DD)"},
+            {n:"refresh", l:"Re-read Zoho", type:"check"} ],
+    rows:(d) => d.points,
+    cols:[ {k:"month", l:"Month", mono:true},
+           {k:(r) => r.income.toLocaleString(), l:"Income"},
+           {k:(r) => r.cost_of_sales.toLocaleString(), l:"Cost of sales"},
+           {k:(r) => r.operating_expenses.toLocaleString(), l:"Opex"},
+           {k:(r) => r.net_profit.toLocaleString(), l:"Net profit"} ],
+    note:"Built from ONE sweep and bucketed by posting date, not twelve monthly " +
+         "sweeps - which would multiply the upstream calls by twelve and hit " +
+         "Zoho 100-per-minute limit. Months with no postings are absent " +
+         "rather than zero." },
+  { g:"finance", m:"GET", p:"/api/v1/finance/accounts/{account_id}/postings",
+    t:"Documents behind one figure", auth:"finance",
+    params:[ {n:"account_id", l:"Zoho account id - the account_id column above"} ],
+    query:[ {n:"period", l:"Preset - must match the statement you are checking"},
+            {n:"start", l:"From (YYYY-MM-DD)"}, {n:"end", l:"To (YYYY-MM-DD)"} ],
+    rows:(d) => d.postings,
+    cols:[ {k:"date", l:"Date", mono:true},
+           {k:"source", l:"From"},
+           {k:(r) => r.source_number || "\u2014", l:"Number", mono:true},
+           {k:(r) => (r.party || "\u2014").slice(0,28), l:"Party"},
+           {k:(r) => r.debit.toLocaleString(), l:"Debit"},
+           {k:(r) => r.credit.toLocaleString(), l:"Credit"},
+           {k:(r) => r.amount.toLocaleString(), l:"Effect"} ],
+    note:"What makes a computed P&L defensible rather than merely plausible: the " +
+         "actual documents behind a number. Served from the same cached sweep as " +
+         "the statement, so it costs nothing upstream and cannot disagree with " +
+         "the total it came from. Effect is the amount as it reads in its " +
+         "section - negative for a credit note or a vendor credit, which reduce " +
+         "income and cost respectively. A 404 means that account had no " +
+         "postings in this period." },
+  { g:"finance", m:"GET", p:"/api/v1/finance/diagnostics", t:"What this Zoho token can read",
+    auth:"finance",
+    rows:(d) => d.endpoints,
+    cols:[ {k:"endpoint", l:"Endpoint", mono:true},
+           {k:(r) => r.ok ? "yes" : "NO", l:"Readable"},
+           {k:"scope", l:"Scope needed", mono:true},
+           {k:(r) => r.verified_in_catalogue ? "yes" : "inferred", l:"Path verified"},
+           {k:(r) => r.sample_rows == null ? "\u2014" : r.sample_rows, l:"Sample"},
+           {k:(r) => (r.reason || "\u2014").slice(0,44), l:"Why not"} ],
+    note:"OPEN THIS FIRST when a figure looks wrong. One live probe per endpoint, " +
+         "throttled - not something to poll. It answers the two things most " +
+         "likely to be broken and invisible from outside: an OAuth scope nobody " +
+         "granted, and a catalogue response key that was inferred from Zoho " +
+         "naming pattern rather than verified against the docs. missing_scopes in " +
+         "the JSON is the exact list to hand whoever regenerates the refresh " +
+         "token. A scope cannot be added to an existing token - it means issuing " +
+         "a new one." },
+  { g:"finance", m:"GET", p:"/api/v1/finance/zoho", t:"Every readable Zoho endpoint",
+    auth:"finance",
+    rows:(d) => d.endpoints,
+    cols:[ {k:"key", l:"Key", mono:true},
+           {k:"name", l:"What it holds"},
+           {k:"path", l:"Zoho path", mono:true},
+           {k:"scope", l:"Scope", mono:true},
+           {k:(r) => r.ledger ? "yes" : "\u2014", l:"In the P&L"},
+           {k:(r) => r.verified ? "yes" : "inferred", l:"Verified"} ],
+    note:"The catalogue itself. Free to call - it describes the code and does not " +
+         "touch Zoho. In the P&L marks the six sources the statement is " +
+         "computed from; the rest are readable through the passthrough below." },
+  { g:"finance", m:"GET", p:"/api/v1/finance/zoho/{endpoint_key}", t:"Read one Zoho endpoint raw",
+    auth:"finance",
+    params:[ {n:"endpoint_key", l:"A key from the route above, e.g. bills, contacts, journals"} ],
+    query:[ {n:"limit", l:"Rows - defaults to 200"},
+            {n:"date_start", l:"From (YYYY-MM-DD), where the endpoint honours it"},
+            {n:"date_end", l:"To (YYYY-MM-DD)"} ],
+    note:"The escape hatch: any catalogued endpoint, rows exactly as Zoho sent " +
+         "them. The one place in the module that does not translate Zoho " +
+         "vocabulary, because the point is to see what Zoho actually holds. No " +
+         "table here - the shape differs per endpoint, so read the JSON. " +
+         "truncated:true means there were more rows than limit. Read-only, like " +
+         "everything else in this group." },
+
   { g:"leave", m:"GET", p:"/api/v1/leave/summary/me", t:"My leave at a glance",
     auth:"session" },
   { g:"leave", m:"GET", p:"/api/v1/leave/requests/me", t:"My requests", auth:"session",
@@ -1211,7 +1349,313 @@ const ROUTES = [
     note:"The one place this app writes to SharePoint, and it is the real " +
          "Proposals list the team works in. SharePoint's Modified-By will " +
          "say the app; who really did it lives in our logs." },
+
+  /* -- the assistant ---------------------------------------------------- */
+  { g:"assistant", m:"POST", p:"/api/v1/assistant/chat", t:"Chat with the assistant",
+    auth:"session", chat:true,
+    note:"Not a real endpoint - a panel over /assistant/conversations. Tool calls " +
+         "run as YOU, through this app's own routes, so anything you cannot do the " +
+         "assistant cannot do either. Writes wait for you to confirm." },
+  { g:"assistant", m:"GET", p:"/api/v1/assistant/status", t:"May I use it, and for what",
+    auth:"session",
+    note:"What a frontend asks on load: is it on, am I allowed, and which tools " +
+         "would I get. admitted=false with an empty module list is the normal " +
+         "answer before a super admin releases it." },
+  { g:"assistant", m:"GET", p:"/api/v1/assistant/voices", t:"Voices to choose from",
+    auth:"session", rows:(d) => d.voices,
+    cols:[ {k:"key", l:"Voice", mono:true} ],
+    tags:(r) => [ r.active && "in use" ],
+    note:"Only gpt-4o-mini-tts acts on the steering wording; the tts-1 pair " +
+         "ignore it. How a voice sounds is not something a description can tell " +
+         "you — sample them." },
+  { g:"assistant", m:"POST", p:"/api/v1/assistant/speech", t:"Read text aloud",
+    auth:"session",
+    body:[ {n:"text", l:"What to say", type:"area",
+            def:"You have three proposal tasks open, and the Kuwait bid closes on Thursday."},
+           {n:"voice", l:"Override the configured voice (super admin only)"} ],
+    note:"Streams MP3 audio, so the console shows bytes rather than JSON. The " +
+         "frontend plays it a sentence at a time. Refused with 409 while the " +
+         "voice is switched off." },
+  { g:"assistant", m:"GET", p:"/api/v1/assistant/conversations", t:"My chats",
+    auth:"session", rows:(d) => d,
+    cols:[ {k:"id", l:"Id", mono:true}, {k:"title", l:"Title"},
+           {k:"last_message_at", l:"Last message"} ] },
+  { g:"assistant", m:"GET", p:"/api/v1/assistant/conversations/{conversation_id}",
+    t:"One chat with its messages", auth:"session",
+    params:[ {n:"conversation_id", l:"Conversation id"} ] },
+  { g:"assistant", m:"DELETE", p:"/api/v1/assistant/conversations/{conversation_id}",
+    t:"Delete a chat", auth:"session",
+    params:[ {n:"conversation_id", l:"Conversation id"} ] },
+
+  { g:"assistant admin", m:"GET", p:"/api/v1/assistant/admin/settings",
+    t:"Assistant settings", auth:"super_admin",
+    note:"Super admin only - narrower than the admin role used elsewhere. A CEO " +
+         "or manager gets 403 on every route in this group." },
+  { g:"assistant admin", m:"PATCH", p:"/api/v1/assistant/admin/settings",
+    t:"Change the settings", auth:"super_admin",
+    body:[ {n:"enabled", l:"Master switch", type:"check"},
+           {n:"model_key", l:"Model (must be enabled)"},
+           {n:"reasoning_effort", l:"Effort: none, minimal, low, medium, high, xhigh, max"},
+           {n:"audience_mode", l:"everyone | allow_list"},
+           {n:"confirm_writes_default", l:"Ask before writes", type:"check"},
+           {n:"max_tool_rounds", l:"Tool rounds per turn"},
+           {n:"turns_per_user_per_hour", l:"Turns per person per hour"},
+           {n:"daily_cost_cap_user_usd", l:"Daily cap per person (USD)"},
+           {n:"daily_cost_cap_total_usd", l:"Daily cap for everyone (USD)"},
+           {n:"voice_enabled", l:"Voice", type:"check"},
+           {n:"voice_model", l:"Speech model: gpt-4o-mini-tts | tts-1 | tts-1-hd"},
+           {n:"voice", l:"Voice: alloy ash ballad coral echo sage shimmer verse marin cedar"},
+           {n:"voice_instructions", l:"How it should sound (blank = shipped wording)",
+            type:"area"},
+           {n:"extra_instructions", l:"House rules added to the prompt", type:"area"} ],
+    note:"Only the fields you fill in change. Checkboxes always send, so clear the " +
+         "ones you do not mean to set." },
+  { g:"assistant admin", m:"GET", p:"/api/v1/assistant/admin/models", t:"Models",
+    auth:"super_admin", rows:(d) => d,
+    cols:[ {k:"key", l:"Model", mono:true}, {k:"name", l:"Name"},
+           {k:"input_price", l:"In $/M"}, {k:"cached_input_price", l:"Cached $/M"},
+           {k:"output_price", l:"Out $/M"} ],
+    tags:(r) => [ r.active && "active", !r.enabled && "disabled" ],
+    note:"Prices drive every cost figure the panel shows. Correct them here when " +
+         "OpenAI changes them." },
+  { g:"assistant admin", m:"PATCH", p:"/api/v1/assistant/admin/models/{key}",
+    t:"Enable, disable or reprice a model", auth:"super_admin",
+    params:[ {n:"key", l:"Model key"} ],
+    body:[ {n:"enabled", l:"Enabled", type:"check"},
+           {n:"input_price", l:"Input $/M"}, {n:"cached_input_price", l:"Cached $/M"},
+           {n:"output_price", l:"Output $/M"} ],
+    note:"The active model cannot be disabled - choose another in settings first." },
+  { g:"assistant admin", m:"GET", p:"/api/v1/assistant/admin/policies",
+    t:"What it may read and write", auth:"super_admin", rows:(d) => d,
+    cols:[ {k:"module_key", l:"Module", mono:true}, {k:"gate", l:"Shown to"},
+           {k:(r) => r.read_enabled ? "yes" : "no", l:"Reads"},
+           {k:(r) => r.write_enabled ? "yes" : "no", l:"Writes"},
+           {k:(r) => r.tools.length, l:"Tools"},
+           {k:(r) => (r.allowed_roles || []).join(", ") || "anyone", l:"Roles"} ],
+    note:"Every module with its tools. effective_enabled and effective_confirm are " +
+         "what a turn actually sees once the module and the global default are " +
+         "folded in - the columns that matter." },
+  { g:"assistant admin", m:"PATCH", p:"/api/v1/assistant/admin/policies/modules/{module_key}",
+    t:"Change a module's permissions", auth:"super_admin",
+    params:[ {n:"module_key", l:"Module key, e.g. leave"} ],
+    body:[ {n:"read_enabled", l:"Allow reads", type:"check"},
+           {n:"write_enabled", l:"Allow writes", type:"check"},
+           {n:"confirm_writes", l:"Ask before writes", type:"check"},
+           {n:"allowed_roles", l:"Limit to roles", type:"roles", multi:true} ],
+    note:"Writes ship off for every module. Turning them on here is what lets the " +
+         "assistant act rather than only answer." },
+  { g:"assistant admin", m:"PATCH", p:"/api/v1/assistant/admin/policies/tools/{tool_key}",
+    t:"Change one tool", auth:"super_admin",
+    params:[ {n:"tool_key", l:"Tool key, e.g. leave.request"} ],
+    body:[ {n:"enabled", l:"Enabled", type:"check"},
+           {n:"confirm_override", l:"Ask before this one", type:"check"},
+           {n:"allowed_roles", l:"Limit to roles", type:"roles", multi:true} ] },
+  { g:"assistant admin", m:"GET", p:"/api/v1/assistant/admin/rules", t:"Access rules",
+    auth:"super_admin", rows:(d) => d,
+    cols:[ {k:"effect", l:"Effect"}, {k:"subject_type", l:"Kind"},
+           {k:"subject_label", l:"Who"}, {k:"note", l:"Note"} ],
+    tags:(r) => [ !r.enabled && "off" ] },
+  { g:"assistant admin", m:"POST", p:"/api/v1/assistant/admin/rules",
+    t:"Release it to somebody, or withhold it", auth:"super_admin",
+    body:[ {n:"subject_type", l:"user | team | role"},
+           {n:"subject", l:"Email or id, team handle, or role key", from:"any"},
+           {n:"effect", l:"allow | block"},
+           {n:"note", l:"Why", type:"area"} ],
+    note:"In allow_list mode nobody gets in without a matching allow rule - that is " +
+         "how you release to one team first. A block always beats an allow." },
+  { g:"assistant admin", m:"DELETE", p:"/api/v1/assistant/admin/rules/{rule_id}",
+    t:"Delete a rule", auth:"super_admin",
+    params:[ {n:"rule_id", l:"Rule id"} ] },
+  { g:"assistant admin", m:"GET", p:"/api/v1/assistant/admin/runs", t:"Runs and logs",
+    auth:"super_admin", rows:(d) => d.runs,
+    query:[ {n:"user_id", l:"One person's runs", from:"any"},
+            {n:"status", l:"running | completed | failed | blocked | cancelled"},
+            {n:"since", l:"From (YYYY-MM-DD)"}, {n:"until", l:"To (YYYY-MM-DD)"},
+            {n:"limit", l:"Limit", def:"50"} ],
+    cols:[ {k:"started_at", l:"When"}, {k:"user_email", l:"Who"},
+           {k:"status", l:"Status"}, {k:"user_text", l:"Asked"},
+           {k:"tool_calls", l:"Tools"}, {k:"cost_usd", l:"Cost $"} ],
+    pick:(r) => setUser({ id:r.user_id, name:r.user_name, email:r.user_email }) },
+  { g:"assistant admin", m:"GET", p:"/api/v1/assistant/admin/runs/live",
+    t:"Turns happening now", auth:"super_admin", rows:(d) => d,
+    cols:[ {k:"started_at", l:"Started"}, {k:"user_email", l:"Who"},
+           {k:"status", l:"Status"}, {k:"user_text", l:"Asked"} ],
+    note:"Running, or parked waiting for somebody to confirm an action." },
+  { g:"assistant admin", m:"GET", p:"/api/v1/assistant/admin/runs/{run_id}",
+    t:"One turn, with its full log", auth:"super_admin",
+    params:[ {n:"run_id", l:"Run id"} ],
+    note:"Every event in order: the message, each tool call and result, each " +
+         "confirmation, every refusal, the tokens and any error." },
+  { g:"assistant admin", m:"POST", p:"/api/v1/assistant/admin/runs/{run_id}/cancel",
+    t:"Stop a turn", auth:"super_admin",
+    params:[ {n:"run_id", l:"Run id"} ] },
+  { g:"assistant admin", m:"GET", p:"/api/v1/assistant/admin/analytics",
+    t:"Usage and cost", auth:"super_admin",
+    query:[ {n:"since", l:"From (YYYY-MM-DD)"}, {n:"until", l:"To (YYYY-MM-DD)"} ],
+    note:"Totals plus breakdowns by day, person, team, model and tool. Somebody on " +
+         "two teams counts for both, so team rows add to more than the total." },
+  { g:"assistant admin", m:"GET", p:"/api/v1/assistant/admin/catalogue",
+    t:"Every tool it knows", auth:"super_admin",
+    note:"The code catalogue before any policy is applied." },
 ];
+
+/* ── zoho data: one browsable route per module in app/zoho/catalogue.py ──
+   All of these hit GET /api/v1/finance/zoho/{key}, which returns Zoho rows
+   untranslated. Generated from a table because the specs differ only in title
+   and columns; writing thirty near-identical literals is how they drift.
+
+   Columns use field names taken from real rows of this organisation, not from
+   the documentation - Zoho returns forty-odd fields per record and only a few
+   are worth a column. Modules with no cols render as JSON, which is honest:
+   they were empty here, so there were no field names to read.
+
+   Whether a module answers depends on the token AND on the Books role of the
+   user who authorised it. Do not assume - run finance -> "What this Zoho token
+   can read", which reports both.                                          */
+const Z = (k, t, cols, note) => ({
+  g:"zoho data", m:"GET", p:`/api/v1/finance/zoho/${k}`, t:t, auth:"finance",
+  query:[ {n:"limit", l:"Rows - defaults to 200"},
+          {n:"date_start", l:"From (YYYY-MM-DD), where the module honours it"},
+          {n:"date_end", l:"To (YYYY-MM-DD)"} ],
+  rows:(d) => d.rows,
+  cols:cols,
+  note:(note ? note + " " : "") +
+       "Rows exactly as Zoho sent them - this is the untranslated view. " +
+       "truncated:true means there were more rows than limit. Read-only." });
+
+const money = (f) => (r) => (r[f] == null ? "\u2014" : Number(r[f]).toLocaleString());
+const txt = (f, n) => (r) => (r[f] == null || r[f] === "" ? "\u2014" : String(r[f]).slice(0, n || 30));
+
+ROUTES.push(
+  /* purchasing */
+  Z("purchaseorders", "Purchase orders",
+    [ {k:"purchaseorder_number", l:"PO", mono:true}, {k:"date", l:"Date", mono:true},
+      {k:txt("vendor_name", 26), l:"Vendor"}, {k:"status", l:"Status"},
+      {k:txt("delivery_date"), l:"Delivery"}, {k:money("total"), l:"Total"},
+      {k:txt("currency_code"), l:"Ccy"} ],
+    "Readable on the current token."),
+  Z("bills", "Bills",
+    [ {k:"bill_number", l:"Bill", mono:true}, {k:"date", l:"Date", mono:true},
+      {k:txt("vendor_name", 26), l:"Vendor"}, {k:"status", l:"Status"},
+      {k:txt("due_date"), l:"Due"}, {k:money("total"), l:"Total"},
+      {k:money("balance"), l:"Balance"} ],
+    "Readable on the current token. Also a P&L ledger source."),
+  Z("vendorcredits", "Vendor credits",
+    [ {k:txt("vendor_credit_number"), l:"Credit", mono:true}, {k:"date", l:"Date", mono:true},
+      {k:txt("vendor_name", 26), l:"Vendor"}, {k:"status", l:"Status"},
+      {k:money("total"), l:"Total"} ],
+    "A P&L ledger source - it REDUCES cost."),
+  Z("vendorpayments", "Vendor payments",
+    [ {k:txt("payment_number"), l:"Payment", mono:true}, {k:"date", l:"Date", mono:true},
+      {k:txt("vendor_name", 26), l:"Vendor"}, {k:txt("payment_mode"), l:"Mode"},
+      {k:money("amount"), l:"Amount"} ]),
+  Z("expenses", "Expenses",
+    [ {k:"date", l:"Date", mono:true}, {k:txt("account_name", 24), l:"Account"},
+      {k:txt("vendor_name", 22), l:"Vendor"}, {k:"status", l:"Status"},
+      {k:money("total"), l:"Total"} ],
+    "A P&L ledger source."),
+  Z("recurringbills", "Recurring bills", null),
+  Z("recurringexpenses", "Recurring expenses", null),
+
+  /* sales */
+  Z("estimates", "Quotes (estimates)",
+    [ {k:"estimate_number", l:"Quote", mono:true}, {k:"date", l:"Date", mono:true},
+      {k:txt("customer_name", 26), l:"Customer"}, {k:"status", l:"Status"},
+      {k:money("total"), l:"Total"} ],
+    "Readable on the current token. The quotes group renders these properly."),
+  Z("salesorders", "Sales orders",
+    [ {k:"salesorder_number", l:"SO", mono:true}, {k:"date", l:"Date", mono:true},
+      {k:txt("customer_name", 26), l:"Customer"}, {k:"status", l:"Status"},
+      {k:txt("invoiced_status"), l:"Invoiced"}, {k:money("total"), l:"Total"} ],
+    "Readable on the current token."),
+  Z("deliverychallans", "Delivery challans",
+    [ {k:"deliverychallan_number", l:"Challan", mono:true}, {k:"date", l:"Date", mono:true},
+      {k:txt("customer_name", 26), l:"Customer"}, {k:"status", l:"Status"},
+      {k:money("total"), l:"Total"} ],
+    "Readable on the current token."),
+  Z("invoices", "Invoices",
+    [ {k:"invoice_number", l:"Invoice", mono:true}, {k:"date", l:"Date", mono:true},
+      {k:txt("customer_name", 26), l:"Customer"}, {k:"status", l:"Status"},
+      {k:txt("due_date"), l:"Due"}, {k:money("total"), l:"Total"},
+      {k:money("balance"), l:"Balance"} ],
+    "The main P&L income source."),
+  Z("creditnotes", "Credit notes",
+    [ {k:txt("creditnote_number"), l:"Note", mono:true}, {k:"date", l:"Date", mono:true},
+      {k:txt("customer_name", 26), l:"Customer"}, {k:"status", l:"Status"},
+      {k:money("total"), l:"Total"} ],
+    "A P&L ledger source - it REDUCES income."),
+  Z("customerpayments", "Customer payments",
+    [ {k:txt("payment_number"), l:"Payment", mono:true}, {k:"date", l:"Date", mono:true},
+      {k:txt("customer_name", 26), l:"Customer"}, {k:txt("payment_mode"), l:"Mode"},
+      {k:money("amount"), l:"Amount"} ]),
+  Z("recurringinvoices", "Recurring invoices", null),
+  Z("retainerinvoices", "Retainer invoices", null),
+  Z("salesreceipts", "Sales receipts", null),
+
+  /* the ledger */
+  Z("chartofaccounts", "Chart of accounts",
+    [ {k:txt("account_code"), l:"Code", mono:true}, {k:"account_name", l:"Account"},
+      {k:"account_type", l:"Type"}, {k:(r) => r.is_active ? "yes" : "no", l:"Active"} ],
+    "The P&L cannot be built at all without this - it is what classifies every " +
+    "posting as income, cost or balance sheet."),
+  Z("journals", "Manual journals",
+    [ {k:txt("entry_number"), l:"Entry", mono:true},
+      {k:txt("journal_date"), l:"Date", mono:true},
+      {k:txt("reference_number"), l:"Reference"}, {k:"status", l:"Status"},
+      {k:money("total"), l:"Total"} ],
+    "MANUAL entries only. Zoho does not expose the postings it generates from " +
+    "invoices and bills, which is why the P&L is rebuilt from documents."),
+  Z("basecurrencyadjustment", "Base currency adjustments", null),
+  Z("fixedassets", "Fixed assets", null),
+  Z("openingbalances", "Opening balances", null),
+  Z("transactionlocking", "Transaction locking", null),
+
+  /* banking */
+  Z("bankaccounts", "Bank accounts",
+    [ {k:"account_name", l:"Account"}, {k:txt("account_type"), l:"Type"},
+      {k:txt("currency_code"), l:"Ccy"}, {k:money("balance"), l:"Balance"} ]),
+  Z("banktransactions", "Bank transactions", null),
+  Z("bankrules", "Bank rules", null),
+
+  /* master data */
+  Z("contacts", "Customers and vendors",
+    [ {k:"contact_name", l:"Name"}, {k:txt("company_name", 24), l:"Company"},
+      {k:txt("contact_type"), l:"Type"}, {k:txt("email", 26), l:"Email"},
+      {k:txt("phone"), l:"Phone"},
+      {k:money("outstanding_receivable_amount"), l:"Receivable"} ],
+    "Readable on the current token. Customers and vendors share this module."),
+  Z("items", "Items",
+    [ {k:txt("name", 44), l:"Item"}, {k:txt("sku"), l:"SKU", mono:true},
+      {k:money("rate"), l:"Sell"}, {k:money("purchase_rate"), l:"Buy"},
+      {k:txt("unit"), l:"Unit"}, {k:"status", l:"Status"} ],
+    "Readable on the current token."),
+  Z("pricebooks", "Price lists", null, "Readable on the current token, but empty here."),
+  Z("users", "Books users", null),
+  Z("projects", "Projects", null, "Readable on the current token, but empty here."),
+  Z("timeentries", "Time entries", null, "Readable on the current token, but empty here."),
+
+  /* settings */
+  Z("organizations", "Organisations",
+    [ {k:"name", l:"Organisation"}, {k:"organization_id", l:"Id", mono:true},
+      {k:txt("currency_code"), l:"Base ccy"}, {k:txt("plan_name"), l:"Plan"},
+      {k:(r) => r.is_user_super_admin ? "yes" : "NO", l:"Token user is admin"},
+      {k:(r) => r.is_user_accountant ? "yes" : "NO", l:"Token user is accountant"} ],
+    "Readable on the current token. The last two columns are the ones to look " +
+    "at when accounting data is refused: if BOTH say NO, the Books ROLE of the " +
+    "user who authorised the token is the restriction, and no amount of " +
+    "widening OAuth scopes will fix it."),
+  Z("currencies", "Currencies",
+    [ {k:"currency_code", l:"Code", mono:true}, {k:"currency_name", l:"Name"},
+      {k:(r) => r.is_base_currency ? "—" : Number(r.exchange_rate || 0).toLocaleString(), l:"Rate"},
+      {k:(r) => r.is_base_currency ? "yes" : "\u2014", l:"Base"} ],
+    "Readable on the current token."),
+  Z("taxes", "Taxes",
+    [ {k:"tax_name", l:"Tax"}, {k:money("tax_percentage"), l:"%"},
+      {k:txt("tax_type"), l:"Type"}, {k:txt("status"), l:"Status"} ],
+    "Readable on the current token."),
+  Z("locations", "Locations", null),
+  Z("reportingtags", "Reporting tags", null),
+);
 
 let roleKeys = [];
 let teamRoleKeys = [];
@@ -1440,7 +1884,11 @@ function renderView(i) {
   $("m" + i).className = "m " + r.m;
   $("p" + i).textContent = r.p;
   $("a" + i).textContent = { public:"no auth", session:"signed in", admin:"admin only",
-                             super_admin:"super admin only" }[r.auth] || "";
+                             super_admin:"super admin only",
+                             finance:"CEO, manager, accountant or super admin" }[r.auth] || "";
+
+  // The assistant streams and pauses for confirmation, so it gets its own view.
+  if (r.chat) { renderChat(i, body); return; }
 
   const host = el("div", "body");
   host.dataset.form = i;
@@ -1742,6 +2190,212 @@ function renderResult(i, r, res, data, text) {
   const card = el("div", "card");
   card.append(kvList(data));
   mount.append(card);
+}
+
+/* -- the assistant: a live chat panel ---------------------------------- */
+/* The only route in this console that is not one request. A turn streams
+   Server-Sent Events, and a write stops mid-turn to ask, so it needs its own
+   view rather than the generic form-and-result one. */
+const chats = [{}, {}];
+
+function chatLog(i) { return document.querySelector(`[data-chatlog="${i}"]`); }
+
+function chatAdd(i, node) {
+  const log = chatLog(i);
+  if (!log) return null;
+  log.append(node);
+  log.parentElement.scrollTop = log.parentElement.scrollHeight;
+  return node;
+}
+
+function chatSay(i, role, text) {
+  return chatAdd(i, el("div", "msg " + role, text));
+}
+
+async function chatStatus(i) {
+  const chip = document.querySelector(`[data-chatchip="${i}"]`);
+  if (!chip) return;
+  try {
+    const res = await fetch("/api/v1/assistant/status", { credentials: "include" });
+    if (!res.ok) {
+      chip.textContent = res.status === 401 ? "sign in first" : "status " + res.status;
+      chip.className = "chip off";
+      return;
+    }
+    const s = await res.json();
+    const tools = s.modules.reduce((n, m) => n + m.tools.length, 0);
+    chip.textContent = s.admitted ? `${s.model} · ${tools} tools` : (s.reason || s.code);
+    chip.className = "chip " + (s.admitted ? "on" : "off");
+    chats[i].ready = s.admitted;
+  } catch (e) {
+    chip.textContent = "server down";
+    chip.className = "chip off";
+  }
+}
+
+async function chatNew(i) {
+  const res = await fetch("/api/v1/assistant/conversations", {
+    method: "POST", credentials: "include",
+    headers: { "Content-Type": "application/json" }, body: "{}",
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok) {
+    chatSay(i, "bad", (data && data.detail) || `Could not start a chat (${res.status}).`);
+    return null;
+  }
+  chats[i].id = data.id;
+  const chip = document.querySelector(`[data-chatid="${i}"]`);
+  if (chip) chip.textContent = data.id.slice(0, 8);
+  chatLog(i).replaceChildren();
+  chatSay(i, "note", "New chat. Ask something.");
+  return data.id;
+}
+
+/* Read one event stream to the end, rendering as it arrives. */
+async function chatStream(i, res) {
+  if (!res.ok || !res.body) {
+    const data = await res.json().catch(() => null);
+    chatSay(i, "bad", (data && data.detail) || `The assistant refused (${res.status}).`);
+    return;
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let bubble = null;
+
+  const handle = (name, data) => {
+    if (name === "text") {
+      if (!bubble) bubble = chatSay(i, "assistant", "");
+      bubble.textContent += data.delta;
+      chatLog(i).parentElement.scrollTop = chatLog(i).parentElement.scrollHeight;
+    } else if (name === "tool_call") {
+      chatAdd(i, el("div", "tool", `→ ${data.tool_key} ${JSON.stringify(data.arguments)}`));
+    } else if (name === "tool_result") {
+      const how = data.ok ? "good" : "bad";
+      chatAdd(i, el("div", "tool " + how,
+        `← ${data.tool_key} ${data.status} in ${data.ms}ms — ${data.summary || ""}`));
+    } else if (name === "confirm") {
+      chatAsk(i, data);
+    } else if (name === "error") {
+      chatSay(i, "bad", data.message);
+    } else if (name === "done") {
+      if (data.cost_usd) {
+        chatAdd(i, el("div", "msg note",
+          `${data.status} · ${data.tool_calls} tool calls · ` +
+          `${data.input_tokens}+${data.output_tokens} tokens · $${(+data.cost_usd).toFixed(5)}`));
+      }
+      bubble = null;
+    }
+  };
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let cut;
+    while ((cut = buffer.indexOf("\n\n")) >= 0) {
+      const block = buffer.slice(0, cut);
+      buffer = buffer.slice(cut + 2);
+      let name = null, data = {};
+      for (const line of block.split("\n")) {
+        if (line.startsWith("event: ")) name = line.slice(7);
+        else if (line.startsWith("data: ")) { try { data = JSON.parse(line.slice(6)); } catch (e) {} }
+      }
+      if (name) handle(name, data);
+    }
+  }
+}
+
+/* The confirmation card: what would happen, and the two answers. */
+function chatAsk(i, ask) {
+  const box = el("div", "askbox");
+  box.append(el("h4", null, "This needs your confirmation"));
+  for (const action of ask.actions) {
+    box.append(el("div", null, action.label + "  (" + action.tool_key + ")"));
+    if (action.warning) box.append(el("p", "warn", action.warning));
+    box.append(el("pre", null, JSON.stringify(action.arguments, null, 2)));
+  }
+  const row = el("div", "row");
+  const yes = el("button", "primary", "Do it");
+  const no = el("button", null, "No");
+  const answer = async (approved) => {
+    yes.disabled = no.disabled = true;
+    chatSay(i, "note", approved ? "You approved it." : "You declined.");
+    const res = await fetch(
+      `/api/v1/assistant/conversations/${chats[i].id}/confirm`,
+      { method: "POST", credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ run_id: ask.run_id, approved }) });
+    await chatStream(i, res);
+  };
+  yes.onclick = () => answer(true);
+  no.onclick = () => answer(false);
+  row.append(yes, no);
+  box.append(row);
+  chatAdd(i, box);
+}
+
+async function chatSend(i) {
+  const input = document.querySelector(`[data-chatinput="${i}"]`);
+  const text = (input.value || "").trim();
+  if (!text || chats[i].busy) return;
+  if (!chats[i].id && !(await chatNew(i))) return;
+
+  chats[i].busy = true;
+  input.value = "";
+  chatSay(i, "user", text);
+  try {
+    const res = await fetch(`/api/v1/assistant/conversations/${chats[i].id}/messages`, {
+      method: "POST", credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    await chatStream(i, res);
+  } catch (err) {
+    chatSay(i, "bad", "The connection dropped: " + err.message);
+  } finally {
+    chats[i].busy = false;
+    input.focus();
+  }
+}
+
+function renderChat(i, body) {
+  const host = el("div", "chat");
+
+  const bar = el("div", "chatbar");
+  const chip = el("span", "chip", "checking…");
+  chip.dataset.chatchip = i;
+  const idChip = el("span", "chip", chats[i].id ? chats[i].id.slice(0, 8) : "no chat yet");
+  idChip.dataset.chatid = i;
+  const fresh = el("button", null, "New chat");
+  fresh.onclick = () => chatNew(i);
+  bar.append(chip, idChip, fresh);
+
+  const scroll = el("div", "scroll");
+  scroll.style.maxHeight = "46vh";
+  const log = el("div", "chatlog");
+  log.dataset.chatlog = i;
+  scroll.append(log);
+
+  const input = el("textarea");
+  input.dataset.chatinput = i;
+  input.placeholder = "Ask about your leave, teams, quotes, meetings…  (Enter sends)";
+  input.onkeydown = (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); chatSend(i); }
+  };
+  const go = el("button", "primary", "Send");
+  go.onclick = () => chatSend(i);
+  const row = el("div", "row");
+  row.append(go);
+
+  host.append(bar, scroll, input, row);
+  if (views[i].route.note) host.append(el("p", "hint", views[i].route.note));
+  body.replaceChildren(host);
+
+  chatSay(i, "note", chats[i].id
+    ? "Carrying on the chat above."
+    : "Type a message to start. A new chat opens on the first message.");
+  chatStatus(i);
 }
 
 /* ── context pane ────────────────────────────────────────────────────── */

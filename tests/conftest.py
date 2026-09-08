@@ -85,7 +85,10 @@ async def db(engine) -> AsyncIterator[AsyncSession]:
                 # that leaked an opening would make the next one's seed fail on
                 # a template it could not replace.
                 "job_openings, job_applications, employee_documents, "
-                "review_cycles cascade"
+                "review_cycles, "
+                "assistant_settings, assistant_models, assistant_module_policies, "
+                "assistant_tool_policies, assistant_access_rules, "
+                "assistant_conversations cascade"
             )
         )
 

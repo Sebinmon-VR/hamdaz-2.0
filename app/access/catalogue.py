@@ -180,6 +180,55 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         ),
     ),
     ModuleSpec(
+        key="finance",
+        name="Finance",
+        description=(
+            "Profit and loss computed from the Zoho Books ledger, and the ledger "
+            "data behind it. Gated by a global role — super admin, CEO, Manager "
+            "or Accountant — rather than by a team grant, because there is one "
+            "set of company accounts and not a set per team. admin_only here "
+            "means 'not grantable to a team', which is exactly right: there is "
+            "no team that should be given the company P&L."
+        ),
+        admin_only=True,
+        pages=(
+            PageSpec("statement", "Profit & loss", "/finance/profit-and-loss"),
+            PageSpec("comparison", "Period comparison", "/finance/comparison"),
+            PageSpec("trend", "Monthly trend", "/finance/trend"),
+            PageSpec("account", "Account detail", "/finance/accounts/[id]"),
+            PageSpec("diagnostics", "Zoho data health", "/finance/diagnostics"),
+        ),
+    ),
+    ModuleSpec(
+        key="assistant",
+        name="Assistant",
+        description=(
+            "A chat assistant over every module, acting as the person asking. "
+            "Listed here for navigation; who may use it is decided by the "
+            "assistant's own access rules, which a super admin sets, not by a "
+            "team grant."
+        ),
+        pages=(PageSpec("chat", "Assistant", "/assistant"),),
+    ),
+    ModuleSpec(
+        key="assistant_admin",
+        name="Assistant Administration",
+        description=(
+            "The assistant's switches: model, what it may read and write per "
+            "module, who it is released to, every run it has made and what "
+            "they cost. Super admin only — narrower than admin_only usually "
+            "means, and enforced by the endpoints themselves."
+        ),
+        admin_only=True,
+        pages=(
+            PageSpec("settings", "Assistant settings", "/admin/assistant"),
+            PageSpec("policies", "Permissions", "/admin/assistant/permissions"),
+            PageSpec("rules", "Access rules", "/admin/assistant/access"),
+            PageSpec("runs", "Runs & logs", "/admin/assistant/runs"),
+            PageSpec("analytics", "Usage & cost", "/admin/assistant/analytics"),
+        ),
+    ),
+    ModuleSpec(
         key="templates",
         name="Form Templates",
         description=(

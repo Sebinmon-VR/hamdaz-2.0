@@ -14,6 +14,7 @@ from app.auth.oidc import EntraIdentity
 from app.auth.service import upsert_user
 from app.models.role import Role, RoleScope
 from app.roles import service
+from app.roles.catalogue import SYSTEM_ROLES
 from app.roles.service import RoleConflictError, RoleError, RoleNotFoundError
 
 
@@ -26,11 +27,16 @@ async def _user(db, email: str = "person@hamdaz.com", oid: str | None = None):
 # ── seeding ────────────────────────────────────────────────────────────
 
 
-async def test_seeds_the_six_system_roles(db) -> None:
+async def test_seeds_every_system_role(db) -> None:
+    """Derived from the catalogue rather than listed here.
+
+    This assertion used to name the roles literally, and went stale silently the
+    moment one was added — the catalogue and the test disagreed for as long as
+    nobody ran it. What is worth asserting is that the seeder writes *the
+    catalogue*, not that the catalogue holds any particular number of rows.
+    """
     roles = await service.seed_system_roles(db)
-    assert {r.key for r in roles} == {
-        "super_admin", "ceo", "manager", "team_lead", "member", "approver",
-    }
+    assert {r.key for r in roles} == {r.key for r in SYSTEM_ROLES}
     assert all(r.is_system for r in roles)
 
 
@@ -38,12 +44,16 @@ async def test_seed_splits_global_from_team_scope(db) -> None:
     await service.seed_system_roles(db)
     by_key = {r.key: r for r in await service.list_roles(db)}
 
-    assert {k for k, r in by_key.items() if r.scope == RoleScope.GLOBAL} == {
-        "super_admin", "ceo", "manager",
-    }
-    assert {k for k, r in by_key.items() if r.scope == RoleScope.TEAM} == {
-        "team_lead", "member", "approver",
-    }
+    for scope in (RoleScope.GLOBAL, RoleScope.TEAM):
+        assert {k for k, r in by_key.items() if r.scope == scope} == {
+            r.key for r in SYSTEM_ROLES if r.scope == scope
+        }
+
+    # The one split worth stating outright, because code branches on it: an
+    # organisation-wide authority must never be seeded as a team role.
+    assert by_key["super_admin"].scope == RoleScope.GLOBAL
+    assert by_key["accountant"].scope == RoleScope.GLOBAL
+    assert by_key["member"].scope == RoleScope.TEAM
 
 
 async def test_seeding_twice_creates_nothing_new(db) -> None:
@@ -51,7 +61,7 @@ async def test_seeding_twice_creates_nothing_new(db) -> None:
     await db.commit()
     await service.seed_system_roles(db)
     await db.commit()
-    assert len(await service.list_roles(db)) == 6
+    assert len(await service.list_roles(db)) == len(SYSTEM_ROLES)
 
 
 async def test_seed_repairs_a_corrupted_scope(db) -> None:
@@ -292,7 +302,16 @@ async def test_assignments_are_empty_when_nobody_holds_a_role(db) -> None:
 async def test_list_roles_can_filter_by_scope(db) -> None:
     await service.seed_system_roles(db)
     team = await service.list_roles(db, scope=RoleScope.TEAM)
-    assert {r.key for r in team} == {"team_lead", "member", "approver"}
+
+    # Derived from the catalogue for the same reason as the seeding tests: a
+    # literal list here silently went stale when team_manager was added.
+    assert {r.key for r in team} == {
+        r.key for r in SYSTEM_ROLES if r.scope == RoleScope.TEAM
+    }
+    # The filter must actually filter — a global role appearing here would mean
+    # scope is being ignored, which the whole permission split depends on.
+    assert "super_admin" not in {r.key for r in team}
+    assert "accountant" not in {r.key for r in team}
 
 
 async def test_unique_constraint_backs_the_idempotency(db) -> None:

@@ -41,6 +41,18 @@ SYSTEM_ROLES: Final[tuple[SystemRole, ...]] = (
         description="Manages teams and their members across the organisation.",
     ),
     SystemRole(
+        key="accountant",
+        name="Accountant",
+        scope=RoleScope.GLOBAL,
+        description=(
+            "Reads the company accounts: profit and loss, and the Zoho Books "
+            "ledger behind it. Global rather than per team — there is one set of "
+            "company accounts, not a set per team. Deliberately NOT an admin "
+            "role: see ADMIN_ROLES below for why finance and user administration "
+            "are kept apart."
+        ),
+    ),
+    SystemRole(
         key="team_manager",
         name="Team Manager",
         scope=RoleScope.TEAM,
@@ -80,6 +92,23 @@ DEFAULT_TEAM_ROLE: Final = "member"
 #: Who may create teams, create roles, and grant roles. Straight from the brief:
 #: super admin, CEO and managers.
 ADMIN_ROLES: Final[frozenset[str]] = frozenset({SUPER_ADMIN, "ceo", "manager"})
+
+#: Who may read the company accounts — the profit and loss and the Zoho Books
+#: ledger behind it.
+#:
+#: A separate set rather than a reuse of ADMIN_ROLES, and the distinction is the
+#: point. ADMIN_ROLES answers "who may administer people", which is a different
+#: question from "who may see company profit". Collapsing the two would mean the
+#: Accounts team could only be given the P&L by being made a Manager, which
+#: would also hand them the power to create teams and grant roles — a privilege
+#: nobody asked for, arriving as a side effect of a reporting requirement. That
+#: is the ordinary way an access model quietly stops meaning anything.
+#:
+#: The reverse also holds: ``accountant`` confers no administrative authority at
+#: all. It reads the accounts and nothing else.
+FINANCE_ROLES: Final[frozenset[str]] = frozenset(
+    {SUPER_ADMIN, "ceo", "manager", "accountant"}
+)
 
 #: Granting or revoking super_admin requires *being* super_admin — a manager
 #: who could grant it to themselves would make the distinction meaningless, and

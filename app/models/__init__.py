@@ -1,6 +1,17 @@
 from app.models.access import Module, ModulePage, TeamModuleAccess, TeamPageAccess
 from app.models.analytics import AnalyticsRun, UserAnalytics
 from app.models.assignment import AssignmentPolicy
+from app.models.assistant import (
+    AssistantAccessRule,
+    AssistantConversation,
+    AssistantMessage,
+    AssistantModel,
+    AssistantModulePolicy,
+    AssistantRun,
+    AssistantRunEvent,
+    AssistantSettings,
+    AssistantToolPolicy,
+)
 from app.models.base import Base
 from app.models.comparison import (
     ComparisonStatus,
@@ -47,6 +58,15 @@ __all__ = [
     "AnalyticsRun",
     "ApplicationFile",
     "ApplicationStage",
+    "AssistantAccessRule",
+    "AssistantConversation",
+    "AssistantMessage",
+    "AssistantModel",
+    "AssistantModulePolicy",
+    "AssistantRun",
+    "AssistantRunEvent",
+    "AssistantSettings",
+    "AssistantToolPolicy",
     "AssignmentPolicy",
     "Base",
     "CLOSED_STAGES",
