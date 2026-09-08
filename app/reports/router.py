@@ -18,6 +18,7 @@ day, which is itself something they are not entitled to know.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Any
@@ -40,6 +41,7 @@ from app.proposals.sharepoint import (
 )
 from app.reports import service
 from app.reports.access import (
+    COMPANY_WIDE,
     Viewer,
     may_comment,
     may_delete,
@@ -83,6 +85,8 @@ from app.roles.catalogue import SUPER_ADMIN
 from app.roles.deps import CurrentRoles
 from app.teams import service as teams_service
 from app.teams.service import TeamError
+
+logger = logging.getLogger("hamdaz.reports")
 
 router = APIRouter(prefix="/reports", tags=["reports"])
 #: Setting reports up is a separate surface from filing them, and separate for
@@ -137,7 +141,24 @@ def _translate(exc: ReportError) -> HTTPException:
 
 
 async def require_module(user: CurrentUser, roles: CurrentRoles, session: Session) -> None:
-    """The caller's team must have been granted the reports module."""
+    """The caller reaches reports by a team grant, or by running the company.
+
+    The second half is not a loophole, it is the module's shape. Filing a report
+    is ordinary team work, so the module has to be team-grantable — which means
+    the grant is held through membership. But the people the reports are *for*
+    are exactly the ones who are on no team: a CEO reads every team's reports
+    and belongs to none of them, and making them join all of them to read what
+    is written about them would be absurd.
+
+    Nothing is widened by letting them in. This gate answers "may you use this
+    feature at all"; what any of them can actually see is decided afterwards by
+    ``app.reports.access``, which still gives a CEO nobody's drafts and gives an
+    ordinary person only their own. Filing is narrower still — ``may_file_for``
+    wants real membership, so a CEO admitted here cannot file for a team they
+    are not on.
+    """
+    if not COMPANY_WIDE.isdisjoint(set(roles)):
+        return
     if not await access_service.can_reach(
         session, user_id=user.id, global_roles=roles, module_key=MODULE_KEY
     ):
@@ -396,13 +417,14 @@ async def edit_report(
         report = await service.get_for(session, report_id, viewer)
     except ReportError as exc:
         raise _translate(exc) from exc
-    if not may_edit(report, viewer):
+    # Two different refusals, and telling them apart is the whole point.
+    # Somebody else's report is a 403 — they may not touch it, ever. Their own
+    # filed report is a 409 — they could have, and the moment has passed. One
+    # of those is worth explaining and the other is worth apologising for.
+    if report.author_id != viewer.user_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=(
-                "Only its author can change a report, and only before it is "
-                "submitted."
-            ),
+            detail="Only its author can change a report.",
         )
     try:
         await service.edit(
@@ -455,7 +477,8 @@ async def submit_report(
         report = await service.get_for(session, report_id, viewer)
     except ReportError as exc:
         raise _translate(exc) from exc
-    if not may_edit(report, viewer):
+    # Same split as editing: not yours is a 403, already filed is a 409.
+    if report.author_id != viewer.user_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only its author can submit a report.",
@@ -516,6 +539,12 @@ async def _notify(
             status=DeliveryStatus.FAILED, addresses=plan.addresses, detail=str(exc),
         )
     except Exception as exc:  # noqa: BLE001 - a notification never fails the filing
+        # Logged as well as recorded. The catch-all is right — a report that is
+        # filed is filed whether or not the mail went — but it will happily
+        # swallow a programming error and file it under "delivery failed",
+        # which reads as an infrastructure problem and gets ignored. The
+        # traceback is the difference between that and a bug somebody fixes.
+        logger.exception("report %s: could not send the notification", report.id)
         await service.record_delivery(
             session, report,
             status=DeliveryStatus.FAILED,

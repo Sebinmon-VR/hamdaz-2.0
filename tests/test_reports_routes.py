@@ -15,6 +15,7 @@ same tool differently for a manager and for a colleague.
 from __future__ import annotations
 
 from datetime import date
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
@@ -94,13 +95,18 @@ class SilentMailer:
         self.sent: list[dict] = []
         self.fail = False
 
-    async def send_submitted(self, report, recipients, *, link):
+    async def send_submitted(self, report, recipients, *, link, rules=None):
         if self.fail:
             from app.core.mail import MailError
 
             raise MailError("Graph refused the token")
         self.sent.append(
-            {"report_id": report.id, "recipients": list(recipients), "link": link}
+            {
+                "report_id": report.id,
+                "recipients": list(recipients),
+                "link": link,
+                "rules": rules,
+            }
         )
         return {}
 
@@ -324,10 +330,10 @@ async def test_the_metrics_follow_from_the_tasks(
 ) -> None:
     body = await _start(client, author, presales)
     figures = {m["key"]: m for m in body["metrics"]}
-    assert figures["tasks_total"]["computed"] == "2"
+    assert Decimal(figures["tasks_total"]["computed"]) == 2
     # Not done and the deadline has passed, whatever the source list says.
-    assert figures["tasks_overdue"]["computed"] == "1"
-    assert figures["tasks_with_attachments"]["computed"] == "1"
+    assert Decimal(figures["tasks_overdue"]["computed"]) == 1
+    assert Decimal(figures["tasks_with_attachments"]["computed"]) == 1
 
 
 async def test_a_report_opens_even_when_sharepoint_is_down(
@@ -355,9 +361,9 @@ async def test_a_correction_survives_a_recompute(
         )
     ).json()
     total = next(m for m in body["metrics"] if m["key"] == "tasks_total")
-    assert total["computed"] == "2"
-    assert total["value"] == "9"
-    assert total["effective"] == "9"
+    assert Decimal(total["computed"]) == 2
+    assert Decimal(total["value"]) == 9
+    assert Decimal(total["effective"]) == 9
     assert total["edited"] is True
 
 

@@ -22,7 +22,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Any, Iterable
+from typing import Any, Final, Iterable
 
 from sqlalchemy import Select, case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -447,11 +447,19 @@ def _apply_issues(report: Report, rows: list[IssueInput]) -> None:
 COMPUTED_KEYS: frozenset[str] = frozenset(m.key for m in COMPUTED_METRICS)
 
 
+#: The scale the metric columns store at. Values are quantized to it on the way
+#: in so that a figure reads the same before and after it has been round-tripped
+#: through the database — otherwise the response to the save says "2" and every
+#: response after it says "2.00", and a frontend comparing the two decides the
+#: number changed.
+_SCALE: Final = Decimal("0.01")
+
+
 def _decimal(value: Any) -> Decimal | None:
     if value is None or value == "":
         return None
     try:
-        return Decimal(str(value))
+        return Decimal(str(value)).quantize(_SCALE)
     except (InvalidOperation, ValueError) as exc:
         raise ReportError(f"{value!r} is not a number") from exc
 
@@ -482,7 +490,8 @@ def refresh_metrics(report: Report, *, overrides: dict[str, Any] | None = None) 
         row.position = position
         row.label = spec.label
         row.unit = spec.unit
-        row.computed = computed.get(spec.key)
+        counted = computed.get(spec.key)
+        row.computed = None if counted is None else counted.quantize(_SCALE)
         if spec.key in overrides:
             row.value = _decimal(overrides[spec.key])
 

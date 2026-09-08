@@ -158,7 +158,7 @@ class OpenAIChat:
                         # Transcribing the microphone as well is what lets the
                         # screen show what a person said. Without it a spoken
                         # conversation leaves no readable trace of their half.
-                        "input": {"transcription": {"model": "gpt-4o-mini-transcribe"}},
+                        "input": {"transcription": {"model": "gpt-4o-mini-transcribe","language": "en"}},
                     },
                 },
             )
