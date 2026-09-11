@@ -22,7 +22,7 @@ Two things this table deliberately keeps that a bare score would not:
 from __future__ import annotations
 
 import uuid
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 
 from sqlalchemy import (
@@ -34,6 +34,7 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    UniqueConstraint,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -41,6 +42,88 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, Timestamped, UUIDPrimaryKey
 from app.models.user import User
+
+
+class LiveScore(Base, Timestamped):
+    """One person's current standing, overwritten as the work moves.
+
+    The runs below are history — why somebody was given a proposal in March,
+    answerable in April. This is the other question, "who should get the next
+    one", and it has exactly one right answer at any moment. Keeping it as a
+    row per person that is overwritten, rather than as another run, is what
+    stops the history filling with hundreds of recomputations a day that
+    nobody made a decision from.
+
+    Recomputed from the Proposals mirror rather than from SharePoint, which is
+    what makes recomputing on every change affordable: counting the mirror is a
+    grouped query over an indexed table, where the same answer from SharePoint
+    means pulling every row again.
+    """
+
+    __tablename__ = "live_scores"
+    __table_args__ = (
+        UniqueConstraint("user_id", "team_id", name="uq_live_score_user_team"),
+        Index("ix_live_scores_team_rank", "team_id", "rank"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    #: NULL is the organisation-wide ranking. A person can hold a row for both
+    #: that and each team they are scored within, because the answer differs:
+    #: the least loaded person in presales is not the least loaded overall.
+    team_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("teams.id", ondelete="CASCADE")
+    )
+
+    display_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    email: Mapped[str | None] = mapped_column(String(320))
+    sharepoint_lookup_id: Mapped[str | None] = mapped_column(String(40))
+
+    total_tasks: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    open_tasks: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    active_tasks: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    completed_tasks: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    overdue_tasks: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    due_soon_tasks: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    no_status_tasks: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    days_since_assigned: Mapped[int | None] = mapped_column(Integer)
+
+    capacity: Mapped[Decimal] = mapped_column(
+        Numeric(5, 2), default=Decimal(1), server_default=text("1"), nullable=False
+    )
+    #: Higher is more available. The same scale the runs use, so a number here
+    #: and a number there mean the same thing.
+    priority_score: Mapped[Decimal] = mapped_column(
+        Numeric(8, 4), default=Decimal(0), server_default=text("0"), nullable=False
+    )
+    #: 1 is next. Stored rather than derived on read so "who is next" is an
+    #: indexed lookup and not a sort of everybody.
+    rank: Mapped[int] = mapped_column(Integer, default=0, nullable=False, index=True)
+    #: Whether they are in the pool at all — a manager, or somebody labelled
+    #: out. Kept in the table rather than filtered out of it so a screen can
+    #: show why somebody is not being offered work.
+    eligible: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=text("true"), nullable=False
+    )
+    excluded_reason: Mapped[str | None] = mapped_column(String(200))
+    #: The factor breakdown, for the same reason the runs keep one: a single
+    #: number nobody can decompose is a number nobody will trust.
+    factors: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
+
+    #: What moved it last — a mirror sync, a task we created, a manual run.
+    reason: Mapped[str | None] = mapped_column(String(80))
+    computed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()"), nullable=False
+    )
+
+    user: Mapped[User] = relationship(foreign_keys=[user_id], lazy="joined")
+
+    def __repr__(self) -> str:
+        return f"<LiveScore {self.display_name} rank={self.rank}>"
 
 
 class AnalyticsRun(Base, UUIDPrimaryKey, Timestamped):

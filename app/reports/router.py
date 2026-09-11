@@ -20,10 +20,11 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.access import service as access_service
@@ -31,9 +32,14 @@ from app.auth.deps import CurrentUser
 from app.core.config import Settings, get_settings
 from app.core.db import get_session
 from app.core.mail import MailError
-from app.models.report import DeliveryStatus, Report, ReportStatus
+from app.models.project import OPEN_TASK_STATUSES, ProjectUpdate, TaskStatus
+from app.models.report import DeliveryStatus, Report, ReportScope, ReportStatus
 from app.models.templates import FormTemplate
 from app.models.user import User
+from app.projects import service as projects_service
+from app.projects.access import may_report_on
+from app.projects.progress import milestone_percent, milestone_state
+from app.projects.service import ProjectError
 from app.proposals.sharepoint import (
     SharePointConsentError,
     SharePointError,
@@ -48,7 +54,14 @@ from app.reports.access import (
     may_edit,
     may_file_for,
 )
-from app.reports.catalogue import COMPLETIONS, SECTIONS, period_for, period_label
+from app.reports.catalogue import (
+    COMPLETIONS,
+    PROJECT_SCHEDULE_DEFAULTS,
+    period_for,
+    period_label,
+    scope_of,
+    sections_for,
+)
 from app.reports.mailer import ReportMailer
 from app.reports.schemas import (
     CommentIn,
@@ -58,6 +71,8 @@ from app.reports.schemas import (
     IssueOut,
     MetricOut,
     OverviewOut,
+    ProjectChoiceOut,
+    ProjectLineOut,
     ReportEditIn,
     ReportFieldOut,
     ReportFormOut,
@@ -182,10 +197,17 @@ ModuleGate = Annotated[None, Depends(require_module)]
 # ── rendering ──────────────────────────────────────────────────────────
 
 
-def _sections() -> list[SectionOut]:
+def _sections(template: FormTemplate) -> list[SectionOut]:
+    """The sections *this* template has, not every section that exists.
+
+    A presales daily gets the standard six; a project status report gets health
+    dials and a milestone timeline instead of some of them. Resolved from the
+    template rather than from a constant, because the whole point of project
+    reporting is that selecting a different team changes the shape of the form.
+    """
     return [
         SectionOut(key=s.key, name=s.name, description=s.description, kind=s.kind)
-        for s in SECTIONS
+        for s in sections_for(template)
     ]
 
 
@@ -216,6 +238,15 @@ def _summary_out(report: Report, viewer: Viewer, *, read: bool = False) -> Repor
         period_start=report.period_start,
         period_end=report.period_end,
         period_label=period_label(report.cadence, report.period_start, report.period_end),
+        scope=report.scope,
+        project_id=report.project_id,
+        # Read off the report's own snapshot rather than the live project, so a
+        # listing still names a project that has since been deleted.
+        project_name=(
+            report.project_lines[0].name
+            if report.scope == ReportScope.PROJECT and report.project_lines
+            else None
+        ),
         status=report.status,
         submitted_at=report.submitted_at,
         task_count=len(report.tasks),
@@ -241,10 +272,11 @@ def _report_out(
         remarks=report.remarks,
         summary=report.summary,
         answers=report.answers or {},
-        sections=_sections(),
+        sections=_sections(template),
         fields=_fields(template),
         tasks=[TaskLineOut.model_validate(t) for t in report.tasks],
         issues=[IssueOut.model_validate(i) for i in report.issues],
+        project_lines=[ProjectLineOut.model_validate(p) for p in report.project_lines],
         metrics=[
             MetricOut(
                 key=m.key, label=m.label, unit=m.unit, computed=m.computed,
@@ -308,6 +340,18 @@ async def report_form(
         raise _translate(exc) from exc
 
     start, end = period_for(cadence, on or datetime.now(UTC).date())
+    scope = scope_of(template)
+
+    # A project-scoped form has to offer a choice of project, because the very
+    # first thing it asks is which one. Offered rather than left to the caller
+    # to guess at, and narrowed twice over: only projects on this team, and
+    # only ones this person may actually report on.
+    choices: list[ProjectChoiceOut] = []
+    if scope == ReportScope.PROJECT:
+        choices = await _project_choices(
+            session, user, team_id=found.id, cadence=cadence, period_start=start
+        )
+
     return ReportFormOut(
         team_id=found.id,
         team=found.name,
@@ -315,13 +359,69 @@ async def report_form(
         template_id=template.id,
         template_name=template.name,
         template_version=template.version,
-        sections=_sections(),
+        scope=scope,
+        projects=choices,
+        sections=_sections(template),
         fields=_fields(template),
         completions=list(COMPLETIONS),
         period_start=start,
         period_end=end,
         period_label=period_label(cadence, start, end),
     )
+
+
+async def _project_choices(
+    session: AsyncSession,
+    user: User,
+    *,
+    team_id: uuid.UUID,
+    cadence: str,
+    period_start: date,
+) -> list[ProjectChoiceOut]:
+    """The projects this person may file a status report on for this team.
+
+    Two narrowings, and both matter. ``summaries`` already limits the list to
+    projects they may *read*; ``may_report_on`` narrows it again to the ones
+    they run, because filing a status report on somebody else's project would
+    be reporting on work you are not answerable for.
+
+    Each choice says whether they have already filed on it for this period, so
+    the picker can grey it out rather than letting somebody fill in a whole
+    report and be refused at the end.
+    """
+    viewer = await projects_service.build_viewer(session, user)
+    rows, _total = await projects_service.summaries(
+        session, viewer, team_id=team_id, limit=200
+    )
+    mine = [r for r in rows if may_report_on(r.project, viewer)]
+    if not mine:
+        return []
+
+    taken = set(
+        (
+            await session.scalars(
+                select(Report.project_id).where(
+                    Report.author_id == user.id,
+                    Report.cadence == cadence,
+                    Report.period_start == period_start,
+                    Report.project_id.in_([r.project.id for r in mine]),
+                )
+            )
+        ).all()
+    )
+    return [
+        ProjectChoiceOut(
+            id=r.project.id,
+            name=r.project.name,
+            code=r.project.code,
+            label=r.project.label,
+            status=r.project.status,
+            rag_overall=r.project.rag_overall,
+            percent_complete=r.rollup.percent_complete,
+            already_reported=r.project.id in taken,
+        )
+        for r in mine
+    ]
 
 
 # ── writing one ────────────────────────────────────────────────────────
@@ -355,11 +455,48 @@ async def start_report(
             detail="You can only file a report for a team you are on.",
         )
 
-    prefill: list[TaskInput] = []
-    if body.prefill_tasks:
-        prefill = await _own_tasks(
-            get_sharepoint(request), user.email, include_closed=body.include_closed
+    # Which template applies decides what the draft is even made of, so it is
+    # resolved once here and handed to the service rather than looked up twice
+    # and possibly differently.
+    try:
+        template = await service.template_for(
+            session, team_id=body.team_id, cadence=body.cadence
         )
+    except ReportError as exc:
+        raise _translate(exc) from exc
+    scope = scope_of(template)
+
+    start_on, end_on = period_for(body.cadence, body.on or datetime.now(UTC).date())
+    if body.period_start is not None:
+        start_on = body.period_start
+    if body.period_end is not None:
+        end_on = body.period_end
+
+    prefill: list[TaskInput] = []
+    project_lines: list[service.ProjectLineInput] = []
+
+    if scope == ReportScope.TEAM:
+        if body.prefill_tasks:
+            prefill = await _own_tasks(
+                get_sharepoint(request), user.email, include_closed=body.include_closed
+            )
+    else:
+        project_lines = await _project_prefill(
+            session,
+            user,
+            scope=scope,
+            team_id=body.team_id,
+            project_id=body.project_id,
+            since=start_on,
+            until=end_on,
+            with_milestones=body.prefill_milestones,
+        )
+        # A project report's task section is the project's own open work, not
+        # the author's SharePoint bids — those are a different kind of task
+        # belonging to a different system, and putting them on a project status
+        # report would be nonsense.
+        if body.prefill_tasks and scope == ReportScope.PROJECT and body.project_id:
+            prefill = await _project_tasks(session, viewer_user=user, project_id=body.project_id)
 
     try:
         report = await service.start(
@@ -371,6 +508,13 @@ async def start_report(
             period_start=body.period_start,
             period_end=body.period_end,
             prefill=prefill,
+            # Passed through as sent rather than nulled for the non-project
+            # scopes, so the service's own check runs and a caller naming a
+            # project on a team report is told why it was refused instead of
+            # having it quietly dropped.
+            project_id=body.project_id,
+            project_lines=project_lines,
+            template=template,
         )
     except ReportError as exc:
         raise _translate(exc) from exc
@@ -401,6 +545,190 @@ async def _own_tasks(
         tasks = [t for t in tasks if t.is_open]
     tasks = sorted(tasks, key=lambda t: (t.deadline is None, t.deadline or ""))
     return service.tasks_from_proposals(tasks)
+
+
+async def _project_prefill(
+    session: AsyncSession,
+    user: User,
+    *,
+    scope: str,
+    team_id: uuid.UUID,
+    project_id: uuid.UUID | None,
+    since: date,
+    until: date,
+    with_milestones: bool,
+) -> list[service.ProjectLineInput]:
+    """Snapshot the projects a status report covers, as of right now.
+
+    One line for a project report, one per project for a portfolio report. The
+    figures are taken here and frozen — see ``ReportProjectLine`` for why a
+    report that changed after it was filed would not be a report.
+
+    The two "in period" counts are read from the project's update log between
+    the report's own dates, which is what makes a weekly report about the week
+    rather than about the running total. That is also the only reason the log
+    exists: nothing else can answer "what moved between these two dates" once
+    the tasks have moved on twice more.
+
+    Refuses rather than silently filing an empty report when the caller may not
+    report on the project they named. A status report with no project on it
+    would be a blank page nobody could explain.
+    """
+    viewer = await projects_service.build_viewer(session, user)
+
+    if scope == ReportScope.PROJECT:
+        if project_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="This report is about one project. Say which.",
+            )
+        try:
+            project = await projects_service.get_for(session, project_id, viewer)
+        except ProjectError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+            ) from exc
+        if not may_report_on(project, viewer):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only the project lead or somebody running the team files on it.",
+            )
+        if project.team_id != team_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="That project belongs to a different team.",
+            )
+        chosen = [projects_service.summarise(project)]
+    else:
+        rows, _total = await projects_service.summaries(
+            session, viewer, team_id=team_id, limit=200
+        )
+        # A portfolio report covers what this person can see of the team's
+        # work. Not everything the team runs: a report listing projects its
+        # author may not open would leak exactly what the access rules exist
+        # to keep back.
+        chosen = rows
+
+    if not chosen:
+        return []
+
+    counts = await _movement_in_period(
+        session, [r.project.id for r in chosen], since=since, until=until
+    )
+
+    today = datetime.now(UTC).date()
+    lines: list[service.ProjectLineInput] = []
+    for row in chosen:
+        stones: list[service.MilestoneInput] = []
+        if with_milestones:
+            tasks = list(row.project.tasks)
+            stones = [
+                service.MilestoneInput(
+                    milestone_id=m.id,
+                    name=m.name,
+                    owner_name=m.owner.display_name if m.owner else None,
+                    start_on=m.start_on,
+                    due_on=m.due_on,
+                    done_on=m.done_on,
+                    baseline_due_on=m.baseline_due_on,
+                    percent_complete=milestone_percent(m, tasks),
+                    plan=m.plan,
+                    state=milestone_state(m, today),
+                    is_key=m.is_key,
+                )
+                for m in row.project.milestones
+            ]
+        moved = counts.get(row.project.id, (0, 0))
+        lines.append(
+            service.project_line_from(
+                row,
+                milestones=stones,
+                updates_in_period=moved[0],
+                tasks_completed_in_period=moved[1],
+            )
+        )
+    return lines
+
+
+async def _movement_in_period(
+    session: AsyncSession,
+    project_ids: list[uuid.UUID],
+    *,
+    since: date,
+    until: date,
+) -> dict[uuid.UUID, tuple[int, int]]:
+    """Per project: how many updates landed in the window, and how many tasks
+    were finished in it.
+
+    Both counted from the update log rather than from the tasks themselves.
+    ``done_at`` on a task would answer the second question only until the task
+    was reopened and closed again, at which point last month's report would
+    quietly change its mind. The log does not move.
+    """
+    if not project_ids:
+        return {}
+
+    lower = datetime.combine(since, time.min, tzinfo=UTC)
+    upper = datetime.combine(until + timedelta(days=1), time.min, tzinfo=UTC)
+
+    rows = (
+        await session.execute(
+            select(
+                ProjectUpdate.project_id,
+                func.count().label("updates"),
+                func.count()
+                .filter(ProjectUpdate.status_after == TaskStatus.DONE)
+                .label("completed"),
+            )
+            .where(
+                ProjectUpdate.project_id.in_(project_ids),
+                ProjectUpdate.created_at >= lower,
+                ProjectUpdate.created_at < upper,
+            )
+            .group_by(ProjectUpdate.project_id)
+        )
+    ).all()
+    return {row[0]: (int(row[1]), int(row[2])) for row in rows}
+
+
+async def _project_tasks(
+    session: AsyncSession, *, viewer_user: User, project_id: uuid.UUID
+) -> list[TaskInput]:
+    """A project's open work, as report task rows.
+
+    Ordered soonest-first with the undated last, the same convention the
+    projects board uses — a task with no deadline is unplanned rather than
+    urgent, and a null that sorted to the top would put it where the most
+    pressing work belongs.
+    """
+    viewer = await projects_service.build_viewer(session, viewer_user)
+    try:
+        project = await projects_service.get_for(session, project_id, viewer)
+    except ProjectError:
+        return []
+
+    rows = sorted(
+        (t for t in project.tasks if t.status in OPEN_TASK_STATUSES),
+        key=lambda t: (t.due_on is None, t.due_on or date.max),
+    )
+    return [
+        TaskInput(
+            title=task.title,
+            # The vocabularies are identical by design — see
+            # ``models.project.TaskStatus`` — so no mapping is needed and there
+            # is no value at which a mapping could be wrong.
+            completion=task.status,
+            source="manual",
+            external_id=str(task.id),
+            status=task.status,
+            percent_complete=task.percent_complete,
+            priority=task.priority,
+            deadline=task.due_on,
+            link=f"/projects/{project.id}/tasks/{task.id}",
+            note=task.blocked_reason,
+        )
+        for task in rows[:200]
+    ]
 
 
 @router.patch("/{report_id}", response_model=ReportOut, summary="Fill in a draft")
@@ -445,6 +773,14 @@ async def edit_report(
                 else None
             ),
             metrics=body.metrics,
+            project_notes=(
+                {
+                    str(line_id): note.model_dump(exclude_unset=True)
+                    for line_id, note in body.project_notes.items()
+                }
+                if body.project_notes
+                else None
+            ),
         )
     except ReportError as exc:
         raise _translate(exc) from exc
@@ -598,6 +934,12 @@ async def list_reports(
     since: Annotated[date | None, Query()] = None,
     until: Annotated[date | None, Query()] = None,
     mine: Annotated[bool, Query(description="Only my own.")] = False,
+    scope: Annotated[
+        str | None, Query(description="team, project or portfolio")
+    ] = None,
+    project_id: Annotated[
+        uuid.UUID | None, Query(description="Status reports on one project")
+    ] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> ReportPage:
@@ -624,6 +966,8 @@ async def list_reports(
         since=since,
         until=until,
         mine_only=mine,
+        scope=scope,
+        project_id=project_id,
         limit=limit,
         offset=offset,
     )
@@ -905,3 +1249,48 @@ async def put_schedule(
         raise _translate(exc) from exc
     await session.commit()
     return _schedule_out(row)
+
+
+@admin_router.post(
+    "/schedules/project-reporting",
+    response_model=list[ScheduleOut],
+    summary="Switch a team over to project status reporting",
+)
+async def adopt_project_reporting(
+    admin: SuperAdmin,
+    session: Session,
+    team: Annotated[str, Query(description="Team handle (slug) or id")],
+    cadences: Annotated[
+        list[str] | None,
+        Query(description=f"Any of: {', '.join(PROJECT_SCHEDULE_DEFAULTS)}"),
+    ] = None,
+) -> list[ScheduleOut]:
+    """Point a team's cadences at the shipped project status templates.
+
+    A convenience over ``PUT /schedules``, not a new power: it writes the same
+    rows an administrator would write by hand, without them having to know
+    which of the shipped templates goes with which cadence. Everything else on
+    an existing schedule — who is copied, the note, the hour it is due — is
+    carried over, because changing what a team is asked should not silently
+    reset who reads the answers.
+
+    After this, somebody on that team opening the report page for one of these
+    cadences is asked which project, and gets health dials and a milestone
+    timeline instead of the six standard sections. That needed no new
+    mechanism: which template a team files has always been a schedule row.
+    """
+    try:
+        found = await teams_service.get_team(session, team)
+    except TeamError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="No such team"
+        ) from exc
+
+    try:
+        rows = await service.adopt_project_reporting(
+            session, team_id=found.id, actor_id=admin.id, cadences=cadences
+        )
+    except ReportError as exc:
+        raise _translate(exc) from exc
+    await session.commit()
+    return [_schedule_out(row) for row in rows]

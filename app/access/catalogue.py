@@ -101,6 +101,28 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         ),
     ),
     ModuleSpec(
+        key="projects",
+        name="Projects",
+        description=(
+            "Project management for a team: the plan, its milestones, the tasks "
+            "people hold, the issues in the way, and a log of every movement. "
+            "Members see the projects they are on and move their own work; team "
+            "leads and managers run the plan; the CEO and super admins see the "
+            "whole portfolio. Who sees which project is decided in "
+            "app/projects/access.py and not by this grant, which only decides "
+            "who can reach the module at all."
+        ),
+        pages=(
+            PageSpec("board", "My work", "/projects/board"),
+            PageSpec("list", "All projects", "/projects"),
+            PageSpec("detail", "Project", "/projects/[id]"),
+            PageSpec("plan", "Plan and milestones", "/projects/[id]/plan"),
+            PageSpec("portfolio", "Portfolio", "/projects/portfolio"),
+            PageSpec("activity", "What moved", "/projects/activity"),
+            PageSpec("team", "Team projects", "/teams/[slug]/projects", team_scoped=True),
+        ),
+    ),
+    ModuleSpec(
         key="reports",
         name="Reports",
         description=(

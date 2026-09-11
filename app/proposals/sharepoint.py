@@ -484,6 +484,36 @@ class SharePointProposals:
             )
         return await self.task(item_id)
 
+    async def create_task(self, fields: dict[str, Any]) -> ProposalTask:
+        """Add a row to the Proposals list. **The only write this app makes.**
+
+        Everything else here reads. This exists for the mail intake, which
+        raises a task when a tender arrives that is not already in the list —
+        and it is called from exactly one place, behind a setting that ships
+        off, because the list is live and the team works in it.
+
+        The caller decides the fields, as with ``update_task``: the shape of a
+        proposal row is the intake's business, and putting a whitelist here
+        would give false comfort about what the API lets through.
+        """
+        token = await self._access_token()
+        url = f"{self._site}/lists/{self._settings.sharepoint_proposals_list_id}/items"
+        response = await self._http.post(
+            url,
+            json={"fields": fields},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        if response.status_code not in (200, 201):
+            raise SharePointError(
+                f"SharePoint refused the new task ({response.status_code}): "
+                f"{response.text[:300]}"
+            )
+        created = response.json()
+        # Re-read rather than trusting the echo: the list applies its own
+        # defaults and calculated columns, and the row we hand back should be
+        # the row that exists.
+        return await self.task(str(created.get("id")))
+
     async def _get(self, url: str, params: dict[str, str] | None = None, **extra) -> dict:
         token = await self._access_token()
         headers = {"Authorization": f"Bearer {token}", **extra.pop("headers", {})}

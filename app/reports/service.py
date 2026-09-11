@@ -19,10 +19,10 @@ Three properties this file is responsible for:
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Any, Final, Iterable
+from typing import Any, Final, Iterable, Sequence
 
 from sqlalchemy import Select, case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -37,8 +37,11 @@ from app.models.report import (
     ReportDelivery,
     ReportIssue,
     ReportMetric,
+    ReportMilestoneLine,
+    ReportProjectLine,
     ReportRead,
     ReportSchedule,
+    ReportScope,
     ReportSettings,
     ReportStatus,
     ReportTaskLine,
@@ -58,11 +61,16 @@ from app.reports.access import (
 from app.reports.catalogue import (
     COMPLETIONS,
     COMPUTED_METRICS,
+    PROJECT_METRICS,
+    PROJECT_SCHEDULE_DEFAULTS,
     REPORT_KIND,
+    STANDARD_SECTIONS,
     TEMPLATES,
     compute,
+    compute_projects,
     period_for,
     period_label,
+    scope_of,
     section_specs,
 )
 from app.roles.service import global_role_keys
@@ -142,7 +150,10 @@ async def seed_templates(session: AsyncSession) -> list[FormTemplate]:
             kind=REPORT_KIND,
             description=spec.get("description"),
             fields=spec["fields"],
-            sections=section_specs(),
+            # Per template, not one list for all of them. A presales daily has
+            # the standard six; a project status report has dials and a
+            # timeline instead. See ``catalogue.sections_for``.
+            sections=section_specs(spec.get("sections", STANDARD_SECTIONS)),
             status=TemplateStatus.ACTIVE,
         )
         template.grants = []
@@ -214,7 +225,8 @@ async def set_schedule(
         raise ReportConflictError(
             f"{template.name} is {template.status}; publish it before scheduling it"
         )
-    if await session.get(Team, team_id) is None:
+    team = await session.get(Team, team_id)
+    if team is None:
         raise ReportNotFoundError("No team with that id")
 
     row = await session.scalar(
@@ -225,6 +237,13 @@ async def set_schedule(
     if row is None:
         row = ReportSchedule(team_id=team_id, cadence=cadence)
         session.add(row)
+    # The objects are assigned, not just their ids, and that is not tidiness.
+    # A freshly flushed row has no loaded ``team`` or ``template``, so a caller
+    # reading ``row.team.name`` to build a response would emit a SELECT from
+    # synchronous code — which inside an async session is a MissingGreenlet
+    # rather than a query. Both were fetched above anyway.
+    row.team = team
+    row.template = template
     row.template_id = template_id
     row.enabled = enabled
     row.due_hour = due_hour
@@ -237,6 +256,75 @@ async def set_schedule(
     row.created_by_id = actor_id
     await session.flush()
     return row
+
+
+async def adopt_project_reporting(
+    session: AsyncSession,
+    *,
+    team_id: uuid.UUID,
+    actor_id: uuid.UUID | None,
+    cadences: Sequence[str] | None = None,
+) -> list[ReportSchedule]:
+    """Switch one team over to project status reporting, in one action.
+
+    This is what makes "select the AI team and the form changes" true, and it
+    is worth being clear that **it needed no new mechanism**. Which template a
+    team files has always been a ``ReportSchedule`` row; this only writes the
+    right rows for the right cadences without an administrator having to know
+    which of the shipped templates goes with which cadence.
+
+    Deliberately explicit rather than automatic. Nothing infers that a team
+    with projects wants project reports — a team can perfectly well run
+    projects and still file personal weeklies, and silently rewriting what
+    everybody is asked at the end of the week is not a thing to do on an
+    inference. Somebody decides, and this is the button they press.
+
+    Idempotent, and it replaces rather than adds: a team already reporting
+    weekly on something else has that schedule pointed at the project template.
+    The old schedule row is reused, so its recipients and its note survive the
+    change — the questions change, not who reads the answers.
+    """
+    wanted = list(cadences or PROJECT_SCHEDULE_DEFAULTS)
+    unknown = [c for c in wanted if c not in PROJECT_SCHEDULE_DEFAULTS]
+    if unknown:
+        raise ReportError(
+            f"There is no project report for: {', '.join(unknown)}. "
+            f"Choose from {', '.join(PROJECT_SCHEDULE_DEFAULTS)}."
+        )
+
+    await seed_templates(session)
+    by_key = {
+        template.key: template
+        for template in await report_templates(session)
+    }
+
+    done: list[ReportSchedule] = []
+    for cadence in wanted:
+        key = PROJECT_SCHEDULE_DEFAULTS[cadence]
+        template = by_key.get(key)
+        if template is None:
+            raise ReportNotFoundError(
+                f"The {key} template is missing. A super admin can re-seed it."
+            )
+        existing = await get_schedule(session, team_id=team_id, cadence=cadence)
+        done.append(
+            await set_schedule(
+                session,
+                team_id=team_id,
+                cadence=cadence,
+                template_id=template.id,
+                actor_id=actor_id,
+                # Everything but the template is carried over from whatever was
+                # there. Changing what a team is asked should not silently
+                # reset who gets told about it.
+                due_hour=existing.due_hour if existing else 18,
+                due_weekday=existing.due_weekday if existing else None,
+                note=existing.note if existing else None,
+                notify=existing.notify if existing else None,
+                extra_recipients=list(existing.extra_recipients) if existing else None,
+            )
+        )
+    return done
 
 
 async def template_for(
@@ -445,6 +533,7 @@ def _apply_issues(report: Report, rows: list[IssueInput]) -> None:
 #: The metric keys this module works out for itself. Anything else in an
 #: overrides dict is one the team types, and is created on demand.
 COMPUTED_KEYS: frozenset[str] = frozenset(m.key for m in COMPUTED_METRICS)
+PROJECT_METRIC_KEYS: frozenset[str] = frozenset(m.key for m in PROJECT_METRICS)
 
 
 #: The scale the metric columns store at. Values are quantized to it on the way
@@ -453,6 +542,216 @@ COMPUTED_KEYS: frozenset[str] = frozenset(m.key for m in COMPUTED_METRICS)
 #: response after it says "2.00", and a frontend comparing the two decides the
 #: number changed.
 _SCALE: Final = Decimal("0.01")
+
+
+# ── projects on a report ───────────────────────────────────────────────
+
+
+@dataclass(slots=True)
+class MilestoneInput:
+    """One milestone as it is about to be written onto a report."""
+
+    name: str
+    milestone_id: uuid.UUID | None = None
+    owner_name: str | None = None
+    start_on: date | None = None
+    due_on: date | None = None
+    done_on: date | None = None
+    baseline_due_on: date | None = None
+    percent_complete: int = 0
+    plan: str | None = None
+    state: str | None = None
+    is_key: bool = False
+    note: str | None = None
+
+
+@dataclass(slots=True)
+class ProjectLineInput:
+    """One project as it is about to be written onto a report.
+
+    Deliberately a plain dataclass of already-derived values rather than a
+    ``Project``. The reports module does not import the projects service, and
+    should not: this is the same arrangement ``TaskInput`` has with SharePoint,
+    where the caller does the reading and hands over something inert. It keeps
+    the snapshot honest too — everything here has to be *decided* by the caller
+    at draft time rather than lazily read later from a project that has since
+    moved on.
+    """
+
+    name: str
+    project_id: uuid.UUID | None = None
+    code: str | None = None
+    lead_name: str | None = None
+    status: str | None = None
+    start_on: date | None = None
+    target_end_on: date | None = None
+
+    rag_overall: str | None = None
+    rag_scope: str | None = None
+    rag_cost: str | None = None
+    rag_schedule: str | None = None
+    rag_benefits: str | None = None
+    trend_overall: str | None = None
+    trend_scope: str | None = None
+    trend_cost: str | None = None
+    trend_schedule: str | None = None
+    trend_benefits: str | None = None
+
+    percent_complete: int = 0
+    tasks_total: int = 0
+    tasks_done: int = 0
+    tasks_open: int = 0
+    tasks_blocked: int = 0
+    tasks_overdue: int = 0
+    milestones_total: int = 0
+    milestones_done: int = 0
+    milestones_overdue: int = 0
+    issues_open: int = 0
+    updates_in_period: int = 0
+    tasks_completed_in_period: int = 0
+
+    budget_amount: Decimal | None = None
+    spend_amount: Decimal | None = None
+    currency: str | None = None
+
+    #: The author's words. Empty at prefill; filled in as they write.
+    activities: str | None = None
+    action_required: str | None = None
+    note: str | None = None
+
+    milestones: list[MilestoneInput] = field(default_factory=list)
+
+
+def project_line_from(
+    summary: Any,
+    *,
+    milestones: Iterable[Any] = (),
+    updates_in_period: int = 0,
+    tasks_completed_in_period: int = 0,
+) -> ProjectLineInput:
+    """Turn a project summary into the row a report will carry.
+
+    ``summary`` is whatever ``app.projects.service.summarise`` returns — a
+    project with its figures already worked out. Duck-typed rather than
+    imported so this module keeps no dependency on the projects package; the
+    router does the reading and passes the result in, exactly as it does with
+    SharePoint tasks.
+
+    The two "in period" figures cannot be derived from a project's current
+    state at all — they are counts over its update log between two dates — so
+    they are asked for rather than guessed at. A report that silently showed
+    lifetime totals in a column headed "this week" would be worse than one that
+    showed nothing.
+    """
+    project, rollup = summary.project, summary.rollup
+    return ProjectLineInput(
+        project_id=project.id,
+        name=project.name,
+        code=project.code,
+        lead_name=project.lead.display_name if project.lead else None,
+        status=project.status,
+        start_on=project.start_on,
+        target_end_on=project.target_end_on,
+        rag_overall=project.rag_overall,
+        rag_scope=project.rag_scope,
+        rag_cost=project.rag_cost,
+        rag_schedule=project.rag_schedule,
+        rag_benefits=project.rag_benefits,
+        trend_overall=project.trend_overall,
+        trend_scope=project.trend_scope,
+        trend_cost=project.trend_cost,
+        trend_schedule=project.trend_schedule,
+        trend_benefits=project.trend_benefits,
+        percent_complete=rollup.percent_complete,
+        tasks_total=rollup.tasks_total,
+        tasks_done=rollup.tasks_done,
+        tasks_open=rollup.tasks_open,
+        tasks_blocked=rollup.tasks_blocked,
+        tasks_overdue=rollup.tasks_overdue,
+        milestones_total=rollup.milestones_total,
+        milestones_done=rollup.milestones_done,
+        milestones_overdue=rollup.milestones_overdue,
+        issues_open=rollup.issues_open,
+        updates_in_period=updates_in_period,
+        tasks_completed_in_period=tasks_completed_in_period,
+        budget_amount=project.budget_amount,
+        spend_amount=project.spend_amount,
+        currency=project.currency,
+        milestones=list(milestones),
+    )
+
+
+def _apply_project_lines(report: Report, rows: list[ProjectLineInput]) -> None:
+    """Replace the report's project lines with these, milestones and all.
+
+    Replacing rather than merging, exactly as the task and issue sections work.
+    Partial row edits would need stable ids on the client and go wrong
+    silently; sending the whole set is unambiguous and the payloads are small.
+
+    Called only while the report is still transient, or on one already loaded
+    with its lines — ``report.project_lines`` is eagerly loaded, so clearing it
+    emits no query. That matters: doing so from synchronous code inside an
+    async session would be a ``MissingGreenlet`` rather than a SELECT.
+    """
+    report.project_lines.clear()
+    for position, row in enumerate(rows):
+        line = ReportProjectLine(
+            position=position,
+            project_id=row.project_id,
+            name=row.name[:200],
+            code=row.code,
+            lead_name=row.lead_name,
+            status=row.status,
+            start_on=row.start_on,
+            target_end_on=row.target_end_on,
+            rag_overall=row.rag_overall,
+            rag_scope=row.rag_scope,
+            rag_cost=row.rag_cost,
+            rag_schedule=row.rag_schedule,
+            rag_benefits=row.rag_benefits,
+            trend_overall=row.trend_overall,
+            trend_scope=row.trend_scope,
+            trend_cost=row.trend_cost,
+            trend_schedule=row.trend_schedule,
+            trend_benefits=row.trend_benefits,
+            percent_complete=max(0, min(100, row.percent_complete)),
+            tasks_total=row.tasks_total,
+            tasks_done=row.tasks_done,
+            tasks_open=row.tasks_open,
+            tasks_blocked=row.tasks_blocked,
+            tasks_overdue=row.tasks_overdue,
+            milestones_total=row.milestones_total,
+            milestones_done=row.milestones_done,
+            milestones_overdue=row.milestones_overdue,
+            issues_open=row.issues_open,
+            updates_in_period=row.updates_in_period,
+            tasks_completed_in_period=row.tasks_completed_in_period,
+            budget_amount=row.budget_amount,
+            spend_amount=row.spend_amount,
+            currency=row.currency,
+            activities=row.activities,
+            action_required=row.action_required,
+            note=row.note,
+        )
+        for index, stone in enumerate(row.milestones):
+            line.milestones.append(
+                ReportMilestoneLine(
+                    position=index,
+                    milestone_id=stone.milestone_id,
+                    name=stone.name[:300],
+                    owner_name=stone.owner_name,
+                    start_on=stone.start_on,
+                    due_on=stone.due_on,
+                    done_on=stone.done_on,
+                    baseline_due_on=stone.baseline_due_on,
+                    percent_complete=max(0, min(100, stone.percent_complete)),
+                    plan=stone.plan,
+                    state=stone.state,
+                    is_key=stone.is_key,
+                    note=stone.note,
+                )
+            )
+        report.project_lines.append(line)
 
 
 def _decimal(value: Any) -> Decimal | None:
@@ -465,23 +764,42 @@ def _decimal(value: Any) -> Decimal | None:
 
 
 def refresh_metrics(report: Report, *, overrides: dict[str, Any] | None = None) -> None:
-    """Recompute the figures from the report's own task rows.
+    """Recompute the figures from whatever this report is actually about.
 
-    Computed from the report's tasks rather than from SharePoint directly,
-    because the author decides which tasks the report is about — they may drop a
-    row that is not really theirs, or add one the list has never heard of. A
-    figure that disagreed with the list of tasks printed directly above it would
-    be read as a bug whatever it was actually measuring.
+    **Two families, and a report uses exactly one.** A team report counts its
+    own task rows; a project or portfolio report sums its project lines. Which
+    applies is decided by the report's scope and never by both at once, so
+    there is no case where two metrics called ``tasks_overdue`` could sit on the
+    same report meaning different things.
 
-    An author's correction survives a recompute. That is the whole point of
-    keeping both numbers: the computed one moves as the rows change, and what
-    the person put stays put until they change it.
+    A team report's figures come from the report's tasks rather than from
+    SharePoint directly, because the author decides which tasks the report is
+    about — they may drop a row that is not really theirs, or add one the list
+    has never heard of. A figure that disagreed with the list printed directly
+    above it would be read as a bug whatever it was measuring.
+
+    A project report's figures come from its project lines for the mirror-image
+    reason: those lines are a snapshot of the whole project taken when the draft
+    was opened, and they are the only thing on the report that knows about work
+    the author chose not to list. The task rows on a project report are
+    illustrative detail — the interesting few, not the basis of any number.
+
+    An author's correction survives a recompute either way. That is the whole
+    point of keeping both numbers: the computed one moves as the rows change,
+    and what the person put stays put until they change it.
     """
     overrides = overrides or {}
-    computed = compute(report.tasks)
+    if report.is_about_projects:
+        specs: tuple = PROJECT_METRICS
+        computed = compute_projects(report.project_lines)
+        native = PROJECT_METRIC_KEYS
+    else:
+        specs = COMPUTED_METRICS
+        computed = compute(report.tasks)
+        native = COMPUTED_KEYS
     existing = {m.key: m for m in report.metrics}
 
-    for position, spec in enumerate(COMPUTED_METRICS):
+    for position, spec in enumerate(specs):
         row = existing.get(spec.key)
         if row is None:
             row = ReportMetric(key=spec.key, label=spec.label, unit=spec.unit)
@@ -496,14 +814,14 @@ def refresh_metrics(report: Report, *, overrides: dict[str, Any] | None = None) 
             row.value = _decimal(overrides[spec.key])
 
     # A metric the template asks for that nothing can compute: the team types it.
-    extra = {k: v for k, v in overrides.items() if k not in COMPUTED_KEYS}
+    extra = {k: v for k, v in overrides.items() if k not in native}
     for offset, (key, value) in enumerate(sorted(extra.items())):
         row = existing.get(key)
         if row is None:
             row = ReportMetric(key=key, label=key.replace("_", " ").title())
             report.metrics.append(row)
             existing[key] = row
-        row.position = len(COMPUTED_METRICS) + offset
+        row.position = len(specs) + offset
         row.value = _decimal(value)
 
 
@@ -520,12 +838,29 @@ async def start(
     period_start: date | None = None,
     period_end: date | None = None,
     prefill: list[TaskInput] | None = None,
+    project_id: uuid.UUID | None = None,
+    project_lines: list[ProjectLineInput] | None = None,
+    template: FormTemplate | None = None,
 ) -> Report:
-    """Open a draft for one period, prefilled with whatever the tasks say.
+    """Open a draft for one period, prefilled with whatever the work says.
 
-    Refuses a second report for the same person, team and period. Two daily
+    Refuses a second report for the same person, period and subject. Two daily
     reports for the same Tuesday is a mistake every time, and catching it here
     is kinder than letting a manager read both and wonder which one is current.
+
+    **What counts as the same report depends on what it is about.** For a team
+    report the key is the team, the cadence, the period and the scope; for a
+    project report it is the project, the cadence and the period — so the same
+    person can file on three projects in the same week without colliding, while
+    still being stopped from filing twice on one of them. The two partial
+    unique indexes on ``reports`` say the same thing at the database level;
+    this check exists so the refusal is a sentence rather than a constraint
+    violation.
+
+    ``template`` is accepted so a caller who has already decided which one
+    applies — a project report being filed against a template the team's
+    schedule does not name — need not have it looked up again and possibly
+    differently.
     """
     if cadence not in set(ReportCadence):
         raise ReportError(f"cadence must be one of: {', '.join(ReportCadence)}")
@@ -536,24 +871,47 @@ async def start(
         end_on = period_end or start_on
     else:
         start_on, end_on = period_for(cadence, on or today)
+        # An explicit range still wins for a calendar cadence. A quarterly
+        # report on a phase that does not line up with the calendar is a real
+        # thing to want, and refusing it would push people to ad_hoc and lose
+        # the cadence that makes the report findable later.
+        if period_start is not None:
+            start_on = period_start
+        if period_end is not None:
+            end_on = period_end
     if end_on < start_on:
         raise ReportError("The period ends before it starts")
 
-    clash = await session.scalar(
-        select(Report).where(
+    if template is None:
+        template = await template_for(session, team_id=team_id, cadence=cadence)
+    scope = scope_of(template)
+
+    if scope == ReportScope.PROJECT and project_id is None:
+        raise ReportError("A project status report has to say which project.")
+    if scope != ReportScope.PROJECT and project_id is not None:
+        raise ReportError(f"A {scope} report is not about a single project.")
+
+    clash_where = [
+        Report.author_id == author.id,
+        Report.cadence == cadence,
+        Report.period_start == start_on,
+    ]
+    if project_id is not None:
+        clash_where.append(Report.project_id == project_id)
+    else:
+        clash_where += [
             Report.team_id == team_id,
-            Report.author_id == author.id,
-            Report.cadence == cadence,
-            Report.period_start == start_on,
-        )
-    )
+            Report.scope == scope,
+            Report.project_id.is_(None),
+        ]
+    clash = await session.scalar(select(Report).where(*clash_where))
     if clash is not None:
+        subject = "this project" if project_id is not None else "this team"
         raise ReportConflictError(
-            f"You already have a {cadence} report for "
+            f"You already have a {cadence} report on {subject} for "
             f"{period_label(cadence, start_on, end_on)}."
         )
 
-    template = await template_for(session, team_id=team_id, cadence=cadence)
     report = Report(
         team_id=team_id,
         author_id=author.id,
@@ -562,6 +920,8 @@ async def start(
         cadence=cadence,
         period_start=start_on,
         period_end=end_on,
+        scope=scope,
+        project_id=project_id,
         status=ReportStatus.DRAFT,
     )
     # Filled in *before* the report is added to the session, and the order
@@ -571,6 +931,7 @@ async def start(
     # is a MissingGreenlet rather than a query. While it is still transient the
     # collections are simply empty, and the cascade inserts them with it.
     _apply_tasks(report, prefill or [])
+    _apply_project_lines(report, project_lines or [])
     refresh_metrics(report)
     session.add(report)
     await session.flush()
@@ -588,11 +949,20 @@ async def edit(
     tasks: list[TaskInput] | None = None,
     issues: list[IssueInput] | None = None,
     metrics: dict[str, Any] | None = None,
+    project_notes: dict[str, dict[str, str | None]] | None = None,
 ) -> Report:
     """Change a draft. Only what is given changes.
 
     A submitted report is refused here rather than quietly ignored — the caller
     asked to change something and needs to know it did not happen.
+
+    ``project_notes`` is the narrative on a project line — the key activities
+    and the management action required of the reference layout — keyed by the
+    line's own id. Only the prose is editable: the figures beside it are a
+    snapshot of the project taken when the draft was opened, and letting
+    somebody type over them would turn a record of what the project said into a
+    record of what they wished it had said. A project whose figures are wrong
+    is fixed in the project and the draft re-opened.
     """
     if report.status != ReportStatus.DRAFT:
         raise ReportConflictError("A submitted report cannot be changed.")
@@ -610,8 +980,21 @@ async def edit(
         _apply_tasks(report, tasks)
     if issues is not None:
         _apply_issues(report, issues)
+    if project_notes:
+        by_id = {str(line.id): line for line in report.project_lines}
+        for line_id, note in project_notes.items():
+            line = by_id.get(str(line_id))
+            if line is None:
+                # Silently skipped rather than refused: a stale page sending a
+                # line that has since gone should not fail the whole save and
+                # lose everything else the author typed.
+                continue
+            for key in ("activities", "action_required", "note"):
+                if key in note:
+                    value = (note[key] or "").strip()
+                    setattr(line, key, value or None)
 
-    # Always, because the task rows may have moved underneath the figures.
+    # Always, because the rows may have moved underneath the figures.
     refresh_metrics(report, overrides=metrics)
     await session.flush()
     return report
@@ -708,6 +1091,8 @@ async def listing(
     since: date | None = None,
     until: date | None = None,
     mine_only: bool = False,
+    scope: str | None = None,
+    project_id: uuid.UUID | None = None,
     limit: int = 50,
     offset: int = 0,
 ) -> tuple[list[Report], int]:
@@ -717,6 +1102,11 @@ async def listing(
     normal person asking for another team's reports gets an empty list rather
     than a refusal, because the honest answer to "show me presales' reports"
     from somebody who cannot read them is that there are none they can see.
+
+    ``project_id`` is no exception. Filtering by a project somebody cannot see
+    returns nothing rather than refusing — the report-level rules still apply
+    on top, so a project filter can never be used to discover that reports on
+    some project exist.
     """
     query = _visible(select(Report), viewer)
     if team_id is not None:
@@ -729,6 +1119,10 @@ async def listing(
         query = query.where(Report.cadence == cadence)
     if status is not None:
         query = query.where(Report.status == status)
+    if scope is not None:
+        query = query.where(Report.scope == scope)
+    if project_id is not None:
+        query = query.where(Report.project_id == project_id)
     if since is not None:
         query = query.where(Report.period_end >= since)
     if until is not None:
@@ -828,7 +1222,7 @@ async def update_settings(
     """Change the reporting settings. Only the keys given change."""
     row = await get_settings(session)
 
-    for field in (
+    for key in (
         "notify_on_submit",
         "notify_team_oversight",
         "notify_company_wide",
@@ -836,8 +1230,8 @@ async def update_settings(
         "include_task_list",
         "include_issue_list",
     ):
-        if changes.get(field) is not None:
-            setattr(row, field, bool(changes[field]))
+        if changes.get(key) is not None:
+            setattr(row, key, bool(changes[key]))
 
     if changes.get("max_tasks_in_email") is not None:
         row.max_tasks_in_email = max(0, int(changes["max_tasks_in_email"]))

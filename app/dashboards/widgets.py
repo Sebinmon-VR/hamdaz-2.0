@@ -7,13 +7,18 @@ to every team that has that module.
 
 from __future__ import annotations
 
+from datetime import UTC, date, datetime, timedelta
+
 from sqlalchemy import func, select
 
 from app.access import service as access_service
 from app.dashboards.registry import Widget, WidgetContext, register
 from app.directory.graph import GraphError
+from app.models.project import OPEN_PROJECT_STATUSES
 from app.models.role import Role
 from app.models.team import TeamMembership
+from app.projects import service as projects_service
+from app.projects.progress import milestone_percent, milestone_state, slip_days, task_is_overdue
 from app.proposals.analytics import scope_for_team
 from app.proposals.sharepoint import SharePointError
 from app.roles.catalogue import TEAM_LEAD
@@ -430,4 +435,287 @@ register(Widget(
     load=_leave_queue,
     size="large",
     default=True,
+))
+
+
+# ── projects module ────────────────────────────────────────────────────
+#
+# Every card here is narrowed to what the *viewer* may read, not to what the
+# team owns. A team dashboard is rendered for a person, and a card that showed
+# the whole team's projects to somebody who may only see one of them would be a
+# quieter version of the same leak the API refuses.
+
+
+async def _projects_viewer(ctx: WidgetContext):
+    return await projects_service.build_viewer(ctx.session, ctx.viewer)
+
+
+async def _project_health(ctx: WidgetContext) -> dict:
+    """The portfolio in one card: how many projects, and how they are doing."""
+    viewer = await _projects_viewer(ctx)
+    totals = await projects_service.portfolio(ctx.session, viewer, team_id=ctx.team.id)
+    return {
+        "projects": totals.projects,
+        "by_status": totals.by_status,
+        "by_rag": totals.by_rag,
+        "average_percent": totals.average_percent,
+        # Surfaced beside the colours on purpose. A board showing four greens
+        # and two greys reads as "mostly fine"; the same board saying two sets
+        # of dials have not been looked at for a fortnight reads correctly.
+        "stale_health": totals.stale_health,
+    }
+
+
+async def _project_attention(ctx: WidgetContext) -> dict:
+    """What is going wrong across the team's projects, in the order it matters.
+
+    Overdue milestones first, then blocked work, then escalations. That order
+    is the card's whole argument: a slipped milestone changes a date somebody
+    has promised, a blocked task changes somebody's afternoon.
+    """
+    viewer = await _projects_viewer(ctx)
+    totals = await projects_service.portfolio(ctx.session, viewer, team_id=ctx.team.id)
+    return {
+        "milestones_overdue": totals.milestones_overdue,
+        "tasks_overdue": totals.tasks_overdue,
+        "tasks_blocked_or_open": totals.tasks_open,
+        "issues_open": totals.issues_open,
+        "issues_needing_support": totals.issues_needing_support,
+    }
+
+
+async def _project_board(ctx: WidgetContext) -> dict:
+    """The team's live projects, worst health first. options: limit."""
+    limit = int(ctx.options.get("limit", 8))
+    viewer = await _projects_viewer(ctx)
+    rows, total = await projects_service.summaries(
+        ctx.session,
+        viewer,
+        team_id=ctx.team.id,
+        statuses=sorted(OPEN_PROJECT_STATUSES),
+        limit=100,
+    )
+    # Red first, then amber, then unassessed, then green — and within each, the
+    # nearest target date. A portfolio sorted alphabetically buries the one
+    # project somebody needed to see.
+    order = {"red": 0, "amber": 1, "grey": 2, "green": 3}
+    rows.sort(
+        key=lambda r: (
+            order.get(r.project.rag_overall, 4),
+            r.project.target_end_on or date.max,
+            r.project.name,
+        )
+    )
+    return {
+        "total": total,
+        "showing": min(limit, len(rows)),
+        "projects": [
+            {
+                "id": str(r.project.id),
+                "name": r.project.name,
+                "code": r.project.code,
+                "status": r.project.status,
+                "rag_overall": r.project.rag_overall,
+                "trend_overall": r.project.trend_overall,
+                "percent_complete": r.rollup.percent_complete,
+                "lead": r.project.lead.display_name if r.project.lead else None,
+                "target_end_on": (
+                    r.project.target_end_on.isoformat() if r.project.target_end_on else None
+                ),
+                "tasks_open": r.rollup.tasks_open,
+                "tasks_overdue": r.rollup.tasks_overdue,
+                "milestones_overdue": r.rollup.milestones_overdue,
+                "issues_open": r.rollup.issues_open,
+                "health_stale": r.stale,
+                # What the dates would say, next to what the lead said. Shown
+                # only where they disagree — agreement is not news.
+                "schedule_hint": (
+                    r.schedule_hint.reason
+                    if r.schedule_hint.rag != r.project.rag_schedule
+                    else None
+                ),
+            }
+            for r in rows[:limit]
+        ],
+    }
+
+
+async def _my_project_work(ctx: WidgetContext) -> dict:
+    """The viewer's own open tasks across this team's projects. options: limit."""
+    limit = int(ctx.options.get("limit", 8))
+    today = datetime.now(UTC).date()
+    tasks = await projects_service.my_tasks(ctx.session, user_id=ctx.viewer.id)
+    mine = [t for t in tasks if t.project.team_id == ctx.team.id]
+    return {
+        "total": len(mine),
+        "overdue": sum(1 for t in mine if task_is_overdue(t, today)),
+        "due_this_week": sum(
+            1
+            for t in mine
+            if t.due_on is not None and today <= t.due_on <= today + timedelta(days=7)
+        ),
+        "tasks": [
+            {
+                "id": str(t.id),
+                "project_id": str(t.project_id),
+                "project": t.project.name,
+                "title": t.title,
+                "status": t.status,
+                "priority": t.priority,
+                "percent_complete": t.percent_complete,
+                "due_on": t.due_on.isoformat() if t.due_on else None,
+                "overdue": task_is_overdue(t, today),
+            }
+            for t in mine[:limit]
+        ],
+    }
+
+
+async def _milestones_ahead(ctx: WidgetContext) -> dict:
+    """What is due next across the team's projects. options: limit, days.
+
+    Overdue milestones are included and sorted first, because a plan's next
+    date is not interesting while an earlier one is still unmet.
+    """
+    limit = int(ctx.options.get("limit", 8))
+    horizon = int(ctx.options.get("days", 30))
+    today = datetime.now(UTC).date()
+    cutoff = today + timedelta(days=horizon)
+
+    viewer = await _projects_viewer(ctx)
+    rows, _total = await projects_service.summaries(
+        ctx.session, viewer, team_id=ctx.team.id,
+        statuses=sorted(OPEN_PROJECT_STATUSES), limit=100,
+    )
+
+    upcoming = []
+    for row in rows:
+        tasks = list(row.project.tasks)
+        for stone in row.project.milestones:
+            state = milestone_state(stone, today)
+            if state in ("done", "undated"):
+                continue
+            if stone.due_on and stone.due_on > cutoff:
+                continue
+            upcoming.append(
+                {
+                    "id": str(stone.id),
+                    "project_id": str(row.project.id),
+                    "project": row.project.name,
+                    "name": stone.name,
+                    "owner": stone.owner.display_name if stone.owner else None,
+                    "due_on": stone.due_on.isoformat() if stone.due_on else None,
+                    "percent_complete": milestone_percent(stone, tasks),
+                    "state": state,
+                    "plan": stone.plan,
+                    "is_key": stone.is_key,
+                    "slip_days": slip_days(stone),
+                }
+            )
+
+    upcoming.sort(key=lambda m: (m["state"] != "overdue", m["due_on"] or ""))
+    return {
+        "within_days": horizon,
+        "total": len(upcoming),
+        "overdue": sum(1 for m in upcoming if m["state"] == "overdue"),
+        "milestones": upcoming[:limit],
+    }
+
+
+async def _project_activity(ctx: WidgetContext) -> dict:
+    """What actually moved this week. options: days, limit.
+
+    The counterpart to every other card here, which show a state. This one
+    shows movement, and a project with none is the one worth asking about.
+    """
+    days = int(ctx.options.get("days", 7))
+    limit = int(ctx.options.get("limit", 10))
+    today = datetime.now(UTC).date()
+
+    viewer = await _projects_viewer(ctx)
+    ids = await projects_service.visible_project_ids(ctx.session, viewer, team_id=ctx.team.id)
+    updates = await projects_service.log_between(
+        ctx.session,
+        project_ids=ids,
+        since=today - timedelta(days=days - 1),
+        until=today,
+        limit=200,
+    )
+
+    counts: dict[str, int] = {}
+    for row in updates:
+        counts[row.kind] = counts.get(row.kind, 0) + 1
+
+    return {
+        "days": days,
+        "total": len(updates),
+        "counts": counts,
+        "updates": [
+            {
+                "id": str(u.id),
+                "project_id": str(u.project_id),
+                "kind": u.kind,
+                "subject": u.subject,
+                "author": u.author.display_name if u.author else None,
+                "percent_delta": u.percent_delta,
+                "status_after": u.status_after,
+                "body": u.body,
+                "at": u.created_at.isoformat(),
+            }
+            for u in updates[:limit]
+        ],
+    }
+
+
+register(Widget(
+    key="project_health",
+    title="Project health",
+    description="How many projects the team runs and how they are doing.",
+    module="projects",
+    load=_project_health,
+    size="small",
+    default=True,
+))
+register(Widget(
+    key="project_board",
+    title="Projects",
+    description="The team's live projects, worst health first. options: limit.",
+    module="projects",
+    load=_project_board,
+    size="full",
+    default=True,
+))
+register(Widget(
+    key="my_project_work",
+    title="My project work",
+    description="The viewer's own open tasks on this team's projects. options: limit.",
+    module="projects",
+    load=_my_project_work,
+    size="large",
+    default=True,
+))
+register(Widget(
+    key="milestones_ahead",
+    title="Milestones ahead",
+    description="Overdue first, then what is coming. options: limit, days.",
+    module="projects",
+    load=_milestones_ahead,
+    size="large",
+    default=True,
+))
+register(Widget(
+    key="project_attention",
+    title="Needs attention",
+    description="Overdue milestones, blocked work and escalations across the team.",
+    module="projects",
+    load=_project_attention,
+    size="small",
+))
+register(Widget(
+    key="project_activity",
+    title="What moved",
+    description="Progress recorded over the last few days. options: days, limit.",
+    module="projects",
+    load=_project_activity,
+    size="large",
 ))

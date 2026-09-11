@@ -90,13 +90,26 @@ async def gather(
     *,
     team: Team | None = None,
     refresh: bool = False,
+    workload: dict[str, Any] | None = None,
+    last_seen: dict[str, datetime] | None = None,
 ) -> tuple[list[Candidate], AssignmentPolicy, dict[str, Any]]:
-    """Everything the score needs, for one team or for everybody."""
-    try:
-        workload = await cache.get(sharepoint, refresh=refresh)
-        last_seen = await _last_assigned(sharepoint)
-    except SharePointError as exc:
-        raise AnalyticsError(f"Could not read the Proposals list: {exc}") from exc
+    """Everything the score needs, for one team or for everybody.
+
+    ``workload`` and ``last_seen`` may be supplied by a caller that already has
+    them, in which case SharePoint is not touched at all. That is how the live
+    scoring in ``app.analytics.live`` reuses every rule below — capacity by
+    label, on-leave, the manager exclusion, the open-work ceiling — while
+    sourcing its counts from the local mirror. Two rankings that disagreed
+    would be worse than one that is occasionally a minute out of date, so
+    there is deliberately only one copy of this.
+    """
+    if workload is None:
+        try:
+            workload = await cache.get(sharepoint, refresh=refresh)
+            last_seen = await _last_assigned(sharepoint)
+        except SharePointError as exc:
+            raise AnalyticsError(f"Could not read the Proposals list: {exc}") from exc
+    last_seen = last_seen or {}
 
     policy = await policy_service.for_team(session, team.id if team else None)
 

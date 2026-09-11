@@ -17,7 +17,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.reports.catalogue import COMPLETIONS
 
-Cadence = Literal["daily", "weekly", "monthly", "ad_hoc"]
+Cadence = Literal["daily", "weekly", "monthly", "quarterly", "yearly", "ad_hoc"]
+Scope = Literal["team", "project", "portfolio"]
 Completion = Literal["not_started", "in_progress", "blocked", "done", "dropped"]
 Severity = Literal["low", "medium", "high", "blocked"]
 
@@ -25,6 +26,131 @@ Severity = Literal["low", "medium", "high", "blocked"]
 # completion added there and forgotten here would be accepted by the service
 # and refused by the schema, which is the confusing way round.
 assert set(COMPLETIONS) == set(Completion.__args__)
+
+
+# ── projects on a report ───────────────────────────────────────────────
+
+
+class ProjectChoiceOut(BaseModel):
+    """A project somebody may file a status report on, for the picker."""
+
+    id: uuid.UUID
+    name: str
+    code: str | None
+    label: str
+    status: str
+    rag_overall: str
+    percent_complete: int
+    #: Whether they already filed on this project for this period. Shown so the
+    #: picker can grey it out rather than letting somebody choose it and then
+    #: be refused.
+    already_reported: bool = False
+
+
+class MilestoneLineOut(BaseModel):
+    """One milestone on a filed report — a bar on the timeline.
+
+    Carries the original date beside the current one, because the gap between
+    them is the most useful thing on a project timeline and it disappears the
+    moment only one is kept.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    position: int
+    milestone_id: uuid.UUID | None
+    name: str
+    owner_name: str | None
+    start_on: date | None
+    due_on: date | None
+    done_on: date | None
+    baseline_due_on: date | None
+    #: The "PoC" column of a project status report.
+    percent_complete: int
+    plan: str | None
+    #: How it stood when the report was filed. Stored rather than recomputed,
+    #: so a report written in March still describes March in June.
+    state: str | None
+    is_key: bool
+    note: str | None
+
+
+class ProjectLineOut(BaseModel):
+    """One project as it stood when the report was filed.
+
+    Every figure here is a snapshot. The project it came from has almost
+    certainly moved since, and following ``project_id`` is how somebody reaches
+    the live version — the numbers below are deliberately frozen, because a
+    report that changed after it was filed would not be a report.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    position: int
+    #: Null once the project itself has been deleted. Everything else on this
+    #: row still reads, which is the whole reason it is a copy.
+    project_id: uuid.UUID | None
+    name: str
+    code: str | None
+    lead_name: str | None
+    status: str | None
+    start_on: date | None
+    target_end_on: date | None
+
+    rag_overall: str | None
+    rag_scope: str | None
+    rag_cost: str | None
+    rag_schedule: str | None
+    rag_benefits: str | None
+    trend_overall: str | None
+    trend_scope: str | None
+    trend_cost: str | None
+    trend_schedule: str | None
+    trend_benefits: str | None
+
+    percent_complete: int
+    tasks_total: int
+    tasks_done: int
+    tasks_open: int
+    tasks_blocked: int
+    tasks_overdue: int
+    milestones_total: int
+    milestones_done: int
+    milestones_overdue: int
+    issues_open: int
+    #: Movement inside the window this report covers, rather than the running
+    #: total. The figures that make a weekly report about the week.
+    updates_in_period: int
+    tasks_completed_in_period: int
+
+    budget_amount: Decimal | None
+    spend_amount: Decimal | None
+    currency: str | None
+
+    #: The author's own words — the "key activities" and "management action
+    #: required" of a project status report. The only part of this row a person
+    #: types, and the only part they may edit.
+    activities: str | None
+    action_required: str | None
+    note: str | None
+
+    milestones: list[MilestoneLineOut]
+
+
+class ProjectNoteIn(BaseModel):
+    """The narrative on one project line. Figures are not editable.
+
+    Only the prose: the numbers beside it are a snapshot taken when the draft
+    was opened, and letting somebody type over them would turn a record of what
+    the project said into a record of what they wished it had said. A project
+    whose figures are wrong is fixed in the project, and the draft re-opened.
+    """
+
+    activities: str | None = Field(default=None, max_length=8000)
+    action_required: str | None = Field(default=None, max_length=8000)
+    note: str | None = Field(default=None, max_length=8000)
 
 
 # ── the sections, as the frontend needs them ───────────────────────────
@@ -63,6 +189,14 @@ class ReportFormOut(BaseModel):
     template_id: uuid.UUID
     template_name: str
     template_version: int
+    #: "team", "project" or "portfolio" — worked out from the sections this
+    #: team's template declares. A frontend reads this to know whether to ask
+    #: which project the report is about before anything else.
+    scope: Scope
+    #: Only for a project-scoped form: the projects this person may file a
+    #: report on for this team, so the page can offer a choice rather than
+    #: making somebody paste an id.
+    projects: list[ProjectChoiceOut] = Field(default_factory=list)
     sections: list[SectionOut]
     fields: list[ReportFieldOut]
     completions: list[str]
@@ -122,6 +256,15 @@ class ReportStartIn(BaseModel):
     #: matters is what is live.
     include_closed: bool = False
 
+    #: Required when the team's template for this cadence is a project status
+    #: report, and refused otherwise. A portfolio report covers every project
+    #: the author may see on the team and so names none.
+    project_id: uuid.UUID | None = None
+    #: Pull the project's milestones onto the report as a timeline. On by
+    #: default — a status report without its milestones is a status report
+    #: missing the thing people open it for.
+    prefill_milestones: bool = True
+
 
 def _as_mapping(value: Any) -> Any:
     """Accept ``{"quotes_sent": 7}`` or ``[{"key": ..., "value": ...}]``.
@@ -165,6 +308,10 @@ class ReportEditIn(BaseModel):
     #: and the computed figure is kept beside it; an unknown key becomes a
     #: metric of its own, which is how a template's typed figures are stored.
     metrics: dict[str, Decimal | None] | None = None
+    #: The narrative on each project line, keyed by that line's id. Merged, not
+    #: replaced — a portfolio report is written a project at a time, and saving
+    #: one row's notes must not clear the five above it.
+    project_notes: dict[uuid.UUID, ProjectNoteIn] | None = None
 
     _pairs = field_validator("answers", "metrics", mode="before")(
         staticmethod(_as_mapping)
@@ -253,6 +400,13 @@ class ReportSummaryOut(BaseModel):
     period_start: date
     period_end: date
     period_label: str
+    #: "team", "project" or "portfolio".
+    scope: str
+    #: The project a project-scoped report is about. Null for the other two,
+    #: and also null once that project has been deleted — the report's own
+    #: project line keeps the name either way.
+    project_id: uuid.UUID | None
+    project_name: str | None
     status: str
     submitted_at: datetime | None
     task_count: int
@@ -275,6 +429,10 @@ class ReportOut(ReportSummaryOut):
     tasks: list[TaskLineOut]
     issues: list[IssueOut]
     metrics: list[MetricOut]
+    #: One row for a project status report, one per project for a portfolio
+    #: report, and empty for a team report. Same shape either way — the two
+    #: layouts are the same figures arranged differently.
+    project_lines: list[ProjectLineOut]
     comments: list[CommentOut]
     #: What this particular caller may do with it, so a frontend does not have
     #: to reimplement the rules to decide which buttons to draw.

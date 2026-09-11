@@ -39,10 +39,17 @@ from app.leave.router import router as leave_router
 from app.meetings.calendar import GraphCalendar
 from app.meetings.router import router as meetings_router
 from app.profiles.router import router as profiles_router
+from app.projects.router import router as projects_router
 from app.proposals.analytics import WorkloadCache
 from app.proposals.oversight import TeamTasksCache
 from app.proposals.router import router as proposals_router
 from app.proposals.sharepoint import SharePointProposals
+from app.admin.router import router as admin_router
+from app.intake.graph_mail import MailReader
+from app.intake.router import router as intake_router
+from app.intake.router import webhook_router as intake_webhook_router
+from app.intake.worker import Worker
+from app.notifications.router import router as notifications_router
 from app.quoting.mailer import QuoteMailer
 from app.reports.mailer import ReportMailer
 from app.reports.router import admin_router as reports_admin_router
@@ -130,11 +137,35 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         ),
         get_session_factory(),
     )
+    # Reads the watched mailbox. Shares the HTTP client and inherits the
+    # mailer's token cache — same token, no reason for a second copy.
+    app.state.mail_reader = MailReader(settings, http)
+    # The background half: keep the local copy of the Proposals list current,
+    # keep the ranking current with it, and watch the mailbox. Only one
+    # instance runs each loop — see app/intake/worker.py — and the loops are
+    # off unless somebody turns them on, because a timer that reads a live
+    # SharePoint list from a laptop is not what anybody meant.
+    app.state.intake_worker = Worker(
+        factory=get_session_factory(),
+        settings=settings,
+        sharepoint=app.state.sharepoint,
+        mail=app.state.mail_reader,
+        http=http,
+    )
+    # Started always. Both loops decide for themselves whether to do anything,
+    # by reading the intake settings each tick — so turning the intake on
+    # through the API is enough, and does not also need an environment
+    # variable and a restart. Two sleeping tasks cost nothing; an admin switch
+    # that silently does not take effect costs an afternoon.
+    app.state.intake_worker.start()
     logger.info("started environment=%s", settings.environment)
 
     try:
         yield
     finally:
+        # Stopped before the client closes: a loop mid-request against a
+        # closed connection pool is a noisy shutdown for no reason.
+        await app.state.intake_worker.stop()
         await http.aclose()
         await dispose_engine()
 
@@ -161,6 +192,7 @@ def create_app() -> FastAPI:
     app.include_router(access_router, prefix=settings.api_prefix)
     app.include_router(dashboards_router, prefix=settings.api_prefix)
     app.include_router(proposals_router, prefix=settings.api_prefix)
+    app.include_router(projects_router, prefix=settings.api_prefix)
     app.include_router(leave_router, prefix=settings.api_prefix)
     app.include_router(meetings_router, prefix=settings.api_prefix)
     app.include_router(zoho_router, prefix=settings.api_prefix)
@@ -174,6 +206,12 @@ def create_app() -> FastAPI:
     app.include_router(finance_router, prefix=settings.api_prefix)
     # Admin first: /reports/admin/... must be matched before /reports/{id},
     # which would otherwise try to read "admin" as a report id.
+    app.include_router(admin_router, prefix=settings.api_prefix)
+    app.include_router(notifications_router, prefix=settings.api_prefix)
+    # The webhook first: Graph posts to it unauthenticated, and it must not
+    # inherit anything that would refuse Microsoft.
+    app.include_router(intake_webhook_router, prefix=settings.api_prefix)
+    app.include_router(intake_router, prefix=settings.api_prefix)
     app.include_router(reports_admin_router, prefix=settings.api_prefix)
     app.include_router(reports_router, prefix=settings.api_prefix)
     app.include_router(assistant_router, prefix=settings.api_prefix)

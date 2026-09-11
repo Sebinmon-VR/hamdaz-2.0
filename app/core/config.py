@@ -168,10 +168,25 @@ class Settings(BaseSettings):
     #: A tool result longer than this is cut before the model sees it, so a
     #: full quote list cannot fill the context window in one call.
     assistant_tool_result_max_chars: int = 12_000
+    #: What the Proposals mirror embeds rows with, so an incoming email can be
+    #: matched to one by meaning rather than by spelling. Small and cheap: the
+    #: text being compared is a title and a few notes, and the larger models
+    #: buy almost nothing on that. See app/proposals/mirror.py.
+    embedding_model: str = "text-embedding-3-small"
 
     @property
     def openai_configured(self) -> bool:
         return bool(self.openai_api_key)
+
+    # ── the background loops ───────────────────────────────────────────
+    #: How often the local copy of the Proposals list is refreshed. Every read
+    #: that matters — matching an email, counting somebody's workload — goes to
+    #: the mirror, so this is the only thing that touches SharePoint on a timer
+    #: and its cost is one list read.
+    mirror_sync_seconds: int = 120
+    #: Off in development and in tests. A background loop that fires against a
+    #: live SharePoint list from somebody's laptop is not what anybody meant.
+    mirror_sync_enabled: bool = False
 
     # ── careers (the public application links) ─────────────────────────
     #: The origin this API is reached at from outside, used to build the share

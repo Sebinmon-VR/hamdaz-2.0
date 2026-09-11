@@ -58,14 +58,55 @@ from app.models.user import User
 
 
 class ReportCadence(StrEnum):
-    """How often a report is filed. Also decides what period one covers."""
+    """How often a report is filed. Also decides what period one covers.
+
+    The period arithmetic behind each of these lives in ``app.core.periods``,
+    shared with the projects module — see ``CADENCE_GRAIN`` below.
+    """
 
     DAILY = "daily"
     WEEKLY = "weekly"
     MONTHLY = "monthly"
+    #: A project's quarter. Added with project reporting: a status report on a
+    #: piece of work that runs for a year is meaningless weekly and unreadable
+    #: daily, and quarters are the unit programme reviews already use.
+    QUARTERLY = "quarterly"
+    YEARLY = "yearly"
     #: Filed when there is something to file — a bid post-mortem, a site visit.
     #: Its period is whatever the author says, because nothing else can know.
     AD_HOC = "ad_hoc"
+
+
+#: How each cadence maps onto the shared calendar. The one place the two
+#: vocabularies meet: reports say "weekly", the calendar says "week", and
+#: neither module has to learn the other's word for it.
+CADENCE_GRAIN: dict[str, str] = {
+    ReportCadence.DAILY: "day",
+    ReportCadence.WEEKLY: "week",
+    ReportCadence.MONTHLY: "month",
+    ReportCadence.QUARTERLY: "quarter",
+    ReportCadence.YEARLY: "year",
+    ReportCadence.AD_HOC: "custom",
+}
+
+
+class ReportScope(StrEnum):
+    """What a report is *about*, which is a different question from who filed it.
+
+    The module began with one answer — a person's account of their own period of
+    work for their team — and project reporting needs two more. Kept as a column
+    rather than inferred from whether ``project_id`` is set, because "every
+    project this team runs" and "the team's own work" are both project-less and
+    are emphatically not the same report.
+    """
+
+    #: One person's account of their own period. What every report was before
+    #: projects existed, and still what presales and purchasing file.
+    TEAM = "team"
+    #: The status of one project over a period. The reference status report.
+    PROJECT = "project"
+    #: Every project a team runs, one row each. The portfolio view, filed.
+    PORTFOLIO = "portfolio"
 
 
 class ReportStatus(StrEnum):
@@ -311,13 +352,35 @@ class Report(Base, UUIDPrimaryKey, Timestamped):
         # One person files one report per period per team. Two daily reports for
         # the same Tuesday is a mistake every time, and catching it here is
         # kinder than letting a manager read both and wonder which is current.
-        UniqueConstraint(
-            "team_id", "author_id", "cadence", "period_start",
-            name="uq_report_author_period",
+        #
+        # **Two partial indexes rather than one constraint, and the reason is
+        # NULL.** Postgres treats NULLs as distinct in a unique index, so adding
+        # ``project_id`` to a single constraint would silently stop guarding
+        # team reports — every one of them has a null project, so every one of
+        # them would be unique. Split by whether a project is named:
+        #
+        #   * no project — one report per team, author, cadence, period **and
+        #     scope**. Scope is in the key so somebody can file both their own
+        #     weekly and the team's portfolio weekly in the same week, which are
+        #     different reports about different things;
+        #   * a project — one report per project, author, cadence and period, so
+        #     the same person can report on three projects in the same week.
+        Index(
+            "uq_report_author_period",
+            "team_id", "author_id", "cadence", "period_start", "scope",
+            unique=True,
+            postgresql_where=text("project_id IS NULL"),
+        ),
+        Index(
+            "uq_report_project_period",
+            "project_id", "author_id", "cadence", "period_start",
+            unique=True,
+            postgresql_where=text("project_id IS NOT NULL"),
         ),
         Index("ix_reports_team_period", "team_id", "period_start"),
         Index("ix_reports_author_period", "author_id", "period_start"),
         Index("ix_reports_status", "status"),
+        Index("ix_reports_project", "project_id", "period_start"),
     )
 
     team_id: Mapped[uuid.UUID] = mapped_column(
@@ -341,6 +404,22 @@ class Report(Base, UUIDPrimaryKey, Timestamped):
     #: every query over a range written one way instead of two.
     period_start: Mapped[date] = mapped_column(Date, nullable=False)
     period_end: Mapped[date] = mapped_column(Date, nullable=False)
+
+    #: What this report is about. Defaults to ``team``, so every report filed
+    #: before projects existed keeps meaning exactly what it meant.
+    scope: Mapped[str] = mapped_column(
+        String(16), default=ReportScope.TEAM,
+        server_default=text("'team'"), nullable=False, index=True,
+    )
+    #: The project a ``project``-scoped report covers. Null for the other two.
+    #:
+    #: ``SET NULL`` rather than cascade, deliberately. Deleting a project must
+    #: not delete the reports filed about it — those are the record of what was
+    #: said at the time, and ``ReportProjectLine`` below keeps a copy of the
+    #: project's name and figures so the report still reads afterwards.
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="SET NULL")
+    )
 
     status: Mapped[str] = mapped_column(
         String(16), default=ReportStatus.DRAFT, server_default=text("'draft'"), nullable=False
@@ -395,6 +474,16 @@ class Report(Base, UUIDPrimaryKey, Timestamped):
         order_by="ReportMetric.position",
         lazy="selectin",
     )
+    project_lines: Mapped[list[ReportProjectLine]] = relationship(
+        back_populates="report",
+        cascade="all, delete-orphan",
+        order_by="ReportProjectLine.position",
+        lazy="selectin",
+    )
+
+    @property
+    def is_about_projects(self) -> bool:
+        return self.scope in (ReportScope.PROJECT, ReportScope.PORTFOLIO)
 
     @property
     def is_editable(self) -> bool:
@@ -605,3 +694,186 @@ class ReportRead(Base, UUIDPrimaryKey, Timestamped):
 
     def __repr__(self) -> str:
         return f"<ReportRead {self.report_id} {self.user_id}>"
+
+
+class ReportProjectLine(Base, UUIDPrimaryKey, Timestamped):
+    """One project as it stood when a report was filed.
+
+    A status report on a single project has one of these; a portfolio report
+    has one per project. Same table either way, because the portfolio table on
+    a report and the header block of a single-project report are the same
+    figures laid out differently, and two tables would mean two chances to
+    disagree about what "percent complete" meant that week.
+
+    **Snapshotted, not referenced**, for exactly the reason the task lines are.
+    A project that goes green next month must not silently rewrite the report
+    that said it was red — a report that changes after it is filed is not a
+    report. The link back to the live project stays, so anybody wanting the
+    current state is one click away, and the copied name means the row still
+    reads after the project is deleted.
+    """
+
+    __tablename__ = "report_project_lines"
+    __table_args__ = (
+        Index("ix_report_project_lines_report", "report_id", "position"),
+        # "How has this project's health moved across its reports" — the
+        # question a quarterly review asks, answered by scanning this column.
+        Index("ix_report_project_lines_project", "project_id"),
+    )
+
+    report_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("reports.id", ondelete="CASCADE"), nullable=False
+    )
+    position: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    #: The live project, while it exists. ``SET NULL`` so a deleted project
+    #: leaves the report intact — everything below is a copy.
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="SET NULL")
+    )
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    code: Mapped[str | None] = mapped_column(String(32))
+    lead_name: Mapped[str | None] = mapped_column(String(200))
+    status: Mapped[str | None] = mapped_column(String(16))
+
+    start_on: Mapped[date | None] = mapped_column(Date)
+    target_end_on: Mapped[date | None] = mapped_column(Date)
+
+    #: The five dials and their trends, as the lead had them at filing time.
+    #: Plain columns rather than JSONB because the whole point of a RAG history
+    #: is querying it — "show me every project that went red this quarter" is
+    #: the first question anybody asks of a set of status reports.
+    rag_overall: Mapped[str | None] = mapped_column(String(8), index=True)
+    rag_scope: Mapped[str | None] = mapped_column(String(8))
+    rag_cost: Mapped[str | None] = mapped_column(String(8))
+    rag_schedule: Mapped[str | None] = mapped_column(String(8))
+    rag_benefits: Mapped[str | None] = mapped_column(String(8))
+    trend_overall: Mapped[str | None] = mapped_column(String(12))
+    trend_scope: Mapped[str | None] = mapped_column(String(12))
+    trend_cost: Mapped[str | None] = mapped_column(String(12))
+    trend_schedule: Mapped[str | None] = mapped_column(String(12))
+    trend_benefits: Mapped[str | None] = mapped_column(String(12))
+
+    percent_complete: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+
+    #: The counts behind the percentage, so a reader can see what it is made of
+    #: rather than being asked to trust it.
+    tasks_total: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+    tasks_done: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+    tasks_open: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+    tasks_blocked: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+    tasks_overdue: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+    milestones_total: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+    milestones_done: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+    milestones_overdue: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+    issues_open: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+
+    #: What moved during the period this report covers, counted from the
+    #: project's update log. The figures that make a weekly report about the
+    #: week rather than about the running total.
+    updates_in_period: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+    tasks_completed_in_period: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+
+    budget_amount: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+    spend_amount: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+    currency: Mapped[str | None] = mapped_column(String(3))
+
+    #: The author's words about this project on this report — the "key
+    #: activities" and "management action required" of the reference layout.
+    #: Prose, so it stays text; nobody queries it.
+    activities: Mapped[str | None] = mapped_column(Text)
+    action_required: Mapped[str | None] = mapped_column(Text)
+    note: Mapped[str | None] = mapped_column(Text)
+
+    report: Mapped[Report] = relationship(back_populates="project_lines")
+    milestones: Mapped[list[ReportMilestoneLine]] = relationship(
+        back_populates="project_line",
+        cascade="all, delete-orphan",
+        order_by="ReportMilestoneLine.position",
+        lazy="selectin",
+    )
+
+    def __repr__(self) -> str:
+        return f"<ReportProjectLine {self.name!r} {self.rag_overall} {self.percent_complete}%>"
+
+
+class ReportMilestoneLine(Base, UUIDPrimaryKey, Timestamped):
+    """One milestone on a status report — a bar on the timeline.
+
+    Carries both the date it was originally promised and the date it had when
+    the report was filed, because the gap between them is the single most
+    useful thing on a project timeline and it disappears the moment only one
+    date is kept.
+
+    Hangs off the project line rather than the report, so a portfolio report
+    covering six projects keeps each one's milestones with the project they
+    belong to rather than in one undifferentiated list.
+    """
+
+    __tablename__ = "report_milestone_lines"
+    __table_args__ = (
+        Index("ix_report_milestone_lines_line", "project_line_id", "position"),
+    )
+
+    project_line_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("report_project_lines.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    position: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    milestone_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("project_milestones.id", ondelete="SET NULL")
+    )
+    name: Mapped[str] = mapped_column(String(300), nullable=False)
+    owner_name: Mapped[str | None] = mapped_column(String(200))
+
+    start_on: Mapped[date | None] = mapped_column(Date)
+    due_on: Mapped[date | None] = mapped_column(Date)
+    done_on: Mapped[date | None] = mapped_column(Date)
+    baseline_due_on: Mapped[date | None] = mapped_column(Date)
+
+    #: The "PoC" column of the reference report.
+    percent_complete: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+    #: on_plan / off_plan_no_impact / off_plan_impact — the marker on the bar.
+    plan: Mapped[str | None] = mapped_column(String(24))
+    #: done / due / overdue / upcoming / undated, as it stood at filing time.
+    #: Stored rather than recomputed on read: "overdue" is relative to a date,
+    #: and recomputing it later would make a report filed in March describe
+    #: itself differently in June.
+    state: Mapped[str | None] = mapped_column(String(16))
+    is_key: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
+    )
+    note: Mapped[str | None] = mapped_column(Text)
+
+    project_line: Mapped[ReportProjectLine] = relationship(back_populates="milestones")
+
+    def __repr__(self) -> str:
+        return f"<ReportMilestoneLine {self.name!r} {self.state}>"

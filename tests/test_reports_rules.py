@@ -39,13 +39,22 @@ from app.reports.catalogue import (
     COMPLETION_LABELS,
     COMPLETIONS,
     COMPUTED_METRICS,
+    PORTFOLIO_SECTIONS,
+    PROJECT_METRICS,
+    PROJECT_SCHEDULE_DEFAULTS,
+    PROJECT_SECTIONS,
     SECTIONS,
     SECTIONS_BY_KEY,
+    STANDARD_SECTIONS,
     TEMPLATES,
+    average_percent,
     compute,
+    compute_projects,
     period_for,
     period_label,
+    scope_of,
     section_specs,
+    sections_for,
 )
 from app.reports.service import _clean_emails, merge_answers, validate_answers
 
@@ -306,21 +315,66 @@ def test_an_empty_report_computes_zeroes_rather_than_nothing() -> None:
 
 
 def test_the_six_sections_are_the_ones_asked_for() -> None:
-    assert [s.key for s in SECTIONS] == [
+    """The standard frame is still the original six, in the original order.
+
+    Project reporting added three more sections to the catalogue, but it must
+    not have changed what an ordinary team report is made of — a presales daily
+    that grew a milestone timeline would be a regression whatever else it was.
+    """
+    assert list(STANDARD_SECTIONS) == [
         "overview", "tasks", "issues", "remarks", "metrics", "summary"
     ]
 
 
 def test_every_section_says_how_to_render_it() -> None:
     for section in SECTIONS:
-        assert section.kind in {"prose", "rows", "figures"}, section.key
+        assert section.kind in {"prose", "rows", "figures", "dials", "projects", "timeline"}, (
+            section.key
+        )
         assert section.description
 
 
 def test_the_template_sections_are_built_from_the_skeleton() -> None:
-    """One definition, so a section added to the skeleton appears on every
-    template rather than needing a second list kept in step."""
-    assert [s["key"] for s in section_specs()] == [s.key for s in SECTIONS]
+    """One definition, so a section's wording is never kept in step by hand."""
+    assert [s["key"] for s in section_specs()] == list(STANDARD_SECTIONS)
+    assert [s["key"] for s in section_specs(PROJECT_SECTIONS)] == list(PROJECT_SECTIONS)
+
+
+def test_a_template_declares_which_sections_it_has() -> None:
+    """A project template carries the timeline; a team template does not."""
+
+    class Fake:
+        def __init__(self, sections):
+            self.sections = sections
+
+    project = Fake(section_specs(PROJECT_SECTIONS))
+    assert [s.key for s in sections_for(project)] == list(PROJECT_SECTIONS)
+
+    portfolio = Fake(section_specs(PORTFOLIO_SECTIONS))
+    keys = [s.key for s in sections_for(portfolio)]
+    assert "projects" in keys
+    # A portfolio report deliberately carries no milestone timeline and no task
+    # list: six projects' milestones on one chart is a chart nobody reads.
+    assert "milestones" not in keys and "tasks" not in keys
+
+
+def test_a_template_that_declares_nothing_gets_the_standard_six() -> None:
+    """Anything seeded before project reporting existed must still render."""
+
+    class Bare:
+        sections: list = []
+
+    assert [s.key for s in sections_for(Bare())] == list(STANDARD_SECTIONS)
+
+
+def test_an_unknown_section_key_is_dropped_rather_than_passed_through() -> None:
+    """A heading with no definition behind it has no description and no idea
+    what kind of control belongs under it."""
+
+    class Odd:
+        sections = [{"key": "overview"}, {"key": "invented"}]
+
+    assert [s.key for s in sections_for(Odd())] == ["overview"]
 
 
 def test_every_shipped_template_puts_its_fields_in_a_real_section() -> None:
@@ -441,3 +495,155 @@ def test_a_mistyped_address_is_dropped_and_the_rest_kept() -> None:
 def test_no_addresses_at_all_is_an_empty_list_not_a_crash() -> None:
     assert _clean_emails(None) == []
     assert _clean_emails([]) == []
+
+
+# ── project status reports ─────────────────────────────────────────────
+#
+# The reports module gained a second frame when project reporting arrived. What
+# is tested here is the seam: that a template knows which frame it belongs to,
+# that the figures come from the right rows, and — most importantly — that none
+# of it changed what an ordinary team report is or does.
+
+
+class _FakeTemplate:
+    def __init__(self, sections: list) -> None:
+        self.sections = sections
+
+
+@pytest.mark.parametrize(
+    "sections,expected",
+    [
+        (STANDARD_SECTIONS, "team"),
+        (PROJECT_SECTIONS, "project"),
+        (PORTFOLIO_SECTIONS, "portfolio"),
+    ],
+)
+def test_a_templates_scope_is_inferred_from_its_sections(
+    sections: tuple, expected: str
+) -> None:
+    """The sections *are* the scope. Asking an administrator to set it twice
+    would only create the chance of two answers — a "project" report with
+    nowhere to put a project."""
+    assert scope_of(_FakeTemplate(section_specs(sections))) == expected
+
+
+def test_a_template_with_no_sections_is_a_team_report() -> None:
+    """Every template seeded before project reporting existed keeps meaning
+    exactly what it meant."""
+    assert scope_of(_FakeTemplate([])) == "team"
+
+
+def test_the_shipped_templates_declare_the_scope_they_claim() -> None:
+    """The catalogue says what each shipped template is for; the sections have
+    to agree, or the seeder would produce a template the module misreads."""
+    for spec in TEMPLATES:
+        template = _FakeTemplate(section_specs(spec["sections"]))
+        assert scope_of(template) == spec.get("scope", "team"), spec["key"]
+
+
+def test_every_project_schedule_default_names_a_real_template() -> None:
+    """A missing key here would leave a team adopting project reporting with a
+    schedule pointing at nothing."""
+    keys = {spec["key"] for spec in TEMPLATES}
+    for cadence, key in PROJECT_SCHEDULE_DEFAULTS.items():
+        assert key in keys, cadence
+        assert cadence in set(ReportCadence), cadence
+
+
+def test_there_is_no_daily_project_report() -> None:
+    """A project does not change enough in a day to be worth a set of dials,
+    and offering one would get it asked for."""
+    assert "daily" not in PROJECT_SCHEDULE_DEFAULTS
+
+
+class _FakeProjectLine:
+    def __init__(
+        self,
+        *,
+        rag: str | None = "green",
+        percent: int = 0,
+        milestones_overdue: int = 0,
+        tasks_overdue: int = 0,
+        tasks_blocked: int = 0,
+        issues_open: int = 0,
+        updates: int = 0,
+        completed: int = 0,
+    ) -> None:
+        self.rag_overall = rag
+        self.percent_complete = percent
+        self.milestones_overdue = milestones_overdue
+        self.tasks_overdue = tasks_overdue
+        self.tasks_blocked = tasks_blocked
+        self.issues_open = issues_open
+        self.updates_in_period = updates
+        self.tasks_completed_in_period = completed
+
+
+def test_project_metrics_count_the_reports_own_lines() -> None:
+    lines = [
+        _FakeProjectLine(rag="red", milestones_overdue=2, issues_open=1, completed=3),
+        _FakeProjectLine(rag="amber", tasks_blocked=1, updates=7),
+        _FakeProjectLine(rag="green"),
+        _FakeProjectLine(rag="grey"),
+    ]
+    figures = compute_projects(lines)
+    assert figures["projects_total"] == Decimal(4)
+    assert figures["projects_red"] == Decimal(1)
+    assert figures["projects_amber"] == Decimal(1)
+    assert figures["projects_green"] == Decimal(1)
+    assert figures["projects_unassessed"] == Decimal(1)
+    assert figures["milestones_overdue"] == Decimal(2)
+    assert figures["tasks_blocked"] == Decimal(1)
+    assert figures["issues_open"] == Decimal(1)
+    assert figures["updates_in_period"] == Decimal(7)
+    assert figures["tasks_completed_in_period"] == Decimal(3)
+
+
+def test_a_line_with_no_health_counts_as_unassessed_not_green() -> None:
+    """A portfolio where half the rows are grey is a portfolio nobody is
+    running, and that has to be visible as its own number."""
+    figures = compute_projects([_FakeProjectLine(rag=None), _FakeProjectLine(rag="grey")])
+    assert figures["projects_unassessed"] == Decimal(2)
+    assert figures["projects_green"] == Decimal(0)
+
+
+def test_an_empty_project_report_computes_zeroes_rather_than_nothing() -> None:
+    figures = compute_projects([])
+    assert set(figures) == {m.key for m in PROJECT_METRICS}
+    assert all(v == Decimal(0) for v in figures.values())
+
+
+def test_average_percent_counts_every_project_once() -> None:
+    """Unweighted. A weighted average would need a measure of size nothing here
+    has, and inventing one from task counts would make a project with many
+    small tasks look more important than one with a few large ones."""
+    assert average_percent([_FakeProjectLine(percent=100), _FakeProjectLine(percent=0)]) == 50
+    assert average_percent([]) == 0
+
+
+def test_the_new_cadences_get_real_periods() -> None:
+    """Quarterly and yearly arrived with project reporting and have to resolve
+    like every other cadence, through the same shared calendar."""
+    assert period_for(ReportCadence.QUARTERLY, date(2026, 11, 7)) == (
+        date(2026, 10, 1), date(2026, 12, 31)
+    )
+    assert period_for(ReportCadence.YEARLY, date(2026, 11, 7)) == (
+        date(2026, 1, 1), date(2026, 12, 31)
+    )
+    assert period_label(
+        ReportCadence.QUARTERLY, date(2026, 10, 1), date(2026, 12, 31)
+    ) == "Q4 2026"
+
+
+def test_the_original_cadences_still_mean_what_they_meant() -> None:
+    """The period arithmetic moved to app.core.periods when the projects module
+    needed to share it. Moving it must not have changed any answer."""
+    assert period_for(ReportCadence.DAILY, date(2026, 9, 8)) == (
+        date(2026, 9, 8), date(2026, 9, 8)
+    )
+    assert period_for(ReportCadence.WEEKLY, date(2026, 9, 8)) == (
+        date(2026, 9, 7), date(2026, 9, 13)
+    )
+    assert period_for(ReportCadence.MONTHLY, date(2026, 9, 8)) == (
+        date(2026, 9, 1), date(2026, 9, 30)
+    )

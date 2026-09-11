@@ -91,6 +91,8 @@ async def db(engine) -> AsyncIterator[AsyncSession]:
                 # test that leaked one would make the next test's template seed
                 # fail on a row it could not replace.
                 "reports, report_schedules, report_settings, report_deliveries, "
+                "intake_messages, intake_settings, notifications, "
+                "proposal_index, proposal_mirror_state, live_scores, "
                 "assistant_settings, assistant_models, assistant_module_policies, "
                 "assistant_tool_policies, assistant_access_rules, "
                 "assistant_conversations cascade"

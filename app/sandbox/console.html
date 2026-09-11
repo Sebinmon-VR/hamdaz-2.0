@@ -438,31 +438,375 @@ const ROUTES = [
   { g:"dashboards", m:"GET", p:"/api/v1/dashboards/me", t:"My teams' dashboards",
     auth:"session",
     query:[ {n:"local_only", l:"Skip Entra widgets", type:"check", checked:true} ] },
+  /* -- administration console ------------------------------------------- */
+  { g:"admin", m:"GET", p:"/api/v1/admin/console",
+    t:"Everything just built, and what it says", auth:"super_admin",
+    query:[ {n:"status_only", l:"Figures only, no endpoint lists", type:"check"} ],
+    rows:(d) => d.sections,
+    cols:[ {k:"name", l:"Section"}, {k:"audience", l:"For"},
+           {k:(r) => (r.endpoints||[]).length, l:"Endpoints"},
+           {k:(r) => (r.status||{}).needs_attention || 0, l:"Wants a look"},
+           {k:(r) => r.caution ? "yes" : "", l:"Caution"} ],
+    tags:(r) => [ ((r.status||{}).needs_attention||0) > 0 && "attention" ],
+    note:"One call for the whole new admin section: mail intake, the Proposals " +
+         "mirror, the live ranking, team reports and notifications. Each " +
+         "section carries its endpoints, a caution where there is a real risk, " +
+         "and live figures. needs_attention is the number a tile should badge " +
+         "— failed messages, failed deliveries, a mirror that has never " +
+         "synced — so every screen does not re-decide what counts as a problem." },
+  { g:"admin", m:"GET", p:"/api/v1/admin/permissions",
+    t:"Who may do what, in words", auth:"super_admin", rows:(d) => d,
+    cols:[ {k:"area", l:"Area"}, {k:"what", l:"Action"},
+           {k:(r) => (r.who||[]).join(", ") || "see the note", l:"Who"},
+           {k:(r) => (r.holders||[]).map(h => h.display_name).join(", ") || "—",
+            l:"Currently"} ],
+    note:"These rules live in code and cannot be derived from any other " +
+         "endpoint, so they are restated here — an admin screen that cannot " +
+         "explain WHY somebody is refused generates support questions instead " +
+         "of answering them. 'holders' is who actually holds those global " +
+         "roles today, so the screen can answer 'who can do this right now'. " +
+         "A blank 'who' means the answer is not a role at all — its author, " +
+         "or anyone on a team with the module — and the note says which." },
+
+  /* -- mail intake ------------------------------------------------------ */
+  { g:"intake", m:"GET", p:"/api/v1/intake/settings", t:"What mail is watched",
+    auth:"super_admin",
+    note:"Super admin only. The switch to look at is create_in_sharepoint: it " +
+         "ships FALSE, and while it is false a tender that would raise a task " +
+         "records the exact payload it would have posted and posts nothing. " +
+         "allowed_senders empty admits NOBODY — the opposite of the usual " +
+         "convention, so an unconfigured intake cannot read a whole mailbox." },
+  { g:"intake", m:"PATCH", p:"/api/v1/intake/settings", t:"Change it",
+    auth:"super_admin",
+    body:[ {n:"enabled", l:"Watch the mailbox", type:"check"},
+           {n:"mailbox", l:"Mailbox to watch, e.g. sebin@hamdaz.com"},
+           {n:"allowed_senders", l:"Only mail from these addresses"},
+           {n:"allowed_domains", l:"...or these whole domains"},
+           {n:"create_in_sharepoint", l:"WRITE new tasks to the live list",
+            type:"check"},
+           {n:"assign_team_id", l:"Team whose ranking picks the assignee"},
+           {n:"classify_threshold", l:"Min confidence to act at all", def:"0.6"},
+           {n:"match_threshold", l:"Min confidence to call it the same task", def:"0.7"},
+           {n:"teams_webhook_url", l:"Teams channel incoming webhook URL"},
+           {n:"notify_in_app", l:"Raise in-app notifications", type:"check"},
+           {n:"notify_teams", l:"Post to the Teams channel", type:"check"},
+           {n:"poll_seconds", l:"How often to check the mailbox", def:"60"} ],
+    note:"Changing the mailbox starts watching from NOW rather than replaying " +
+         "it — a fresh watch must not raise a year of tasks. Turning on " +
+         "create_in_sharepoint is the moment this starts writing rows into the " +
+         "live Proposals list the team works in; everything else is undoable." },
+  { g:"intake", m:"GET", p:"/api/v1/intake/messages", t:"Every mail it has seen",
+    auth:"super_admin",
+    query:[ {n:"status", l:"received | classified | actioned | ignored | simulated | failed"},
+            {n:"category", l:"tender | proposal | negotiation | order | general | unknown"},
+            {n:"limit", l:"Limit", def:"50"} ],
+    rows:(d) => d.messages,
+    cols:[ {k:(r) => (r.received_at||"").slice(0,16).replace("T"," "), l:"When"},
+           {k:"sender_email", l:"From"}, {k:"subject", l:"Subject"},
+           {k:(r) => r.category || "—", l:"Read as"},
+           {k:(r) => r.confidence == null ? "—" : r.confidence.toFixed(2), l:"Sure"},
+           {k:"status", l:"Status"}, {k:"action", l:"Did"},
+           {k:(r) => r.assigned_name || "—", l:"To"} ],
+    tags:(r) => [ r.status === "failed" && "failed",
+                  r.status === "simulated" && "not written",
+                  r.is_reopened && "reopened" ],
+    note:"Includes the IGNORED ones, which are the useful rows: 'why did " +
+         "nothing happen when I sent that' is the question this log exists to " +
+         "answer. Open one to see the model's reasoning, the shortlist it " +
+         "chose from with scores, and the SharePoint payload it would post." },
+  { g:"intake", m:"GET", p:"/api/v1/intake/messages/{message_id}", t:"One mail in full",
+    auth:"super_admin", params:[ {n:"message_id", l:"Message id"} ],
+    note:"candidates[] is the shortlist the matcher considered, each with its " +
+         "score — so a wrong match can be seen to have been a close call " +
+         "rather than a wild guess. would_create is the exact field-for-field " +
+         "payload; while writing is off, that is the whole output." },
+  { g:"intake", m:"POST", p:"/api/v1/intake/messages/{message_id}/retry",
+    t:"Put one back through", auth:"super_admin",
+    params:[ {n:"message_id", l:"Message id"} ],
+    note:"For after a setting changed — a sender added, a threshold lowered, " +
+         "or writing switched on. The classification is redone rather than " +
+         "reused, because the thing being retried is usually the decision." },
+  { g:"intake", m:"GET", p:"/api/v1/intake/mirror", t:"Is the local list copy current",
+    auth:"super_admin",
+    note:"Every question about the Proposals list — matching an email, " +
+         "counting somebody's workload — goes to this local copy, not to " +
+         "SharePoint. Watch rows_embedded: if it stays near the row count on " +
+         "every sync, the text hash is not doing its job and the embedding " +
+         "bill is real. embedded < rows means matching is running without its " +
+         "middle stage, usually a missing OpenAI key." },
+  { g:"intake", m:"POST", p:"/api/v1/intake/mirror/sync", t:"Refresh the copy now",
+    auth:"super_admin",
+    query:[ {n:"embed", l:"Also embed changed rows", type:"check"} ],
+    note:"Reads the Proposals list and rewrites the ranking. Reads only — " +
+         "nothing is written to SharePoint by this." },
+  { g:"intake", m:"GET", p:"/api/v1/intake/standing", t:"Who gets the next task",
+    auth:"super_admin",
+    query:[ {n:"team", l:"Team handle (blank = whole organisation)", from:"team"} ],
+    rows:(d) => d,
+    cols:[ {k:"rank", l:"#"}, {k:"display_name", l:"Who"},
+           {k:"active_tasks", l:"Active"}, {k:"open_tasks", l:"Open"},
+           {k:"overdue_tasks", l:"Overdue"},
+           {k:(r) => r.days_since_assigned == null ? "never" : r.days_since_assigned,
+            l:"Days since"},
+           {k:(r) => r.excluded_reason || "", l:"Why not"} ],
+    tags:(r) => [ !r.eligible && "not in the queue" ],
+    note:"Rank 1 gets the next task. A stored table rather than a computation, " +
+         "recomputed whenever the mirror changes — which is what makes the " +
+         "score live instead of a snapshot from whenever somebody last asked." },
+  { g:"intake", m:"POST", p:"/api/v1/intake/subscription",
+    t:"Ask Graph to notify us on new mail", auth:"super_admin",
+    note:"Optional. Polling already works and stays on as the safety net — " +
+         "Microsoft's own advice is not to depend on notifications alone. " +
+         "Needs PUBLIC_BASE_URL set to an https address Graph can reach, " +
+         "because Graph validates the endpoint before it will subscribe." },
+
+  /* -- notifications ---------------------------------------------------- */
+  { g:"notifications", m:"GET", p:"/api/v1/notifications", t:"What I have been told",
+    auth:"session",
+    query:[ {n:"unread_only", l:"Unread only", type:"check"},
+            {n:"limit", l:"Limit", def:"50"} ],
+    rows:(d) => d.notifications,
+    cols:[ {k:(r) => (r.created_at||"").slice(0,16).replace("T"," "), l:"When"},
+           {k:"kind", l:"Kind"}, {k:"title", l:"What"},
+           {k:(r) => r.read_at ? "read" : "unread", l:"State"} ],
+    note:"Always and only your own — there is no route that takes a user id, " +
+         "because there is no reason for one person to read another's. In-app " +
+         "is the record; the Teams copy is a copy, so a misconfigured webhook " +
+         "loses a duplicate rather than the only trace." },
+  { g:"notifications", m:"GET", p:"/api/v1/notifications/unread-count",
+    t:"Just the number on the bell", auth:"session",
+    note:"Its own route because a frontend polls this and nothing else." },
+  { g:"notifications", m:"POST", p:"/api/v1/notifications/read", t:"Mark as read",
+    auth:"session",
+    body:[ {n:"ids", l:"Notification ids (blank = mark everything read)"} ],
+    note:"An id belonging to somebody else simply matches nothing." },
+
   /* -- reports ---------------------------------------------------------- */
+  { g:"projects", m:"GET", p:"/api/v1/projects/board", t:"My work and my projects",
+    auth:"session",
+    query:[ {n:"team", l:"Team handle", from:"team"} ],
+    rows:(d) => d.tasks,
+    cols:[ {k:"title", l:"Task"}, {k:"project", l:"Project"},
+           {k:"status", l:"Status"}, {k:"priority", l:"Priority"},
+           {k:(r) => r.percent_complete + "%", l:"Done"},
+           {k:(r) => r.due_on || "—", l:"Due"} ],
+    tags:(r) => [ r.overdue && "overdue", r.status === "blocked" && "blocked" ],
+    note:"One call, because it is one screen. Your own open tasks across every " +
+         "project you are on, the projects themselves, and the portfolio totals. " +
+         "Everything is narrowed to what YOU may read — a card never shows the " +
+         "whole team's work to somebody who may only see one project of it." },
+  { g:"projects", m:"GET", p:"/api/v1/projects", t:"Projects I can see", auth:"session",
+    query:[ {n:"team", l:"Team handle", from:"team"},
+            {n:"status", l:"planned | active | on_hold | done | cancelled"},
+            {n:"mine_only", l:"Only projects I am on", type:"check"},
+            {n:"include_archived", l:"Include archived", type:"check"} ],
+    rows:(d) => d.projects,
+    cols:[ {k:"label", l:"Project"}, {k:"status", l:"Status"},
+           {k:"rag_overall", l:"Health"},
+           {k:(r) => r.percent_complete + "%", l:"Complete"},
+           {k:(r) => r.lead?.name || "—", l:"Lead"},
+           {k:(r) => r.target_end_on || "—", l:"Target"},
+           {k:(r) => r.rollup.tasks_overdue, l:"Overdue"} ],
+    tags:(r) => [ r.rag_overall === "red" && "red",
+                  r.rag_overall === "grey" && "not assessed",
+                  r.health_stale && "stale" ],
+    note:"You see the projects you are on, all of your team's if you run it, and " +
+         "everyone's if you run the company. Being a MEMBER of a team is not " +
+         "enough — that is authority versus membership, and only authority " +
+         "carries a right to other people's work. 'grey' means nobody has " +
+         "assessed the dials, which is deliberately not the same as green." },
+  { g:"projects", m:"POST", p:"/api/v1/projects", t:"Start a project", auth:"session",
+    body:[ {n:"team_id", l:"Team id"},
+           {n:"name", l:"Name"},
+           {n:"code", l:"Short code, e.g. AI-01"},
+           {n:"objective", l:"What it is for", type:"area"},
+           {n:"status", l:"planned | active | on_hold | done | cancelled"},
+           {n:"lead_id", l:"Lead user id"},
+           {n:"start_on", l:"Starts (YYYY-MM-DD)"},
+           {n:"target_end_on", l:"Target end (YYYY-MM-DD)"},
+           {n:"budget_amount", l:"Budget"} ],
+    note:"Team lead, team manager or an admin only — creating a project commits " +
+         "other people's time, so it takes oversight rather than membership. " +
+         "That is the opposite of filing a report, which any member does. Every " +
+         "health dial starts GREY and unreviewed: a new project showing green " +
+         "would be indistinguishable at a glance from one that is actually fine." },
+  { g:"projects", m:"GET", p:"/api/v1/projects/{project_id}", t:"One project in full",
+    auth:"session", params:[ {n:"project_id", l:"Project id"} ],
+    rows:(d) => d.milestones,
+    cols:[ {k:"name", l:"Milestone"},
+           {k:(r) => r.owner?.name || "—", l:"Owner"},
+           {k:(r) => r.due_on || "—", l:"Due"},
+           {k:(r) => r.percent_complete + "%", l:"PoC"},
+           {k:"state", l:"State"},
+           {k:(r) => r.slip_days == null ? "" : (r.slip_days > 0 ? "+" : "") + r.slip_days,
+            l:"Slip"} ],
+    tags:(r) => [ r.state === "overdue" && "overdue", r.is_key && "key" ],
+    note:"A project you may not read comes back 404, not 403 — a refusal would " +
+         "confirm the id names a real project of some team. The response also " +
+         "carries can_manage / can_administer / can_report so a frontend does " +
+         "not reimplement the rules to decide which buttons to draw. Milestone " +
+         "percentages are derived from the tasks under them, so they cannot " +
+         "disagree with the work." },
+  { g:"projects", m:"PATCH", p:"/api/v1/projects/{project_id}", t:"Change a project",
+    auth:"session", params:[ {n:"project_id", l:"Project id"} ],
+    body:[ {n:"name", l:"Name"},
+           {n:"status", l:"planned | active | on_hold | done | cancelled"},
+           {n:"lead_id", l:"Lead user id"},
+           {n:"target_end_on", l:"Target end (YYYY-MM-DD)"},
+           {n:"spend_amount", l:"Spent so far"},
+           {n:"percent_complete", l:"Override the derived %"} ],
+    note:"Project lead or somebody running the team. A field you leave out is " +
+         "untouched; a field sent as null is CLEARED — those are different " +
+         "intentions. Leaving percent_complete null hands the number back to the " +
+         "tasks, which is the default and usually right. Moving to done or " +
+         "cancelled dates the project automatically." },
+  { g:"projects", m:"PUT", p:"/api/v1/projects/{project_id}/health", t:"Assess the dials",
+    auth:"session", params:[ {n:"project_id", l:"Project id"} ],
+    body:[ {n:"rag_overall", l:"Overall: green | amber | red | grey"},
+           {n:"rag_scope", l:"Scope"}, {n:"rag_cost", l:"Costs"},
+           {n:"rag_schedule", l:"Schedule"}, {n:"rag_benefits", l:"Benefits"},
+           {n:"trend_overall", l:"improving | steady | declining"},
+           {n:"note", l:"Why", type:"area"} ],
+    note:"Its own endpoint because the TIMESTAMP is the point. Saving a " +
+         "description must not claim the health was reassessed, and confirming " +
+         "the dials unchanged must count as a review — 'looked at it, still " +
+         "amber' is information. Dials nobody has touched for a fortnight are " +
+         "reported as stale. The response shows what the dates and the budget " +
+         "would suggest beside what you said; they are never merged." },
+  { g:"projects", m:"POST", p:"/api/v1/projects/{project_id}/milestones",
+    t:"Add a milestone", auth:"session", params:[ {n:"project_id", l:"Project id"} ],
+    body:[ {n:"name", l:"Name"}, {n:"detail", l:"Detail", type:"area"},
+           {n:"owner_id", l:"Owner user id"},
+           {n:"start_on", l:"Starts (YYYY-MM-DD)"},
+           {n:"due_on", l:"Due (YYYY-MM-DD)"},
+           {n:"is_key", l:"Key milestone", type:"check"} ],
+    note:"The due date given here becomes the BASELINE and is never rewritten. " +
+         "Every later move is measured from it, so 'how far has this slipped' " +
+         "still has an answer after the third reschedule — which is exactly when " +
+         "somebody starts asking. Its owner is put on the project automatically." },
+  { g:"projects", m:"PATCH", p:"/api/v1/projects/{project_id}/milestones/{milestone_id}",
+    t:"Move or complete a milestone", auth:"session",
+    params:[ {n:"project_id", l:"Project id"}, {n:"milestone_id", l:"Milestone id"} ],
+    body:[ {n:"due_on", l:"New due date (YYYY-MM-DD)"},
+           {n:"done_on", l:"Reached on (YYYY-MM-DD)"},
+           {n:"percent_complete", l:"Percent 0-100"},
+           {n:"plan", l:"on_plan | off_plan_no_impact | off_plan_impact"} ],
+    note:"Moving a date writes to the progress log with both dates and the slip. " +
+         "A rescheduling nobody can see afterwards is how a project arrives four " +
+         "months late having been green throughout. 'off_plan_impact' means " +
+         "something else moves because of it — that distinction is what turns " +
+         "the schedule dial red rather than amber." },
+  { g:"projects", m:"POST", p:"/api/v1/projects/{project_id}/tasks", t:"Add a task",
+    auth:"session", params:[ {n:"project_id", l:"Project id"} ],
+    body:[ {n:"title", l:"Title"}, {n:"detail", l:"Detail", type:"area"},
+           {n:"milestone_id", l:"Milestone id (optional)"},
+           {n:"assignee_id", l:"Assign to user id"},
+           {n:"priority", l:"low | medium | high | critical"},
+           {n:"due_on", l:"Due (YYYY-MM-DD)"},
+           {n:"estimate_hours", l:"Estimate in hours"} ],
+    note:"Project lead or team oversight. Whoever it lands on is added to the " +
+         "project and notified — assignment IMPLIES membership, so there is one " +
+         "answer to who can see it rather than two that can disagree. A task " +
+         "with nobody on it is deliberately allowed: a plan is usually written " +
+         "before it is shared out." },
+  { g:"projects", m:"PATCH", p:"/api/v1/projects/{project_id}/tasks/{task_id}",
+    t:"Report progress on a task", auth:"session",
+    params:[ {n:"project_id", l:"Project id"}, {n:"task_id", l:"Task id"} ],
+    body:[ {n:"status", l:"not_started | in_progress | blocked | done | dropped"},
+           {n:"percent_complete", l:"Percent 0-100"},
+           {n:"blocked_reason", l:"What is in the way", type:"area"},
+           {n:"note", l:"What happened (goes in the log)", type:"area"},
+           {n:"hours", l:"Hours spent today"} ],
+    note:"The one thing an ordinary member may do, and the thing every status " +
+         "report is ultimately built from. The ASSIGNEE may move percentage, " +
+         "status, hours and the blocked reason; changing the title, the due " +
+         "date, the priority or who holds it is a planning decision and is " +
+         "REFUSED for them rather than ignored. A note with nothing else is " +
+         "valid — 'nothing moved, here is why' is a useful line on a weekly." },
+  { g:"projects", m:"POST", p:"/api/v1/projects/{project_id}/issues", t:"Raise an issue",
+    auth:"session", params:[ {n:"project_id", l:"Project id"} ],
+    body:[ {n:"title", l:"What is wrong"}, {n:"detail", l:"Detail", type:"area"},
+           {n:"priority", l:"low | medium | high | critical"},
+           {n:"owner_id", l:"Who owns it"},
+           {n:"needs_support", l:"Needs somebody above me", type:"check"},
+           {n:"support_note", l:"What is being asked for", type:"area"} ],
+    note:"ANYBODY on the project may raise one — deliberately wider than " +
+         "managing the plan, because the person who trips over a blocker is " +
+         "usually not the person running the project. needs_support is a flag " +
+         "rather than a severity: 'serious' and 'needs somebody above me' are " +
+         "different claims, and only the second fills the support box on a " +
+         "status report." },
+  { g:"projects", m:"GET", p:"/api/v1/projects/activity", t:"What moved over a period",
+    auth:"session",
+    query:[ {n:"grain", l:"day | week | month | quarter | year | custom", def:"week"},
+            {n:"on", l:"Any day inside the period (YYYY-MM-DD)"},
+            {n:"since", l:"custom only: from"}, {n:"until", l:"custom only: to"},
+            {n:"team", l:"Team handle", from:"team"},
+            {n:"project_id", l:"One project (blank = all I can see)"},
+            {n:"mine_only", l:"Only my own updates", type:"check"} ],
+    rows:(d) => d.updates,
+    cols:[ {k:"kind", l:"Kind"}, {k:"subject", l:"What"},
+           {k:(r) => r.author?.name || "—", l:"Who"},
+           {k:(r) => r.percent_delta == null ? ""
+                     : (r.percent_delta > 0 ? "+" : "") + r.percent_delta + "%", l:"Moved"},
+           {k:(r) => r.status_after || "", l:"To"},
+           {k:(r) => r.at.slice(0, 16).replace("T", " "), l:"When"} ],
+    note:"Day, week, month, quarter and year all resolve to two dates and then " +
+         "run the same query, which is why this is one endpoint rather than " +
+         "four. This is the log a status report reads: deriving 'what happened " +
+         "last week' from the current state of the tasks would give whatever is " +
+         "true NOW, which is the one thing a report on a past period must not do." },
+  { g:"projects", m:"POST", p:"/api/v1/projects/{project_id}/updates",
+    t:"Post a progress update", auth:"session",
+    params:[ {n:"project_id", l:"Project id"} ],
+    body:[ {n:"body", l:"What happened", type:"area"} ],
+    note:"Words with no numbers attached, open to anybody on the project. The " +
+         "plainest way to say what happened — and a status report that can " +
+         "quote what the people doing the work actually said is worth more than " +
+         "one that cannot." },
+  { g:"projects", m:"GET", p:"/api/v1/projects/portfolio", t:"Every project at a glance",
+    auth:"session",
+    query:[ {n:"team", l:"Team handle", from:"team"} ],
+    note:"Narrowed to what you may read, exactly as the listing is — an " +
+         "ordinary member asking gets a portfolio of their own projects rather " +
+         "than a refusal. Read stale_health before believing any of the other " +
+         "numbers: it counts the projects whose dials nobody has confirmed." },
   { g:"reports", m:"GET", p:"/api/v1/reports/form", t:"What my report will ask",
     auth:"session",
     query:[ {n:"team", l:"Team handle", from:"team"},
-            {n:"cadence", l:"daily | weekly | monthly | ad_hoc", def:"daily"},
+            {n:"cadence", l:"daily | weekly | monthly | quarterly | yearly | ad_hoc",
+             def:"daily"},
             {n:"on", l:"A day inside the period (YYYY-MM-DD)"} ],
     rows:(d) => d.fields,
     cols:[ {k:"section", l:"Section"}, {k:"key", l:"Field", mono:true},
            {k:"label", l:"Label"}, {k:"type", l:"Type"},
            {k:(r) => r.required ? "yes" : "", l:"Required"} ],
-    note:"The six sections are fixed — overview, tasks, issues, remarks, metrics, " +
-         "summary — because a manager reading four teams' reports should find the " +
-         "issues in the same place each time. The fields listed here are what THIS " +
-         "team is asked on top, and come from the template a super admin scheduled. " +
-         "A team with no schedule gets the generic template and no extra fields." },
+    note:"CHECK 'scope' FIRST. A team report has the standard six sections — " +
+         "overview, tasks, issues, remarks, metrics, summary — so a manager " +
+         "reading four teams' reports finds the issues in the same place each " +
+         "time. A team pointed at a project template instead gets scope=project, " +
+         "health dials and a milestone timeline, and a list of projects to " +
+         "choose from. Which one a team gets is its schedule; that is the whole " +
+         "of 'select the AI team and the form changes'. The fields here are what " +
+         "THIS team is asked on top of its sections." },
   { g:"reports", m:"POST", p:"/api/v1/reports", t:"Start a report", auth:"session",
     body:[ {n:"team_id", l:"Team id"},
-           {n:"cadence", l:"daily | weekly | monthly | ad_hoc"},
+           {n:"cadence", l:"daily | weekly | monthly | quarterly | yearly | ad_hoc"},
            {n:"on", l:"A day inside the period (blank = today)"},
-           {n:"prefill_tasks", l:"Pull in my Proposals tasks", type:"check"},
+           {n:"period_start", l:"Override the start (YYYY-MM-DD)"},
+           {n:"period_end", l:"Override the end (YYYY-MM-DD)"},
+           {n:"project_id", l:"Project id — project reports only"},
+           {n:"prefill_tasks", l:"Pull the work in", type:"check"},
+           {n:"prefill_milestones", l:"Pull the milestones in", type:"check"},
            {n:"include_closed", l:"Include finished tasks", type:"check"} ],
-    note:"Opens a draft, prefilled with YOUR Proposals tasks — title, status, " +
-         "deadline, the SharePoint link and its attachments. Whose tasks is taken " +
-         "from your session; no parameter changes it. Nothing goes to anybody " +
-         "until you submit. If SharePoint is down the draft still opens, empty." },
+    note:"Opens a draft. For a TEAM report it prefills YOUR Proposals tasks — " +
+         "whose is taken from your session, no parameter changes it. For a " +
+         "PROJECT report it snapshots the project's health, milestones and " +
+         "counts as they stand right now, and project_id is required; for a " +
+         "PORTFOLIO report it snapshots every project on that team you may see. " +
+         "Those figures are then FROZEN — the project moving on afterwards must " +
+         "not rewrite what the report said. Nothing goes to anybody until you " +
+         "submit." },
   { g:"reports", m:"PATCH", p:"/api/v1/reports/{report_id}", t:"Fill in a draft",
     auth:"session", params:[ {n:"report_id", l:"Report id"} ],
     body:[ {n:"overview", l:"Overview", type:"area"},
