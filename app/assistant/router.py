@@ -53,6 +53,7 @@ from app.assistant.places import (
     PlaceError,
     describe,
     detail_page,
+    extra_places,
     fill,
     places_from,
     resolve,
@@ -65,7 +66,7 @@ from app.assistant.records import (
     match,
     rows_of,
 )
-from app.assistant.policy import resolve_tools
+from app.assistant.policy import may_delete, resolve_tools
 from app.assistant.schemas import (
     PlaceOut,
     RealtimeStartIn,
@@ -73,6 +74,7 @@ from app.assistant.schemas import (
     AccessRuleOut,
     AccessRulePatch,
     AnalyticsOut,
+    ClientResultIn,
     ConfirmIn,
     ConversationDetailOut,
     ConversationIn,
@@ -93,6 +95,7 @@ from app.assistant.schemas import (
     RunDetailOut,
     RunOut,
     RunPage,
+    ScreenControlIn,
     SendIn,
     SettingsIn,
     SettingsOut,
@@ -118,6 +121,7 @@ from app.models.team import Team, slugify
 from app.models.user import User
 from app.roles.catalogue import SUPER_ADMIN
 from app.roles.deps import CurrentRoles
+from app.leave import service as leave_service
 from app.roles.service import global_role_keys
 
 router = APIRouter(prefix="/assistant", tags=["assistant"])
@@ -424,6 +428,7 @@ async def status_for_me(
         voice=snapshot.settings.voice if snapshot.settings.voice_enabled else None,
         realtime_enabled=snapshot.settings.realtime_enabled and admission.admitted,
         modules=modules,
+        can_delete=admission.admitted and may_delete(actor),
     )
 
 
@@ -460,12 +465,26 @@ async def my_conversations(
 
 
 def _pending_out(run: AssistantRun | None) -> PendingOut | None:
-    if run is None or run.status != RunStatus.AWAITING_CONFIRMATION or not run.pending:
+    """What the last turn stopped on, if it stopped.
+
+    Only the actions the browser has to deal with *now*: while a write waits
+    on the person's yes, any client actions parked alongside it stay out of
+    sight — they are handed over once the yes is answered, by the loop.
+    """
+    if run is None or not run.pending:
         return None
-    return PendingOut(
-        run_id=run.id,
-        actions=[PendingActionOut(**action) for action in run.pending],
-    )
+    if run.status == RunStatus.AWAITING_CONFIRMATION:
+        wanted = "confirm"
+    elif run.status == RunStatus.AWAITING_CLIENT:
+        wanted = "client"
+    else:
+        return None
+    actions = [
+        PendingActionOut(**action)
+        for action in run.pending
+        if action.get("kind", "confirm") == wanted
+    ]
+    return PendingOut(run_id=run.id, actions=actions, status=run.status)
 
 
 @router.get(
@@ -528,6 +547,7 @@ async def _prepare(
     settings: Settings,
     conversation: Any | None = None,
     page: str | None = None,
+    screen: list[ScreenControlIn] | None = None,
 ) -> tuple[service.Snapshot, TurnContext]:
     """Everything a turn needs, with every gate checked before anything starts."""
     snapshot = await cached_snapshot(session, get_config_cache(request))
@@ -561,13 +581,51 @@ async def _prepare(
         snapshot=snapshot,
         tools=tools,
         subject=_subject_note(conversation),
-        where=await _where(request, session, user, page),
+        where=await _where(request, session, user, page, screen),
     )
     return snapshot, context
 
 
+#: How many controls a screen description carries. A page with more than
+#: this has a table on it, and the model does not need every row's button to
+#: press the one somebody named — it needs the first screenful, and
+#: app.screen for the rest.
+_SCREEN_CONTROLS = 120
+
+
+def _controls(screen: list[ScreenControlIn] | None) -> str | None:
+    """The screen's controls as a list the model can press from.
+
+    One line per control, by kind and label, so "press Save" resolves to a
+    label that is actually on the page rather than one the model imagined.
+    Fields carry their current value, which is what makes "change the title
+    to X" a fill rather than a question.
+    """
+    if not screen:
+        return None
+    lines: list[str] = []
+    for control in screen[:_SCREEN_CONTROLS]:
+        label = control.label.strip()
+        if not label:
+            continue
+        kind = control.kind.strip().lower() or "control"
+        line = f"  - {kind}: {label}"
+        if control.value:
+            line += f" = {control.value.strip()}"
+        lines.append(line)
+    if not lines:
+        return None
+    if len(screen) > _SCREEN_CONTROLS:
+        lines.append(f"  - … and {len(screen) - _SCREEN_CONTROLS} more; app.screen lists them")
+    return "\n".join(lines)
+
+
 async def _where(
-    request: Request, session: AsyncSession, user: User, page: str | None
+    request: Request,
+    session: AsyncSession,
+    user: User,
+    page: str | None,
+    screen: list[ScreenControlIn] | None = None,
 ) -> str | None:
     """The screen the person is on, said so the model can act on it.
 
@@ -582,10 +640,18 @@ async def _where(
         return None
     places = await _places_for(request, session, user)
     place = describe(places, page)
-    if place is None:
-        return None
-
     nl = chr(10)
+    controls = _controls(screen)
+    if place is None:
+        # Not one of the catalogue's screens — but the browser still said
+        # what is on it, and pressing what is there does not need a name.
+        if controls is None:
+            return None
+        return (
+            f"- Route: {page}{nl}- Controls on this screen (press with app.click, "
+            f"fill with app.fill):{nl}{controls}"
+        )
+
     told = f"- Screen: {place.label} ({place.key}){nl}- Route: {page}"
     # The parameter a detail route carries IS the record they are looking at,
     # which is the single most useful fact here: it turns "summarise this
@@ -622,18 +688,38 @@ async def _where(
             reader = candidate
     if reader:
         told += f"{nl}- The data on this screen comes from: {reader}. Read it before answering about what they can see."
+    if controls:
+        told += (
+            f"{nl}- Controls on this screen (press with app.click, fill with app.fill, "
+            f"scroll to a heading with app.scroll):{nl}{controls}"
+        )
     return told
 
 
 async def _places_for(request: Request, session: AsyncSession, user: User) -> list[Any]:
-    """This person's reachable screens, from the cache when it is warm."""
+    """This person's reachable screens, from the cache when it is warm.
+
+    The effective access payload first, then everything the navigation shows
+    without a grant — the always-open modules, the screens the catalogue does
+    not list, the HR screens for the HR team, the admin screens for admins.
+    Same rules as the frontend's own rail, so what the assistant can open is
+    what the person can click. See ``places.extra_places``.
+    """
     cached = get_places_cache(request).get(user.id)
     if cached is not None:
         return cached
+    roles = await global_role_keys(session, user.id)
     access = await access_service.effective_access(
-        session, user_id=user.id, global_roles=await global_role_keys(session, user.id)
+        session, user_id=user.id, global_roles=roles
     )
-    return get_places_cache(request).put(user.id, places_from(access))
+    places = places_from(access)
+    places += extra_places(
+        places,
+        roles=set(roles),
+        is_hr=await leave_service.is_hr(session, user.id),
+        user_id=str(user.id),
+    )
+    return get_places_cache(request).put(user.id, places)
 
 
 def _subject_note(conversation: Any | None) -> str | None:
@@ -693,12 +779,14 @@ async def send_message(
             detail=(
                 "This chat is still working on the previous message."
                 if open_run.status == RunStatus.RUNNING
+                else "This chat is waiting for the screen to finish an action first."
+                if open_run.status == RunStatus.AWAITING_CLIENT
                 else "This chat is waiting for you to confirm an action first."
             ),
         )
 
     snapshot, context = await _prepare(
-        request, user, session, settings, conversation, page=body.page
+        request, user, session, settings, conversation, page=body.page, screen=body.screen
     )
     run = await service.create_run(
         session,
@@ -756,6 +844,51 @@ async def confirm(
     _, context = await _prepare(request, user, session, settings, conversation)
     await session.commit()
     return _sse_response(agent.resume(run.id, context, approved=body.approved))
+
+
+@router.post(
+    "/conversations/{conversation_id}/client-result",
+    summary="Report what the screen did, and let the turn carry on",
+    response_class=StreamingResponse,
+)
+async def client_result(
+    conversation_id: uuid.UUID,
+    body: ClientResultIn,
+    request: Request,
+    user: CurrentUser,
+    session: Session,
+    settings: Config,
+    agent: Agent,
+) -> StreamingResponse:
+    """The other half of a client tool.
+
+    The turn asked the browser to press, fill, scroll or read; the browser did
+    it — or could not — and says so here. The loop picks up from where it
+    parked with those results as tool outputs, exactly as a confirmation
+    resumes it with the person's decision. Streams like a message does,
+    because the model's next words are the answer to what just happened.
+
+    ``page`` and ``screen`` are not taken here: the screen after the action
+    is what the browser reports in the results themselves.
+    """
+    try:
+        conversation = await service.get_conversation(session, conversation_id, user_id=user.id)
+        run = await service.get_run(session, body.run_id)
+    except AssistantError as exc:
+        raise _translate(exc) from exc
+
+    if run.conversation_id != conversation.id or run.user_id != user.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such run")
+    if run.status != RunStatus.AWAITING_CLIENT:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"That run is not waiting on the screen ({run.status}).",
+        )
+
+    _, context = await _prepare(request, user, session, settings, conversation)
+    await session.commit()
+    results = [item.model_dump() for item in body.results]
+    return _sse_response(agent.report(run.id, context, results=results))
 
 
 # ── the voice ──────────────────────────────────────────────────────────

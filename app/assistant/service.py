@@ -24,6 +24,7 @@ from sqlalchemy.orm import selectinload
 
 from app.access.service import effective_access
 from app.assistant.catalogue import (
+    DELETE_ROLES,
     GROUPS,
     GROUPS_BY_KEY,
     LIVE_TOOLS,
@@ -60,6 +61,7 @@ from app.models.assistant import (
     AssistantVoiceModel,
     AssistantVoiceUsage,
     AudienceMode,
+    OPEN_STATUSES,
     EventKind,
     RuleEffect,
     RunStatus,
@@ -579,6 +581,10 @@ def policy_matrix(
                     "warning": spec.warning,
                     "status": spec.status,
                     "deferred": spec.deferred,
+                    #: A delete. Offered to DELETE_ROLES only, whatever the
+                    #: rows below say — shown so the screen can say why a
+                    #: write_roles edit did not reach a member.
+                    "destructive": spec.is_destructive,
                     "enabled": tool.enabled if tool else True,
                     "confirm_override": tool.confirm_override if tool else None,
                     "allowed_roles": (
@@ -624,6 +630,7 @@ def policy_matrix(
                     spec.module_key == group.key and spec.is_write and spec.is_live
                     for spec in TOOLS
                 ),
+                "delete_roles": list(DELETE_ROLES),
                 "effective_confirm": effective_confirm(settings, module, None),
                 "tools": rows,
             }
@@ -1005,7 +1012,7 @@ async def open_run_for(
         select(AssistantRun)
         .where(
             AssistantRun.conversation_id == conversation_id,
-            AssistantRun.status.in_([RunStatus.RUNNING, RunStatus.AWAITING_CONFIRMATION]),
+            AssistantRun.status.in_(list(OPEN_STATUSES)),
         )
         .order_by(AssistantRun.started_at.desc())
     )
@@ -1105,7 +1112,7 @@ async def open_runs(session: AsyncSession) -> list[AssistantRun]:
             await session.scalars(
                 select(AssistantRun)
                 .where(
-                    AssistantRun.status.in_([RunStatus.RUNNING, RunStatus.AWAITING_CONFIRMATION])
+                    AssistantRun.status.in_(list(OPEN_STATUSES))
                 )
                 .order_by(AssistantRun.started_at.desc())
             )
@@ -1118,7 +1125,7 @@ async def request_cancel(session: AsyncSession, run: AssistantRun) -> AssistantR
     if not run.is_open:
         raise AssistantConflictError(f"That run already finished ({run.status})")
     run.cancel_requested = True
-    if run.status == RunStatus.AWAITING_CONFIRMATION:
+    if run.status in (RunStatus.AWAITING_CONFIRMATION, RunStatus.AWAITING_CLIENT):
         run.status = RunStatus.CANCELLED
         run.pending = None
         run.finished_at = datetime.now(UTC)
@@ -1397,8 +1404,7 @@ async def analytics(session: AsyncSession, *, since: date, until: date) -> dict[
             "failed": by_status.get(RunStatus.FAILED, 0),
             "blocked": by_status.get(RunStatus.BLOCKED, 0),
             "cancelled": by_status.get(RunStatus.CANCELLED, 0),
-            "open": by_status.get(RunStatus.RUNNING, 0)
-            + by_status.get(RunStatus.AWAITING_CONFIRMATION, 0),
+            "open": sum(by_status.get(status, 0) for status in OPEN_STATUSES),
             "people": int(totals_row.people or 0),
             "tool_calls": int(totals_row.tool_calls or 0),
             "input_tokens": int(totals_row.input_tokens or 0),

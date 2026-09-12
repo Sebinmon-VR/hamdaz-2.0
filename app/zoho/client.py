@@ -255,6 +255,74 @@ class ZohoBooks:
 
         return response
 
+    async def _post(
+        self, path: str, body: dict[str, Any], *, scope: str | None = None
+    ) -> dict:
+        """One authenticated POST. **The only way this client writes.**
+
+        Kept apart from ``_request`` so that reading that method never gives
+        false comfort: everything above it is a read. The one caller is the
+        workflow step that creates an estimate, and that step sits behind a
+        switch that ships off.
+        """
+        try:
+            token = await self._tokens.get()
+        except ZohoAuthError as exc:
+            raise ZohoError(str(exc)) from exc
+        try:
+            response = await self._http.post(
+                f"{token.api_domain}/books/v3{path}",
+                params={"organization_id": self._settings.zoho_organization_id},
+                json=body,
+                headers={"Authorization": f"Zoho-oauthtoken {token.value}"},
+            )
+        except httpx.HTTPError as exc:
+            raise ZohoError(f"Could not reach Zoho Books: {exc}") from exc
+        if response.status_code == 401:
+            await self._tokens.invalidate()
+            raise ZohoError("Zoho rejected the access token")
+        if response.status_code == 403:
+            raise ZohoScopeError(_scope_message(scope), scope)
+        if response.status_code not in (200, 201):
+            raise ZohoError(
+                f"Zoho Books returned {response.status_code}: {response.text[:300]}"
+            )
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise ZohoError("Zoho Books answered with something that is not JSON") from exc
+
+    async def find_contact(self, name: str) -> dict | None:
+        """The customer with this name, if Zoho has one. An estimate needs its id."""
+        payload = await self._get(
+            "/contacts", {"contact_name": name, "contact_type": "customer"},
+            scope="ZohoBooks.contacts.READ",
+        )
+        rows = payload.get("contacts") or []
+        exact = [r for r in rows if (r.get("contact_name") or "").strip().lower() == name.strip().lower()]
+        chosen = exact[0] if exact else (rows[0] if rows else None)
+        return chosen
+
+    async def create_estimate(self, body: dict[str, Any]) -> dict:
+        """Create an estimate. Needs ``ZohoBooks.estimates.CREATE``."""
+        payload = await self._post("/estimates", body, scope="ZohoBooks.estimates.CREATE")
+        estimate = payload.get("estimate")
+        if not estimate:
+            raise ZohoError(f"Zoho did not return the estimate: {str(payload)[:200]}")
+        return estimate
+
+    async def estimate_pdf(self, estimate_id: str) -> bytes:
+        """The estimate as Zoho renders it — the commercial proposal."""
+        response = await self._request(
+            f"/estimates/{estimate_id}", {"accept": "pdf"}, scope="ZohoBooks.estimates.READ"
+        )
+        return response.content
+
+    async def estimate_documents(self, estimate_id: str) -> list[dict]:
+        """The files attached to an estimate, as Zoho lists them."""
+        estimate = await self.estimate(estimate_id)
+        return list(estimate.get("documents") or [])
+
     async def _get(
         self, path: str, params: dict[str, Any] | None = None, *, scope: str | None = None
     ) -> dict:

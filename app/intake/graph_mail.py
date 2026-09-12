@@ -150,6 +150,46 @@ class MailReader(GraphMailer):
             {"$select": f"{MESSAGE_FIELDS},body"},
         )
 
+    async def attachments(
+        self, mailbox: str, message_id: str
+    ) -> list[tuple[str, str | None, bytes]]:
+        """The files on one message: ``(name, content type, bytes)`` each.
+
+        Only file attachments — an item or a reference attachment is a link
+        to something elsewhere, and a supplier's quote is a file. Read for the
+        workflows that wait on a reply, so what the supplier sent lands on the
+        run rather than staying in a mailbox somebody has to go and look in.
+        """
+        import base64
+
+        payload = await self._graph(
+            f"{GRAPH_BASE}/users/{mailbox}/messages/{message_id}/attachments",
+            {"$select": "id,name,contentType,size,isInline,@odata.type"},
+        )
+        out: list[tuple[str, str | None, bytes]] = []
+        for entry in payload.get("value", []):
+            if entry.get("@odata.type") != "#microsoft.graph.fileAttachment":
+                continue
+            if entry.get("isInline"):
+                continue
+            # The listing omits the bytes; each file is one more call. Fine
+            # for a quote or three, which is what a reply carries.
+            full = await self._graph(
+                f"{GRAPH_BASE}/users/{mailbox}/messages/{message_id}"
+                f"/attachments/{entry['id']}"
+            )
+            raw = full.get("contentBytes")
+            if not raw:
+                continue
+            out.append(
+                (
+                    str(entry.get("name") or "attachment"),
+                    entry.get("contentType"),
+                    base64.b64decode(raw),
+                )
+            )
+        return out
+
     async def body_of(self, mailbox: str, message_id: str) -> str:
         """The plain-text body, trimmed to what a model needs to read."""
         payload = await self._graph(

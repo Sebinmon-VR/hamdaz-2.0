@@ -49,6 +49,10 @@ from app.intake.graph_mail import MailReader
 from app.intake.router import router as intake_router
 from app.intake.router import webhook_router as intake_webhook_router
 from app.intake.worker import Worker
+from app.workflows.engine import Services as WorkflowServices
+from app.workflows.router import admin_router as workflows_admin_router
+from app.workflows.router import router as workflows_router
+from app.workflows.worker import WorkflowWorker
 from app.notifications.router import router as notifications_router
 from app.quoting.mailer import QuoteMailer
 from app.reports.brief import Briefer
@@ -136,6 +140,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     #: base URL or a timeout is configured once and means the same thing to
     #: both, rather than two clients that drift apart on the third setting.
     openai = OpenAIChat(settings)
+    # Held on the state as well: the workflow steps that ask the model reach
+    # it here, so a flow and a chat use the same client and the same key.
+    app.state.openai = openai
     # The one way anything reaches a module: the app's own routes, in-process,
     # carrying the caller's session. Held on the state as well as inside the
     # assistant because navigation-by-name uses it too — see
@@ -178,6 +185,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # variable and a restart. Two sleeping tasks cost nothing; an admin switch
     # that silently does not take effect costs an afternoon.
     app.state.intake_worker.start()
+    # Wakes the workflow runs that are waiting on the world — a supplier's
+    # reply, a quote's approval. One instance runs it; see app/workflows/worker.py.
+    app.state.workflow_worker = WorkflowWorker(
+        factory=get_session_factory(),
+        services=WorkflowServices(
+            settings=settings,
+            sharepoint=app.state.sharepoint,
+            mail=app.state.mail_reader,
+            zoho=app.state.zoho,
+            extractor=app.state.quote_extractor,
+            llm=openai,
+            executor=app.state.assistant_executor,
+        ),
+    )
+    app.state.workflow_worker.start()
     logger.info("started environment=%s", settings.environment)
 
     try:
@@ -186,6 +208,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Stopped before the client closes: a loop mid-request against a
         # closed connection pool is a noisy shutdown for no reason.
         await app.state.intake_worker.stop()
+        await app.state.workflow_worker.stop()
         await http.aclose()
         await dispose_engine()
 
@@ -236,6 +259,8 @@ def create_app() -> FastAPI:
     app.include_router(reports_router, prefix=settings.api_prefix)
     app.include_router(assistant_router, prefix=settings.api_prefix)
     app.include_router(assistant_admin_router, prefix=settings.api_prefix)
+    app.include_router(workflows_admin_router, prefix=settings.api_prefix)
+    app.include_router(workflows_router, prefix=settings.api_prefix)
 
     # Mounted at the root, NOT under the API prefix, and holding no
     # authentication dependency of any kind. That separation is the whole

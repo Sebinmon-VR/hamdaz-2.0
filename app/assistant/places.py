@@ -5,12 +5,19 @@ screen, and here it is" — a person who asks *show me the quotes* wants the
 quotes page, not a paragraph describing it. This is the resolution behind that:
 a word or two from the model, turned into one of the app's own routes.
 
-**There is no catalogue here.** Every destination comes from
+**There is almost no catalogue here.** Every destination comes from
 ``app.access.catalogue``, which already names each module's pages and their
 frontend paths precisely so one list drives both the permission model and the
 navigation. A second list of routes in this file would be a second thing to
 forget to update, and the way it would fail — the assistant confidently sending
 people to a page that moved — is the way nobody notices for a month.
+
+The exception is ``EXTRA_SCREENS``, and it is kept short and explained. The
+frontend's rail shows a handful of screens the access catalogue does not list
+— notifications, meetings, settings, the administrator's console — and shows
+some catalogue modules to everyone without a grant, because their routes take
+nothing but a session. ``extra_places`` mirrors exactly that, so what the
+assistant can open is what the person can click, no more and no less.
 
 **Permission comes for free, and that is the point.** What gets resolved is the
 caller's *effective access*, so a page somebody may not reach is not a page the
@@ -27,7 +34,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Final
+from typing import Any, Final, Literal
+
+from app.access.catalogue import BY_KEY as _ERP_MODULES
+from app.roles.catalogue import ADMIN_ROLES, SUPER_ADMIN
 
 #: A route parameter as the access catalogue writes it: ``/teams/[slug]/members``.
 _PARAM: Final = re.compile(r"\[([a-zA-Z_]+)\]")
@@ -97,6 +107,121 @@ def places_from(access: dict[str, Any]) -> list[Place]:
                     team_scoped=bool(page.get("team_scoped")),
                 )
             )
+    return out
+
+
+#: Catalogue modules the frontend shows to everyone signed in, grant or no
+#: grant, and which of their pages — ``None`` for all of them. The same list
+#: as the frontend's ``ALWAYS_OPEN`` / ``OPEN_PAGES`` in ``lib/session.tsx``,
+#: for the same reason it gives: these routers take a bare session. HR is
+#: the half-open one — two personal pages for everybody, the rest for the HR
+#: team, which ``extra_places`` is told about.
+OPEN_MODULES: Final[dict[str, tuple[str, ...] | None]] = {
+    "leave": None,
+    "quotes": None,
+    "assignment": None,
+    "hr": ("my_reviews", "my_record"),
+}
+
+ExtraGate = Literal["open", "admin", "super_admin"]
+
+
+@dataclass(frozen=True, slots=True)
+class ExtraScreen:
+    """A screen the navigation shows that the access catalogue does not list."""
+
+    key: str
+    module_key: str
+    module_name: str
+    name: str
+    #: ``[me]`` is the caller's own user id.
+    path: str
+    gate: ExtraGate = "open"
+
+
+#: Kept in the frontend's own order, with the frontend's own reasons: these
+#: routes are gated by nothing (notifications, meetings, settings, your own
+#: profile), by the assignment module being open to all (its analytics), or
+#: by a global role that the endpoints behind them enforce themselves.
+EXTRA_SCREENS: Final[tuple[ExtraScreen, ...]] = (
+    ExtraScreen("notifications.list", "notifications", "Notifications", "Notifications", "/notifications"),
+    ExtraScreen("meetings.list", "meetings", "Meetings", "My meetings", "/meetings"),
+    ExtraScreen("settings.mine", "settings", "Settings", "Settings", "/settings"),
+    ExtraScreen("me.profile", "me", "About me", "My profile", "/admin/users/[me]"),
+    ExtraScreen(
+        "assignment.analytics", "assignment", "Work Assignment", "User analytics",
+        "/assignment/user-analytics",
+    ),
+    ExtraScreen(
+        "assignment.run", "assignment", "Work Assignment", "Kept ranking", "/assignment/runs/[id]",
+    ),
+    ExtraScreen(
+        "system.console", "system", "System", "System console", "/admin/console", "super_admin"
+    ),
+    ExtraScreen(
+        "system.permissions", "system", "System", "Who may do what", "/admin/permissions",
+        "super_admin",
+    ),
+    ExtraScreen("intake.admin", "intake", "Mail Intake", "Mail intake", "/admin/intake", "super_admin"),
+    ExtraScreen(
+        "reports.admin", "reports", "Reports", "Report settings", "/admin/reports", "super_admin"
+    ),
+)
+
+
+def extra_places(
+    places: list[Place], *, roles: set[str], is_hr: bool, user_id: str
+) -> list[Place]:
+    """The screens the rail shows this person beyond their effective access.
+
+    Adds nothing already present — a super admin's access payload carries
+    every catalogue module, so for them only ``EXTRA_SCREENS`` is new — and
+    never adds a screen the person's roles would not let the frontend show.
+    """
+    have = {p.key for p in places}
+    out: list[Place] = []
+
+    for module_key, page_keys in OPEN_MODULES.items():
+        spec = _ERP_MODULES.get(module_key)
+        if spec is None:
+            continue
+        wanted = None if module_key == "hr" and is_hr else page_keys
+        for page in spec.pages:
+            if wanted is not None and page.key not in wanted:
+                continue
+            key = f"{module_key}.{page.key}"
+            if key in have:
+                continue
+            have.add(key)
+            out.append(
+                Place(
+                    key=key,
+                    module_key=module_key,
+                    module_name=spec.name,
+                    name=page.name,
+                    path=page.path,
+                    team_scoped=page.team_scoped,
+                )
+            )
+
+    for extra in EXTRA_SCREENS:
+        if extra.gate == "super_admin" and SUPER_ADMIN not in roles:
+            continue
+        if extra.gate == "admin" and roles.isdisjoint(ADMIN_ROLES):
+            continue
+        if extra.key in have:
+            continue
+        have.add(extra.key)
+        out.append(
+            Place(
+                key=extra.key,
+                module_key=extra.module_key,
+                module_name=extra.module_name,
+                name=extra.name,
+                path=extra.path.replace("[me]", user_id),
+                team_scoped=False,
+            )
+        )
     return out
 
 

@@ -105,9 +105,25 @@ from app.models.role import Role, RoleScope, UserRole
 from app.models.team import Team, TeamMembership
 from app.models.templates import FieldType, FormTemplate, TemplateGrant, TemplateStatus
 from app.models.user import User
+from app.models.workflow import (
+    FileSource,
+    OPEN_RUN_STATUSES,
+    RunEventKind,
+    RunStatus as WorkflowRunStatus,
+    Workflow,
+    WorkflowRun,
+    WorkflowRunEvent,
+    WorkflowRunFile,
+    WorkflowRunMessage,
+    WorkflowSettings,
+    WorkflowTrigger,
+)
 from app.models.zoho import ZohoToken
 
 __all__ = [
+    "Workflow", "WorkflowRun", "WorkflowRunEvent", "WorkflowRunFile", "WorkflowRunMessage",
+    "WorkflowSettings", "WorkflowTrigger", "WorkflowRunStatus", "RunEventKind", "FileSource",
+    "OPEN_RUN_STATUSES",
     "AnalyticsRun",
     "ApplicationFile",
     "ApplicationStage",

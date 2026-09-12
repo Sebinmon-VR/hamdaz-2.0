@@ -16,9 +16,12 @@ from __future__ import annotations
 import pytest
 
 from app.assistant.places import (
+    EXTRA_SCREENS,
+    OPEN_MODULES,
     Place,
     PlaceError,
     describe,
+    extra_places,
     fill,
     places_from,
     resolve,
@@ -335,3 +338,75 @@ def test_a_handle_with_slashes_in_it_cannot_escape_the_route() -> None:
         team_scoped=True,
     )
     assert fill(place, team="/presales/") == "/teams/presales/dashboard"
+
+
+# ── the screens the rail shows without a grant ─────────────────────────
+#
+# The frontend lists a few modules for everyone and a few screens the access
+# catalogue never had. ``extra_places`` mirrors that list, so "open my
+# notifications" works for a person whose effective access is empty — which is
+# most people, most of the time.
+
+
+def test_an_ordinary_person_gets_the_open_modules_and_open_screens() -> None:
+    places = extra_places([], roles=set(), is_hr=False, user_id="u-1")
+    keys = {p.key for p in places}
+    assert {"leave.mine", "quotes.list", "assignment.policy", "notifications.list",
+            "meetings.list", "settings.mine", "me.profile"} <= keys
+    # HR: the two personal pages and nothing else.
+    assert "hr.my_reviews" in keys and "hr.my_record" in keys
+    assert "hr.openings" not in keys
+    # Nothing administrative.
+    assert not any(k.startswith(("system.", "intake.")) for k in keys)
+    assert "reports.admin" not in keys
+
+
+def test_the_hr_team_gets_the_whole_of_hr() -> None:
+    keys = {p.key for p in extra_places([], roles=set(), is_hr=True, user_id="u-1")}
+    assert {"hr.openings", "hr.applications", "hr.people", "hr.cycles"} <= keys
+
+
+def test_a_super_admin_gets_the_administrative_screens() -> None:
+    keys = {p.key for p in extra_places([], roles={"super_admin"}, is_hr=False, user_id="u-1")}
+    assert {"system.console", "system.permissions", "intake.admin", "reports.admin"} <= keys
+
+
+def test_a_manager_does_not_get_the_super_admin_screens() -> None:
+    keys = {p.key for p in extra_places([], roles={"manager"}, is_hr=False, user_id="u-1")}
+    assert not any(k.startswith(("system.", "intake.")) for k in keys)
+
+
+def test_my_profile_is_filled_with_my_own_id() -> None:
+    places = extra_places([], roles=set(), is_hr=False, user_id="u-42")
+    mine = next(p for p in places if p.key == "me.profile")
+    assert mine.path == "/admin/users/u-42"
+    assert not mine.params
+    assert resolve(places, "my profile") is mine
+
+
+def test_nothing_already_reachable_is_added_twice() -> None:
+    granted = places_from(ACCESS)
+    extra = extra_places(granted, roles=set(), is_hr=False, user_id="u-1")
+    assert not {p.key for p in extra} & {p.key for p in granted}
+    # And the union resolves the granted copy, not a duplicate.
+    assert resolve(granted + extra, "leave") is granted[[p.key for p in granted].index("leave.mine")]
+
+
+def test_the_open_modules_are_real_catalogue_modules() -> None:
+    from app.access.catalogue import BY_KEY
+
+    for key, pages in OPEN_MODULES.items():
+        assert key in BY_KEY, key
+        for page in pages or ():
+            assert page in {p.key for p in BY_KEY[key].pages}, f"{key}.{page}"
+
+
+def test_the_extra_screens_are_ones_the_frontend_has() -> None:
+    """A hand-kept list. Each path is a page in the Next.js app; a new entry
+    here without a page there sends people to a 404."""
+    known = {
+        "/notifications", "/meetings", "/settings", "/admin/users/[me]",
+        "/assignment/user-analytics", "/assignment/runs/[id]", "/admin/console",
+        "/admin/permissions", "/admin/intake", "/admin/reports",
+    }
+    assert {e.path for e in EXTRA_SCREENS} == known

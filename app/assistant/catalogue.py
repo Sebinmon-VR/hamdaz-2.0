@@ -11,12 +11,16 @@ Tool descriptions are written for the model, not copied from the OpenAPI
 summary. A tool the model misunderstands is a tool it will misuse, so the words
 here say when to use it, what identifiers it accepts, and what it will not do.
 
-Two kinds of tool, told apart by ``kind``:
+Three kinds of tool, told apart by ``kind``:
 
 * ``read`` — GET. Runs as soon as the model asks.
-* ``write`` — anything else. Available, but only to the roles the module's
-  ``write_roles`` names, and paused for the person's confirmation unless policy
-  says otherwise.
+* ``write`` — anything else that hits a route. Available, but only to the
+  roles the module's ``write_roles`` names, and paused for the person's
+  confirmation unless policy says otherwise. A write that *deletes* is
+  further held to ``DELETE_ROLES``, whatever the policy rows say.
+* ``client`` — performed by the browser on the screen in front of the person:
+  press this, fill that, scroll, read what is there. The turn waits for the
+  browser to report back.
 
 Adding a tool means adding one entry here and running the seed, which creates
 its policy row. Nothing else needs to know.
@@ -28,7 +32,12 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, ClassVar, Final, Literal
 
-Kind = Literal["read", "write"]
+#: ``client`` is a third kind: a tool the *browser* performs rather than a
+#: route — clicking a button on the screen, scrolling, filling a field,
+#: reading what is on the page. The turn parks until the browser reports
+#: back, exactly as a write parks for a confirmation, so the model sees the
+#: result before it carries on. See ``app.assistant.agent``.
+Kind = Literal["read", "write", "client"]
 Location = Literal["path", "query", "body"]
 Gate = Literal["open", "access", "admin"]
 #: ``planned`` is a tool that is written down but not built. It is never
@@ -450,6 +459,17 @@ VOICE_MODELS_BY_KEY: Final[dict[str, VoiceModelSpec]] = {m.key: m for m in VOICE
 #: membership and record ownership in a way a list of global roles cannot.
 SENSITIVE_WRITE_ROLES: Final[tuple[str, ...]] = ("super_admin", "ceo", "manager")
 
+#: Who may have the assistant *delete* anything, anywhere. A floor rather
+#: than a default: a super admin's ``write_roles`` can narrow it further and
+#: cannot widen it. Members and team leads are not on it, and that is the
+#: decision — a colleague asking the assistant to "clear that out" should be
+#: told it is a manager's call, not have it happen.
+#:
+#: What counts as a delete is decided per tool by ``ToolSpec.is_destructive``:
+#: every DELETE route, and any write flagged ``destructive`` because it erases
+#: data behind a POST — resetting a user, wiping somebody's HR file.
+DELETE_ROLES: Final[tuple[str, ...]] = ("super_admin", "ceo", "manager")
+
 
 @dataclass(frozen=True, slots=True)
 class ModuleGroup:
@@ -589,6 +609,38 @@ GROUPS: Final[tuple[ModuleGroup, ...]] = (
     ),
     ModuleGroup("meetings", "Meetings", "open", "The person's own Outlook calendar."),
     ModuleGroup(
+        "workflows",
+        "Workflows",
+        "access",
+        "A team's process run one task at a time — the presales flow from task "
+        "to Zoho quote. Starting one, answering its questions and verifying "
+        "what it found is the everyday work of the person whose task it is; "
+        "the run does everything as them, through the same routes.",
+    ),
+    ModuleGroup(
+        "notifications",
+        "Notifications",
+        "open",
+        "What the system has told this person. Open because the routes only "
+        "ever return the caller's own; marking one read is theirs to do.",
+    ),
+    ModuleGroup(
+        "intake",
+        "Mail Intake",
+        "admin",
+        "The watched mailbox that turns enquiries into proposal tasks: what is "
+        "watched, every mail seen, and the mirror of the SharePoint list. Super "
+        "admin territory on every route, which the routes enforce themselves.",
+        write_roles=SENSITIVE_WRITE_ROLES,
+    ),
+    ModuleGroup(
+        "system",
+        "System",
+        "admin",
+        "The administrator's console: what every background surface currently "
+        "says, and who may do what across the parts recently built. Reads only.",
+    ),
+    ModuleGroup(
         "roles",
         "Roles & Permissions",
         "admin",
@@ -642,10 +694,24 @@ class ToolSpec:
     warning: str | None = None
     #: ``planned`` tools are listed for an administrator and given to nobody.
     status: Status = "live"
+    #: Erases data irreversibly behind a method other than DELETE. A DELETE
+    #: route is destructive without saying so; this is for the POST that
+    #: wipes a file or resets an account. Read through ``is_destructive``.
+    destructive: bool = False
 
     @property
     def is_live(self) -> bool:
         return self.status == "live"
+
+    @property
+    def is_client(self) -> bool:
+        """Performed by the browser, not by a route."""
+        return self.kind == "client"
+
+    @property
+    def is_destructive(self) -> bool:
+        """Deletes something. Offered only to ``DELETE_ROLES``, whatever else says."""
+        return self.method == "DELETE" or self.destructive
 
     @property
     def deferred(self) -> bool:
@@ -664,6 +730,10 @@ class ToolSpec:
     @property
     def is_write(self) -> bool:
         return self.kind == "write"
+
+    @property
+    def is_read(self) -> bool:
+        return self.kind == "read"
 
     def schema(self) -> dict[str, Any]:
         """The strict JSON schema for this tool's arguments.
@@ -764,8 +834,9 @@ class ToolSpec:
 #: The rule for being on this list is "somebody asks this most weeks". Anything
 #: rarer is a search away and none the worse for it.
 EVERYDAY_TOOLS: Final[frozenset[str]] = frozenset({
-    # taking somebody to a screen, which is often the whole answer
-    "app.open",
+    # taking somebody to a screen, which is often the whole answer — and
+    # pressing what is on it, which is the rest of the answer
+    "app.open", "app.click", "app.fill", "app.scroll", "app.screen",
     # who am I and what can I see
     "me.roles", "me.teams", "me.access",
     "dashboard.mine",
@@ -861,6 +932,151 @@ _ANY_USER: Final = (
 
 _READ: Final = "read"
 _WRITE: Final = "write"
+_CLIENT: Final = "client"
+
+# ── shared shapes: projects, reports, proposals, notifications ──
+_PROJECT_ID = _path("project_id", "The project id, from projects.list or projects.get.")
+_PROJECT_STATUS = _s("string", enum=["planned", "active", "on_hold", "done", "cancelled"])
+_RAG = _s("string", enum=["green", "amber", "red", "grey"])
+_TREND = _s("string", enum=["improving", "steady", "declining"])
+_TASK_STATE = _s("string", enum=["not_started", "in_progress", "blocked", "done", "dropped"])
+_PRIORITY = _s("string", enum=["low", "medium", "high", "critical"])
+_PLAN = _s("string", enum=["on_plan", "off_plan_no_impact", "off_plan_impact"])
+_ISSUE_STATE = _s("string", enum=["open", "in_progress", "resolved", "closed"])
+_CADENCE = _s("string", enum=["daily", "weekly", "monthly", "quarterly", "yearly", "ad_hoc"])
+
+# ── shared shapes: hr, templates, labels ──
+# Shared pieces, each used by more than one tool below. The enum values are
+# the StrEnum members in app.models.hr, app.models.templates and
+# app.models.labels, spelled out so the model sees them.
+_EMPLOYMENT_TYPE = _s(
+    "string", enum=["full_time", "part_time", "contract", "internship", "temporary"]
+)
+_DOCUMENT_KIND = _s(
+    "string",
+    enum=[
+        "offer_letter", "contract", "amendment", "id_document", "visa", "certificate",
+        "payslip", "appraisal", "warning", "resignation", "other",
+    ],
+)
+_LABEL_KIND = _s("string", enum=["category", "status", "skill"])
+_DATETIME = _s("string", description="ISO 8601 date-time")
+
+#: One question on a form, as ``app.forms.schemas.FieldIn`` takes it. Two of
+#: its fields are left out because strict mode cannot express them: ``columns``
+#: (a list of free-form field specs, for table fields) and ``scoring`` (a
+#: free-form object). ``default`` is any scalar, so it is listed as required
+#: with null already in its type rather than made nullable by ``_object``,
+#: which would nest one type list inside another.
+_FIELD = _object(
+    {
+        "key": STR,
+        "label": STR,
+        "type": _s(
+            "string",
+            enum=[
+                "text", "textarea", "number", "currency", "percent", "date",
+                "checkbox", "select", "table", "file",
+            ],
+        ),
+        "section": _s("string", description="The section key it sits under."),
+        "required": BOOL,
+        "help": STR,
+        "options": _s("array", items={"type": "string"}, description="For select."),
+        "default": _s(["string", "number", "boolean", "null"]),
+        "maps_to": _s("string", description="The Zoho estimate field it becomes, if any."),
+    },
+    required=("key", "label", "type", "default"),
+)
+_SECTION = _object({"key": STR, "name": STR, "help": STR}, required=("key", "name"))
+
+# ── shared shapes: quote requests, comparisons, dashboards, teams, users ──
+#: One supplier's offer, as ``app.comparison.schemas.QuoteIn`` has it. Used by
+#: both the unsaved analysis and the save, so it is written once.
+_SUPPLIER_QUOTE = _object(
+    {
+        "supplier_name": STR,
+        "quote_number": STR,
+        "quote_date": _s("string", description="As printed on the quote; free text."),
+        "currency": _s("string", description="Three-letter code. Defaults to AED."),
+        "fx_rate": _s(
+            "number",
+            description="One unit of this quote's currency in the comparison's "
+                        "currency. Leave at 1 when they are the same.",
+        ),
+        "validity": STR,
+        "delivery_time": STR,
+        "payment_terms": STR,
+        "warranty": STR,
+        "incoterms": STR,
+        "contact": STR,
+        "notes": STR,
+        "discount": _s("number"),
+        "freight": _s("number"),
+        "tax": _s("number"),
+        "quoted_total": _s("number", description="The total the supplier printed."),
+        "items": _s("array", items=_object(
+            {
+                "description": STR,
+                "part_number": STR,
+                "brand": STR,
+                "unit": STR,
+                "quantity": _s("number"),
+                "unit_price": _s("number"),
+                "line_total": _s(
+                    "number",
+                    description="As printed. Leave out and it is quantity x unit price.",
+                ),
+                "lead_time": STR,
+            },
+            required=("description",),
+        )),
+        "source": _s("string", enum=["upload", "manual"]),
+        "file_name": STR,
+        "extraction_note": STR,
+    },
+    required=("supplier_name",),
+)
+
+# ── shared shapes: assignment, analytics, intake, system, finance ──
+_TEAM_ID: tuple = (_path("team_id", "The team's handle (slug) or its id."),)
+
+#: The PolicyIn fields a strict schema can carry. ``capacity_by_label`` and
+#: ``max_open_by_label`` are open dicts keyed by label, which strict mode has no
+#: way to express (see the note on reports.fill), so they stay on the screen.
+_POLICY_FIELDS: tuple = (
+    _body("name", "What to call the policy."),
+    _body("description", "What it is for, in a line."),
+    _body("enabled", "Whether it is in force at all.", BOOL),
+    _body(
+        "default_capacity",
+        "The share of work for anyone with no label saying otherwise. 1 is a "
+        "full share, 0.5 is one task for every two, 0 is no work. 0-100.",
+        _s("number"),
+    ),
+    _body("default_max_open", "The most open tasks anyone may hold. 0 or more.", INT),
+    _body("excluded_labels", "Label keys that take somebody out of the pool.", STR_LIST),
+    _body(
+        "excluded_roles",
+        "Role keys that are never given work — managers by default.",
+        STR_LIST,
+    ),
+    _body("exclude_on_leave", "Skip anyone on approved leave today.", BOOL),
+    _body("new_joiner_days", "How recent counts as a new joiner. 0-3650.", INT),
+    _body(
+        "new_joiner_from_first_seen",
+        "Count new-joiner days from first sign-in rather than the join date.",
+        BOOL,
+    ),
+    _body("weight_load", "How much effective load moves the ranking. 0-100.", _s("number")),
+    _body("weight_open_count", "How much the open-task count moves it. 0-100.", _s("number")),
+    _body(
+        "weight_idle_days",
+        "How much time since last assignment moves it. 0-100.",
+        _s("number"),
+    ),
+)
+
 
 TOOLS: Final[tuple[ToolSpec, ...]] = (
     # ── moving around the app ──────────────────────────────────────────
@@ -903,6 +1119,72 @@ TOOLS: Final[tuple[ToolSpec, ...]] = (
         ),
     ),
     # ── about me ───────────────────────────────────────────────────────
+    # ── acting on the screen ───────────────────────────────────────────
+    #
+    # These four are not routes. The browser performs them and reports back,
+    # and the turn waits for that report the way it waits for a confirmation.
+    # They exist because "press Submit for me" and "scroll down" are things a
+    # person says, and a tool that could only navigate had to answer them
+    # with an apology. What the model may press is bounded twice: the screen
+    # snapshot it is given lists only what is actually there, and the browser
+    # refuses a destructive control — delete, remove, revoke — for anybody the
+    # policy would not let delete through a tool either. See ``DELETE_ROLES``.
+    ToolSpec(
+        "app.screen", "app", _CLIENT, "CLIENT", "", "Read the screen",
+        "What is on the screen in front of the person right now: its headings, "
+        "and every button, link, tab and field with the label they see. Call "
+        "this after app.open, app.click or app.fill to see what changed, or "
+        "when the 'Controls on this screen' list you were given is stale. "
+        "Returns the list; it changes nothing.",
+    ),
+    ToolSpec(
+        "app.click", "app", _CLIENT, "CLIENT", "", "Press a button or link",
+        "Press a button, link, tab or menu item on the screen the person is "
+        "looking at, by the label they see on it — exactly as listed under "
+        "'Controls on this screen' or by app.screen. Use it for things no "
+        "other tool does: opening a dialog, switching a tab, pressing Save or "
+        "Submit on a form the person has filled in. Prefer the module's own "
+        "tool when one exists for the same action, because that one is "
+        "checked and confirmed properly. It refuses a control whose label "
+        "says delete, remove or similar unless the person may delete.",
+        (
+            _body("label", "The visible text of the control, as listed.", required=True),
+            _body(
+                "nth",
+                "Which one, counting from 1, when several controls share the label.",
+                INT,
+            ),
+        ),
+    ),
+    ToolSpec(
+        "app.fill", "app", _CLIENT, "CLIENT", "", "Fill in a field",
+        "Type a value into a field on the current screen, named by its label "
+        "or placeholder as listed under 'Controls on this screen'. Works for "
+        "text boxes, text areas, selects (pass the option's visible text or "
+        "value) and checkboxes (pass true or false). It does not submit the "
+        "form — press the button with app.click afterwards, and say what you "
+        "filled in before you do.",
+        (
+            _body("label", "The field's label or placeholder, as listed.", required=True),
+            _body("value", "What to put in it. For a checkbox, true or false.", required=True),
+            _body("nth", "Which one, counting from 1, when several fields share the label.", INT),
+        ),
+    ),
+    ToolSpec(
+        "app.scroll", "app", _CLIENT, "CLIENT", "", "Scroll the page",
+        "Scroll the screen the person is looking at: to the top or bottom, up "
+        "or down by a screen, or to a heading or section by the text on it. "
+        "Use it when they ask to see more, or to bring the part you are about "
+        "to talk about into view.",
+        (
+            _body(
+                "to",
+                "top, bottom, up, down — or the text of a heading or section to "
+                "bring into view.",
+                required=True,
+            ),
+        ),
+    ),
     ToolSpec(
         "me.roles", "me", _READ, "GET", "/roles/me", "My roles",
         "The global roles the signed-in person holds (super admin, CEO, manager, "
@@ -2156,22 +2438,1802 @@ TOOLS: Final[tuple[ToolSpec, ...]] = (
         ),
         warning="Candidates may be told about stage changes.",
     ),
-    # ── written down, not built ────────────────────────────────────────
+    # ── the last of the held-back reads ─────────────────────────────────
     #
-    # Listed so the administration screen shows what is coming as well as what
-    # is here. ``planned`` tools are filtered out of every list the model sees,
-    # so nothing below can be called; they are a roadmap kept next to the code
-    # rather than in somebody's head.
+    # ``zoho.read`` was planned until the decision was taken to give the
+    # assistant the whole surface, bounded by the person's own access rather
+    # than by a shortlist. The ``planned`` status is kept in the type for the
+    # next tool that is written down before it is built.
     ToolSpec(
         "zoho.read", "finance", _READ, "GET", "/finance/zoho/{endpoint_key}",
         "Read a Zoho endpoint directly",
-        "Read one Zoho Books endpoint straight through. Planned deliberately: it "
-        "is the widest read in the system and wants a narrower shape before an "
-        "assistant is given it.",
-        (_path("endpoint_key", "Which endpoint, from finance.zoho."),),
-        status="planned",
+        "Read one Zoho Books endpoint straight through, by the key finance.zoho "
+        "lists. The widest read in the system and the rawest: it answers with "
+        "Zoho's own payload, so prefer the finance.* tools when one covers the "
+        "question, and reach for this only for a figure they do not carry. "
+        "Restricted to the finance roles by the route.",
+        (
+            _path("endpoint_key", "Which endpoint, from finance.zoho."),
+            _query("page", "Page number, for endpoints that page.", INT),
+            _query("per_page", "Rows per page, for endpoints that page.", INT),
+        ),
     ),
 
+
+    # ── projects, reports, proposals, notifications ───────────────────
+    # ── projects ───────────────────────────────────────────────────────
+    ToolSpec(
+        "projects.create", "projects", _WRITE, "POST", "/projects",
+        "Start a project",
+        "Start a new project on a team. Only that team's lead or manager, or "
+        "somebody running the company, may — anybody else is refused. Takes the "
+        "team's id (use me.teams or teams.get to find it), not its handle. The "
+        "person creating it is put on the project; the lead, if named, is put "
+        "on it as lead. Read the name, team and dates back before calling this.",
+        (
+            _body("team_id", "The team's id, not its handle.", required=True),
+            _body("name", "The project's name.", required=True),
+            _body("code", "A short reference code, up to 32 characters."),
+            _body("description", "What the project is, at length."),
+            _body("objective", "What it is meant to achieve, in a few lines."),
+            _body(
+                "status",
+                "planned, active, on_hold, done or cancelled. Defaults to planned.",
+                _PROJECT_STATUS,
+            ),
+            _body("lead_id", "ERP user id of the person who will run it."),
+            _body("start_on", "When it starts.", DATE),
+            _body("target_end_on", "When it is meant to finish.", DATE),
+            _body("budget_amount", "The budget, in the project's currency.", _s("number")),
+            _body("currency", "Three-letter code. Defaults to AED."),
+        ),
+        warning="Creates a real project the team will see on its board.",
+    ),
+    ToolSpec(
+        "projects.update", "projects", _WRITE, "PATCH", "/projects/{project_id}",
+        "Change a project",
+        "Change a project's name, code, description, objective, status, lead, "
+        "dates, budget or spend. Only the fields given change. Project lead or "
+        "somebody running the team only. This does not assess the health dials "
+        "— that is projects.set_health, and it is kept apart so that saving a "
+        "description never claims the health was reviewed.",
+        (
+            _PROJECT_ID,
+            _body("name", "New name."),
+            _body("code", "New reference code."),
+            _body("description", "New description."),
+            _body("objective", "New objective."),
+            _body("status", "planned, active, on_hold, done or cancelled.", _PROJECT_STATUS),
+            _body("lead_id", "ERP user id of the new lead."),
+            _body("start_on", "New start date.", DATE),
+            _body("target_end_on", "New target finish date.", DATE),
+            _body("actual_end_on", "When it actually finished.", DATE),
+            _body("budget_amount", "New budget.", _s("number")),
+            _body("spend_amount", "Spend to date.", _s("number")),
+            _body("currency", "Three-letter code."),
+            _body(
+                "percent_complete",
+                "The lead's own completion figure, 0-100. Leave out to let the "
+                "tasks decide it, which is usually right.",
+                INT,
+            ),
+        ),
+        warning="Changes what everyone on the project sees about it.",
+    ),
+    ToolSpec(
+        "projects.set_health", "projects", _WRITE, "PUT", "/projects/{project_id}/health",
+        "Assess the health dials",
+        "Record the lead's judgement of the five dials — overall, scope, cost, "
+        "schedule, benefits — each as a colour and a trend, with a note. Every "
+        "dial is optional but sending this at all stamps the project as reviewed "
+        "now, so call it only when the person is actually assessing health, not "
+        "as a side effect of something else. Project lead or somebody running "
+        "the team only. projects.get shows what the dates and budget suggest "
+        "beside what is stored; read that first.",
+        (
+            _PROJECT_ID,
+            _body("rag_overall", "green, amber, red or grey.", _RAG),
+            _body("rag_scope", "green, amber, red or grey.", _RAG),
+            _body("rag_cost", "green, amber, red or grey.", _RAG),
+            _body("rag_schedule", "green, amber, red or grey.", _RAG),
+            _body("rag_benefits", "green, amber, red or grey.", _RAG),
+            _body("trend_overall", "improving, steady or declining.", _TREND),
+            _body("trend_scope", "improving, steady or declining.", _TREND),
+            _body("trend_cost", "improving, steady or declining.", _TREND),
+            _body("trend_schedule", "improving, steady or declining.", _TREND),
+            _body("trend_benefits", "improving, steady or declining.", _TREND),
+            _body("note", "Why the dials say what they say."),
+        ),
+        warning="Stamps the project as reviewed now and writes the assessment to "
+                "the progress log.",
+    ),
+    ToolSpec(
+        "projects.archive", "projects", _WRITE, "POST", "/projects/{project_id}/archive",
+        "Archive a project",
+        "Archive a project so it drops off the board and the portfolio. Only "
+        "somebody running the team may. Reversible with projects.restore; "
+        "nothing is deleted.",
+        (_PROJECT_ID,),
+        warning="The project disappears from everyone's board until restored.",
+    ),
+    ToolSpec(
+        "projects.restore", "projects", _WRITE, "POST", "/projects/{project_id}/restore",
+        "Restore a project",
+        "Bring an archived project back onto the board. Only somebody running "
+        "the team may. Find archived ones with projects.list and "
+        "include_archived=true.",
+        (_PROJECT_ID,),
+        warning="The project reappears on the team's board.",
+    ),
+    ToolSpec(
+        "projects.delete", "projects", _WRITE, "DELETE", "/projects/{project_id}",
+        "Delete a project",
+        "Permanently delete a project and everything under it — milestones, "
+        "tasks, issues and the progress log. Only somebody running the team "
+        "may. Reports already filed against it survive with their own copy of "
+        "its figures. Prefer projects.archive unless the person clearly wants "
+        "it gone for good.",
+        (_PROJECT_ID,),
+        warning="Permanent. Milestones, tasks, issues and the whole progress log "
+                "go with it.",
+    ),
+    ToolSpec(
+        "projects.set_member", "projects", _WRITE, "PUT", "/projects/{project_id}/members",
+        "Add or change a member",
+        "Put somebody on a project, or change the role they hold on it: lead, "
+        "member or viewer. Project lead or somebody running the team only. "
+        "Takes the person's ERP user id — look them up with teams.members or "
+        "users.profile first. Somebody already on the project has their role "
+        "and responsibility replaced.",
+        (
+            _PROJECT_ID,
+            _body("user_id", "The person's ERP user id.", required=True),
+            _body(
+                "role",
+                "lead, member or viewer. Defaults to member.",
+                _s("string", enum=["lead", "member", "viewer"]),
+            ),
+            _body("responsibility", "What they are on the project for, in a few words."),
+        ),
+        warning="Replaces whatever role they already hold on this project.",
+    ),
+    ToolSpec(
+        "projects.remove_member", "projects", _WRITE, "DELETE",
+        "/projects/{project_id}/members/{user_id}",
+        "Take somebody off a project",
+        "Remove a person from a project. Project lead or somebody running the "
+        "team only. Refused while they still hold open tasks on it — reassign "
+        "those with projects.update_task first.",
+        (_PROJECT_ID, _path("user_id", "The person's ERP user id.")),
+        warning="They lose sight of the project unless the team grant still gives it.",
+    ),
+    ToolSpec(
+        "projects.add_milestone", "projects", _WRITE, "POST",
+        "/projects/{project_id}/milestones",
+        "Add a milestone",
+        "Add a milestone to a project's plan. Project lead or somebody running "
+        "the team only. The due date given becomes its baseline, which slippage "
+        "is measured against from then on.",
+        (
+            _PROJECT_ID,
+            _body("name", "The milestone's name.", required=True),
+            _body("detail", "What reaching it means."),
+            _body("owner_id", "ERP user id of whoever owns it."),
+            _body("start_on", "When work towards it starts.", DATE),
+            _body("due_on", "When it is due. Becomes the baseline.", DATE),
+            _body("is_key", "A key milestone, shown prominently. Default false.", BOOL),
+        ),
+        warning="Adds to the project's plan and writes a line in the progress log.",
+    ),
+    ToolSpec(
+        "projects.update_milestone", "projects", _WRITE, "PATCH",
+        "/projects/{project_id}/milestones/{milestone_id}",
+        "Change a milestone",
+        "Change a milestone's name, owner, dates, plan status or order, or mark "
+        "it done. Only the fields given change. Project lead or somebody "
+        "running the team only. Moving the due date records a slip against the "
+        "baseline; the percentage is only accepted for a milestone with no "
+        "tasks, since otherwise the tasks decide it.",
+        (
+            _PROJECT_ID,
+            _path("milestone_id", "The milestone id, from projects.get."),
+            _body("name", "New name."),
+            _body("detail", "New detail."),
+            _body("owner_id", "ERP user id of the new owner."),
+            _body("start_on", "New start date.", DATE),
+            _body("due_on", "New due date. A move is recorded as slippage.", DATE),
+            _body("done_on", "The day it was reached.", DATE),
+            _body("percent_complete", "0-100. Only for a milestone with no tasks.", INT),
+            _body("plan", "on_plan, off_plan_no_impact or off_plan_impact.", _PLAN),
+            _body("is_key", "Whether it is a key milestone.", BOOL),
+            _body("position", "Its place in the list, from 0.", INT),
+        ),
+        warning="Changes the plan everyone on the project works to.",
+    ),
+    ToolSpec(
+        "projects.delete_milestone", "projects", _WRITE, "DELETE",
+        "/projects/{project_id}/milestones/{milestone_id}",
+        "Delete a milestone",
+        "Remove a milestone from the plan. Project lead or somebody running the "
+        "team only. The tasks under it stay on the project, just no longer "
+        "grouped.",
+        (_PROJECT_ID, _path("milestone_id", "The milestone id, from projects.get.")),
+        warning="Permanent. Its tasks stay but lose their grouping.",
+    ),
+    ToolSpec(
+        "projects.add_task", "projects", _WRITE, "POST", "/projects/{project_id}/tasks",
+        "Add a task",
+        "Add a task to a project, optionally under a milestone and assigned to "
+        "somebody. Project lead or somebody running the team only. Whoever it "
+        "is assigned to is put on the project if they are not already, and is "
+        "told about it. Takes ERP user ids for the assignee and the ids from "
+        "projects.get for the milestone.",
+        (
+            _PROJECT_ID,
+            _body("title", "What the task is.", required=True),
+            _body("detail", "More about it."),
+            _body("milestone_id", "The milestone it belongs under."),
+            _body("assignee_id", "ERP user id of who will do it."),
+            _body(
+                "status",
+                "not_started, in_progress, blocked, done or dropped. Defaults to "
+                "not_started.",
+                _TASK_STATE,
+            ),
+            _body("priority", "low, medium, high or critical. Defaults to medium.", _PRIORITY),
+            _body("start_on", "When it starts.", DATE),
+            _body("due_on", "When it is due.", DATE),
+            _body("estimate_hours", "How long it should take, in hours.", _s("number")),
+        ),
+        warning="Adds work to somebody's list and tells them about it.",
+    ),
+    ToolSpec(
+        "projects.update_task", "projects", _WRITE, "PATCH",
+        "/projects/{project_id}/tasks/{task_id}",
+        "Change a task",
+        "The full edit of a task: retitle it, move it under a milestone, hand it "
+        "to somebody else, change its priority, dates, estimate or order — as "
+        "well as the progress fields. Only the fields given change. Handing it "
+        "to somebody, moving it, retitling it, or changing its due date or "
+        "priority is the project lead's call; an ordinary assignee is refused "
+        "on those and should use projects.move_task for progress. Read the task "
+        "back first if you did not just look at it.",
+        (
+            _PROJECT_ID,
+            _path("task_id", "The task id, from projects.get or projects.my_tasks."),
+            _body("title", "New title."),
+            _body("detail", "New detail."),
+            _body("milestone_id", "Move it under this milestone."),
+            _body("assignee_id", "ERP user id of who should now hold it."),
+            _body("status", "not_started, in_progress, blocked, done or dropped.", _TASK_STATE),
+            _body("priority", "low, medium, high or critical.", _PRIORITY),
+            _body("percent_complete", "0-100.", INT),
+            _body("start_on", "New start date.", DATE),
+            _body("due_on", "New due date.", DATE),
+            _body("estimate_hours", "New estimate, in hours.", _s("number")),
+            _body("blocked_reason", "Why it is stuck. Say this when marking it blocked."),
+            _body("position", "Its place in the list, from 0.", INT),
+            _body("note", "A line for the progress log alongside the change."),
+            _body("hours", "Hours to add to the time already spent.", _s("number")),
+        ),
+        warning="Changes the task for everyone on the project, and tells whoever "
+                "holds it.",
+    ),
+    ToolSpec(
+        "projects.delete_task", "projects", _WRITE, "DELETE",
+        "/projects/{project_id}/tasks/{task_id}",
+        "Delete a task",
+        "Remove a task from a project entirely. Project lead or somebody running "
+        "the team only. If the work was abandoned rather than mistaken, marking "
+        "it dropped with projects.move_task keeps the record; this does not.",
+        (_PROJECT_ID, _path("task_id", "The task id, from projects.get.")),
+        warning="Permanent. The task and its history on the log's rows go.",
+    ),
+    ToolSpec(
+        "projects.raise_issue", "projects", _WRITE, "POST", "/projects/{project_id}/issues",
+        "Raise an issue",
+        "Raise an issue or blocker on a project. Anybody on the project may — "
+        "this is deliberately wider than changing the plan, because the person "
+        "who trips over a problem is rarely the one running the project. Set "
+        "needs_support with a note to put it in the 'support needed' box of the "
+        "next status report.",
+        (
+            _PROJECT_ID,
+            _body("title", "What the issue is.", required=True),
+            _body("detail", "More about it."),
+            _body("priority", "low, medium, high or critical. Defaults to medium.", _PRIORITY),
+            _body("owner_id", "ERP user id of who should resolve it."),
+            _body("due_on", "When it needs resolving by.", DATE),
+            _body("needs_support", "Escalate it onto the next status report.", BOOL),
+            _body("support_note", "What support is needed, if escalating."),
+        ),
+        warning="Everyone on the project sees the issue, and the owner is told.",
+    ),
+    ToolSpec(
+        "projects.update_issue", "projects", _WRITE, "PATCH",
+        "/projects/{project_id}/issues/{issue_id}",
+        "Change an issue",
+        "Work an issue: change its status, priority, owner, due date or support "
+        "flag, or resolve it. Only the fields given change. Its owner, whoever "
+        "raised it, or somebody running the project may; anybody else is "
+        "refused. Marking it resolved or closed records when.",
+        (
+            _PROJECT_ID,
+            _path("issue_id", "The issue id, from projects.get."),
+            _body("title", "New title."),
+            _body("detail", "New detail."),
+            _body("status", "open, in_progress, resolved or closed.", _ISSUE_STATE),
+            _body("priority", "low, medium, high or critical.", _PRIORITY),
+            _body("owner_id", "ERP user id of the new owner."),
+            _body("due_on", "New due date.", DATE),
+            _body("needs_support", "Whether it goes on the next status report.", BOOL),
+            _body("support_note", "What support is needed."),
+            _body("position", "Its place in the list, from 0.", INT),
+        ),
+        warning="Changes the issue for everyone on the project.",
+    ),
+    ToolSpec(
+        "projects.delete_issue", "projects", _WRITE, "DELETE",
+        "/projects/{project_id}/issues/{issue_id}",
+        "Delete an issue",
+        "Remove an issue from a project entirely. Project lead or somebody "
+        "running the team only. Resolving it with projects.update_issue keeps "
+        "the record; this does not.",
+        (_PROJECT_ID, _path("issue_id", "The issue id, from projects.get.")),
+        warning="Permanent. The issue is gone rather than resolved.",
+    ),
+    # ── reports ────────────────────────────────────────────────────────
+    ToolSpec(
+        "reports.delete", "reports", _WRITE, "DELETE", "/reports/{report_id}",
+        "Delete a report",
+        "Remove a report. An author may remove their own draft; a submitted "
+        "report can only be removed by a super admin. Anybody else is refused.",
+        (_path("report_id", "The report id."),),
+        warning="Permanent. A filed report is a record, and removing one is not "
+                "undone.",
+    ),
+    ToolSpec(
+        "reports.brief", "reports", _READ, "GET", "/reports/{report_id}/brief",
+        "The short version of a report",
+        "The AI-written paragraph summarising one submitted report, if the "
+        "administrator has turned briefs on. Comes back with a state — "
+        "disabled, not_applicable (a draft), absent, failed, stale or ready — "
+        "and whether this reader may ask for it again. Shown to exactly the "
+        "people who may read the report. Under some settings the first reader "
+        "to ask is the one who waits for it to be written.",
+        (_path("report_id", "The report id."),),
+    ),
+    ToolSpec(
+        "reports.refresh_brief", "reports", _WRITE, "POST", "/reports/{report_id}/brief",
+        "Write the brief again",
+        "Ask for the brief on a submitted report to be written again, usually "
+        "because the first one was too short or missed what the reader cares "
+        "about. Costs a model call each time, and the administrator may have "
+        "switched it off — read reports.brief first and check may_refresh.",
+        (_path("report_id", "The report id."),),
+        warning="Replaces the stored brief for everyone who reads this report.",
+    ),
+    ToolSpec(
+        "reports.settings", "reports", _READ, "GET", "/reports/admin/settings",
+        "Report delivery settings",
+        "Who filed reports are emailed to, what the email carries, and how the "
+        "AI brief is configured. Super admin only. These control delivery, not "
+        "who may read a report.",
+    ),
+    ToolSpec(
+        "reports.update_settings", "reports", _WRITE, "PATCH", "/reports/admin/settings",
+        "Change report delivery settings",
+        "Change who filed reports go to, what the email includes, and how the AI "
+        "brief behaves. Only the fields given change. Super admin only. A "
+        "common change is dropping daily from notify_cadences so managers are "
+        "not mailed thirty times a week.",
+        (
+            _body("notify_on_submit", "Email anybody at all when a report is filed.", BOOL),
+            _body("notify_team_oversight", "Email the team's managers and leads.", BOOL),
+            _body("notify_company_wide", "Email holders of the company roles.", BOOL),
+            _body(
+                "company_roles",
+                "Global role keys to email, e.g. ceo, super_admin. Every one must "
+                "exist.",
+                STR_LIST,
+            ),
+            _body("extra_recipients", "Extra email addresses, always copied.", STR_LIST),
+            _body("copy_author", "Copy the author on their own report.", BOOL),
+            _body(
+                "notify_cadences",
+                "Which cadences are emailed at all: daily, weekly, monthly, ad_hoc.",
+                STR_LIST,
+            ),
+            _body("max_tasks_in_email", "How many task rows the email carries, 0-100.", INT),
+            _body("include_task_list", "Put the task rows in the email.", BOOL),
+            _body("include_issue_list", "Put the issues in the email.", BOOL),
+            _body("log_retention_days", "How long delivery records are kept, 1-3650.", INT),
+            _body("brief_enabled", "Turn the AI brief on or off.", BOOL),
+            _body(
+                "brief_mode",
+                "on_submit writes it as the report is filed, on_first_open when "
+                "the first manager opens it, on_request only when asked.",
+                _s("string", enum=["on_submit", "on_first_open", "on_request"]),
+            ),
+            _body(
+                "brief_followup",
+                "off: read it only; refresh: may ask again; chat: may ask it questions.",
+                _s("string", enum=["off", "refresh", "chat"]),
+            ),
+            _body(
+                "brief_model_key",
+                "An assistant model key, or empty to follow the assistant's own.",
+            ),
+            _body("brief_max_words", "How long a brief may be, 40-600 words.", INT),
+        ),
+        warning="Changes who is emailed about every report filed from now on.",
+    ),
+    ToolSpec(
+        "reports.deliveries", "reports", _READ, "GET", "/reports/admin/deliveries",
+        "Report delivery log",
+        "What was emailed about which report, to whom, and what failed or was "
+        "skipped and why. Super admin only. The answer to 'why did my manager "
+        "not get it'. Counts by status come back alongside the rows.",
+        (
+            _query("since", "From this day. Defaults to the retention window.", DATE),
+            _query(
+                "status",
+                "sent, failed or skipped.",
+                _s("string", enum=["sent", "failed", "skipped"]),
+            ),
+            _query("limit", "How many (1-500, default 100).", INT),
+            _query("offset", "Skip this many, for paging.", INT),
+        ),
+    ),
+    ToolSpec(
+        "reports.templates", "reports", _READ, "GET", "/reports/admin/templates",
+        "Report templates",
+        "The report templates a team can be pointed at, with their ids — what "
+        "reports.set_schedule needs. Super admin only.",
+    ),
+    ToolSpec(
+        "reports.schedules", "reports", _READ, "GET", "/reports/admin/schedules",
+        "Which template each team files",
+        "Every team's schedule: for each cadence, which template it files, "
+        "whether it is enabled, when it is due and who else is copied. Super "
+        "admin only.",
+    ),
+    ToolSpec(
+        "reports.set_schedule", "reports", _WRITE, "PUT", "/reports/admin/schedules",
+        "Point a team's cadence at a template",
+        "Set which template one team files for one cadence — this is what makes "
+        "one team's report differ from the next. Replaces the schedule row for "
+        "that team and cadence. Super admin only. Get template ids from "
+        "reports.templates and the team id from teams.get.",
+        (
+            _body("team_id", "The team's id, not its handle.", required=True),
+            _body(
+                "cadence",
+                "daily, weekly, monthly, quarterly, yearly or ad_hoc.",
+                _CADENCE,
+                required=True,
+            ),
+            _body("template_id", "The template's id, from reports.templates.", required=True),
+            _body("enabled", "Whether the team files this cadence. Default true.", BOOL),
+            _body("due_hour", "Hour of the day it is due, 0-23. Default 18.", INT),
+            _body("due_weekday", "0 is Monday. Only meaningful for a weekly.", INT),
+            _body("note", "A note shown to the team."),
+            _body(
+                "notify",
+                "true or false to override the global emailing for this team's "
+                "reports of this cadence; leave out to follow it.",
+                BOOL,
+            ),
+            _body("extra_recipients", "Extra addresses copied on this team's reports.", STR_LIST),
+        ),
+        warning="Changes what everyone on that team is asked to report from now on.",
+    ),
+    ToolSpec(
+        "reports.adopt_project_reporting", "reports", _WRITE, "POST",
+        "/reports/admin/schedules/project-reporting",
+        "Switch a team to project status reporting",
+        "Point a team's cadences at the shipped project status templates, so "
+        "people on it are asked which project and get health dials and a "
+        "milestone timeline instead of the standard sections. Defaults to "
+        "weekly, monthly and quarterly. Existing recipients, notes and due "
+        "hours on those schedules are kept. Super admin only.",
+        (
+            _query("team", "The team's handle (slug) or id. Required."),
+            _query(
+                "cadences",
+                "Which cadences to switch: any of weekly, monthly, quarterly. "
+                "Leave out for all three.",
+                STR_LIST,
+            ),
+        ),
+        warning="Replaces what the team files for those cadences from now on.",
+    ),
+    # ── proposals ──────────────────────────────────────────────────────
+    ToolSpec(
+        "proposals.columns", "proposals", _READ, "GET", "/proposals/columns",
+        "Proposals list columns",
+        "The columns of the SharePoint Proposals list and, for choice columns, "
+        "the values each accepts. Read it before proposals.update_task when you "
+        "need the exact wording of a status or priority the list will take.",
+    ),
+    ToolSpec(
+        "proposals.remove_attachment", "proposals", _WRITE, "DELETE",
+        "/proposals/tasks/{task_id}/attachments/{file_name}",
+        "Remove a task attachment",
+        "Remove one file from one of the signed-in person's own proposal tasks "
+        "in SharePoint. Admins may do it on any task. Get the exact file name "
+        "from proposals.attachments first.",
+        (
+            _path("task_id", "The SharePoint task id, from proposals.my_tasks."),
+            _path("file_name", "The file's name exactly as proposals.attachments gives it."),
+        ),
+        warning="Deletes the file from the live Proposals list the team works in.",
+    ),
+    # ── notifications ──────────────────────────────────────────────────
+    ToolSpec(
+        "notifications.list", "notifications", _READ, "GET", "/notifications",
+        "My notifications",
+        "What the signed-in person has been told — task assignments, reports "
+        "filed, issues raised — newest first, with an unread count. Only ever "
+        "their own; there is no way to read anybody else's.",
+        (
+            _query("unread_only", "Only the ones not yet read.", BOOL),
+            _query("limit", "How many (1-200, default 50).", INT),
+            _query("offset", "Skip this many, for paging.", INT),
+        ),
+    ),
+    ToolSpec(
+        "notifications.unread_count", "notifications", _READ, "GET",
+        "/notifications/unread-count",
+        "How many unread",
+        "Just the number of unread notifications for the signed-in person.",
+    ),
+    ToolSpec(
+        "notifications.mark_read", "notifications", _WRITE, "POST", "/notifications/read",
+        "Mark notifications read",
+        "Mark some or all of the signed-in person's notifications as read. Pass "
+        "ids for particular ones, or leave ids out to mark everything. An id "
+        "that is not theirs simply matches nothing.",
+        (
+            _body(
+                "ids",
+                "Notification ids to mark. Leave out to mark all unread.",
+                STR_LIST,
+            ),
+        ),
+        warning="Clears the unread marks; there is no way to put them back.",
+    ),
+
+    # ── hr, templates, labels ─────────────────────────────────────────
+    # ── hr ──
+    ToolSpec(
+        "hr.meta", "hr", _READ, "GET", "/hr/meta", "HR choices",
+        "The vocabulary this module uses — document kinds, employment types, "
+        "application stages, opening statuses, reviewer relations — and which "
+        "posting, application and review forms exist, with the default of each. "
+        "Read it before creating an opening or a cycle when a template has to be "
+        "chosen, or when somebody asks what kinds of document HR can file.",
+    ),
+    ToolSpec(
+        "hr.create_opening", "hr", _WRITE, "POST", "/hr/openings", "Create an opening",
+        "Draft a new job opening. It is created as a draft and accepts nobody "
+        "until hr.post_opening is called, so a half-described role does no "
+        "harm. Leave the template ids out for the canonical forms; hr.meta "
+        "lists the alternatives. HR team members only. The advert's own form "
+        "answers cannot be given here — HR fills those in on screen.",
+        (
+            _body("title", "The job title.", required=True),
+            _body("template_id", "The application form's template id. Omit for the default."),
+            _body("posting_template_id", "The posting form's template id. Omit for the default."),
+            _body("reference", "HR's own reference for the role."),
+            _body("team_id", "The team's id, if the role belongs to one."),
+            _body("department", "Department."),
+            _body("location", "Where the job is."),
+            _body(
+                "employment_type",
+                "full_time, part_time, contract, internship or temporary. Defaults to full_time.",
+                _EMPLOYMENT_TYPE,
+            ),
+            _body("headcount", "How many to hire (default 1).", INT),
+            _body("salary_range", "Salary range, in words."),
+            _body("summary", "A short summary of the role."),
+            _body("description", "The full description."),
+            _body("requirements", "What a candidate needs."),
+            _body("closes_on", "Last day applications are accepted.", DATE),
+            _body("publicly_listed", "Show it on the public careers list. Default false.", BOOL),
+            _body("hosted_form", "Use the hosted application form. Default true.", BOOL),
+        ),
+        warning="Creates a draft opening. Nothing is published until it is posted.",
+    ),
+    ToolSpec(
+        "hr.update_opening", "hr", _WRITE, "PATCH", "/hr/openings/{ref}", "Edit an opening",
+        "Change the details of a job opening. Only the fields given change. "
+        "HR team members only. The status is not edited here: use "
+        "hr.post_opening and hr.close_opening for that.",
+        (
+            _path("ref", "The opening's id or handle."),
+            _body("title", "New title."),
+            _body("template_id", "The application form's template id."),
+            _body("posting_template_id", "The posting form's template id."),
+            _body("reference", "HR's own reference."),
+            _body("team_id", "The team's id."),
+            _body("department", "Department."),
+            _body("location", "Where the job is."),
+            _body(
+                "employment_type",
+                "full_time, part_time, contract, internship or temporary.",
+                _EMPLOYMENT_TYPE,
+            ),
+            _body("headcount", "How many to hire.", INT),
+            _body("salary_range", "Salary range, in words."),
+            _body("summary", "A short summary of the role."),
+            _body("description", "The full description."),
+            _body("requirements", "What a candidate needs."),
+            _body("closes_on", "Last day applications are accepted.", DATE),
+            _body("publicly_listed", "Show it on the public careers list.", BOOL),
+            _body("hosted_form", "Use the hosted application form.", BOOL),
+        ),
+        warning="Changes what candidates see if the opening is already posted.",
+    ),
+    ToolSpec(
+        "hr.post_opening", "hr", _WRITE, "POST", "/hr/openings/{ref}/post", "Post an opening",
+        "Make a drafted opening live: the share link starts working and "
+        "applications are accepted. Required fields on the posting form are "
+        "checked now, so an incomplete draft is refused with a reason. HR team "
+        "members only.",
+        (_path("ref", "The opening's id or handle."),),
+        warning="The opening goes live and candidates can apply from this moment.",
+    ),
+    ToolSpec(
+        "hr.close_opening", "hr", _WRITE, "POST", "/hr/openings/{ref}/close", "Close an opening",
+        "Stop an opening accepting applications. The record and every "
+        "application to it are kept — this is what to use when somebody asks "
+        "to 'remove' or 'take down' a job, not hr.delete_opening. Pass "
+        "filled=true when it is closing because somebody was hired. HR team "
+        "members only.",
+        (
+            _path("ref", "The opening's id or handle."),
+            _query("filled", "Closed because somebody was hired.", BOOL),
+        ),
+        warning="The share link stops accepting applications.",
+    ),
+    ToolSpec(
+        "hr.rotate_opening_link", "hr", _WRITE, "POST", "/hr/openings/{ref}/rotate-link",
+        "Issue a new share link",
+        "Replace an opening's public share link with a fresh one. The old link "
+        "stops working immediately for everyone who has it, including "
+        "candidates part way through the form. Use it when a link has been "
+        "shared somewhere it should not have been. HR team members only.",
+        (_path("ref", "The opening's id or handle."),),
+        warning="Everybody holding the old link loses it at once, candidates included.",
+    ),
+    ToolSpec(
+        "hr.delete_opening", "hr", _WRITE, "DELETE", "/hr/openings/{ref}", "Delete an opening",
+        "Permanently destroy an opening, every application sent to it and "
+        "their uploaded files. Super admin only. Almost always the wrong tool: "
+        "hr.close_opening keeps the record and stops applications, which is "
+        "what people usually mean. Offer letters already filed against an "
+        "employee survive.",
+        (_path("ref", "The opening's id or handle."),),
+        warning="Permanent. Every application and candidate file on this opening goes with it.",
+    ),
+    ToolSpec(
+        "hr.candidate_notes", "hr", _WRITE, "PATCH", "/hr/applications/{application_id}/notes",
+        "Set HR's notes on a candidate",
+        "Replace HR's private notes on one application. Candidates never see "
+        "these. The text given replaces what is there, so read the application "
+        "first and include anything worth keeping. HR team members only.",
+        (
+            _path("application_id", "The application id."),
+            _body("internal_notes", "The notes, replacing what is there."),
+        ),
+        warning="Replaces the existing notes rather than adding to them.",
+    ),
+    ToolSpec(
+        "hr.hire", "hr", _WRITE, "POST", "/hr/applications/{application_id}/hire",
+        "Record who a candidate became",
+        "Link a hired candidate to the employee record they became, once "
+        "their Microsoft account has signed in for the first time. Find the "
+        "ERP user id with directory.search or teams.members. Set close_opening "
+        "to also mark the opening filled. HR team members only.",
+        (
+            _path("application_id", "The application id."),
+            _body("user_id", "The ERP user id of the employee they became.", required=True),
+            _body("close_opening", "Also close the opening as filled. Default false.", BOOL),
+        ),
+        warning="Marks the candidate hired and ties their application to an employee record.",
+    ),
+    ToolSpec(
+        "hr.delete_application", "hr", _WRITE, "DELETE", "/hr/applications/{application_id}",
+        "Delete an application",
+        "Permanently remove one candidate's application and the files they "
+        "uploaded. This is the endpoint behind a candidate asking to be "
+        "forgotten. Super admin only. Rejecting a candidate is "
+        "hr.move_candidate, not this.",
+        (_path("application_id", "The application id."),),
+        warning="Permanent. The candidate's CV and other uploads are destroyed with it.",
+    ),
+    ToolSpec(
+        "hr.purge_person", "hr", _WRITE, "DELETE", "/hr/people/{user_id}/hr-data",
+        "Erase somebody's HR file",
+        "Destroy everything HR holds about one person: their documents and "
+        "every review written about them. Reviews they wrote about colleagues "
+        "are kept, and their user account is untouched. Super admin only. Do "
+        "not call this for a leaver unless asked in those words — deactivating "
+        "somebody is a teams matter, not this.",
+        (_path("user_id", "The person's ERP user id."),),
+        warning="Permanent. Their contracts, documents and every review about them are destroyed.",
+    ),
+    ToolSpec(
+        "hr.document", "hr", _READ, "GET", "/hr/documents/{document_id}", "One HR document",
+        "The details of one employee document — kind, title, dates, expiry — "
+        "without the file itself. HR sees any; a colleague sees only their own "
+        "and only those marked visible to them, and anything else answers 404.",
+        (_path("document_id", "The document id, from hr.documents or hr.my_documents."),),
+    ),
+    ToolSpec(
+        "hr.update_document", "hr", _WRITE, "PATCH", "/hr/documents/{document_id}",
+        "Edit a document's details",
+        "Change the kind, title, note, dates or employee visibility of a filed "
+        "document. Only the fields given change; the file itself is never "
+        "replaced here. HR team members only.",
+        (
+            _path("document_id", "The document id."),
+            _body("kind", "What sort of document it is.", _DOCUMENT_KIND),
+            _body("title", "New title."),
+            _body("note", "A note about it."),
+            _body("issued_on", "When it was issued.", DATE),
+            _body("expires_on", "When it runs out.", DATE),
+            _body("visible_to_employee", "Whether the person may see it themselves.", BOOL),
+        ),
+        warning="Making a document visible lets the employee read it at once.",
+    ),
+    ToolSpec(
+        "hr.delete_document", "hr", _WRITE, "DELETE", "/hr/documents/{document_id}",
+        "Delete a document",
+        "Permanently delete one employee document and its file. Super admin "
+        "only — HR files documents but does not destroy them, because the file "
+        "is often the only copy anybody can produce later.",
+        (_path("document_id", "The document id."),),
+        warning="Permanent. The file may be the only copy that exists.",
+    ),
+    ToolSpec(
+        "hr.create_cycle", "hr", _WRITE, "POST", "/hr/review-cycles", "Start a review cycle",
+        "Create a performance review cycle. It starts as a draft with nobody "
+        "nominated: follow it with hr.nominate to say who reviews whom and "
+        "hr.open_cycle to let them begin. Leave template_id out for the newest "
+        "active review form; hr.meta lists the others. HR team members only.",
+        (
+            _body("name", "The cycle's name, e.g. 'H2 2026 reviews'.", required=True),
+            _body("template_id", "The review form's template id. Omit for the newest active one."),
+            _body("description", "What the cycle is for."),
+            _body("period_start", "First day of the period being reviewed.", DATE),
+            _body("period_end", "Last day of the period being reviewed.", DATE),
+            _body("due_on", "When reviews are due.", DATE),
+            _body(
+                "shared_with_subjects",
+                "Let the people reviewed read what was written. Default false.",
+                BOOL,
+            ),
+        ),
+        warning="Creates a draft cycle. Nobody is asked to write anything until it is opened.",
+    ),
+    ToolSpec(
+        "hr.review_cycle", "hr", _READ, "GET", "/hr/review-cycles/{cycle_id}", "One review cycle",
+        "One cycle in full: its state, period, due date, whether the results "
+        "are shared, and how many reviews are nominated and submitted. HR only.",
+        (_path("cycle_id", "The cycle id, from hr.review_cycles."),),
+    ),
+    ToolSpec(
+        "hr.open_cycle", "hr", _WRITE, "POST", "/hr/review-cycles/{cycle_id}/open",
+        "Open a review cycle",
+        "Let the nominated reviewers start filling their forms in. HR team "
+        "members only.",
+        (_path("cycle_id", "The cycle id."),),
+        warning="Every nominated reviewer can start writing from this moment.",
+    ),
+    ToolSpec(
+        "hr.close_cycle", "hr", _WRITE, "POST", "/hr/review-cycles/{cycle_id}/close",
+        "Close a review cycle",
+        "Stop a cycle: nobody can submit after this, and what was submitted "
+        "stays readable. This is what to use when somebody asks to 'end' or "
+        "'wrap up' reviews — not hr.delete_cycle. HR team members only.",
+        (_path("cycle_id", "The cycle id."),),
+        warning="Reviews not yet submitted cannot be submitted afterwards.",
+    ),
+    ToolSpec(
+        "hr.share_cycle", "hr", _WRITE, "POST", "/hr/review-cycles/{cycle_id}/sharing",
+        "Share or hide a cycle's results",
+        "Decide whether the people reviewed in a cycle may read the reviews "
+        "written about them. shared=true opens them up; shared=false hides "
+        "them again. HR team members only.",
+        (
+            _path("cycle_id", "The cycle id."),
+            # Required, unlike most query parameters: the route has no default,
+            # and a null dropped by strict mode would be a 422 rather than "no".
+            Param(
+                "shared",
+                "query",
+                BOOL,
+                "Whether the people reviewed may read their reviews. Required.",
+                required=True,
+            ),
+        ),
+        warning="Sharing lets everyone reviewed in the cycle read what colleagues wrote about them.",
+    ),
+    ToolSpec(
+        "hr.delete_cycle", "hr", _WRITE, "DELETE", "/hr/review-cycles/{cycle_id}",
+        "Delete a review cycle",
+        "Permanently destroy a cycle and every review in it, submitted ones "
+        "included. Super admin only. hr.close_cycle is what is wanted almost "
+        "every time.",
+        (_path("cycle_id", "The cycle id."),),
+        warning="Permanent. Every assessment written in this cycle is destroyed.",
+    ),
+    ToolSpec(
+        "hr.nominate", "hr", _WRITE, "POST", "/hr/review-cycles/{cycle_id}/nominations",
+        "Nominate reviewers",
+        "Ask people to review people in a cycle: each nomination names who is "
+        "reviewed (subject) and who writes it (reviewer), by ERP user id. The "
+        "same id for both is a self-review. All or nothing — one bad "
+        "nomination fails the whole request. HR team members only.",
+        (
+            _path("cycle_id", "The cycle id."),
+            _body(
+                "nominations",
+                "Who reviews whom. relation is how the reviewer knows them: self, "
+                "manager, peer, report, hr or other (default other).",
+                _s("array", items=_object(
+                    {
+                        "subject_id": _s(
+                            "string", description="ERP user id of the person reviewed."
+                        ),
+                        "reviewer_id": _s("string", description="ERP user id of who writes it."),
+                        "relation": _s(
+                            "string", enum=["self", "manager", "peer", "report", "hr", "other"]
+                        ),
+                        "due_on": DATE,
+                    },
+                    required=("subject_id", "reviewer_id"),
+                )),
+                required=True,
+            ),
+        ),
+        warning="Each reviewer is asked to write about a colleague.",
+    ),
+    ToolSpec(
+        "hr.withdraw_nomination", "hr", _WRITE, "POST", "/hr/reviews/{review_id}/withdraw",
+        "Withdraw a nomination",
+        "Un-invite a reviewer who has not started writing — the ordinary fix "
+        "for nominating the wrong person. Refused once they have written "
+        "anything; at that point it is a deletion and a super admin's call "
+        "through hr.delete_review. HR team members only.",
+        (_path("review_id", "The review id."),),
+        warning="The reviewer is no longer asked to write this review.",
+    ),
+    ToolSpec(
+        "hr.delete_review", "hr", _WRITE, "DELETE", "/hr/reviews/{review_id}", "Delete a review",
+        "Permanently delete one review whatever state it is in, submitted "
+        "included. Super admin only. For a review nobody has started, "
+        "hr.withdraw_nomination is enough.",
+        (_path("review_id", "The review id."),),
+        warning="Permanent. What was written is destroyed.",
+    ),
+    ToolSpec(
+        "hr.reviews", "hr", _READ, "GET", "/hr/reviews", "Search reviews",
+        "Reviews across cycles, filtered by cycle, subject, reviewer or status. "
+        "HR sees everything. Anyone else is narrowed to reviews they wrote or "
+        "that are about them, whatever filters they pass, and sees content "
+        "only where the cycle has been shared.",
+        (
+            _query("cycle_id", "Only this cycle."),
+            _query("subject_id", "Only reviews about this person, by ERP user id."),
+            _query("reviewer_id", "Only reviews written by this person, by ERP user id."),
+            _query(
+                "status",
+                "pending, draft, submitted or declined.",
+                _s("string", enum=["pending", "draft", "submitted", "declined"]),
+            ),
+        ),
+    ),
+    ToolSpec(
+        "hr.review", "hr", _READ, "GET", "/hr/reviews/{review_id}", "One review",
+        "One review in full. The reviewer and HR get the form's questions with "
+        "it; a subject sees it only once the cycle is shared. Anything the "
+        "caller may not read answers 404.",
+        (_path("review_id", "The review id, from hr.my_reviews or hr.reviews."),),
+    ),
+    ToolSpec(
+        "hr.decline_review", "hr", _WRITE, "POST", "/hr/reviews/{review_id}/decline",
+        "Decline to write a review",
+        "Turn down a review the signed-in person was nominated to write, with "
+        "a reason. Only the nominated reviewer can do this.",
+        (
+            _path("review_id", "The review id, from hr.my_reviews."),
+            _body("reason", "Why they are declining."),
+        ),
+        warning="HR sees the refusal and the reason.",
+    ),
+    ToolSpec(
+        "hr.reopen_review", "hr", _WRITE, "POST", "/hr/reviews/{review_id}/reopen",
+        "Hand a review back",
+        "Return a submitted review to its author for more work, clearing the "
+        "frozen score. HR team members only.",
+        (_path("review_id", "The review id."),),
+        warning="The submitted score is cleared until the reviewer submits again.",
+    ),
+    # ── templates ──
+    ToolSpec(
+        "templates.get", "templates", _READ, "GET", "/templates/{ref}", "One form template",
+        "One template in full: its fields in order, their sections, scoring "
+        "and Zoho mappings, who may use it, and whether the caller may fill it "
+        "in (may_use) and why not (use_reason).",
+        (_path("ref", "The template's key or id."),),
+    ),
+    ToolSpec(
+        "templates.create", "templates", _WRITE, "POST", "/templates", "Create a form template",
+        "Create a new form as a draft, granted to nobody. Publish it with "
+        "templates.publish and hand it out with grants before anyone can fill "
+        "it in. Super admin only. kind says what the form is for ('job_posting', "
+        "'performance_review') and defaults to the key. Table-field columns "
+        "and scoring rules cannot be set here; they are edited on screen.",
+        (
+            _body("key", "A short unique key, lowercase with underscores.", required=True),
+            _body("name", "The form's display name.", required=True),
+            _body("kind", "What it is for, so a module can find its own. Defaults to the key."),
+            _body("description", "What the form is for, in a sentence."),
+            _body("fields", "The questions, in order.", _s("array", items=_FIELD)),
+            _body(
+                "sections",
+                "The sections the fields are grouped under.",
+                _s("array", items=_SECTION),
+            ),
+        ),
+        warning="Creates a draft. Nobody can fill it in until it is published and granted.",
+    ),
+    ToolSpec(
+        "templates.update", "templates", _WRITE, "PATCH", "/templates/{ref}",
+        "Edit a form template",
+        "Change a template's name, kind, description, fields or sections. Only "
+        "what is given changes — but fields or sections given at all replace "
+        "that whole list, so read the template first and send every field to "
+        "keep. Super admin only. A field's table columns and scoring rules "
+        "cannot be sent here and are lost from any field this call resends; "
+        "edit those on screen.",
+        (
+            _path("ref", "The template's key or id."),
+            _body("name", "New display name."),
+            _body("kind", "What it is for."),
+            _body("description", "New description."),
+            _body(
+                "fields",
+                "The whole list of fields, replacing what is there.",
+                _s("array", items=_FIELD),
+            ),
+            _body(
+                "sections",
+                "The whole list of sections, replacing what is there.",
+                _s("array", items=_SECTION),
+            ),
+        ),
+        warning="Changes what every future form of this kind collects; a list sent "
+                "replaces the whole list.",
+    ),
+    ToolSpec(
+        "templates.publish", "templates", _WRITE, "POST", "/templates/{ref}/publish",
+        "Publish a form template",
+        "Make a draft template usable by the teams it is granted to. Super admin only.",
+        (_path("ref", "The template's key or id."),),
+        warning="The form becomes fillable by everyone it is granted to.",
+    ),
+    ToolSpec(
+        "templates.archive", "templates", _WRITE, "POST", "/templates/{ref}/archive",
+        "Retire a form template",
+        "Retire a template so nobody can fill it in, keeping it readable so "
+        "forms already submitted from it still make sense. Reversible with "
+        "templates.restore. Super admin only.",
+        (_path("ref", "The template's key or id."),),
+        warning="Nobody can fill this form in until it is restored.",
+    ),
+    ToolSpec(
+        "templates.restore", "templates", _WRITE, "POST", "/templates/{ref}/restore",
+        "Restore a form template",
+        "Bring an archived template back into use. Super admin only.",
+        (_path("ref", "The template's key or id."),),
+        warning="The form becomes fillable again by everyone it is granted to.",
+    ),
+    ToolSpec(
+        "templates.delete", "templates", _WRITE, "DELETE", "/templates/{ref}",
+        "Delete a form template",
+        "Permanently delete a template that nothing has ever been filled in "
+        "from. One that has been used is refused — archive it instead. Super "
+        "admin only.",
+        (_path("ref", "The template's key or id."),),
+        warning="Permanent. Only an unused template can be deleted.",
+    ),
+    ToolSpec(
+        "templates.grants", "templates", _READ, "GET", "/templates/{ref}/grants",
+        "Who may use a template",
+        "The grants on one template: which teams may use it and, within each, "
+        "which team roles. A grant with no team means every team; one with no "
+        "roles means anyone on the team. No grants at all means super admins only.",
+        (_path("ref", "The template's key or id."),),
+    ),
+    # ── labels (assignment) ──
+    ToolSpec(
+        "labels.create", "assignment", _WRITE, "POST", "/labels", "Add a label",
+        "Create a label the assignment policy can speak in. kind is category, "
+        "status or skill. Pass team to scope it to one team rather than the "
+        "whole organisation. Super admin, CEO or manager only.",
+        (
+            _query("team", "The team's id, to scope the label to one team. Omit for everywhere."),
+            _body("key", "A short unique key, lowercase with hyphens.", required=True),
+            _body("name", "The display name.", required=True),
+            _body("kind", "category, status or skill.", _LABEL_KIND, required=True),
+            _body("description", "What holding it means."),
+            _body("color", "A colour for the badge, e.g. a hex code."),
+        ),
+        warning="Adds a label the assignment policy can then refer to.",
+    ),
+    ToolSpec(
+        "labels.update", "assignment", _WRITE, "PATCH", "/labels/{key}", "Rename a label",
+        "Change a label's name, description, colour or kind. The key itself "
+        "cannot change — the policy and every assignment refer to it. kind can "
+        "only change on a label the product did not ship with. Pass team for "
+        "a team-scoped label. Super admin, CEO or manager only.",
+        (
+            _path("key", "The label's key, from labels.list."),
+            _query("team", "The team's id, for a team-scoped label."),
+            _body("name", "New display name."),
+            _body("description", "New description."),
+            _body("color", "New colour."),
+            _body("kind", "category, status or skill.", _LABEL_KIND),
+        ),
+        warning="Changes how the label reads everywhere it is shown.",
+    ),
+    ToolSpec(
+        "labels.delete", "assignment", _WRITE, "DELETE", "/labels/{key}", "Remove a label",
+        "Delete a label. System labels — the ones the policy is built on — are "
+        "refused; rename those instead. Pass team for a team-scoped label. "
+        "Super admin, CEO or manager only.",
+        (
+            _path("key", "The label's key."),
+            _query("team", "The team's id, for a team-scoped label."),
+        ),
+        warning="Everyone holding the label loses it.",
+    ),
+    ToolSpec(
+        "labels.assign", "assignment", _WRITE, "POST", "/labels/assign", "Give someone a label",
+        "Put a label on a person, optionally only within one team and "
+        "optionally until a date. on-leave and new-joiner cannot be given "
+        "here: they are worked out from approved leave and joining dates, so "
+        "change those instead. Super admin, CEO or manager only.",
+        (
+            _body("user_id", "The person's ERP user id.", required=True),
+            _body("label_key", "The label's key, from labels.list.", required=True),
+            _body("team_id", "Scope it to one team. Omit for everywhere."),
+            _body(
+                "expires_at",
+                "When it should lapse on its own. Omit to keep it until removed.",
+                _DATETIME,
+            ),
+            _body("note", "Why, for the record."),
+        ),
+        warning="Changes how work is shared out to this person.",
+    ),
+    ToolSpec(
+        "labels.unassign", "assignment", _WRITE, "POST", "/labels/unassign", "Take a label away",
+        "Remove a label from a person. Give the same team_id the label was "
+        "assigned with, or omit it for an organisation-wide one. A derived "
+        "label (on-leave, new-joiner) cannot be removed this way. Super admin, "
+        "CEO or manager only.",
+        (
+            _body("user_id", "The person's ERP user id.", required=True),
+            _body("label_key", "The label's key.", required=True),
+            _body("team_id", "The team it was scoped to, if any."),
+            _body("expires_at", "Ignored when removing.", _DATETIME),
+            _body("note", "Ignored when removing."),
+        ),
+        warning="Changes how work is shared out to this person.",
+    ),
+    ToolSpec(
+        "labels.set_joined_on", "assignment", _WRITE, "PUT", "/labels/people/{user_id}/joined-on",
+        "Set someone's joining date",
+        "Record the date the new-joiner rule counts from for one person. "
+        "Entra gives no hire date, so without this the rule falls back to when "
+        "they first appeared in the ERP, which can be very wrong for somebody "
+        "who was here long before it. Super admin, CEO or manager only.",
+        (
+            _path("user_id", "The person's ERP user id."),
+            _body("joined_on", "The date they joined.", DATE, required=True),
+        ),
+        warning="Changes whether the person counts as a new joiner.",
+    ),
+    ToolSpec(
+        "labels.suggested", "assignment", _READ, "GET", "/labels/suggested", "Shipped labels",
+        "The labels the product ships with and the capacity each suggests, "
+        "which is what a new policy is seeded with. Use it to explain the "
+        "defaults; labels.list is what actually exists.",
+    ),
+
+    # ── quote requests, comparisons, dashboards, teams, users ─────────
+    # ── quote requests ─────────────────────────────────────────────────
+    ToolSpec(
+        "quote_requests.tasks", "quote_requests", _READ, "GET", "/quote-requests/tasks",
+        "My tasks that could become quotes",
+        "The signed-in person's own Proposals tasks, each marked with whether a "
+        "quote request has already been raised for it. Use it before "
+        "quote_requests.from_task to find the task id, and to answer 'which of "
+        "my bids still has no quote'. Only ever their own tasks.",
+        (_query("open_only", "Hide tasks whose status is Completed (default true).", BOOL),),
+    ),
+    ToolSpec(
+        "quote_requests.from_task", "quote_requests", _WRITE, "POST",
+        "/quote-requests/from-task", "Raise a quote from a task",
+        "Start a quote request from one of the signed-in person's own Proposals "
+        "tasks instead of typing it in: the title, customer, bid closing date "
+        "and remarks are copied from the task. It arrives with no priced lines "
+        "— those come from the supplier quotes attached on the screen, or from "
+        "quote_requests.update. Find the task id with quote_requests.tasks; a "
+        "task that is not theirs is refused.",
+        (
+            Param(
+                "team", "query", STR,
+                "The team's handle (slug) or id the quote belongs to. Required.",
+                required=True,
+            ),
+            _body("task_id", "The SharePoint task id, from quote_requests.tasks.", required=True),
+        ),
+        warning="This raises a real quote request against that task.",
+    ),
+    ToolSpec(
+        "quote_requests.update", "quote_requests", _WRITE, "PATCH",
+        "/quote-requests/{request_id}", "Edit a quote request",
+        "Rewrite a quote request that is still the caller's — in draft, or sent "
+        "back for rework. Despite the method this is a whole replacement, not a "
+        "merge: every field and every line is set from what you send, and a "
+        "line left out is gone. Read the quote with quote_requests.get first "
+        "and send it back whole with the change made. Refused once it is with "
+        "the approvers or approved.",
+        (
+            _path("request_id", "The quote request id."),
+            _body("title", "What the quote is for.", required=True),
+            _body("customer_name", "The customer, as they should appear.", required=True),
+            _body("customer_id", "The customer's Zoho id, when it is known."),
+            _body("contact_person", "Who at the customer asked."),
+            _body("reference", "Our own reference for the quote."),
+            _body("reference_number", "The customer's own PO or enquiry number."),
+            _body("quote_date", "Quote date.", DATE),
+            _body("expiry_date", "When the quote lapses.", DATE),
+            _body("currency", "Three-letter code. Defaults to AED."),
+            _body("salesperson_name", "The salesperson, as Zoho names them."),
+            _body("place_of_supply", "Place of supply, for tax."),
+            _body("payment_terms", "Payment terms, in words."),
+            _body("delivery_terms", "Delivery terms, in words."),
+            _body("cf_bcd", "Bid closing date.", DATE),
+            _body("cf_portal", "The portal the enquiry came through."),
+            _body("subject", "Subject line for the quote."),
+            _body("notes", "Notes for the customer."),
+            _body("terms", "Terms and conditions text."),
+            _body("discount", "Quote-level discount. Defaults to 0.", _s("number")),
+            _body("shipping_charge", "Shipping charge. Defaults to 0.", _s("number")),
+            _body("adjustment", "A final adjustment to the total. Defaults to 0.", _s("number")),
+            _body(
+                "multiple_supplier_quotes",
+                "True when several suppliers quoted the same requirement and the "
+                "approver must choose between them.",
+                BOOL,
+            ),
+            _body(
+                "items",
+                "The whole set of priced lines, replacing what is there. Each "
+                "needs a name; quantity defaults to 1 and rate to 0.",
+                _s("array", items=_object(
+                    {
+                        "name": STR,
+                        "description": STR,
+                        "item_code": STR,
+                        "brand": STR,
+                        "unit": STR,
+                        "quantity": _s("number"),
+                        "rate": _s("number", description="Unit selling price."),
+                        "discount": _s("number"),
+                        "tax_name": STR,
+                        "tax_percentage": _s("number", description="0-100."),
+                        "cost_rate": _s("number", description="What the line costs us, per unit."),
+                        "source_supplier_quote_id": _s(
+                            "string", description="The supplier quote the line was priced from."
+                        ),
+                    },
+                    required=("name",),
+                )),
+            ),
+        ),
+        warning="Replaces every field and every line of the quote with what is sent.",
+    ),
+    ToolSpec(
+        "quote_requests.select_supplier", "quote_requests", _WRITE, "POST",
+        "/quote-requests/{request_id}/select-supplier", "Price a quote from a supplier",
+        "Take one supplier's offer as the quote's own lines: their items become "
+        "the priced lines, each at the supplier's cost plus the markup. A "
+        "markup of 0 prices the job at cost, which is allowed and visible. "
+        "Every rate can still be edited line by line afterwards with "
+        "quote_requests.update. The supplier quote ids are on the quote from "
+        "quote_requests.get. Only while the quote is the caller's to edit.",
+        (
+            _path("request_id", "The quote request id."),
+            _body(
+                "supplier_quote_id",
+                "Which attached supplier quote to price from.",
+                required=True,
+            ),
+            _body(
+                "markup_percent",
+                "Percentage added to the supplier's cost to get the selling rate. "
+                "0 to 1000; defaults to 0.",
+                _s("number"),
+            ),
+        ),
+        warning="Replaces the quote's priced lines with that supplier's, marked up.",
+    ),
+    ToolSpec(
+        "quote_requests.negotiate", "quote_requests", _WRITE, "POST",
+        "/quote-requests/{request_id}/negotiate", "Reopen an approved quote",
+        "Open another round on a quote that was already approved, because the "
+        "customer came back. The approved round is kept whole so the next "
+        "reviewer can see what changed; the quote goes back to being editable "
+        "and must be submitted and approved again. Say what the customer asked "
+        "for in the note. Refused on a quote that is not approved.",
+        (
+            _path("request_id", "The quote request id."),
+            _body("note", "What the customer came back with. Required.", required=True),
+        ),
+        warning="Takes the quote out of the approved queue and emails the "
+                "approvers that their approval no longer stands.",
+    ),
+    ToolSpec(
+        "quote_requests.comment", "quote_requests", _WRITE, "POST",
+        "/quote-requests/{request_id}/comments", "Comment on a quote",
+        "A remark on a quote request, anchored to what it is about: the whole "
+        "quote, one field, one line, or one supplier quote. It decides nothing "
+        "— an approver's decision is quote_requests.review. It is emailed to "
+        "the other side: an owner's comment goes to the approvers, an "
+        "approver's to the people who raised the quote.",
+        (
+            _path("request_id", "The quote request id."),
+            _body("body", "What to say.", required=True),
+            _body(
+                "target_type",
+                "What it is about: quote (the whole thing, the default), field, "
+                "item or supplier_quote.",
+                _s("string", enum=["quote", "field", "item", "supplier_quote"]),
+            ),
+            _body(
+                "target_ref",
+                "For field, the field name; for item, the line id; for "
+                "supplier_quote, the supplier quote id. Omit for the whole quote.",
+            ),
+        ),
+        warning="The people on the other side of the quote are emailed this.",
+    ),
+    ToolSpec(
+        "quote_requests.resolve_comment", "quote_requests", _WRITE, "POST",
+        "/quote-requests/{request_id}/comments/{comment_id}/resolve",
+        "Mark a quote comment dealt with",
+        "Mark one comment on a quote request as resolved. Nothing else about "
+        "the quote changes. Comment ids are on the quote from quote_requests.get.",
+        (
+            _path("request_id", "The quote request id."),
+            _path("comment_id", "The comment id."),
+        ),
+        warning="The comment is shown as dealt with to everyone on the quote.",
+    ),
+    # ── quote comparison ───────────────────────────────────────────────
+    ToolSpec(
+        "comparisons.analyse", "quote_comparison", _WRITE, "POST", "/comparisons/analyse",
+        "Compare supplier quotes without saving",
+        "Compare two or more supplier offers typed in as data — supplier, "
+        "their line items, prices and terms — and get back the matched lines, "
+        "totals, spread and savings. Nothing is stored; it is the tool for "
+        "'which of these is cheapest' when the numbers are in the conversation. "
+        "Uploading the supplier's documents is done on the screen, not here. "
+        "To keep the result, use comparisons.save with the same quotes.",
+        (
+            _body(
+                "currency",
+                "Three-letter code everything is compared in. Defaults to AED.",
+            ),
+            _body(
+                "quotes",
+                "The supplier offers, at least one. Each needs a supplier_name; "
+                "prices are in that quote's own currency, converted by fx_rate.",
+                _s("array", items=_SUPPLIER_QUOTE),
+                required=True,
+            ),
+        ),
+        warning="Runs a model over the quotes to match their lines, which costs money.",
+    ),
+    ToolSpec(
+        "comparisons.save", "quote_comparison", _WRITE, "POST", "/comparisons",
+        "Save a comparison",
+        "Store a supplier quote comparison for colleagues to refer to. The "
+        "analysis is worked out again over what is saved, so the saved figures "
+        "always follow from the saved lines. Read the suppliers and their "
+        "totals back to the person before saving.",
+        (
+            _body("title", "What was being bought.", required=True),
+            _body("reference", "An enquiry or project reference."),
+            _body("notes", "Anything worth recording beside the numbers."),
+            _body(
+                "currency",
+                "Three-letter code everything is compared in. Defaults to AED.",
+            ),
+            _body(
+                "quotes",
+                "The supplier offers. Each needs a supplier_name.",
+                _s("array", items=_SUPPLIER_QUOTE),
+            ),
+        ),
+        warning="Creates a comparison everyone in the module can read.",
+    ),
+    ToolSpec(
+        "comparisons.delete", "quote_comparison", _WRITE, "DELETE",
+        "/comparisons/{comparison_id}", "Delete a comparison",
+        "Permanently delete a saved comparison and the supplier documents "
+        "attached to it. Only the person who created it, or a super admin, may.",
+        (_path("comparison_id", "The comparison id."),),
+        warning="Permanent. The uploaded supplier documents go with it.",
+    ),
+    # ── dashboard ──────────────────────────────────────────────────────
+    ToolSpec(
+        "dashboard.widgets", "dashboard", _READ, "GET", "/widgets", "Dashboard widget catalogue",
+        "Every dashboard card that exists, with its key, what it shows and "
+        "which module it needs. Use it to name a card somebody wants added; "
+        "dashboard.layout says which of these one particular team may use.",
+    ),
+    ToolSpec(
+        "dashboard.reset_layout", "dashboard", _WRITE, "DELETE",
+        "/teams/{ref}/dashboard/layout", "Reset a dashboard",
+        "Drop one team's saved dashboard arrangement so it falls back to the "
+        "defaults for its modules. Admins only. Returns the layout it now has.",
+        (_TEAM_REF,),
+        warning="Throws away the team's arrangement for everyone on it.",
+    ),
+    # ── teams ──────────────────────────────────────────────────────────
+    ToolSpec(
+        "teams.add_members", "teams", _WRITE, "POST", "/teams/{ref}/members/bulk",
+        "Add several members",
+        "Add several people to a team at once, all with the same roles. Admins "
+        "only. Each person is attempted on their own, so one bad id does not "
+        "stop the rest — the answer lists who was added and who failed, and "
+        "why; report both. Someone who has never signed in is provisioned from "
+        "the directory.",
+        (
+            _TEAM_REF,
+            _body(
+                "user_ids",
+                "The people. Each accepts the ERP user id, the Entra object id, "
+                "or the email address.",
+                STR_LIST,
+                required=True,
+            ),
+            _body(
+                "role_keys",
+                "Team roles each will hold: member, team_lead, team_manager, "
+                "approver. Defaults to member.",
+                STR_LIST,
+            ),
+        ),
+        warning="Replaces whatever roles any of them already hold in this team.",
+    ),
+    # ── user administration ────────────────────────────────────────────
+    ToolSpec(
+        "users.sections", "user_admin", _READ, "GET", "/users/sections",
+        "What a profile can contain",
+        "The sections a user profile is made of — their keys, which call out "
+        "to Entra, which are slow, and which users.reset will wipe. Use it to "
+        "choose the include keys for users.profile.",
+    ),
+    ToolSpec(
+        "users.reset", "user_admin", _WRITE, "POST", "/users/{ref}/reset",
+        "Wipe a user's data",
+        "Strip every module's data about one person — their leave, HR file, "
+        "team memberships, roles and the rest — while keeping the account so "
+        "they can still sign in. Admins only. The answer says what was removed "
+        "and what it looked like before, which is the last time it can be "
+        "seen. Confirm the exact person first. Accepts the ERP user id, the "
+        "Entra object id, or the email address.",
+        (_path("ref", "The person. Accepts the ERP user id, the Entra object id, or the email address."),),
+        warning="Irreversible. Everything the ERP holds about this person is erased.",
+        destructive=True,
+    ),
+    ToolSpec(
+        "users.delete", "user_admin", _WRITE, "DELETE", "/users/{ref}",
+        "Remove a user entirely",
+        "Delete a person from the ERP altogether: their data in every module "
+        "and the account itself. Admins only. They are not removed from the "
+        "directory and can be provisioned again by signing in, but with a "
+        "blank record. Confirm the exact person first. Accepts the ERP user "
+        "id, the Entra object id, or the email address.",
+        (_path("ref", "The person. Accepts the ERP user id, the Entra object id, or the email address."),),
+        warning="Irreversible. The account and everything about this person go.",
+    ),
+
+    # ── assignment, analytics, intake, system, finance ────────────────
+    # ── assignment ──
+    ToolSpec(
+        "assignment.policies", "assignment", _READ, "GET", "/assignment/policies",
+        "Every assignment policy",
+        "The organisation default and every team that has a policy of its own, "
+        "each with whether the caller may edit it. Use it to find out which "
+        "teams share work differently from the default before reading or "
+        "changing one.",
+    ),
+    ToolSpec(
+        "assignment.update_policy", "assignment", _WRITE, "PATCH",
+        "/assignment/policies/default", "Change the default policy",
+        "Change the organisation-wide assignment policy. Only the fields given "
+        "change. Super admin or CEO; a manager cannot change the default, only "
+        "their own teams'. Per-label ratios and caps are not editable here — "
+        "they are set on the screen. Read assignment.policy first and say back "
+        "what will change: this decides how much work everybody in the company "
+        "is given.",
+        _POLICY_FIELDS,
+        warning="Changes how work is shared out for every team running on the default.",
+    ),
+    ToolSpec(
+        "assignment.team_policy", "assignment", _READ, "GET",
+        "/assignment/policies/team/{team_id}", "A team's policy",
+        "The policy governing one team: its own if it has one, otherwise the "
+        "organisation default. A null team_id in the answer means it is "
+        "running on the default. Accepts the team's handle or id.",
+        _TEAM_ID,
+    ),
+    ToolSpec(
+        "assignment.create_team_policy", "assignment", _WRITE, "POST",
+        "/assignment/policies/team/{team_id}", "Give a team its own policy",
+        "Create a policy of the team's own, copied from the default, so it can "
+        "be tuned without touching anyone else. Refused if the team already has "
+        "one. Super admin or CEO anywhere; a manager only on a team they belong "
+        "to. Takes no settings — follow it with assignment.update_team_policy.",
+        _TEAM_ID,
+        warning="From now on this team's work is shared out by its own policy, "
+                "not the default.",
+    ),
+    ToolSpec(
+        "assignment.update_team_policy", "assignment", _WRITE, "PATCH",
+        "/assignment/policies/team/{team_id}", "Change a team's policy",
+        "Change one team's own assignment policy. Only the fields given change. "
+        "Refused with 404 if the team has no policy of its own — create one "
+        "with assignment.create_team_policy first. Super admin or CEO anywhere; "
+        "a manager only on a team they belong to. Per-label ratios and caps are "
+        "set on the screen, not here. Read assignment.team_policy first and say "
+        "back what will change.",
+        _TEAM_ID + _POLICY_FIELDS,
+        warning="Changes how work is shared out across this team.",
+    ),
+    ToolSpec(
+        "assignment.drop_team_policy", "assignment", _WRITE, "DELETE",
+        "/assignment/policies/team/{team_id}", "Drop a team's policy",
+        "Delete a team's own policy so it falls back to the organisation "
+        "default. Refused if the team has none. Super admin or CEO anywhere; a "
+        "manager only on a team they belong to.",
+        _TEAM_ID,
+        warning="The team's own settings are gone for good; it runs on the "
+                "default from now on.",
+    ),
+    # ── who gets the next job ──
+    ToolSpec(
+        "analytics.rank", "assignment", _WRITE, "POST", "/analytics/runs",
+        "Rank people and keep it",
+        "Compute the ranking for a team and store it as the record of a "
+        "decision, with the policy frozen onto it. Use analytics.preview "
+        "instead unless the person wants it kept. Re-reads SharePoint every "
+        "time. The team must have a policy of its own, and the caller must be "
+        "allowed to edit it. Writes nothing to SharePoint.",
+        (
+            _query("team", "The team's handle. Required.", STR),
+            _body("notes", "Why it was kept — what was decided on the strength of it."),
+        ),
+        warning="Stores a ranking others will treat as the record of a decision.",
+    ),
+    ToolSpec(
+        "analytics.run", "assignment", _READ, "GET", "/analytics/runs/{run_id}",
+        "One kept ranking",
+        "A kept ranking in full: every person, their place, the task counts "
+        "behind it and the policy as it stood. Get the id from analytics.runs.",
+        (_path("run_id", "The run id, from analytics.runs."),),
+    ),
+    ToolSpec(
+        "analytics.explain", "assignment", _READ, "GET",
+        "/analytics/runs/{run_id}/people/{user_id}", "Why someone ranked where they did",
+        "The factor breakdown for one person in a kept run: the raw number, "
+        "where it sat against everyone else, and how much each factor moved "
+        "them. The tool for 'why is she third'.",
+        (_path("run_id", "The run id, from analytics.runs."), _USER_ID),
+    ),
+    ToolSpec(
+        "analytics.delete_run", "assignment", _WRITE, "DELETE", "/analytics/runs/{run_id}",
+        "Delete a kept ranking",
+        "Remove a kept ranking. Only somebody who may edit that team's policy. "
+        "It was kept as the record of a decision, so ask before removing it.",
+        (_path("run_id", "The run id, from analytics.runs."),),
+        warning="Permanent. The record of what this decision was based on is gone.",
+    ),
+    # ── mail intake ──
+    ToolSpec(
+        "intake.settings", "intake", _READ, "GET", "/intake/settings",
+        "Mail intake settings",
+        "How the tender mailbox is watched: which inbox, who may send, the "
+        "thresholds, where it notifies, and — the one to look at first — "
+        "whether create_in_sharepoint is on, meaning it writes real rows into "
+        "the Proposals list. Super admin only.",
+    ),
+    ToolSpec(
+        "intake.update_settings", "intake", _WRITE, "PATCH", "/intake/settings",
+        "Change mail intake settings",
+        "Change how the tender mailbox is watched. Only the fields given change. "
+        "Super admin only. Empty sender and domain lists admit nobody. "
+        "Changing the mailbox watches from now, never replaying old mail. "
+        "Turning create_in_sharepoint on is the moment this system starts "
+        "writing rows into the live Proposals list — read that back and get an "
+        "explicit yes before sending it.",
+        (
+            _body("enabled", "Watch the mailbox at all.", BOOL),
+            _body("mailbox", "The inbox to watch, as an email address."),
+            _body(
+                "allowed_senders",
+                "Email addresses allowed to raise tenders. Empty admits nobody.",
+                STR_LIST,
+            ),
+            _body("allowed_domains", "Sender domains allowed. Empty admits nobody.", STR_LIST),
+            _body(
+                "create_in_sharepoint",
+                "THE live-write switch: create real Proposals rows.",
+                BOOL,
+            ),
+            _body("update_negotiation", "Mark a matched task's Negotiation column.", BOOL),
+            _body("negotiation_value", "What to write into that column."),
+            _body("assign_team_id", "The team whose ranking picks the assignee, by id."),
+            _body(
+                "match_threshold",
+                "How sure it must be to match an existing task. 0-1.",
+                _s("number"),
+            ),
+            _body(
+                "classify_threshold",
+                "How sure it must be that a mail is a tender. 0-1.",
+                _s("number"),
+            ),
+            _body("teams_webhook_url", "The Microsoft Teams webhook to post to."),
+            _body("notify_in_app", "Raise in-app notifications.", BOOL),
+            _body("notify_teams", "Post to the Teams channel.", BOOL),
+            _body("poll_seconds", "How often to poll the mailbox. 15-3600.", INT),
+        ),
+        warning="Changes whose mail is read and what happens to it. Switching "
+                "create_in_sharepoint on writes to the live Proposals list.",
+    ),
+    ToolSpec(
+        "intake.messages", "intake", _READ, "GET", "/intake/messages",
+        "Mail the intake has seen",
+        "Every email the intake has looked at, including the ones it ignored — "
+        "which are the useful ones when somebody asks why nothing happened to "
+        "a mail they sent. Comes with a count per status. Super admin only.",
+        (
+            _query("status", "Only this status, e.g. received, ignored, failed, done."),
+            _query("category", "Only this category as the classifier named it."),
+            _query("limit", "How many (1-200, default 50).", INT),
+            _query("offset", "Skip this many, for paging.", INT),
+        ),
+    ),
+    ToolSpec(
+        "intake.message", "intake", _READ, "GET", "/intake/messages/{message_id}",
+        "One intake message",
+        "One email and everything decided about it: the classifier's reasoning, "
+        "what it extracted, the match it chose and the shortlist it chose from, "
+        "who it assigned and why, and exactly what it would have posted to "
+        "SharePoint. Read this before retrying one. Super admin only.",
+        (_path("message_id", "The message id, from intake.messages."),),
+    ),
+    ToolSpec(
+        "intake.retry", "intake", _WRITE, "POST", "/intake/messages/{message_id}/retry",
+        "Put a message back through",
+        "Run the intake pipeline over one email again, from where it is now, "
+        "with the classification redone. For after a setting changed — a sender "
+        "added, a threshold lowered. Super admin only. If create_in_sharepoint "
+        "is on, a retry can create or update a real Proposals row; check "
+        "intake.settings first and say so.",
+        (_path("message_id", "The message id, from intake.messages."),),
+        warning="Re-runs the decision. With writing switched on this can post "
+                "to the live Proposals list and notify people.",
+    ),
+    ToolSpec(
+        "intake.mirror", "intake", _READ, "GET", "/intake/mirror",
+        "Is the local copy current",
+        "Whether the local mirror of the Proposals list is up to date: row "
+        "count, how many carry an embedding, when it last synced and any error. "
+        "Fewer embedded than rows means matching is degraded. Super admin only.",
+    ),
+    ToolSpec(
+        "intake.sync_mirror", "intake", _WRITE, "POST", "/intake/mirror/sync",
+        "Refresh the mirror now",
+        "Pull the Proposals list into the local mirror and rewrite the ranking "
+        "without waiting for the timer. Reads SharePoint; writes nothing to it. "
+        "Super admin only. Takes a while on a large list.",
+        (_query("embed", "Also embed changed rows (default true).", BOOL),),
+        warning="Re-reads SharePoint and recomputes who is next in line.",
+    ),
+    ToolSpec(
+        "intake.standing", "intake", _READ, "GET", "/intake/standing",
+        "Who the intake gives the next task to",
+        "The stored ranking the intake assigns from — rank 1 is next — with "
+        "the counts and factors behind each place and why anyone is out. A "
+        "table kept current by the mirror sync, not a fresh computation. Super "
+        "admin only.",
+        (_query("team", "The team's handle or id. Omit for the organisation-wide queue."),),
+    ),
+    # ── system console ──
+    ToolSpec(
+        "system.console", "system", _READ, "GET", "/admin/console",
+        "The administration console",
+        "Every administration surface in one call: each section's endpoints, "
+        "its caution, and live figures — failed intake messages, a mirror that "
+        "has not synced, failed report deliveries — with needs_attention on "
+        "each and summed across them. The first thing to read when a super "
+        "admin asks whether anything needs looking at. Super admin only.",
+        (_query("status_only", "Skip the endpoint lists and return just the figures.", BOOL),),
+    ),
+    ToolSpec(
+        "system.permissions", "system", _READ, "GET", "/admin/permissions",
+        "Who may do what",
+        "The permission rules behind the administration screens, in words, "
+        "with who currently holds each global role. Use it to answer 'why was "
+        "I refused' or 'who can actually do this today'. Super admin only.",
+    ),
+    # ── finance ──
+    ToolSpec(
+        "finance.zoho", "finance", _READ, "GET", "/finance/zoho",
+        "Zoho endpoints this module reads",
+        "The catalogue of Zoho Books endpoints the finance module can read, "
+        "with the key each is called by and the scope it needs. Describes the "
+        "code without calling Zoho, so it is free to call. Super admin, CEO, "
+        "manager or accountant only.",
+    ),
+
+    # ── workflows ──────────────────────────────────────────────────────
+    ToolSpec(
+        "workflows.list", "workflows", _READ, "GET", "/workflows", "Workflows I can start",
+        "The workflows this person may start, with their steps. The presales one "
+        "takes a Proposals task from documents to a Zoho quote.",
+    ),
+    ToolSpec(
+        "workflows.get", "workflows", _READ, "GET", "/workflows/{key}", "One workflow",
+        "One workflow by its key, with every step and what each does.",
+        (_path("key", "The workflow key, e.g. presales_rfq."),),
+    ),
+    ToolSpec(
+        "workflows.runs", "workflows", _READ, "GET", "/workflows/runs", "Workflow runs",
+        "Runs this person owns or their team's: which task, which step, what it "
+        "is waiting for. Use mine=true for only theirs, open=true for only the "
+        "ones still going.",
+        (
+            _query("mine", "Only runs this person owns.", BOOL),
+            _query("open", "Only runs still going.", BOOL),
+            _query("workflow", "Only runs of this workflow key."),
+            _query("limit", "At most this many.", INT),
+        ),
+    ),
+    ToolSpec(
+        "workflows.run", "workflows", _READ, "GET", "/workflows/runs/{run_id}", "One run in full",
+        "Everything about one run: its steps and where it is, what it is waiting "
+        "on (the pending question and its fields), what it has learnt (context), "
+        "the files it holds, the mails it sent and received, and the event log. "
+        "Read this before answering a question about a run.",
+        (_path("run_id", "The run id."),),
+    ),
+    ToolSpec(
+        "workflows.for_task", "workflows", _READ, "GET", "/workflows/for-task/{task_id}",
+        "Runs on a task",
+        "The runs already going on one Proposals task, and the workflows that "
+        "could be started on it.",
+        (_path("task_id", "The SharePoint task id, from proposals.my_tasks."),),
+    ),
+    ToolSpec(
+        "workflows.start", "workflows", _WRITE, "POST", "/workflows/{key}/runs",
+        "Start a workflow on a task",
+        "Begin a workflow for one Proposals task. The run is this person's and "
+        "acts as them. It runs as far as its first question and stops there; "
+        "read it back with workflows.run to see what it asks. One open run per "
+        "task per workflow.",
+        (
+            _path("key", "The workflow key, e.g. presales_rfq."),
+            _body("subject_id", "The SharePoint task id.", required=True),
+            _body("subject_label", "The task title, for the list."),
+        ),
+        warning="The workflow will read the task, ask suppliers for quotes and "
+                "prepare a quote request — each step asking this person first.",
+    ),
+    ToolSpec(
+        "workflows.answer", "workflows", _WRITE, "POST", "/workflows/runs/{run_id}/answer",
+        "Answer what a run is waiting on",
+        "Answer the question a run has stopped on. For a form, give the fields "
+        "as key/value pairs using the keys the pending question lists. For a "
+        "review, either send nothing to verify it as shown, or value_json with "
+        "the edited value (as JSON text) — for instance the supplier list with "
+        "one removed. Read the run first so the answer matches the question.",
+        (
+            _path("run_id", "The run id."),
+            _body(
+                "pairs",
+                "Form answers, one {key, value} per field.",
+                _s("array", items=_object({"key": STR, "value": STR}, required=("key", "value"))),
+            ),
+            _body("value_json", "For a review: the edited value as JSON text."),
+        ),
+        warning="The run carries on from this answer — a verified supplier list "
+                "is what the request for quotation goes to.",
+    ),
+    ToolSpec(
+        "workflows.wake", "workflows", _WRITE, "POST", "/workflows/runs/{run_id}/wake",
+        "Check a waiting run now",
+        "Make a run that is waiting on the world — supplier replies, an "
+        "approval — look now instead of at its next poll.",
+        (_path("run_id", "The run id."),),
+        warning="Only looks; changes nothing unless what it was waiting for has arrived.",
+    ),
+    ToolSpec(
+        "workflows.retry", "workflows", _WRITE, "POST", "/workflows/runs/{run_id}/retry",
+        "Retry a failed run",
+        "Try the step a run failed on again, from where it was.",
+        (_path("run_id", "The run id."),),
+        warning="The failed step runs again; whatever it had already done stays done.",
+    ),
+    ToolSpec(
+        "workflows.cancel", "workflows", _WRITE, "POST", "/workflows/runs/{run_id}/cancel",
+        "Stop a run",
+        "Stop a run for good. Mails already sent stay sent; nothing further happens.",
+        (_path("run_id", "The run id."),),
+        warning="Cannot be undone; a new run has to be started from the beginning.",
+    ),
+    ToolSpec(
+        "workflows.settings", "workflows", _READ, "GET", "/workflows/admin/settings",
+        "The workflow switches",
+        "Whether workflows may send mail, write to SharePoint and create in Zoho. "
+        "Super admin only.",
+    ),
+    ToolSpec(
+        "workflows.update_settings", "workflows", _WRITE, "PATCH", "/workflows/admin/settings",
+        "Flip a workflow switch",
+        "Turn sending mail, writing to SharePoint or creating in Zoho on or off "
+        "for every workflow. Super admin only; the route refuses anybody else.",
+        (
+            _body("send_email", "Whether the email step may send.", BOOL),
+            _body("write_sharepoint", "Whether files may be attached to tasks.", BOOL),
+            _body("write_zoho", "Whether estimates may be created in Zoho Books.", BOOL),
+            _body("from_mailbox", "The mailbox request-for-quote mails go out from."),
+            _body("poll_seconds", "How often waiting runs are checked.", INT),
+        ),
+        warning="Turning a switch on lets every run past that step act on the world.",
+    ),
+    ToolSpec(
+        "workflows.flows", "workflows", _READ, "GET", "/workflows/admin/flows",
+        "Every workflow, archived included",
+        "The full list for an administrator, with each one's steps.",
+    ),
+    ToolSpec(
+        "workflows.archive_flow", "workflows", _WRITE, "POST", "/workflows/admin/flows/{key}/archive",
+        "Retire a workflow",
+        "Stop a workflow being started. Runs already going carry on.",
+        (_path("key", "The workflow key."),),
+        warning="Nobody can start this workflow until it is restored.",
+    ),
+    ToolSpec(
+        "workflows.restore_flow", "workflows", _WRITE, "POST", "/workflows/admin/flows/{key}/restore",
+        "Bring a workflow back",
+        "Make an archived workflow startable again.",
+        (_path("key", "The workflow key."),),
+        warning="The workflow can be started again.",
+    ),
 )
 
 #: Everything, including what is only planned. For the administration

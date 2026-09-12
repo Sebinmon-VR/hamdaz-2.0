@@ -7,6 +7,11 @@ policy says must be confirmed stops the loop: the run is parked as
 ``awaiting_confirmation``, the person is shown what would happen, and a later
 request resumes the loop from exactly that point.
 
+A *client* tool — press this button, scroll there, read the screen — parks the
+loop the same way, as ``awaiting_client``: the browser is the only thing that
+can do it, so the browser is handed the action and the loop waits for its
+report. Same mechanism, same table column, a different party answering.
+
 Everything the loop does is recorded against the run as it happens, in short
 transactions, so a crash mid-turn leaves an honest log rather than a blank one.
 
@@ -70,6 +75,20 @@ ambiguously, search first; ask only if it is still unclear. Ask before a write \
 when a required detail is missing — never invent dates, ids or reasons.
 - Prefer one well-chosen call over several. You may call several tools at once \
 when they are independent.
+
+How you act on the screen:
+- You can see what is in front of them: "Controls on this screen" lists every \
+button, link, tab and field by its label, and app.screen reads it again. Use \
+app.click to press a control, app.fill to type into a field, app.scroll to \
+move the page. These are for what no other tool covers — opening a dialog, \
+switching a tab, pressing Save on a form they have filled in, scrolling to a \
+section. When a module tool does the same job, use the module tool: it is \
+checked and confirmed properly, and it tells you exactly what happened.
+- After pressing or filling, call app.screen if you need to know what changed \
+before answering. Say what you pressed in a few words.
+- Deleting is a manager's call. If no delete tool is offered to this person \
+and they ask you to remove something, say plainly that a manager or above has \
+to do that; do not go looking for a Delete button to press instead.
 
 How you move them around:
 - app.open takes them to a screen and the app follows. When somebody says go to, open, show me, take me to, or names a screen — "the leave page", "quotes", "my reports" — CALL IT IMMEDIATELY. That is the whole answer; they asked to be somewhere, not to be told about it.
@@ -149,6 +168,18 @@ class Assistant:
         """Continue a run parked for confirmation, with the person's decision."""
         return self._watch(run_id, ctx, resume=approved)
 
+    def report(
+        self, run_id: uuid.UUID, ctx: TurnContext, *, results: list[dict[str, Any]]
+    ) -> AsyncIterator[bytes]:
+        """Continue a run parked on the browser, with what the browser did.
+
+        ``results`` is one entry per parked action — ``call_id``, ``ok`` and an
+        ``output`` written for the model. An action the browser says nothing
+        about is answered on its behalf as not done, so the model is never left
+        waiting on a call that will not come.
+        """
+        return self._watch(run_id, ctx, resume=None, client_results=results)
+
     def speak(
         self, text: str, *, model: str, voice: str, instructions: str | None
     ) -> AsyncIterator[bytes]:
@@ -161,10 +192,17 @@ class Assistant:
         return self._llm.speak(text, model=model, voice=voice, instructions=instructions)
 
     async def _watch(
-        self, run_id: uuid.UUID, ctx: TurnContext, *, resume: bool | None
+        self,
+        run_id: uuid.UUID,
+        ctx: TurnContext,
+        *,
+        resume: bool | None,
+        client_results: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[bytes]:
         queue: asyncio.Queue[Any] = asyncio.Queue()
-        task = asyncio.create_task(self._drive(run_id, ctx, queue, resume=resume))
+        task = asyncio.create_task(
+            self._drive(run_id, ctx, queue, resume=resume, client_results=client_results)
+        )
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         while True:
@@ -182,10 +220,11 @@ class Assistant:
         queue: asyncio.Queue[Any],
         *,
         resume: bool | None,
+        client_results: list[dict[str, Any]] | None = None,
     ) -> None:
         emit = queue.put_nowait
         try:
-            await self._loop(run_id, ctx, emit, resume=resume)
+            await self._loop(run_id, ctx, emit, resume=resume, client_results=client_results)
         except Exception as exc:  # noqa: BLE001 - the run must be closed whatever happened
             logger.exception("assistant run %s crashed", run_id)
             message = explain(exc) if not isinstance(exc, LLMError) else str(exc)
@@ -206,7 +245,13 @@ class Assistant:
             emit(_END)
 
     async def _loop(
-        self, run_id: uuid.UUID, ctx: TurnContext, emit: Any, *, resume: bool | None
+        self,
+        run_id: uuid.UUID,
+        ctx: TurnContext,
+        emit: Any,
+        *,
+        resume: bool | None,
+        client_results: list[dict[str, Any]] | None = None,
     ) -> None:
         settings = ctx.snapshot.settings
         model = ctx.snapshot.model
@@ -230,24 +275,52 @@ class Assistant:
                 for e in await self._tool_events(session, run)
             ]
 
-            if resume is not None:
-                if run.status != RunStatus.AWAITING_CONFIRMATION or not run.pending:
+            if resume is not None or client_results is not None:
+                if not run.pending or run.status not in (
+                    RunStatus.AWAITING_CONFIRMATION,
+                    RunStatus.AWAITING_CLIENT,
+                ):
+                    raise LLMError("That run is not waiting for anything.")
+                if resume is not None and run.status != RunStatus.AWAITING_CONFIRMATION:
                     raise LLMError("That run is not waiting for confirmation.")
+                if client_results is not None and run.status != RunStatus.AWAITING_CLIENT:
+                    raise LLMError("That run is not waiting on the browser.")
                 pending = list(run.pending)
                 run.pending = None
                 run.status = RunStatus.RUNNING
                 await session.commit()
+                # One round can ask for a write that needs a yes AND a press on
+                # the screen. The yes is asked first — it is the one a person
+                # answers — and whatever is left over is parked again below,
+                # this time on the browser.
+                still: list[dict[str, Any]] = []
+                reported = {r["call_id"]: r for r in (client_results or [])}
                 for action in pending:
-                    outcome_item = await self._settle(
-                        session, run, ctx, action, approved=resume, emit=emit
-                    )
+                    is_client = action.get("kind") == "client"
+                    if resume is not None and is_client:
+                        still.append(action)
+                        continue
+                    if client_results is not None and not is_client:
+                        still.append(action)
+                        continue
+                    if is_client:
+                        outcome_item = await self._settle_client(
+                            session, run, action, reported.get(action["call_id"]), emit=emit
+                        )
+                    else:
+                        outcome_item = await self._settle(
+                            session, run, ctx, action, approved=resume, emit=emit
+                        )
                     transcript.append(outcome_item)
-                    if resume:
+                    if is_client or resume:
                         tool_calls_made += 1
                         used.append({"tool_key": action["tool_key"], "ok": outcome_item.get("_ok")})
                 run.transcript = _clean(transcript)
                 run.tool_calls = tool_calls_made
                 await session.commit()
+                if still:
+                    await self._park(session, run, still, emit)
+                    return
 
         tool_defs = tool_payload(ctx.tools, settings.model_key)
         instructions = self._instructions(ctx)
@@ -387,7 +460,7 @@ class Assistant:
                     return
 
                 # ── tools ──────────────────────────────────────────────
-                to_confirm: list[dict[str, Any]] = []
+                to_park: list[dict[str, Any]] = []
                 for call in calls:
                     resolved = ctx.by_name.get(call.get("name", ""))
                     arguments = _parse_arguments(call.get("arguments"))
@@ -421,14 +494,15 @@ class Assistant:
                             )
                         )
                         continue
-                    if resolved.requires_confirmation:
-                        to_confirm.append(
+                    if resolved.spec.is_client or resolved.requires_confirmation:
+                        to_park.append(
                             {
                                 "call_id": call["call_id"],
                                 "tool_key": resolved.spec.key,
                                 "label": resolved.spec.label,
                                 "arguments": arguments,
                                 "warning": resolved.spec.warning,
+                                "kind": "client" if resolved.spec.is_client else "confirm",
                             }
                         )
                         continue
@@ -440,25 +514,82 @@ class Assistant:
                 run.transcript = _clean(transcript)
                 run.tool_calls = tool_calls_made
 
-                if to_confirm:
-                    run.pending = to_confirm
-                    run.status = RunStatus.AWAITING_CONFIRMATION
-                    await service.add_event(
-                        session,
-                        run,
-                        EventKind.CONFIRMATION_REQUESTED,
-                        payload={"actions": to_confirm},
-                    )
-                    await session.commit()
-                    emit(_sse("confirm", {"run_id": str(run.id), "actions": to_confirm}))
-                    emit(_sse(
-                        "done",
-                        {"run_id": str(run.id), "status": RunStatus.AWAITING_CONFIRMATION},
-                    ))
+                if to_park:
+                    await self._park(session, run, to_park, emit)
                     return
                 await session.commit()
 
     # ── pieces ─────────────────────────────────────────────────────────
+
+    async def _park(
+        self,
+        session: AsyncSession,
+        run: AssistantRun,
+        actions: list[dict[str, Any]],
+        emit: Any,
+    ) -> None:
+        """Stop the loop and hand the actions to whoever has to answer them.
+
+        Writes needing a yes go to the person; everything else waits. Only
+        when nothing needs a yes are the client actions handed to the browser
+        — a person should not be asked to approve a write while the assistant
+        is, at the same moment, pressing buttons behind the dialog.
+        """
+        confirms = [a for a in actions if a.get("kind") != "client"]
+        clients = [a for a in actions if a.get("kind") == "client"]
+        run.pending = actions
+        if confirms:
+            run.status = RunStatus.AWAITING_CONFIRMATION
+            await service.add_event(
+                session, run, EventKind.CONFIRMATION_REQUESTED, payload={"actions": confirms}
+            )
+            await session.commit()
+            emit(_sse("confirm", {"run_id": str(run.id), "actions": confirms}))
+            emit(_sse(
+                "done", {"run_id": str(run.id), "status": RunStatus.AWAITING_CONFIRMATION}
+            ))
+            return
+        run.status = RunStatus.AWAITING_CLIENT
+        await service.add_event(
+            session, run, EventKind.CLIENT_ACTION_REQUESTED, payload={"actions": clients}
+        )
+        await session.commit()
+        emit(_sse("client_action", {"run_id": str(run.id), "actions": clients}))
+        emit(_sse("done", {"run_id": str(run.id), "status": RunStatus.AWAITING_CLIENT}))
+
+    async def _settle_client(
+        self,
+        session: AsyncSession,
+        run: AssistantRun,
+        action: dict[str, Any],
+        result: dict[str, Any] | None,
+        *,
+        emit: Any,
+    ) -> dict[str, Any]:
+        """One parked client action, answered from the browser's report."""
+        tool_key = action["tool_key"]
+        if result is None:
+            ok = False
+            text = json.dumps(
+                {"error": "The browser did not report on this action; treat it as not done."}
+            )
+        else:
+            ok = bool(result.get("ok"))
+            text = str(result.get("output") or "")[: self._executor_max_chars()] or "(empty)"
+        summary = text[:_SUMMARY_CHARS]
+        await service.add_event(
+            session, run, EventKind.CLIENT_ACTION_RESULT, tool_key=tool_key,
+            payload={"ok": ok, "arguments": action.get("arguments"), "summary": summary},
+        )
+        await session.commit()
+        emit(_sse("tool_result", {
+            "tool_key": tool_key, "label": action.get("label", tool_key), "ok": ok,
+            "status": 200 if ok else 0, "ms": 0, "summary": summary,
+        }))
+        return _output(action["call_id"], text, ok=ok)
+
+    def _executor_max_chars(self) -> int:
+        return getattr(self._executor, "_max_chars", 12_000)
 
     async def _settle(
         self,

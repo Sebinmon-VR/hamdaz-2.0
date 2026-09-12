@@ -34,6 +34,12 @@ PERFORMANCE_REVIEW: Final = "performance_review"
 #: one an opening or a review cycle uses. The template whose key equals its
 #: kind is the canonical one, and is what a module falls back to when nobody
 #: has chosen — see ``app.hr.service.default_template``.
+#: The mail a workflow sends a supplier asking for a quotation. Two fields
+#: whose *defaults* are the subject and body; the workflow's email step reads
+#: them, so the wording is a super admin's to change here rather than a
+#: developer's. Placeholders are the workflow's — see app/workflows/templating.
+RFQ_EMAIL: Final = "rfq_email"
+
 SHORT_APPLICATION: Final = "job_application_short"
 TECHNICAL_APPLICATION: Final = "job_application_technical"
 PROBATION_REVIEW: Final = "probation_review"
@@ -578,7 +584,52 @@ POSTING_FIELDS: Final[list[dict]] = [
 
 
 #: The templates seeded on first run.
+RFQ_SECTIONS: Final[list[dict]] = [
+    {"key": "mail", "name": "The mail", "help": "Sent once per supplier, from the intake mailbox."},
+]
+
+RFQ_FIELDS: Final[list[dict]] = [
+    field(
+        "subject", "Subject", FieldType.TEXT, section="mail", required=True,
+        default="Request for quotation — {{ task.title }} [{{ run.tag }}]",
+        help="Keep [{{ run.tag }}] in it: that is how a reply is matched to the task.",
+    ),
+    field(
+        "body", "Body", FieldType.TEXTAREA, section="mail", required=True,
+        default=(
+            "Dear {{ recipient.name }},\n\n"
+            "We are preparing an offer for {{ requirements.customer }} and would like your "
+            "best quotation for the following:\n\n"
+            "{{ requirements.items | bullets }}\n\n"
+            "Requirements:\n{{ requirements.requirements | bullets }}\n\n"
+            "Please quote in AED, delivered to the UAE, stating lead time, validity and "
+            "payment terms. Please keep the reference [{{ run.tag }}] in the subject of "
+            "your reply so it reaches the right file.\n\n"
+            "Kind regards,\n{{ owner.name }}\nHamdaz Technologies"
+        ),
+        help=(
+            "Placeholders: {{ recipient.name }}, {{ task.title }}, {{ requirements.customer }}, "
+            "{{ requirements.items | bullets }}, {{ requirements.requirements | bullets }}, "
+            "{{ run.tag }}, {{ owner.name }}."
+        ),
+    ),
+]
+
 TEMPLATES: Final[tuple[dict[str, Any], ...]] = (
+    {
+        "key": RFQ_EMAIL,
+        "name": "Request for quotation (email)",
+        "kind": RFQ_EMAIL,
+        "description": (
+            "What the presales workflow writes to a supplier. Not a form anybody "
+            "fills in: the defaults of its two fields are the subject and body the "
+            "workflow sends, so the wording lives here where a super admin can "
+            "change it."
+        ),
+        "sections": RFQ_SECTIONS,
+        "fields": RFQ_FIELDS,
+        "grants": (),
+    },
     {
         "key": JOB_POSTING,
         "name": "Job posting",

@@ -240,6 +240,35 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         ),
     ),
     ModuleSpec(
+        key="workflows",
+        name="Workflows",
+        description=(
+            "A team's process, run one task at a time: the presales flow reads a "
+            "task's documents, finds suppliers, asks them for quotes, compares "
+            "what comes back and takes the quote through approval into Zoho. "
+            "Granted per team; a run is the owner's, and everything it does it "
+            "does as them."
+        ),
+        pages=(
+            PageSpec("runs", "Workflow runs", "/workflows"),
+            PageSpec("run", "Workflow run", "/workflows/runs/[id]"),
+        ),
+    ),
+    ModuleSpec(
+        key="workflow_admin",
+        name="Workflow Administration",
+        description=(
+            "The flows themselves — which blocks in which order — and the three "
+            "switches that let a flow send mail, write to SharePoint and create in "
+            "Zoho. Super admin only."
+        ),
+        admin_only=True,
+        pages=(
+            PageSpec("flows", "Workflows", "/admin/workflows"),
+            PageSpec("flow", "Edit workflow", "/admin/workflows/[key]"),
+        ),
+    ),
+    ModuleSpec(
         key="assistant",
         name="Assistant",
         description=(

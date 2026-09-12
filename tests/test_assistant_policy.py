@@ -16,6 +16,7 @@ import pytest
 from app.assistant.agent import tool_payload
 from app.assistant.catalogue import (
     DEFAULT_MODEL,
+    DELETE_ROLES,
     DEFAULT_REALTIME_MODEL,
     DEFAULT_SPEECH_MODEL,
     EVERYDAY_TOOLS,
@@ -43,6 +44,7 @@ from app.assistant.policy import (
     effective_confirm,
     effective_roles,
     effective_write_roles,
+    may_delete,
     realtime_cost_of,
     resolve_tools,
     speech_cost_of,
@@ -144,8 +146,21 @@ def test_function_names_are_valid_identifiers() -> None:
 def test_get_tools_are_reads_and_everything_else_is_a_write() -> None:
     # The kind decides whether an action can happen without being confirmed, so
     # a GET marked write is merely annoying but a POST marked read is a hole.
+    # A client tool has no route at all, and says so with a method of its own.
     for spec in TOOLS:
+        if spec.is_client:
+            assert spec.method == "CLIENT" and spec.path == "", spec.key
+            assert not spec.is_write and not spec.is_read, spec.key
+            continue
         assert spec.is_write == (spec.method != "GET"), spec.key
+
+
+def test_every_destructive_tool_is_a_write() -> None:
+    for spec in TOOLS:
+        if spec.is_destructive:
+            assert spec.is_write, spec.key
+        if spec.method == "DELETE":
+            assert spec.is_destructive, spec.key
 
 
 @pytest.mark.parametrize("spec", TOOLS, ids=lambda s: s.key)
@@ -550,8 +565,12 @@ def test_every_everyday_tool_exists() -> None:
 
 
 def test_the_everyday_set_stays_small() -> None:
-    """It is the prompt on every turn. Growth here is paid for on every 'hi'."""
-    assert len(EVERYDAY_TOOLS) <= 30
+    """It is the prompt on every turn. Growth here is paid for on every 'hi'.
+
+    Thirty-five, not thirty: the four screen tools joined the list, and they
+    are used on more turns than most of what was there.
+    """
+    assert len(EVERYDAY_TOOLS) <= 35
 
 
 def test_everyday_tools_are_loaded_and_the_rest_deferred() -> None:
@@ -560,12 +579,18 @@ def test_everyday_tools_are_loaded_and_the_rest_deferred() -> None:
 
 
 def test_planned_tools_are_never_live() -> None:
-    """The whole point of the distinction: a roadmap entry must be unreachable."""
+    """The whole point of the distinction: a roadmap entry must be unreachable.
+
+    The roadmap is empty now — the whole surface is live — so this holds
+    vacuously, and holds again the day something is written down before it
+    is built. The type is kept for exactly that day.
+    """
     planned = [spec for spec in TOOLS if spec.status == "planned"]
-    assert planned, "the roadmap should not be empty while there is work outstanding"
     for spec in planned:
         assert spec not in LIVE_TOOLS
         assert spec.name not in TOOLS_BY_NAME
+    fake = ToolSpec("x.y", "app", "read", "GET", "/x", "X", "x", status="planned")
+    assert not fake.is_live
 
 
 def test_a_planned_tool_cannot_be_resolved_for_anybody() -> None:
@@ -965,3 +990,107 @@ def test_realtime_takes_the_cached_tokens_out_of_the_full_price() -> None:
 def test_a_silent_session_costs_nothing() -> None:
     model = _voice_model("realtime", audio_input_price="32.00", audio_output_price="64.00")
     assert realtime_cost_of(model) == 0
+
+
+# ── deleting is a manager's call ───────────────────────────────────────
+#
+# The rule that cannot be edited from the settings screen: a tool that deletes
+# is offered to DELETE_ROLES and nobody else. write_roles may narrow that
+# further and never widens it, so a member or a team lead never sees one.
+
+
+def _everything_on() -> dict[str, AssistantModulePolicy]:
+    return {group.key: _module(group.key, write_enabled=True) for group in GROUPS}
+
+
+def test_the_delete_roles_are_managers_and_above() -> None:
+    assert set(DELETE_ROLES) == {"super_admin", "ceo", "manager"}
+
+
+def test_may_delete_is_a_global_role_question() -> None:
+    assert may_delete(_actor(roles={"manager"}))
+    assert may_delete(_actor(roles={"ceo"}))
+    assert may_delete(_actor(roles={"super_admin"}))
+    assert not may_delete(_actor(roles=set()))
+    assert not may_delete(_actor(roles={"accountant"}))
+    # Team-scoped roles never reach the actor's global set; a lead is a lead of
+    # one team, not a manager of the company.
+    assert not may_delete(_actor(roles={"team_lead", "member", "team_manager"}))
+
+
+def test_a_member_is_never_offered_a_delete_even_with_writes_wide_open() -> None:
+    actor = _actor(access_modules={g.key for g in GROUPS})
+    keys = {t.key for t in resolve_tools(_settings(), _everything_on(), {}, actor)}
+    assert not any(TOOLS_BY_KEY[k].is_destructive for k in keys), sorted(
+        k for k in keys if TOOLS_BY_KEY[k].is_destructive
+    )
+    # ...while the everyday writes in the same modules are there.
+    assert "projects.add_task" in keys
+    assert "reports.start" in keys
+
+
+def test_a_manager_is_offered_the_deletes() -> None:
+    actor = _actor(roles={"manager"}, access_modules={g.key for g in GROUPS})
+    keys = {t.key for t in resolve_tools(_settings(), _everything_on(), {}, actor)}
+    assert {"projects.delete", "reports.delete", "teams.delete", "hr.delete_document"} <= keys
+
+
+def test_a_write_restriction_cannot_widen_the_delete_floor() -> None:
+    """Naming ``member`` in write_roles hands members the module's writes —
+    and still not its deletes. The floor is not a default."""
+    modules = _everything_on()
+    modules["projects"] = _module("projects", write_enabled=True, write_roles=["member"])
+    actor = _actor(roles={"member"}, access_modules={"projects"})
+    keys = {t.key for t in resolve_tools(_settings(), modules, {}, actor)}
+    assert "projects.create" in keys
+    assert "projects.delete" not in keys
+    assert "projects.delete_task" not in keys
+
+
+def test_a_write_restriction_can_still_narrow_who_deletes() -> None:
+    modules = _everything_on()
+    modules["projects"] = _module(
+        "projects", write_enabled=True, write_roles=["super_admin"]
+    )
+    actor = _actor(roles={"manager"}, access_modules={"projects"})
+    keys = {t.key for t in resolve_tools(_settings(), modules, {}, actor)}
+    assert "projects.delete" not in keys
+
+
+# ── the screen tools ───────────────────────────────────────────────────
+
+
+def test_the_screen_tools_reach_everyone_without_a_write_policy() -> None:
+    """They are client tools: no route, no write switch, no write roles. The
+    browser bounds them by what is on the screen and by the delete rule."""
+    actor = _actor()
+    keys = {t.key for t in resolve_tools(_settings(), {}, {}, actor)}
+    assert {"app.screen", "app.click", "app.fill", "app.scroll"} <= keys
+
+
+def test_the_screen_tools_never_ask_for_confirmation() -> None:
+    settings = _settings(confirm_writes_default=True)
+    for tool in resolve_tools(settings, {}, {}, _actor()):
+        if tool.spec.is_client:
+            assert not tool.requires_confirmation, tool.key
+
+
+def test_the_screen_tools_follow_the_read_switch() -> None:
+    modules = {"app": _module("app", read_enabled=False)}
+    keys = {t.key for t in resolve_tools(_settings(), modules, {}, _actor())}
+    assert not any(k.startswith("app.") for k in keys)
+
+
+def test_a_client_tool_has_a_strict_schema_with_no_route() -> None:
+    spec = TOOLS_BY_KEY["app.click"]
+    schema = spec.schema()
+    assert schema["additionalProperties"] is False
+    assert set(schema["required"]) == {"label", "nth"}
+    assert spec.is_client and not spec.is_write and not spec.is_destructive
+
+
+def test_every_tool_covers_a_module_the_person_can_be_shown() -> None:
+    """Every group key is either an ERP module, or one of the open/admin
+    groups the policy knows how to gate. A typo here hides a whole module."""
+    for group in GROUPS:
+        assert group.gate in ("open", "access", "admin"), group.key

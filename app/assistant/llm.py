@@ -148,6 +148,61 @@ class OpenAIChat:
             int(getattr(usage, "output_tokens", 0) or 0),
         )
 
+    async def research(
+        self,
+        *,
+        model: str,
+        instructions: str,
+        prompt: str,
+        schema: dict[str, Any] | None = None,
+        web_search: bool = True,
+        reasoning_effort: str = "medium",
+        max_output_tokens: int = 4000,
+        user_key: str,
+    ) -> tuple[str, int, int]:
+        """One answer that may look things up on the web first.
+
+        ``answer`` above is for summarising what the caller already holds. This
+        is for the question whose answer is out there — which distributor in
+        the UAE stocks a given valve — and the model is given the web search
+        tool and left to use it. Still one call from our side: the searching
+        happens inside the response, and what comes back is the text (or the
+        JSON the schema asks for) and the token counts.
+        """
+        params: dict[str, Any] = {
+            "model": model,
+            "instructions": instructions,
+            "input": prompt,
+            "store": False,
+            "max_output_tokens": max_output_tokens,
+            "truncation": "auto",
+            "safety_identifier": user_key,
+        }
+        if web_search:
+            params["tools"] = [{"type": "web_search"}]
+        if schema is not None:
+            params["text"] = {
+                "format": {
+                    "type": "json_schema",
+                    "name": "answer",
+                    "strict": True,
+                    "schema": schema,
+                }
+            }
+        spec = MODELS_BY_KEY.get(model)
+        if spec is None or spec.supports_reasoning:
+            params["reasoning"] = {"effort": reasoning_effort}
+        try:
+            response = await self.client().responses.create(**params)
+        except openai.OpenAIError as exc:
+            raise LLMError(explain(exc)) from exc
+        usage = getattr(response, "usage", None)
+        return (
+            (getattr(response, "output_text", "") or "").strip(),
+            int(getattr(usage, "input_tokens", 0) or 0),
+            int(getattr(usage, "output_tokens", 0) or 0),
+        )
+
     async def speak(
         self,
         text: str,

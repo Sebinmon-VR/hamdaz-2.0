@@ -435,11 +435,25 @@ class AssistantAccessRule(Base, UUIDPrimaryKey, Timestamped):
 class RunStatus(StrEnum):
     RUNNING = "running"
     AWAITING_CONFIRMATION = "awaiting_confirmation"
+    #: Parked on the browser: the model asked for something only the screen
+    #: can do — press this, scroll there — and the turn waits for the report.
+    AWAITING_CLIENT = "awaiting_client"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
     #: Refused before the model was called: switched off, not released, over a cap.
     BLOCKED = "blocked"
+
+
+#: A run that is still going, in whichever way: working, or parked on a
+#: person's answer, or parked on the browser's report. One list, so that
+#: "is this chat busy" is answered the same by the loop, the routes and the
+#: analytics.
+OPEN_STATUSES: tuple[RunStatus, ...] = (
+    RunStatus.RUNNING,
+    RunStatus.AWAITING_CONFIRMATION,
+    RunStatus.AWAITING_CLIENT,
+)
 
 
 class EventKind(StrEnum):
@@ -450,6 +464,11 @@ class EventKind(StrEnum):
     CONFIRMATION_REQUESTED = "confirmation_requested"
     CONFIRMED = "confirmed"
     DECLINED = "declined"
+    #: The turn asked the browser to do something on the screen, and what
+    #: the browser said happened. Kept apart from tool_call/tool_result so the
+    #: log reads honestly: nothing went through a route.
+    CLIENT_ACTION_REQUESTED = "client_action_requested"
+    CLIENT_ACTION_RESULT = "client_action_result"
     BLOCKED_BY_POLICY = "blocked_by_policy"
     MODEL_USAGE = "model_usage"
     CANCELLED = "cancelled"
@@ -556,7 +575,7 @@ class AssistantRun(Base, UUIDPrimaryKey, Timestamped):
 
     @property
     def is_open(self) -> bool:
-        return self.status in (RunStatus.RUNNING, RunStatus.AWAITING_CONFIRMATION)
+        return self.status in OPEN_STATUSES
 
     def __repr__(self) -> str:
         return f"<AssistantRun {self.id} {self.status}>"

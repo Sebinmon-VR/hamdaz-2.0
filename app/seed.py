@@ -28,6 +28,7 @@ from app.core.config import get_settings
 from app.directory.graph import GraphDirectory, GraphError
 from app.forms.service import seed_templates
 from app.reports.service import seed_templates as seed_report_templates
+from app.workflows.service import seed_flows
 from app.labels.service import seed_labels
 from app.models.user import User
 from app.roles.catalogue import BOOTSTRAP_SUPER_ADMIN_EMAIL, SUPER_ADMIN
@@ -93,6 +94,9 @@ async def seed() -> None:
         # things built on it.
         reports = await seed_report_templates(session)
         logger.info("report templates: %s", ", ".join(sorted(t.key for t in reports)))
+        # The shipped workflows. An edited one is left alone, like a template.
+        flows = await seed_flows(session)
+        logger.info("workflows seeded: %s", flows)
 
         # The assistant's catalogue becomes editable rows. Existing switches are
         # never overwritten — a super admin's decision survives every deploy.

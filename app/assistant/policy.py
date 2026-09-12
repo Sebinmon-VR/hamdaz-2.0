@@ -33,6 +33,7 @@ from decimal import Decimal
 from typing import Final
 
 from app.assistant.catalogue import (
+    DELETE_ROLES,
     GROUPS_BY_KEY,
     LIVE_TOOLS,
     ModuleGroup,
@@ -189,13 +190,28 @@ def tool_enabled(
     """Whether policy lets anyone use this tool, before looking at the person.
 
     A missing module policy — the seed not yet run — means reads on and writes
-    off. A write that nobody has explicitly enabled must not run.
+    off. A write that nobody has explicitly enabled must not run. A client
+    tool follows the read switch: pressing what is on the screen is bounded by
+    the screen, not by the module's write policy, and the route behind the
+    button still decides.
     """
     if tool is not None and not tool.enabled:
         return False
     if spec.is_write:
         return module is not None and module.write_enabled
     return module is None or module.read_enabled
+
+
+def may_delete(actor: Actor) -> bool:
+    """Whether this person may have the assistant delete anything at all.
+
+    Managers and above — ``DELETE_ROLES`` — and nobody else, whatever the
+    module and tool policies say. A member or a team lead asking the assistant
+    to remove something is told it is a manager's call. The same answer is
+    handed to the browser, which refuses to press a delete button on their
+    behalf: two enforcement points, one rule, read from one list.
+    """
+    return not actor.roles.isdisjoint(DELETE_ROLES)
 
 
 def resolve_tools(
@@ -216,8 +232,13 @@ def resolve_tools(
     Planned tools are not in ``LIVE_TOOLS`` and so cannot appear here
     however the policy rows are set — which is the point of the
     distinction rather than a side effect of it.
+
+    A fifth gate sits under all of those and cannot be opened from the
+    settings screen: a tool that deletes is offered only to ``DELETE_ROLES``.
+    ``write_roles`` may narrow that further; nothing widens it.
     """
     out: list[ResolvedTool] = []
+    deleter = may_delete(actor)
     for spec in LIVE_TOOLS:
         group = GROUPS_BY_KEY[spec.module_key]
         if not _visible(group, actor):
@@ -232,6 +253,8 @@ def resolve_tools(
         if spec.is_write:
             writers = effective_write_roles(module, tool)
             if writers and actor.roles.isdisjoint(writers):
+                continue
+            if spec.is_destructive and not deleter:
                 continue
         out.append(
             ResolvedTool(

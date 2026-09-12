@@ -1226,8 +1226,11 @@ async def test_a_spoken_session_is_minted_with_this_persons_tools(
     offered = {t["tool_key"] for t in body["tools"]}
     assert "leave.mine" in offered
     # Admin-gated tools are not this person's, and writes are off in voice mode.
+    # The screen tools ride along: the browser runs a spoken loop, so it can
+    # press the button itself, and pressing is not a write in the policy's eyes.
     assert not any(t.startswith("roles.") for t in offered)
-    assert all(t["kind"] == "read" for t in body["tools"])
+    assert all(t["kind"] in ("read", "client") for t in body["tools"])
+    assert "app.click" in offered
 
 
 async def test_the_session_is_defined_server_side(client, person, realtime_on, wired) -> None:

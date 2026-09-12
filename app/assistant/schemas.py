@@ -17,7 +17,7 @@ from app.assistant.catalogue import VOICE_MAX_CHARS
 class ToolCapabilityOut(BaseModel):
     key: str
     label: str
-    kind: Literal["read", "write"]
+    kind: Literal["read", "write", "client"]
     requires_confirmation: bool
 
 
@@ -39,6 +39,11 @@ class StatusOut(BaseModel):
     voice: str | None
     realtime_enabled: bool
     modules: list[ModuleCapabilityOut]
+    #: Whether this person may have the assistant delete anything — a manager
+    #: or above. The browser reads it to refuse pressing a delete button on
+    #: the assistant's behalf; the policy reads the same list to keep every
+    #: delete tool out of the offer. See ``catalogue.DELETE_ROLES``.
+    can_delete: bool = False
 
 
 class PlaceOut(BaseModel):
@@ -97,11 +102,47 @@ class PendingActionOut(BaseModel):
     label: str
     arguments: dict[str, Any]
     warning: str | None
+    #: ``confirm`` — a write waiting on the person's yes. ``client`` — an
+    #: action waiting on the browser to perform it and report back.
+    kind: Literal["confirm", "client"] = "confirm"
 
 
 class PendingOut(BaseModel):
     run_id: uuid.UUID
     actions: list[PendingActionOut]
+    #: What the run is parked on: ``awaiting_confirmation`` or
+    #: ``awaiting_client``. The browser branches on this rather than on the
+    #: actions, so a card is never drawn for something it should be doing.
+    status: str = "awaiting_confirmation"
+
+
+class ScreenControlIn(BaseModel):
+    """One thing on the screen a person could act on, as the browser sees it.
+
+    Sent with each message so the model knows what "the Save button" refers to
+    before it presses anything. Labels only, no DOM: the browser keeps the
+    mapping from label to element, and the model never sees an element.
+    """
+
+    #: button, link, tab, field, select, checkbox, heading
+    kind: str = Field(max_length=16)
+    label: str = Field(max_length=160)
+    #: A field's current value, or a heading's level. Free text, short.
+    value: str | None = Field(default=None, max_length=200)
+
+
+class ClientResultItem(BaseModel):
+    call_id: str = Field(max_length=120)
+    ok: bool
+    #: What the browser did, or why it could not — written for the model.
+    output: str = Field(max_length=12_000)
+
+
+class ClientResultIn(BaseModel):
+    """The browser's report on the actions a run parked for it."""
+
+    run_id: uuid.UUID
+    results: list[ClientResultItem] = Field(max_length=20)
 
 
 class ConversationDetailOut(ConversationOut):
@@ -117,6 +158,10 @@ class SendIn(BaseModel):
     #: is, and the API turns that back into a screen name and a record id.
     #: Ignored if it is not one of this app's own routes.
     page: str | None = Field(default=None, max_length=512)
+    #: What is on that page: its buttons, links, tabs, fields and headings,
+    #: by label. Capped rather than paged — the model needs what a person can
+    #: see, and a person cannot see three hundred controls either.
+    screen: list[ScreenControlIn] | None = Field(default=None, max_length=300)
 
 
 class RealtimeStartIn(BaseModel):
@@ -176,7 +221,9 @@ class RealtimeToolOut(BaseModel):
     name: str
     tool_key: str
     label: str
-    kind: Literal["read", "write"]
+    #: ``client`` tools are performed in the browser during a spoken
+    #: conversation too — it runs the loop, so it can press the button itself.
+    kind: Literal["read", "write", "client"]
     requires_confirmation: bool
     warning: str | None
 
@@ -343,7 +390,7 @@ class ModelIn(BaseModel):
 class ToolPolicyOut(BaseModel):
     tool_key: str
     label: str
-    kind: Literal["read", "write"]
+    kind: Literal["read", "write", "client"]
     method: str
     path: str
     description: str
@@ -353,6 +400,9 @@ class ToolPolicyOut(BaseModel):
     status: Literal["live", "planned"]
     #: Kept out of the prompt until the model searches for it.
     deferred: bool
+    #: Deletes something. Offered to ``delete_roles`` only, whatever the
+    #: policy below says — a write_roles edit cannot reach past this.
+    destructive: bool = False
     enabled: bool
     confirm_override: bool | None
     allowed_roles: list[str] | None
