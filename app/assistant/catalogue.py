@@ -478,6 +478,15 @@ class ModuleGroup:
 
 GROUPS: Final[tuple[ModuleGroup, ...]] = (
     ModuleGroup(
+        "app",
+        "The app itself",
+        "open",
+        "Moving around the ERP rather than reading from it. Open here because "
+        "opening a screen somebody may already open is not a privilege — and "
+        "the one tool in it resolves against that person's own access, so a "
+        "page they cannot reach is a page it cannot send them to.",
+    ),
+    ModuleGroup(
         "quote_requests",
         "Quote Requests",
         "access",
@@ -528,6 +537,15 @@ GROUPS: Final[tuple[ModuleGroup, ...]] = (
         "What the forms ask for, as data rather than code. A template edit "
         "changes what every future form collects.",
         write_roles=SENSITIVE_WRITE_ROLES,
+    ),
+    ModuleGroup(
+        "projects",
+        "Projects",
+        "access",
+        "Projects, their milestones, the tasks on them and what is blocking "
+        "them. Writes are left open: moving your own task along is the "
+        "everyday work of everybody on a project, and who may change what is a "
+        "question the route answers from membership rather than a global role.",
     ),
     ModuleGroup(
         "reports",
@@ -746,6 +764,8 @@ class ToolSpec:
 #: The rule for being on this list is "somebody asks this most weeks". Anything
 #: rarer is a search away and none the worse for it.
 EVERYDAY_TOOLS: Final[frozenset[str]] = frozenset({
+    # taking somebody to a screen, which is often the whole answer
+    "app.open",
     # who am I and what can I see
     "me.roles", "me.teams", "me.access",
     "dashboard.mine",
@@ -759,6 +779,8 @@ EVERYDAY_TOOLS: Final[frozenset[str]] = frozenset({
     "teams.list", "teams.get", "teams.members",
     # the work in flight
     "quote_requests.mine", "quote_requests.list",
+    # projects: finding one by name is what every other project question needs
+    "projects.list", "projects.get", "projects.board", "projects.my_tasks",
     "hr.my_documents", "hr.my_reviews",
     "finance.profit_and_loss",
 })
@@ -841,6 +863,45 @@ _READ: Final = "read"
 _WRITE: Final = "write"
 
 TOOLS: Final[tuple[ToolSpec, ...]] = (
+    # ── moving around the app ──────────────────────────────────────────
+    ToolSpec(
+        "app.open", "app", _READ, "GET", "/assistant/open",
+        "Open a page",
+        "Take the person to a screen in the ERP. Call it when what they want IS "
+        "a page — 'show me the quotes', 'open my leave', 'take me to presales' "
+        "— and alongside an answer when the screen is where they will carry on "
+        "working. Pass `page` as a module name ('quotes', 'leave', "
+        "'reports') for the obvious page in it, or 'module.page' for a "
+        "particular one. Pass `team` as a team's handle for a page that "
+        "belongs to one team. Pass `record` as the id of the ONE THING a "
+        "detail page is about. It takes an id OR the name somebody used: "
+        "record='Hamdaz ERP' opens that project, and the answer tells you "
+        "which record it found. If the name matches more than one, the "
+        "refusal lists them — ask which. Never invent an id. "
+        "It moves the app and changes nothing else. Afterwards say what the "
+        "answer's `label` says you opened, not what you hoped to open. If it "
+        "comes back 404 the message tells you what to do instead — read it "
+        "rather than guessing again.",
+        (
+            # Required, unlike most query parameters here. Strict mode makes the
+            # model send every key, and an optional one it has nothing to say
+            # about arrives as null and is dropped — which for this tool would
+            # mean asking the route to open nowhere.
+            Param(
+                "page",
+                "query",
+                STR,
+                "A module name like 'quotes', or 'module.page' like 'reports.overview'.",
+                required=True,
+            ),
+            _query("team", "A team's handle, for a page that belongs to one team."),
+            _query(
+                "record",
+                "The id of the record a detail page is about. Look it up first; "
+                "never guess one.",
+            ),
+        ),
+    ),
     # ── about me ───────────────────────────────────────────────────────
     ToolSpec(
         "me.roles", "me", _READ, "GET", "/roles/me", "My roles",
@@ -1643,6 +1704,116 @@ TOOLS: Final[tuple[ToolSpec, ...]] = (
         "Forms I can fill in",
         "The forms the signed-in person may actually use.",
         (_query("kind", "Only this kind of form."),),
+    ),
+    # ── projects ───────────────────────────────────────────────────────
+    #
+    # Reads first and by some distance the most used: "which project is that"
+    # is the question in front of every other one, including opening it.
+    ToolSpec(
+        "projects.list", "projects", _READ, "GET", "/projects",
+        "Projects I can see",
+        "Every project the person may see, newest first. THE way to turn a "
+        "project's name into its id — search this before opening one, or "
+        "before any other tool that takes a project id.",
+        (
+            _query("team", "Team handle (slug) or id."),
+            _query("status", "planned, active, on_hold, done or dropped.", STR_LIST),
+            _query("mine_only", "Only projects this person is on.", BOOL),
+            _query("include_archived", "Include archived projects.", BOOL),
+            _query("limit", "How many (1-200, default 50).", INT),
+            _query("offset", "Skip this many, for paging.", INT),
+        ),
+    ),
+    ToolSpec(
+        "projects.get", "projects", _READ, "GET", "/projects/{project_id}",
+        "One project in full",
+        "Everything about one project: its health dials, milestones with their "
+        "dates and slippage, every task with who holds it, open issues, and the "
+        "people on it. What to read before answering anything about a project "
+        "somebody is looking at.",
+        (_path("project_id", "The project id."),),
+    ),
+    ToolSpec(
+        "projects.board", "projects", _READ, "GET", "/projects/board",
+        "My work and my projects",
+        "The signed-in person's own projects and the tasks they hold across "
+        "all of them. The quickest answer to 'what am I meant to be doing'.",
+    ),
+    ToolSpec(
+        "projects.my_tasks", "projects", _READ, "GET", "/projects/my-tasks",
+        "My tasks across projects",
+        "Just the tasks this person holds, across every project, with the "
+        "project each belongs to.",
+        (
+            _query("open_only", "Only tasks that are not finished.", BOOL),
+            _query("limit", "How many.", INT),
+        ),
+    ),
+    ToolSpec(
+        "projects.portfolio", "projects", _READ, "GET", "/projects/portfolio",
+        "Every project at a glance",
+        "One line per project across the whole portfolio: health, percentage, "
+        "tasks done against open, and what is overdue. For 'how is everything "
+        "going' rather than for one project.",
+    ),
+    ToolSpec(
+        "projects.activity", "projects", _READ, "GET", "/projects/activity",
+        "What moved over a period",
+        "The progress log over a window: tasks that moved, milestones hit, "
+        "issues raised, notes filed. Use it for 'what happened this week' — the "
+        "project's own figures answer 'where is it now' and cannot answer this.",
+        (
+            _query("grain", "day, week, month, quarter, year or custom."),
+            _query("on", "Any day inside the period.", DATE),
+            _query("since", "custom only.", DATE),
+            _query("until", "custom only.", DATE),
+            _query("team", "Team handle or id."),
+            _query("project_id", "One project, or leave out for all."),
+            _query("kind", "task, health, milestone, issue, note.", STR_LIST),
+            _query("mine_only", "Only this person's own updates.", BOOL),
+        ),
+    ),
+    ToolSpec(
+        "projects.updates", "projects", _READ, "GET", "/projects/{project_id}/updates",
+        "One project's progress log",
+        "Everything written down against one project, newest first.",
+        (
+            _path("project_id", "The project id."),
+            _query("limit", "How many.", INT),
+        ),
+    ),
+    # The two writes people say out loud. Everything else about a project —
+    # creating one, moving a milestone, changing the health dials — is a
+    # deliberate act done on the screen, where the consequences are visible.
+    ToolSpec(
+        "projects.move_task", "projects", _WRITE, "PATCH",
+        "/projects/{project_id}/tasks/{task_id}",
+        "Move a task along",
+        "Change how far along a task is, or its status, and write a line in the "
+        "progress log saying so. Only the fields given change. Read the task "
+        "back first if you did not just look at it — 'mark it done' means the "
+        "task they are talking about, not the first one in the list.",
+        (
+            _path("project_id", "The project id."),
+            _path("task_id", "The task id."),
+            _body("status", "not_started, in_progress, blocked, done or dropped."),
+            _body("percent_complete", "0-100.", INT),
+            _body("blocked_reason", "Why it is stuck. Say this when marking it blocked."),
+            _body("note", "A line for the progress log alongside the change."),
+            _body("hours", "Hours to add to the time already spent.", _s("number")),
+        ),
+        warning="Changes what the project says about this task, and tells "
+                "whoever holds it.",
+    ),
+    ToolSpec(
+        "projects.note", "projects", _WRITE, "POST", "/projects/{project_id}/updates",
+        "Write a progress note",
+        "A note on the project's log. No numbers move — this is for saying what "
+        "happened, or why nothing did.",
+        (
+            _path("project_id", "The project id."),
+            _body("body", "What to write down.", required=True),
+        ),
     ),
     # ── reports ────────────────────────────────────────────────────────
     #

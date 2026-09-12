@@ -20,16 +20,19 @@ from __future__ import annotations
 
 import json
 import uuid
+from types import SimpleNamespace
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.access import service as access_service
 from app.assistant import service
 from app.assistant.agent import Assistant, TurnContext, instructions_for
-from app.assistant.cache import ActorCache, ConfigCache
+from app.assistant.cache import ActorCache, ConfigCache, PlacesCache
 from app.assistant.catalogue import (
     DEFAULT_REALTIME_MODEL,
     DEFAULT_SPEECH_MODEL,
@@ -45,8 +48,27 @@ from app.assistant.catalogue import (
     VOICES,
 )
 from app.assistant.llm import LLMError
+from app.assistant.executor import ToolExecutor
+from app.assistant.places import (
+    PlaceError,
+    describe,
+    detail_page,
+    fill,
+    places_from,
+    resolve,
+)
+from app.assistant.records import (
+    FINDERS,
+    RecordError,
+    label_of,
+    looks_like_id,
+    match,
+    rows_of,
+)
 from app.assistant.policy import resolve_tools
 from app.assistant.schemas import (
+    PlaceOut,
+    RealtimeStartIn,
     AccessRuleIn,
     AccessRuleOut,
     AccessRulePatch,
@@ -92,9 +114,11 @@ from app.auth.deps import CurrentUser
 from app.core.config import Settings, get_settings
 from app.core.db import get_session
 from app.models.assistant import AssistantRun, EventKind, RunStatus
+from app.models.team import Team, slugify
 from app.models.user import User
 from app.roles.catalogue import SUPER_ADMIN
 from app.roles.deps import CurrentRoles
+from app.roles.service import global_role_keys
 
 router = APIRouter(prefix="/assistant", tags=["assistant"])
 admin_router = APIRouter(prefix="/assistant/admin", tags=["assistant admin"])
@@ -138,6 +162,10 @@ def get_assistant(request: Request) -> Assistant:
 
 
 Agent = Annotated[Assistant, Depends(get_assistant)]
+
+
+def get_places_cache(request: Request) -> PlacesCache:
+    return request.app.state.assistant_places
 
 
 def get_config_cache(request: Request) -> ConfigCache:
@@ -203,6 +231,150 @@ def _session_cookie(request: Request, settings: Settings) -> str:
 @admin_router.get("", include_in_schema=False)
 async def _admin_root() -> dict[str, str]:  # pragma: no cover - convenience only
     return {"see": "/assistant/admin/settings"}
+
+
+@router.get(
+    "/open",
+    response_model=PlaceOut,
+    summary="Where a page lives",
+)
+async def open_place(
+    page: Annotated[str, Query(min_length=1, max_length=80)],
+    request: Request,
+    user: CurrentUser,
+    session: Session,
+    team: Annotated[str | None, Query(max_length=80)] = None,
+    record: Annotated[str | None, Query(max_length=128)] = None,
+) -> PlaceOut:
+    """Resolve a page name to a route the browser can go to.
+
+    **This changes nothing.** It is a lookup, and the app on the other end is
+    what actually moves — which is the honest shape for it: the assistant does
+    not have hands, it has an opinion about where the person wants to be, and
+    the screen decides whether to act on it.
+
+    What it does do is make that opinion *checkable*. The destinations are the
+    caller's own effective access, so a page they may not reach cannot be
+    resolved at all, and the refusal says what they can reach instead rather
+    than leaving the model to guess again.
+    """
+    places = await _places_for(request, session, user)
+    opened: str | None = None
+    try:
+        place = resolve(places, page)
+        # A record was named but the page resolved to a list — "open the Hamdaz
+        # ERP project" arrives as page='projects' with the name on it, which is
+        # how a model phrases it every time. Opening the list would answer half
+        # the request and look like success.
+        if record and not any(param != "slug" for param in place.params):
+            detail = detail_page(places, place.module_key)
+            if detail is not None:
+                place = detail
+        # A `record` that is not an id is a name, and naming a thing is how
+        # people ask for it. Looked up here rather than left to the model: an
+        # instruction to search first can be skipped, and when it is skipped
+        # the failure is a list opened while claiming a record was — which
+        # reads as success. See app/assistant/records.py.
+        if record and not looks_like_id(record) and place.params:
+            record, opened = await _find_record(
+                request, place.module_key, record, session_cookie=_session_cookie(
+                    request, get_settings()
+                )
+            )
+        path = fill(place, team=team, record=record)
+    except RecordError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
+    except PlaceError as exc:
+        # "Take me to presales" names a team, not a page, and there is no way
+        # for the model to know which of the two it just said. Rather than
+        # refusing something a person would call obvious, a name that turns out
+        # to be a team opens that team.
+        fallback = await _team_page(session, places, page)
+        if fallback is None:
+            # 404 rather than 422: the model asked for somewhere that is not
+            # there for this person, and the message is the correction it needs.
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+            ) from exc
+        place, path = fallback
+
+    return PlaceOut(
+        page=place.key,
+        module=place.module_key,
+        name=place.name,
+        # What was actually opened, by the name the record carries — so the
+        # assistant can say "Opened Hamdaz ERP" and be describing the thing on
+        # the screen rather than the page it lives on.
+        label=f"{place.module_name} · {opened}" if opened else place.label,
+        path=path,
+    )
+
+
+async def _find_record(
+    request: Request, module_key: str, wanted: str, *, session_cookie: str
+) -> tuple[str, str]:
+    """The id of the record somebody named, and the name it actually has.
+
+    Through the module's own list route, in-process, carrying the caller's
+    session — so what can be found is exactly what they could see on the
+    screen, decided by the route rather than by a second copy of its rules.
+    """
+    finder = FINDERS.get(module_key)
+    if finder is None:
+        raise RecordError(
+            f"A {module_key} record has to be opened by id. Find it with the "
+            f"{module_key} tools first, then call this again with that id."
+        )
+
+    executor: ToolExecutor = request.app.state.assistant_executor
+    outcome = await executor.call(
+        SimpleNamespace(
+            method="GET",
+            path=finder.path,
+            key=f"{module_key}.__find__",
+            split=lambda arguments: ({}, dict(finder.params), None),
+        ),
+        {},
+        session_cookie=session_cookie,
+    )
+    if not outcome.ok:
+        raise RecordError(
+            f"Could not look up {module_key} records right now ({outcome.status})."
+        )
+
+    row = match(finder, rows_of(finder, outcome.body), wanted)
+    found = row.get("id")
+    if not found:
+        raise RecordError(f"That {module_key} record has no id to open.")
+    return str(found), label_of(finder, row)
+
+
+async def _team_page(
+    session: AsyncSession, places: list[Any], wanted: str
+) -> tuple[Any, str] | None:
+    """That team's page, when the name turns out to be a team.
+
+    Deliberately a *fallback* rather than a first attempt: a team called
+    Reports must not shadow the reports module. And deliberately by handle
+    only — matching on display names would make "the finance team" and the
+    finance module race each other, which is the kind of ambiguity that is
+    only noticed when somebody lands somewhere strange.
+    """
+    handle = slugify(wanted)
+    if not handle:
+        return None
+    team = await session.scalar(select(Team).where(Team.slug == handle))
+    if team is None or team.archived_at is not None:
+        return None
+    for place in places:
+        if place.key == "teams.detail":
+            try:
+                return place, fill(place, team=team.slug)
+            except PlaceError:
+                return None
+    return None
 
 
 @router.get("/status", response_model=StatusOut, summary="May I use the assistant, and for what")
@@ -350,7 +522,12 @@ def _sse_response(stream: Any) -> StreamingResponse:
 
 
 async def _prepare(
-    request: Request, user: User, session: AsyncSession, settings: Settings
+    request: Request,
+    user: User,
+    session: AsyncSession,
+    settings: Settings,
+    conversation: Any | None = None,
+    page: str | None = None,
 ) -> tuple[service.Snapshot, TurnContext]:
     """Everything a turn needs, with every gate checked before anything starts."""
     snapshot = await cached_snapshot(session, get_config_cache(request))
@@ -383,8 +560,104 @@ async def _prepare(
         session_cookie=_session_cookie(request, settings),
         snapshot=snapshot,
         tools=tools,
+        subject=_subject_note(conversation),
+        where=await _where(request, session, user, page),
     )
     return snapshot, context
+
+
+async def _where(
+    request: Request, session: AsyncSession, user: User, page: str | None
+) -> str | None:
+    """The screen the person is on, said so the model can act on it.
+
+    Turned from a route back into a screen — and, when the route is about one
+    record, that record's id — because "open this one" and "who filed it" are
+    only answerable if the assistant knows what "this" is. Resolved against the
+    same list that decides where it can send somebody, so a path that is not
+    one of this app's own screens simply says nothing rather than being
+    repeated back as fact.
+    """
+    if not page or not page.startswith("/"):
+        return None
+    places = await _places_for(request, session, user)
+    place = describe(places, page)
+    if place is None:
+        return None
+
+    nl = chr(10)
+    told = f"- Screen: {place.label} ({place.key}){nl}- Route: {page}"
+    # The parameter a detail route carries IS the record they are looking at,
+    # which is the single most useful fact here: it turns "summarise this
+    # report" into a tool call rather than a question.
+    pattern = [part for part in place.path.split("/") if part]
+    actual = [part for part in page.split("/") if part]
+    for expected, value in zip(pattern, actual):
+        if expected == "[slug]":
+            told += f"{nl}- Team on this screen: {value}"
+        elif expected.startswith("["):
+            told += f"{nl}- Record open on this screen: {value}"
+
+    # What else is in this module, by key. Without it the assistant knows
+    # a person is on a project and not that "projects.plan" is a thing it
+    # could open — so "show me its plan" became another view of the page
+    # they were already looking at.
+    siblings = sorted(
+        other.key for other in places if other.module_key == place.module_key
+    )
+    if len(siblings) > 1:
+        told += f"{nl}- Other screens here: " + ", ".join(siblings)
+
+    # And the tool that returns what is actually ON the screen. The model
+    # has a hundred tools and no way to know which one backs the page in
+    # front of somebody — so "what is on here" and "summarise this" were
+    # being answered from the route name alone. Named from the catalogue,
+    # so a module whose tools change says something true either way.
+    reader = None
+    if any(part.startswith("[") and part != "[slug]" for part in pattern):
+        if f"{place.module_key}.get" in TOOLS_BY_KEY:
+            reader = f"{place.module_key}.get, with the record id above"
+    for candidate in (f"{place.module_key}.list", f"{place.module_key}.mine"):
+        if reader is None and candidate in TOOLS_BY_KEY:
+            reader = candidate
+    if reader:
+        told += f"{nl}- The data on this screen comes from: {reader}. Read it before answering about what they can see."
+    return told
+
+
+async def _places_for(request: Request, session: AsyncSession, user: User) -> list[Any]:
+    """This person's reachable screens, from the cache when it is warm."""
+    cached = get_places_cache(request).get(user.id)
+    if cached is not None:
+        return cached
+    access = await access_service.effective_access(
+        session, user_id=user.id, global_roles=await global_role_keys(session, user.id)
+    )
+    return get_places_cache(request).put(user.id, places_from(access))
+
+
+def _subject_note(conversation: Any | None) -> str | None:
+    """One paragraph telling the model what this chat is about.
+
+    Only for a chat opened from somewhere specific. A report page's box passes
+    its report, so "why is that blocked?" means the right thing without a tool
+    round spent finding out which report the person is looking at. The id is
+    included because the way to learn more about it is ``reports.get``, and the
+    model cannot call that with a report it was never told the id of.
+    """
+    if conversation is None or not conversation.subject_kind:
+        return None
+    if conversation.subject_kind == "report":
+        label = conversation.subject_label or "a team report"
+        return (
+            f"This chat was opened from a team report: {label}. "
+            f"Its report id is {conversation.subject_id}. "
+            "The summary already in this chat was written from that report. For "
+            "anything it does not cover, call reports.get with that id rather "
+            "than guessing, and answer from what the report actually says — "
+            "including saying when it does not say."
+        )
+    return f"This chat was opened from {conversation.subject_label or conversation.subject_kind}."
 
 
 @router.post(
@@ -424,7 +697,9 @@ async def send_message(
             ),
         )
 
-    snapshot, context = await _prepare(request, user, session, settings)
+    snapshot, context = await _prepare(
+        request, user, session, settings, conversation, page=body.page
+    )
     run = await service.create_run(
         session,
         conversation=conversation,
@@ -478,7 +753,7 @@ async def confirm(
             detail=f"That run is not waiting for confirmation ({run.status}).",
         )
 
-    _, context = await _prepare(request, user, session, settings)
+    _, context = await _prepare(request, user, session, settings, conversation)
     await session.commit()
     return _sse_response(agent.resume(run.id, context, approved=body.approved))
 
@@ -623,6 +898,7 @@ async def realtime_session(
     session: Session,
     config: Config,
     agent: Agent,
+    body: RealtimeStartIn | None = None,
 ) -> RealtimeSessionOut:
     """Mint a short-lived token for one spoken conversation.
 
@@ -658,8 +934,24 @@ async def realtime_session(
     if not snapshot.settings.realtime_writes_enabled:
         tools = [t for t in tools if not t.spec.is_write]
 
-    spoken = "\n\n".join(
-        [instructions_for(snapshot.settings, actor, user, tools), REALTIME_INSTRUCTIONS]
+    # Where they are, at the moment the token is minted. A spoken session's
+    # instructions are fixed for its lifetime — the browser is never allowed
+    # to rewrite them, which is what stops a tampered client granting itself
+    # a tool — so this is the only chance to say it, and a conversation that
+    # outlives a navigation will still be describing where it began.
+    spoken = (chr(10) * 2).join(
+        [
+            instructions_for(
+                snapshot.settings,
+                actor,
+                user,
+                tools,
+                where=await _where(
+                    request, session, user, body.page if body else None
+                ),
+            ),
+            REALTIME_INSTRUCTIONS,
+        ]
     )
     model = snapshot.settings.realtime_model or DEFAULT_REALTIME_MODEL
     voice = snapshot.settings.voice or DEFAULT_VOICE

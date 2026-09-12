@@ -41,6 +41,26 @@ class StatusOut(BaseModel):
     modules: list[ModuleCapabilityOut]
 
 
+class PlaceOut(BaseModel):
+    """Where a page lives, once the assistant has worked out which one is meant.
+
+    The screen navigates; this only says where to. Keeping those apart is what
+    lets the same answer be rendered as "I have opened Quotes for you" by an
+    app that moved and as a link by one that did not.
+    """
+
+    #: ``module.page`` — what was actually resolved, which may not be what was
+    #: asked for. "quotes" resolves to "quotes.list", and the model should say
+    #: what it opened rather than what it guessed.
+    page: str
+    module: str
+    name: str
+    #: "Quotes · All quotes". For a person, in a sentence.
+    label: str
+    #: The frontend route, parameters filled in.
+    path: str
+
+
 class ConversationIn(BaseModel):
     title: str | None = Field(default=None, max_length=200)
 
@@ -52,6 +72,11 @@ class ConversationOut(BaseModel):
     title: str | None
     created_at: datetime
     last_message_at: datetime | None
+    #: What the chat is about, when it was opened from somewhere specific — a
+    #: report page rather than the assistant's own screen. Null for the rest.
+    subject_kind: str | None = None
+    subject_id: uuid.UUID | None = None
+    subject_label: str | None = None
 
 
 class MessageOut(BaseModel):
@@ -87,6 +112,22 @@ class ConversationDetailOut(ConversationOut):
 
 class SendIn(BaseModel):
     text: str = Field(min_length=1, max_length=8000)
+    #: The route the person is looking at, so "open this one" and "who filed
+    #: it" mean something. A path, not a page key — the browser knows where it
+    #: is, and the API turns that back into a screen name and a record id.
+    #: Ignored if it is not one of this app's own routes.
+    page: str | None = Field(default=None, max_length=512)
+
+
+class RealtimeStartIn(BaseModel):
+    """Where the person is when a spoken conversation opens.
+
+    A realtime session's instructions are fixed when its token is minted — the
+    client is never allowed to change them — so this is the one chance to tell
+    it where the conversation is starting from.
+    """
+
+    page: str | None = Field(default=None, max_length=512)
 
 
 class ConfirmIn(BaseModel):

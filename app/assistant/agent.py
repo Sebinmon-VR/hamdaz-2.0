@@ -71,6 +71,14 @@ when a required detail is missing — never invent dates, ids or reasons.
 - Prefer one well-chosen call over several. You may call several tools at once \
 when they are independent.
 
+How you move them around:
+- app.open takes them to a screen and the app follows. When somebody says go to, open, show me, take me to, or names a screen — "the leave page", "quotes", "my reports" — CALL IT IMMEDIATELY. That is the whole answer; they asked to be somewhere, not to be told about it.
+- Never answer a "take me there" with a list of what they could do there, and never ask which page they mean. Call app.open with what they said. If it is ambiguous the tool refuses and tells you the choices — that is when you ask, with the real options in front of you.
+- When they name a particular thing — "open the ADNOC project", "show me quote 1187" — FIND ITS ID FIRST with that module's own list or search tool, then open the detail page with that id. Calling app.open without it only wastes a step: it will refuse and tell you the same thing.
+- Also open a screen, after answering, when that screen is where they will carry on working.
+- Do NOT open the screen they are already on. When they ask about what is in front of them — "what is on this page", "summarise this", "who owns it" — read it with the tool named under "Where they are" and answer. Opening it again does nothing and tells them nothing.
+- Afterwards say where you took them in a few words: "Opened your leave." Not a paragraph. One screen per turn — a second throws away the first before they have seen it.
+
 How you answer:
 - Briefly, in plain language, as a colleague would. Short lists for several \
 items; a sentence for one. Include the identifiers a person would need next \
@@ -94,6 +102,14 @@ class TurnContext:
     session_cookie: str
     snapshot: service.Snapshot
     tools: list[ResolvedTool]
+    #: What this chat is about, when it was opened from somewhere specific — the
+    #: box on a report page rather than the assistant's own screen. Appended to
+    #: the instructions so the first follow-up question does not have to spend a
+    #: tool round working out which report "it" means.
+    subject: str | None = None
+    #: The screen the person is looking at, already turned into a sentence.
+    #: What makes "open this one" and "summarise it" answerable.
+    where: str | None = None
     by_name: dict[str, ResolvedTool] = field(init=False)
 
     def __post_init__(self) -> None:
@@ -542,7 +558,14 @@ class Assistant:
         return list(rows.all())
 
     def _instructions(self, ctx: TurnContext) -> str:
-        return instructions_for(ctx.snapshot.settings, ctx.actor, ctx.user, ctx.tools)
+        return instructions_for(
+            ctx.snapshot.settings,
+            ctx.actor,
+            ctx.user,
+            ctx.tools,
+            subject=ctx.subject,
+            where=ctx.where,
+        )
 
     async def run_tool(
         self, spec: ToolSpec, arguments: dict[str, Any], *, session_cookie: str
@@ -634,7 +657,15 @@ def _loaded(tool: dict[str, Any]) -> dict[str, Any]:
     return tool
 
 
-def instructions_for(settings: Any, actor: Actor, user: User, tools: list[ResolvedTool]) -> str:
+def instructions_for(
+    settings: Any,
+    actor: Actor,
+    user: User,
+    tools: list[ResolvedTool],
+    *,
+    subject: str | None = None,
+    where: str | None = None,
+) -> str:
     """The system prompt for one person.
 
     Stable parts first so the prefix caches, the date last. Shared by the typed
@@ -660,6 +691,15 @@ def instructions_for(settings: Any, actor: Actor, user: User, tools: list[Resolv
             f"- Global roles: {roles}"
         ),
     ]
+    if where:
+        # Both of these change often — a navigation, a different report —
+        # so they sit AFTER the stable description of what this person can
+        # do. That prefix is what the model caches between turns, and
+        # anything volatile above it would throw the cache away every time
+        # somebody moved.
+        parts.append("Where they are right now:" + chr(10) + where.strip())
+    if subject:
+        parts.append("What this chat is about:" + chr(10) + subject.strip())
     if settings.extra_instructions:
         parts.append(
             "House rules from the administrator:\n" + settings.extra_instructions.strip()

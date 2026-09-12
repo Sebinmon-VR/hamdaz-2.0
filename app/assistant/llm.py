@@ -93,6 +93,61 @@ class OpenAIChat:
         return stream
 
 
+    async def answer(
+        self,
+        *,
+        model: str,
+        instructions: str,
+        prompt: str,
+        schema: dict[str, Any] | None = None,
+        reasoning_effort: str = "low",
+        max_output_tokens: int = 2000,
+        user_key: str,
+    ) -> tuple[str, int, int]:
+        """One call, one answer, no tools and no stream.
+
+        The turn loop above exists because the assistant does not know what it
+        will need — it asks for tools, reads results and goes round again.
+        Summarising something the caller is already holding is the opposite
+        problem: the whole input is known, one call is enough, and streaming a
+        result nobody watches being written only adds ways to fail halfway.
+
+        Returns the text and the token counts, because a feature that spends
+        money per use should be able to say how much.
+        """
+        params: dict[str, Any] = {
+            "model": model,
+            "instructions": instructions,
+            "input": prompt,
+            "store": False,
+            "max_output_tokens": max_output_tokens,
+            "truncation": "auto",
+            "safety_identifier": user_key,
+        }
+        if schema is not None:
+            params["text"] = {
+                "format": {
+                    "type": "json_schema",
+                    "name": "answer",
+                    "strict": True,
+                    "schema": schema,
+                }
+            }
+        spec = MODELS_BY_KEY.get(model)
+        if spec is None or spec.supports_reasoning:
+            params["reasoning"] = {"effort": reasoning_effort}
+        try:
+            response = await self.client().responses.create(**params)
+        except openai.OpenAIError as exc:
+            raise LLMError(explain(exc)) from exc
+
+        usage = getattr(response, "usage", None)
+        return (
+            (getattr(response, "output_text", "") or "").strip(),
+            int(getattr(usage, "input_tokens", 0) or 0),
+            int(getattr(usage, "output_tokens", 0) or 0),
+        )
+
     async def speak(
         self,
         text: str,

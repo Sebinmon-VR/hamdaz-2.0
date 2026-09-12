@@ -16,3 +16,8 @@ python-multipart>=0.0.20
 openpyxl>=3.1
 python-docx>=1.1
 pdfplumber>=0.11
+# Writes the PDF a report is exported as. Named here rather than left as
+# something pdfplumber happens to pull in: a transitive dependency that
+# disappears takes a feature with it, and pure Python is why this is the
+# PDF writer rather than one with native libraries to install.
+reportlab>=4.0

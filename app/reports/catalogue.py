@@ -499,13 +499,59 @@ def _field(
     return spec
 
 
+#: The note every section of every report can carry, and the one word that
+#: says what kind of note it is.
+#:
+#: Two fields rather than one, and the dropdown is the point. A week of free
+#: text is unreadable across six people; a week of "supplier risk" beside the
+#: free text is a column somebody can sort by, count, and notice getting
+#: longer. The prose stays because a tag on its own explains nothing — the tag
+#: is for the reader scanning ten reports, the prose for the one who stops.
+def _note_fields(section: str, *, label: str = "Note") -> list[dict[str, Any]]:
+    return [
+        _field(
+            "note_kind", "What kind of note", FieldType.SELECT, section=section,
+            options=[
+                "nothing to flag",
+                "customer risk",
+                "supplier risk",
+                "pricing",
+                "lead time",
+                "technical",
+                "capacity",
+                "process",
+                "good news",
+                "other",
+            ],
+            help="One word for whoever is reading six of these. Pick the "
+                 "closest; 'other' is honest when nothing fits.",
+        ),
+        _field(
+            "note", label, FieldType.TEXTAREA, section=section,
+            help="Anything the sections above have no room for. Written for "
+                 "somebody who was not in the room.",
+        ),
+    ]
+
+
 #: What presales is asked at the end of a day, beyond the six sections.
 #:
 #: Short on purpose. A daily report that takes twenty minutes is a daily report
 #: that gets filed for a fortnight and then stops, and the tasks section already
-#: carries the work itself — these are the few numbers that are not derivable
-#: from it and that presales are actually measured on.
+#: carries the work itself — these are the few things not derivable from it.
+#:
+#: **Restructured to read like the project reports the AI team files.** It was
+#: six number boxes and nothing else, which is a form rather than a report: a
+#: manager could see that four quotes went out and nothing about whether the
+#: day went well. The headline and the two notes are what turn a list of
+#: figures back into an account of a day.
 PRESALES_DAILY_FIELDS: Final[list[dict[str, Any]]] = [
+    _field(
+        "headline", "The day in one line", FieldType.TEXT, section=OVERVIEW,
+        required=True,
+        help="What a manager should know if they read nothing else. "
+             "\"Two quotes out, ADNOC still waiting on Gulf Valves.\"",
+    ),
     _field(
         "quotes_sent", "Quotes sent today", FieldType.NUMBER, section=METRICS,
         help="Customer quotes that actually went out, not ones drafted.",
@@ -526,22 +572,32 @@ PRESALES_DAILY_FIELDS: Final[list[dict[str, Any]]] = [
         "customer_visits", "Customer meetings", FieldType.NUMBER, section=METRICS,
     ),
     _field(
+        "waiting_on", "Waiting on somebody else", FieldType.TEXTAREA, section=ISSUES,
+        help="Who owes you what, by name. The single most useful line in a "
+             "daily report and the one most often left out.",
+    ),
+    _field(
         "support_needed", "Support needed", FieldType.SELECT, section=ISSUES,
         options=["none", "pricing approval", "technical input", "supplier contact",
                  "customer escalation", "other"],
         help="What would move things along fastest. Read by whoever gets this.",
     ),
+    *_note_fields(REMARKS),
     _field(
         "tomorrow_focus", "Focus tomorrow", FieldType.TEXTAREA, section=SUMMARY,
         help="The one or two things being picked up first.",
     ),
 ]
 
-#: The weekly asks for the same figures over a week, plus the judgements a day
-#: is too short to support: what the pipeline looks like, and what was won or
-#: lost. Those are the questions a manager reads a weekly to answer, and asking
-#: them daily would produce noise rather than an answer.
+#: The week. Same spine as the daily — a headline, the figures, what is stuck,
+#: a note, what is next — with the numbers that only mean anything over seven
+#: days: value quoted, won and lost, the live pipeline.
 PRESALES_WEEKLY_FIELDS: Final[list[dict[str, Any]]] = [
+    _field(
+        "headline", "The week in one line", FieldType.TEXT, section=OVERVIEW,
+        required=True,
+        help="The one sentence somebody reading nine reports will remember.",
+    ),
     _field(
         "quotes_sent", "Quotes sent this week", FieldType.NUMBER, section=METRICS,
         required=True,
@@ -563,11 +619,6 @@ PRESALES_WEEKLY_FIELDS: Final[list[dict[str, Any]]] = [
              "nobody asked the customer.",
     ),
     _field(
-        "loss_reasons", "Why they were lost", FieldType.TEXTAREA, section=ISSUES,
-        help="Price, lead time, specification, no reason given. The one field "
-             "here that changes what the company does next.",
-    ),
-    _field(
         "pipeline_value", "Live pipeline", FieldType.CURRENCY, section=METRICS,
         help="Everything still open at the end of the week, in AED.",
     ),
@@ -576,10 +627,20 @@ PRESALES_WEEKLY_FIELDS: Final[list[dict[str, Any]]] = [
         help="Bids whose closing date falls in the coming week.",
     ),
     _field(
+        "loss_reasons", "Why they were lost", FieldType.TEXTAREA, section=ISSUES,
+        help="Price, lead time, specification, no reason given. The one field "
+             "here that changes what the company does next.",
+    ),
+    _field(
+        "waiting_on", "Waiting on somebody else", FieldType.TEXTAREA, section=ISSUES,
+        help="Who owes you what, by name, and since when.",
+    ),
+    _field(
         "support_needed", "Support needed", FieldType.SELECT, section=ISSUES,
         options=["none", "pricing approval", "technical input", "supplier contact",
                  "customer escalation", "more capacity", "other"],
     ),
+    *_note_fields(REMARKS),
     _field(
         "next_week_focus", "Focus next week", FieldType.TEXTAREA, section=SUMMARY,
         required=True,

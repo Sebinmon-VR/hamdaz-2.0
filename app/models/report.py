@@ -117,6 +117,39 @@ class ReportStatus(StrEnum):
     SUBMITTED = "submitted"
 
 
+class BriefMode(StrEnum):
+    """When a report's brief gets written.
+
+    A submitted report never changes, so its brief is written once and read
+    many times. What the three modes really decide is *who waits*: the author
+    at submit time (and nobody notices, because the email is being sent
+    anyway), the first manager to open it, or nobody until somebody asks.
+
+    ``ON_REQUEST`` is not a lesser mode. A company that wants to see what this
+    costs before turning it loose on every daily report starts there.
+    """
+
+    ON_SUBMIT = "on_submit"
+    ON_FIRST_OPEN = "on_first_open"
+    ON_REQUEST = "on_request"
+
+
+class BriefFollowup(StrEnum):
+    """What a reader may do with a brief once it exists.
+
+    Each step costs more than the one before it, which is why this is a choice
+    and not a pair of booleans: ``REFRESH`` is one more model call, ``CHAT`` is
+    an open-ended number of them with tools behind them.
+    """
+
+    #: Read it and nothing else.
+    OFF = "off"
+    #: Ask for it again — a different summary of the same report.
+    REFRESH = "refresh"
+    #: Ask it questions. The box becomes the assistant, opened on this report.
+    CHAT = "chat"
+
+
 class TaskSource(StrEnum):
     #: Pulled from the SharePoint Proposals list and snapshotted at that moment.
     PROPOSALS = "proposals"
@@ -219,6 +252,42 @@ class ReportSettings(Base, Timestamped):
     #: its date range to.
     log_retention_days: Mapped[int] = mapped_column(
         Integer, default=90, server_default=text("90"), nullable=False
+    )
+
+    # ── the brief ──────────────────────────────────────────────────────
+    #
+    # A filled-in report is long by design: six sections, every task, every
+    # issue, every metric, plus whatever the team's template adds. That is the
+    # right shape for the record and the wrong shape for a manager reading nine
+    # of them on a Monday. The brief is a short account of one report, written
+    # by the assistant's model from the report's own contents, stored on the
+    # report and shown before it.
+    #
+    # It never replaces the report. Every brief is shown next to the thing it
+    # summarises, and the summary of a report nobody can read is not visible
+    # either — the brief inherits ``may_read`` exactly.
+
+    #: Off by default, and deliberately. This is the only feature in the module
+    #: that spends money per report, so it starts off and a super admin turns it
+    #: on knowingly rather than discovering it on an invoice.
+    brief_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
+    )
+    brief_mode: Mapped[str] = mapped_column(
+        String(16), default=BriefMode.ON_SUBMIT,
+        server_default=text("'on_submit'"), nullable=False,
+    )
+    brief_followup: Mapped[str] = mapped_column(
+        String(16), default=BriefFollowup.CHAT,
+        server_default=text("'chat'"), nullable=False,
+    )
+    #: Which assistant model writes them. Null follows whatever the assistant
+    #: itself is set to, which is the answer that stays right when that changes.
+    brief_model_key: Mapped[str | None] = mapped_column(String(64))
+    #: The length a brief is asked to stay under. A brief that runs to a page
+    #: has reproduced the problem it was added to solve.
+    brief_max_words: Mapped[int] = mapped_column(
+        Integer, default=180, server_default=text("180"), nullable=False
     )
 
     updated_by_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -450,6 +519,41 @@ class Report(Base, UUIDPrimaryKey, Timestamped):
     #: template on the way in, exactly as HR validates an application.
     answers: Mapped[dict[str, Any]] = mapped_column(
         JSONB, default=dict, server_default=text("'{}'::jsonb"), nullable=False
+    )
+
+    # ── the brief ──────────────────────────────────────────────────────
+    #
+    # **Not to be confused with ``summary`` above.** That one is the author's:
+    # a section of the form, in their words, and part of what they filed. These
+    # are the assistant's account of the whole report, written for a manager
+    # who has nine of them to read. Two fields with similar names is a risk
+    # worth taking over calling the author's own section something it is not.
+
+    #: One line, for a list of reports. The thing a manager scans.
+    brief_headline: Mapped[str | None] = mapped_column(String(300))
+    #: The brief itself, as the box shows it.
+    brief: Mapped[str | None] = mapped_column(Text)
+    brief_model: Mapped[str | None] = mapped_column(String(64))
+    brief_generated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: SHA-256 of exactly what the model was shown. A report edited after being
+    #: briefed has a brief that no longer describes it, and this is how that is
+    #: noticed rather than believed — see ``app.reports.brief.fingerprint``.
+    brief_input_hash: Mapped[str | None] = mapped_column(String(64))
+    #: How many times it has been written. Rises on every refresh, so "this has
+    #: been re-asked four times" is a visible fact rather than a guess.
+    brief_revision: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+    #: Why the last attempt failed, when one did. A manager is told the brief
+    #: could not be written; silence would read as "nothing to say".
+    brief_error: Mapped[str | None] = mapped_column(Text)
+    #: What it cost, in tokens. Per report, because "what is this costing us"
+    #: is asked about the feature and answered by summing a column.
+    brief_tokens_in: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+    brief_tokens_out: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
     )
 
     team: Mapped[Team] = relationship(lazy="joined")

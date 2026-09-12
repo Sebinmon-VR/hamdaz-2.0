@@ -28,7 +28,10 @@ from sqlalchemy import Select, case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.assistant.catalogue import MODELS_BY_KEY
 from app.models.report import (
+    BriefFollowup,
+    BriefMode,
     DeliveryStatus,
     IssueSeverity,
     Report,
@@ -51,6 +54,7 @@ from app.models.role import Role, UserRole
 from app.models.team import Team, TeamMembership
 from app.models.templates import FormTemplate, TemplateStatus
 from app.models.user import User
+from app.reports import brief
 from app.reports.access import (
     COMPANY_WIDE,
     TEAM_OVERSIGHT,
@@ -142,8 +146,30 @@ async def seed_templates(session: AsyncSession) -> list[FormTemplate]:
         ).all()
     }
     for spec in TEMPLATES:
-        if spec["key"] in existing:
-            continue  # an admin owns it now
+        if (current := existing.get(spec["key"])) is not None:
+            # **An admin's edit is never overwritten; an untouched one follows
+            # the code.** ``updated_by_id`` is the whole test: it is null until
+            # somebody saves the template from the admin screen, so a shipped
+            # template nobody has touched can be improved and a team that has
+            # tailored theirs keeps exactly what they wrote.
+            #
+            # Without this the catalogue was write-once — a template seeded on
+            # the first deploy could never be improved again, which made every
+            # change to a report's shape a migration nobody would write.
+            if current.updated_by_id is not None:
+                continue
+            wanted_sections = section_specs(spec.get("sections", STANDARD_SECTIONS))
+            if current.fields == spec["fields"] and current.sections == wanted_sections:
+                continue
+            current.name = spec["name"]
+            current.description = spec.get("description")
+            current.fields = spec["fields"]
+            current.sections = wanted_sections
+            # Bumped so a report filed last month still says which shape it was
+            # filled in against — ``Report.template_version`` is stamped at the
+            # time and never rewritten.
+            current.version = (current.version or 1) + 1
+            continue
         template = FormTemplate(
             key=spec["key"],
             name=spec["name"],
@@ -1229,6 +1255,7 @@ async def update_settings(
         "copy_author",
         "include_task_list",
         "include_issue_list",
+        "brief_enabled",
     ):
         if changes.get(key) is not None:
             setattr(row, key, bool(changes[key]))
@@ -1237,6 +1264,30 @@ async def update_settings(
         row.max_tasks_in_email = max(0, int(changes["max_tasks_in_email"]))
     if changes.get("log_retention_days") is not None:
         row.log_retention_days = max(1, int(changes["log_retention_days"]))
+    if changes.get("brief_max_words") is not None:
+        row.brief_max_words = max(40, min(600, int(changes["brief_max_words"])))
+
+    if changes.get("brief_mode") is not None:
+        mode = str(changes["brief_mode"]).strip()
+        if mode not in set(BriefMode):
+            raise ReportError(f"brief_mode must be one of: {', '.join(BriefMode)}")
+        row.brief_mode = mode
+
+    if changes.get("brief_followup") is not None:
+        followup = str(changes["brief_followup"]).strip()
+        if followup not in set(BriefFollowup):
+            raise ReportError(f"brief_followup must be one of: {', '.join(BriefFollowup)}")
+        row.brief_followup = followup
+
+    if "brief_model_key" in changes:
+        # Empty means "follow the assistant", which is the answer that stays
+        # right when a super admin changes the assistant's model. A key that
+        # does not exist would fail at the first brief and nowhere else, so it
+        # is refused here where somebody is looking at the screen.
+        key = str(changes.get("brief_model_key") or "").strip()
+        if key and key not in MODELS_BY_KEY:
+            raise ReportError(f"No such assistant model: {key}")
+        row.brief_model_key = key or None
 
     if changes.get("company_roles") is not None:
         known = {r.key for r in await session.scalars(select(Role))}
@@ -1262,6 +1313,116 @@ async def update_settings(
     row.updated_by_id = actor_id
     await session.flush()
     return row
+
+
+# ── the brief ──────────────────────────────────────────────────────────
+#
+# A short account of one report, written by the assistant's model and stored on
+# the report. The rules about *when* one gets written are the administrator's
+# (``BriefMode``); the rules about who may see one are not configurable at all
+# — a brief is shown to exactly the people who may read the report it
+# summarises, because it is made of that report's contents.
+
+
+#: A brief is only written for a filed report. A draft is the author's working
+#: copy and changes by the minute; summarising it would spend money on a moving
+#: target and put a manager-facing summary on something no manager may read.
+BRIEFABLE: Final[frozenset[str]] = frozenset({ReportStatus.SUBMITTED})
+
+
+def brief_state(report: Report, settings: ReportSettings) -> str:
+    """What the reader should be told about this report's brief.
+
+    One function rather than a pile of conditions in the router, because the
+    page, the API and the chat box all have to agree about what "there is no
+    brief" means — off, not written yet, written but out of date, or tried and
+    failed.
+    """
+    if not settings.brief_enabled:
+        return "disabled"
+    if report.status not in BRIEFABLE:
+        return "not_applicable"
+    if not report.brief:
+        return "failed" if report.brief_error else "absent"
+    if report.brief_input_hash and report.brief_input_hash != brief.fingerprint(
+        brief.render(report)
+    ):
+        # The report was edited after being briefed. Only reachable for a
+        # report that went back to draft or was changed by a migration; said
+        # out loud rather than quietly serving a brief that describes something
+        # else.
+        return "stale"
+    return "ready"
+
+
+def brief_model_key(settings: ReportSettings, assistant_model_key: str) -> str:
+    """Which model writes the briefs.
+
+    The reports setting wins when it is set; otherwise the assistant's own
+    choice does, so a company that moves the assistant to a cheaper model moves
+    its briefs with it rather than discovering a second bill.
+    """
+    return settings.brief_model_key or assistant_model_key
+
+
+async def write_brief(
+    session: AsyncSession,
+    report: Report,
+    *,
+    briefer: Any,
+    settings: ReportSettings,
+    model_key: str,
+    user_key: str,
+    force: bool = False,
+) -> bool:
+    """Write this report's brief. Returns whether the model was actually called.
+
+    Returning ``False`` for "there was already a good one" is the whole point:
+    every caller here is on a path that runs more than once — a page opened
+    twice, a report read by four managers — and each of them would otherwise
+    pay for the same paragraph again.
+
+    A model failure is recorded on the report and raised. The submit path
+    swallows it deliberately: a report is filed whether or not it could be
+    summarised, exactly as it is filed whether or not the email went out.
+    """
+    if not settings.brief_enabled:
+        raise ReportError("Report briefs are switched off.")
+    if report.status not in BRIEFABLE:
+        raise ReportError("A brief is only written for a report that has been filed.")
+    if not briefer.configured:
+        raise ReportError(
+            "Report briefs need an OpenAI API key. Ask a super admin to set OPENAI_API_KEY."
+        )
+
+    source = brief.render(report)
+    if not force and report.brief and report.brief_input_hash == brief.fingerprint(source):
+        return False
+
+    try:
+        written = await briefer.write(
+            report,
+            model=model_key,
+            max_words=settings.brief_max_words,
+            user_key=user_key,
+            source=source,
+        )
+    except brief.BriefError as exc:
+        report.brief_error = str(exc)[:2000]
+        await session.flush()
+        raise ReportError(str(exc)) from exc
+
+    report.brief_headline = written.headline or None
+    report.brief = written.body
+    report.brief_model = written.model
+    report.brief_generated_at = datetime.now(UTC)
+    report.brief_input_hash = written.fingerprint
+    report.brief_revision = (report.brief_revision or 0) + 1
+    report.brief_error = None
+    report.brief_tokens_in = (report.brief_tokens_in or 0) + written.tokens_in
+    report.brief_tokens_out = (report.brief_tokens_out or 0) + written.tokens_out
+    await session.flush()
+    return True
 
 
 @dataclass(slots=True)

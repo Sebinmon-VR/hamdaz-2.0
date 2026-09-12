@@ -15,17 +15,22 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.models.report import BriefFollowup, BriefMode
 from app.reports.catalogue import COMPLETIONS
 
 Cadence = Literal["daily", "weekly", "monthly", "quarterly", "yearly", "ad_hoc"]
 Scope = Literal["team", "project", "portfolio"]
 Completion = Literal["not_started", "in_progress", "blocked", "done", "dropped"]
 Severity = Literal["low", "medium", "high", "blocked"]
+BriefModeName = Literal["on_submit", "on_first_open", "on_request"]
+BriefFollowupName = Literal["off", "refresh", "chat"]
 
 # Kept honest against the catalogue rather than trusted to stay in step: a
 # completion added there and forgotten here would be accepted by the service
 # and refused by the schema, which is the confusing way round.
 assert set(COMPLETIONS) == set(Completion.__args__)
+assert set(BriefMode) == set(BriefModeName.__args__)
+assert set(BriefFollowup) == set(BriefFollowupName.__args__)
 
 
 # ── projects on a report ───────────────────────────────────────────────
@@ -487,6 +492,50 @@ class ScheduleOut(BaseModel):
 # ── the super admin's settings ─────────────────────────────────────────
 
 
+class BriefOut(BaseModel):
+    """The short version of one report, and what the reader may do with it.
+
+    ``state`` is what the box renders from, and it has five answers rather than
+    "is there a brief": *disabled* (the administrator has not turned this on),
+    *not_applicable* (a draft — briefs are for filed reports), *absent* (nobody
+    has asked for one yet), *failed* (we tried and could not), *stale* (the
+    report changed after it was written) and *ready*. Collapsing those into a
+    null brief would leave the page unable to say anything useful about why.
+    """
+
+    report_id: uuid.UUID
+    state: Literal["disabled", "not_applicable", "absent", "failed", "stale", "ready"]
+    headline: str | None = None
+    body: str | None = None
+    generated_at: datetime | None = None
+    model: str | None = None
+    #: How many times it has been written. 2 or more means somebody asked again.
+    revision: int = 0
+    #: Why the last attempt failed, when one did.
+    error: str | None = None
+    #: Whether this reader may ask for it to be written again, and whether they
+    #: may ask it questions. Both follow the administrator's ``brief_followup``.
+    may_refresh: bool = False
+    may_chat: bool = False
+
+
+class BriefChatOut(BaseModel):
+    """Where to carry on the conversation about this report.
+
+    The box on the page is the assistant, not a copy of it: this hands back a
+    real conversation id, and everything after the first message goes through
+    ``/assistant/conversations/{id}/messages`` like any other chat. One less
+    streaming endpoint to keep in step, and the run shows up in the assistant's
+    own cost and audit screens rather than in a blind spot.
+    """
+
+    conversation_id: uuid.UUID
+    #: True when this call created it. False means the reader is being handed
+    #: back the questions they already asked about this report.
+    created: bool
+    brief: BriefOut
+
+
 class ReportSettingsOut(BaseModel):
     """Who filed reports go to, and how much of one the message carries.
 
@@ -508,6 +557,16 @@ class ReportSettingsOut(BaseModel):
     include_task_list: bool
     include_issue_list: bool
     log_retention_days: int
+
+    #: The AI summariser. Off by default: it is the only part of the module
+    #: that spends money per report.
+    brief_enabled: bool
+    brief_mode: str
+    brief_followup: str
+    #: Null follows whatever model the assistant itself is set to.
+    brief_model_key: str | None
+    brief_max_words: int
+
     updated_by_id: uuid.UUID | None
     updated_at: datetime
 
@@ -530,6 +589,18 @@ class ReportSettingsIn(BaseModel):
     include_task_list: bool | None = None
     include_issue_list: bool | None = None
     log_retention_days: int | None = Field(default=None, ge=1, le=3650)
+
+    #: The AI summariser.
+    brief_enabled: bool | None = None
+    #: ``on_submit`` writes the brief as the report is filed, ``on_first_open``
+    #: when the first manager opens it, ``on_request`` only when asked.
+    brief_mode: BriefModeName | None = None
+    #: What a reader may do with one: ``off`` read it, ``refresh`` ask for
+    #: another, ``chat`` ask it questions.
+    brief_followup: BriefFollowupName | None = None
+    #: An assistant model key, or empty to follow the assistant's own setting.
+    brief_model_key: str | None = Field(default=None, max_length=64)
+    brief_max_words: int | None = Field(default=None, ge=40, le=600)
 
 
 class DeliveryOut(BaseModel):

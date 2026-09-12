@@ -410,6 +410,55 @@ def test_the_weekly_asks_what_a_day_is_too_short_to_answer() -> None:
     assert {"bids_won", "bids_lost", "loss_reasons", "pipeline_value"} <= keys
 
 
+def test_both_presales_reports_open_with_one_line() -> None:
+    """The change that turns a form back into a report.
+
+    Six number boxes told a manager four quotes went out and nothing about
+    whether the day went well. The headline is the sentence somebody reading
+    nine of these will actually remember, which is why it is the one required
+    field in the overview.
+    """
+    for key in ("report_presales_daily", "report_presales_weekly"):
+        spec = next(t for t in TEMPLATES if t["key"] == key)
+        headline = next(f for f in spec["fields"] if f["key"] == "headline")
+        assert headline["section"] == "overview", key
+        assert headline["required"], key
+
+
+def test_both_presales_reports_carry_a_note_and_a_tag_for_it() -> None:
+    """Two fields rather than one, and the dropdown is the point.
+
+    A week of free text is unreadable across six people; the same text with
+    "supplier risk" beside it is something a reader can scan, count, and notice
+    getting longer.
+    """
+    for key in ("report_presales_daily", "report_presales_weekly"):
+        spec = next(t for t in TEMPLATES if t["key"] == key)
+        by_key = {f["key"]: f for f in spec["fields"]}
+        assert by_key["note"]["type"] == "textarea", key
+        assert by_key["note_kind"]["type"] == "select", key
+        assert "supplier risk" in by_key["note_kind"]["options"], key
+        # Both in the same section, because a tag away from the prose it tags
+        # is a dropdown nobody fills in.
+        assert by_key["note"]["section"] == by_key["note_kind"]["section"], key
+
+
+def test_both_presales_reports_ask_who_is_being_waited_on() -> None:
+    """The most useful line in a presales report and the one most often left
+    out: who owes you what, by name."""
+    for key in ("report_presales_daily", "report_presales_weekly"):
+        spec = next(t for t in TEMPLATES if t["key"] == key)
+        assert "waiting_on" in {f["key"] for f in spec["fields"]}, key
+
+
+def test_a_select_field_always_offers_something_to_select() -> None:
+    """A dropdown with no options renders as a dead control."""
+    for spec in TEMPLATES:
+        for field in spec["fields"]:
+            if field.get("type") == "select":
+                assert field.get("options"), f"{spec['key']}.{field['key']}"
+
+
 def test_every_completion_has_a_label() -> None:
     assert set(COMPLETIONS) == set(COMPLETION_LABELS)
 

@@ -458,12 +458,29 @@ class EventKind(StrEnum):
 
 class AssistantConversation(Base, UUIDPrimaryKey, Timestamped):
     __tablename__ = "assistant_conversations"
+    __table_args__ = (
+        Index("ix_assistant_conversations_subject", "subject_kind", "subject_id"),
+    )
 
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
     #: Taken from the first message; editable later.
     title: Mapped[str | None] = mapped_column(String(200))
+
+    #: What this chat is *about*, when it was opened from somewhere specific —
+    #: the box on a report page rather than the assistant's own screen.
+    #:
+    #: Kept as a loose (kind, id) pair with no foreign key on purpose. A
+    #: conversation outlives what it was about: a report deleted last month
+    #: should not take the conversation about it with it, and the chat still
+    #: reads because what was said is in the messages. The kind is validated
+    #: where conversations are opened, not here — ``subject.KINDS``.
+    subject_kind: Mapped[str | None] = mapped_column(String(24))
+    subject_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    #: How to name it to the model and on the screen: "Presales weekly, 1-7 Sep".
+    #: Copied rather than joined, for the same reason the pair has no key.
+    subject_label: Mapped[str | None] = mapped_column(String(200))
     last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 

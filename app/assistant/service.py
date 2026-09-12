@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Final
 
 from sqlalchemy import Date, cast, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -851,13 +851,68 @@ async def admission_for(
 # ── conversations ──────────────────────────────────────────────────────
 
 
+#: What a conversation may be *about*. Only what has a box somewhere: the
+#: reports page opens a chat on one report. Validated here rather than on the
+#: model so an unknown kind is refused where somebody can be told about it,
+#: and so adding "project" later is one entry rather than a migration.
+SUBJECT_KINDS: Final[frozenset[str]] = frozenset({"report"})
+
+
 async def create_conversation(
-    session: AsyncSession, *, user: User, title: str | None = None
+    session: AsyncSession,
+    *,
+    user: User,
+    title: str | None = None,
+    subject_kind: str | None = None,
+    subject_id: uuid.UUID | None = None,
+    subject_label: str | None = None,
 ) -> AssistantConversation:
-    conversation = AssistantConversation(user_id=user.id, title=title)
+    """Start a chat, optionally about something in particular.
+
+    A subject does not grant anything. The chat still acts as the person
+    through the app's own routes, so a conversation opened on a report they may
+    not read is a conversation whose every question is refused — the caller
+    that opens one is expected to have checked, and the tools check again.
+    """
+    if subject_kind is not None and subject_kind not in SUBJECT_KINDS:
+        raise AssistantError(f"A chat cannot be about a {subject_kind!r}.")
+    conversation = AssistantConversation(
+        user_id=user.id,
+        title=title,
+        subject_kind=subject_kind,
+        subject_id=subject_id,
+        subject_label=(subject_label or None),
+    )
     session.add(conversation)
     await session.flush()
     return conversation
+
+
+async def conversation_about(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    subject_kind: str,
+    subject_id: uuid.UUID,
+) -> AssistantConversation | None:
+    """This person's existing chat about this thing, if they have one.
+
+    One per person per subject, so reopening the box on a report brings back
+    what was already asked rather than a blank one. Per *person*: the chat is
+    theirs, and a manager's questions about somebody's report are not something
+    the next reader should find waiting for them.
+    """
+    return await session.scalar(
+        select(AssistantConversation)
+        .where(
+            AssistantConversation.user_id == user_id,
+            AssistantConversation.subject_kind == subject_kind,
+            AssistantConversation.subject_id == subject_id,
+            AssistantConversation.archived_at.is_(None),
+        )
+        .order_by(AssistantConversation.created_at.desc())
+        .limit(1)
+    )
 
 
 async def list_conversations(

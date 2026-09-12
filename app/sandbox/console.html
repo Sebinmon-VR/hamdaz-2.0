@@ -867,6 +867,47 @@ const ROUTES = [
          "report. The author cannot comment on their own — what they have to add " +
          "belongs in the next report, or the report stops being a record of what " +
          "was said at the time." },
+  { g:"assistant", m:"GET", p:"/api/v1/assistant/open", t:"Where a page lives",
+    auth:"session",
+    query:[ {n:"page", l:"A module ('quotes') or module.page ('reports.overview')"},
+            {n:"team", l:"Team handle — only for a page that belongs to one team"} ],
+    note:"What the assistant calls when the honest answer to a question is a " +
+         "screen. It changes nothing: it resolves a name to a route and the " +
+         "browser is what actually moves. The destinations are YOUR effective " +
+         "access, so a page you may not reach cannot be resolved at all — and " +
+         "the 404 lists what you can open, which is the correction the model " +
+         "needs rather than a dead end. There is no route catalogue behind " +
+         "this: it reads the same module/page list that drives the permission " +
+         "model and the navigation." },
+  { g:"reports", m:"GET", p:"/api/v1/reports/{report_id}/brief",
+    t:"The short version of this report", auth:"session",
+    params:[ {n:"report_id", l:"Report id"} ],
+    note:"A report is long because a record should be; a manager with nine to " +
+         "read needs the short one first. Written by the assistant's model from " +
+         "that report and nothing else, and shown to exactly the people who may " +
+         "read it. 'state' tells the page why there is no brief when there is " +
+         "none: disabled, not_applicable (a draft), absent, failed, or stale — " +
+         "the report was edited after it was written. Under 'on first open' " +
+         "this call is where it actually gets written, and the first manager to " +
+         "open the report is the one who waits." },
+  { g:"reports", m:"POST", p:"/api/v1/reports/{report_id}/brief",
+    t:"Write it again", auth:"session",
+    params:[ {n:"report_id", l:"Report id"} ],
+    note:"Not a cache bust — the report has not changed, the reader just wants " +
+         "it said again. Costs a model call every time, which is why a super " +
+         "admin can switch it off with 'What a reader may do with one'. Unlike " +
+         "the read above, this one reports its failures: somebody pressed a " +
+         "button and is waiting." },
+  { g:"reports", m:"POST", p:"/api/v1/reports/{report_id}/chat",
+    t:"Ask the assistant about this report", auth:"session",
+    params:[ {n:"report_id", l:"Report id"} ],
+    note:"Opens the box on the report page and hands back a real assistant " +
+         "conversation with the brief already in it. Everything after this goes " +
+         "through /assistant/conversations/{id}/messages, so the follow-up " +
+         "questions get the same admission rules, tool policies, cost caps and " +
+         "audit log as any other chat rather than a second, less watched way to " +
+         "ask the model things. Called twice by the same person it returns the " +
+         "same conversation — Wednesday's reader should find Tuesday's questions." },
   { g:"reports admin", m:"GET", p:"/api/v1/reports/admin/settings",
     t:"Who filed reports are sent to", auth:"super_admin",
     note:"Super admin only — a CEO reads every report and still cannot change " +
@@ -886,12 +927,27 @@ const ROUTES = [
            {n:"max_tasks_in_email", l:"Tasks shown in the message", def:"8"},
            {n:"include_task_list", l:"Include the task list", type:"check"},
            {n:"include_issue_list", l:"Include the issues", type:"check"},
-           {n:"log_retention_days", l:"Delivery log window (days)", def:"90"} ],
+           {n:"log_retention_days", l:"Delivery log window (days)", def:"90"},
+           {n:"brief_enabled", l:"AI summariser: write a brief on each report",
+            type:"check"},
+           {n:"brief_mode", l:"When to write it", type:"select",
+            opts:["", "on_submit", "on_first_open", "on_request"]},
+           {n:"brief_followup", l:"What a reader may do with one", type:"select",
+            opts:["", "off", "refresh", "chat"]},
+           {n:"brief_model_key", l:"Model (blank follows the assistant's)"},
+           {n:"brief_max_words", l:"Keep the brief under (words)", def:"180"} ],
     note:"Only the fields you fill in change. The common change is taking " +
          "'daily' out of the cadences and leaving weekly on — a manager of six " +
          "people otherwise gets thirty messages a week and reads none of them. " +
          "A role key that does not exist is refused rather than silently " +
-         "mailing nobody. An address without an '@' is dropped and the rest kept." },
+         "mailing nobody. An address without an '@' is dropped and the rest kept. " +
+         "The summariser is off until you turn it on: it is the only part of " +
+         "reporting that spends money per report. 'When to write it' — on_submit " +
+         "writes it as the report is filed (nobody waits, the author is already " +
+         "waiting on the email), on_first_open when the first manager opens it, " +
+         "on_request only when somebody asks. 'What a reader may do' — off is " +
+         "read it, refresh is ask for another, chat turns the box into the " +
+         "assistant opened on that report. Each step costs more than the last." },
   { g:"reports admin", m:"GET", p:"/api/v1/reports/admin/deliveries",
     t:"What was emailed, and what failed", auth:"super_admin",
     query:[ {n:"since", l:"From (YYYY-MM-DD)"},

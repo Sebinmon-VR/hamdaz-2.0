@@ -14,7 +14,7 @@ from app.access.router import router as access_router
 from app.analytics.router import router as analytics_router
 from app.assignment.router import router as assignment_router
 from app.assistant.agent import Assistant
-from app.assistant.cache import ActorCache, ConfigCache
+from app.assistant.cache import ActorCache, ConfigCache, PlacesCache
 from app.assistant.executor import ToolExecutor
 from app.assistant.llm import OpenAIChat
 from app.assistant.router import admin_router as assistant_admin_router
@@ -51,6 +51,7 @@ from app.intake.router import webhook_router as intake_webhook_router
 from app.intake.worker import Worker
 from app.notifications.router import router as notifications_router
 from app.quoting.mailer import QuoteMailer
+from app.reports.brief import Briefer
 from app.reports.mailer import ReportMailer
 from app.reports.router import admin_router as reports_admin_router
 from app.reports.router import router as reports_router
@@ -126,17 +127,36 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # app/assistant/cache.py for why the permission one may be stale.
     app.state.assistant_config = ConfigCache()
     app.state.assistant_actors = ActorCache()
+    # Where each person can be sent. Its own cache because the assistant's
+    # navigation reads a different thing from its permissions, and reading it
+    # uncached costs 2.4 seconds of an ordinary member's turn.
+    app.state.assistant_places = PlacesCache()
+    #: One client, two callers. The assistant drives a tool loop with it; the
+    #: report briefer makes a single call with it. Shared so an OpenAI key, a
+    #: base URL or a timeout is configured once and means the same thing to
+    #: both, rather than two clients that drift apart on the third setting.
+    openai = OpenAIChat(settings)
+    # The one way anything reaches a module: the app's own routes, in-process,
+    # carrying the caller's session. Held on the state as well as inside the
+    # assistant because navigation-by-name uses it too — see
+    # app/assistant/records.py — and reaching into another object's privates
+    # for it would be a worse kind of coupling than naming it here.
+    app.state.assistant_executor = ToolExecutor(
+        app,
+        api_prefix=settings.api_prefix,
+        cookie_name=settings.session_cookie_name,
+        max_chars=settings.assistant_tool_result_max_chars,
+        timeout=settings.assistant_tool_timeout_seconds,
+    )
     app.state.assistant = Assistant(
-        OpenAIChat(settings),
-        ToolExecutor(
-            app,
-            api_prefix=settings.api_prefix,
-            cookie_name=settings.session_cookie_name,
-            max_chars=settings.assistant_tool_result_max_chars,
-            timeout=settings.assistant_tool_timeout_seconds,
-        ),
+        openai,
+        app.state.assistant_executor,
         get_session_factory(),
     )
+    # Writes the short version of a filed report, for the managers who have
+    # several to read. Off until a super admin turns it on: it is the only part
+    # of reporting that spends money per report. See app/reports/brief.py.
+    app.state.report_briefer = Briefer(openai)
     # Reads the watched mailbox. Shares the HTTP client and inherits the
     # mailer's token cache — same token, no reason for a second copy.
     app.state.mail_reader = MailReader(settings, http)

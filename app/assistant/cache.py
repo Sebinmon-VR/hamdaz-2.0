@@ -29,6 +29,7 @@ import time
 import uuid
 from typing import Final
 
+from app.assistant.places import Place
 from app.assistant.policy import Actor
 from app.assistant.service import Snapshot
 
@@ -40,6 +41,13 @@ CONFIG_TTL_SECONDS: Final = 60
 #: longer use and being refused when they try it. Long enough that the several
 #: turns of one conversation share a single lookup.
 ACTOR_TTL_SECONDS: Final = 30
+
+#: The same bargain as ``ACTOR_TTL_SECONDS``, for the same reason — and this
+#: one is measured rather than assumed. ``effective_access`` for an ordinary
+#: member is five queries against a database three time zones away: 2.4 seconds,
+#: every time the assistant is asked to open a page, while the person listens to
+#: silence. The resolution it feeds is 0.3ms.
+PLACES_TTL_SECONDS: Final = 30
 
 #: A bound so a large organisation cannot grow this without limit. Small: the
 #: people using the assistant in any half minute are few.
@@ -94,6 +102,44 @@ class ActorCache:
             del self._entries[oldest]
         self._entries[user_id] = (time.monotonic(), actor)
         return actor
+
+    def invalidate(self, user_id: uuid.UUID | None = None) -> None:
+        if user_id is None:
+            self._entries.clear()
+        else:
+            self._entries.pop(user_id, None)
+
+
+class PlacesCache:
+    """Where one person can be sent — the screens their access reaches.
+
+    Stale for at most half a minute, and safe for the same reason the actor
+    cache is: this decides only where the assistant *offers* to take somebody.
+    The screen at the other end is a route with its own guard, so a page
+    granted or revoked in the last thirty seconds costs a confusing refusal at
+    worst. It cannot let anybody in anywhere.
+    """
+
+    def __init__(self, ttl_seconds: int = PLACES_TTL_SECONDS) -> None:
+        self._ttl = ttl_seconds
+        self._entries: dict[uuid.UUID, tuple[float, list[Place]]] = {}
+
+    def get(self, user_id: uuid.UUID) -> list[Place] | None:
+        entry = self._entries.get(user_id)
+        if entry is None:
+            return None
+        stored_at, places = entry
+        if time.monotonic() - stored_at >= self._ttl:
+            del self._entries[user_id]
+            return None
+        return places
+
+    def put(self, user_id: uuid.UUID, places: list[Place]) -> list[Place]:
+        if len(self._entries) >= _MAX_ACTORS:
+            oldest = min(self._entries, key=lambda key: self._entries[key][0])
+            del self._entries[oldest]
+        self._entries[user_id] = (time.monotonic(), places)
+        return places
 
     def invalidate(self, user_id: uuid.UUID | None = None) -> None:
         if user_id is None:

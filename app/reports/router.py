@@ -23,7 +23,7 @@ import uuid
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -33,7 +33,16 @@ from app.core.config import Settings, get_settings
 from app.core.db import get_session
 from app.core.mail import MailError
 from app.models.project import OPEN_TASK_STATUSES, ProjectUpdate, TaskStatus
-from app.models.report import DeliveryStatus, Report, ReportScope, ReportStatus
+from app.assistant import service as assistant_service
+from app.assistant.service import AssistantError
+from app.models.report import (
+    BriefFollowup,
+    BriefMode,
+    DeliveryStatus,
+    Report,
+    ReportScope,
+    ReportStatus,
+)
 from app.models.templates import FormTemplate
 from app.models.user import User
 from app.projects import service as projects_service
@@ -62,8 +71,12 @@ from app.reports.catalogue import (
     scope_of,
     sections_for,
 )
+from app.reports import export
+from app.reports.brief import Briefer
 from app.reports.mailer import ReportMailer
 from app.reports.schemas import (
+    BriefChatOut,
+    BriefOut,
     CommentIn,
     CommentOut,
     DeliveryOut,
@@ -123,7 +136,12 @@ def get_mailer(request: Request) -> ReportMailer:
     return request.app.state.report_mailer
 
 
+def get_briefer(request: Request) -> Briefer:
+    return request.app.state.report_briefer
+
+
 Mailer = Annotated[ReportMailer, Depends(get_mailer)]
+Writer = Annotated[Briefer, Depends(get_briefer)]
 Config = Annotated[Settings, Depends(get_settings)]
 
 
@@ -800,6 +818,7 @@ async def submit_report(
     session: Session,
     viewer: CurrentViewer,
     mailer: Mailer,
+    briefer: Writer,
     settings: Config,
     _: ModuleGate,
 ) -> ReportOut:
@@ -824,6 +843,18 @@ async def submit_report(
     except ReportError as exc:
         raise _translate(exc) from exc
     await session.commit()
+
+    # Written here under ``on_submit``, which is the mode that costs nobody any
+    # waiting: the author is already waiting on the email, and every manager
+    # who opens the report afterwards finds the short version already there.
+    # Like the email, it never fails the filing — the report is filed.
+    brief_settings = await service.get_settings(session)
+    if (
+        brief_settings.brief_enabled
+        and brief_settings.brief_mode == BriefMode.ON_SUBMIT
+    ):
+        await _ensure_brief(session, report, brief_settings, briefer, user=user)
+        await session.commit()
 
     await _notify(session, report, mailer, settings)
 
@@ -1089,6 +1120,309 @@ async def comment_on_report(
         author_name=user.display_name,
         body=comment.body,
         created_at=comment.created_at,
+    )
+
+
+@router.get(
+    "/{report_id}/export",
+    summary="This report as a file",
+    response_class=Response,
+    responses={200: {"content": {"application/pdf": {}}, "description": "The report"}},
+)
+async def export_report(
+    report_id: uuid.UUID,
+    session: Session,
+    viewer: CurrentViewer,
+    _: ModuleGate,
+    fmt: Annotated[str, Query(alias="format", description="pdf or docx")] = "pdf",
+) -> Response:
+    """The filed report, to attach to something or paste into something.
+
+    A copy of the report, so it is shown to exactly the people who may read the
+    report — the same 404 for everybody else, since whether a report exists for
+    that team on that day is itself not theirs to learn.
+
+    Both formats come from one description of the document, so neither can
+    quietly stop carrying a section the other has. See ``app.reports.export``.
+    """
+    try:
+        report = await service.get_for(session, report_id, viewer)
+    except ReportError as exc:
+        raise _translate(exc) from exc
+
+    try:
+        content, name, media_type = export.render(report, fmt.lower().strip())
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
+
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={
+            # `attachment` rather than `inline`: this is a file somebody asked
+            # for, and a PDF that opens in a browser tab instead of landing in
+            # Downloads is one they then have to save by hand.
+            "Content-Disposition": f'attachment; filename="{name}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+# ── the brief ──────────────────────────────────────────────────────────
+#
+# A report is long because a record should be. A manager with nine of them to
+# read on a Monday needs the short version first and the long one when the
+# short one worries them, which is what these three routes are.
+#
+# None of them is a new permission. A brief is made of one report's contents,
+# so it is shown to exactly the people who may read that report and refused —
+# as a 404, like the report itself — to everybody else.
+
+
+def _brief_out(report: Report, settings: Any) -> BriefOut:
+    state = service.brief_state(report, settings)
+    followup = settings.brief_followup
+    usable = state in ("ready", "stale")
+    return BriefOut(
+        report_id=report.id,
+        state=state,
+        headline=report.brief_headline,
+        body=report.brief,
+        generated_at=report.brief_generated_at,
+        model=report.brief_model,
+        revision=report.brief_revision or 0,
+        error=report.brief_error,
+        # A brief that does not exist cannot be chatted about, and one the
+        # administrator has switched follow-ups off for cannot be either. Both
+        # are said here rather than left for the page to work out, so the page
+        # and the endpoint cannot disagree about which buttons exist.
+        may_refresh=(
+            state in ("absent", "failed", "stale", "ready")
+            and followup in (BriefFollowup.REFRESH, BriefFollowup.CHAT)
+            and settings.brief_enabled
+            and report.status == ReportStatus.SUBMITTED
+        ),
+        may_chat=usable and followup == BriefFollowup.CHAT,
+    )
+
+
+async def _ensure_brief(
+    session: AsyncSession,
+    report: Report,
+    settings: Any,
+    briefer: Briefer,
+    *,
+    user: User,
+    force: bool = False,
+) -> None:
+    """Write the brief if it is wanted and not already there.
+
+    Failures are swallowed into ``brief_error`` on the report rather than
+    raised. Every caller of this is doing something else that matters more —
+    filing a report, opening a page — and none of them should fail because a
+    summary could not be written.
+    """
+    assistant_settings = await assistant_service.get_settings(session)
+    try:
+        await service.write_brief(
+            session,
+            report,
+            briefer=briefer,
+            settings=settings,
+            model_key=service.brief_model_key(settings, assistant_settings.model_key),
+            user_key=str(user.id),
+            force=force,
+        )
+    except ReportError as exc:
+        logger.warning("brief for report %s could not be written: %s", report.id, exc)
+
+
+@router.get(
+    "/{report_id}/brief",
+    response_model=BriefOut,
+    summary="The short version of this report",
+)
+async def read_brief(
+    report_id: uuid.UUID,
+    user: CurrentUser,
+    session: Session,
+    viewer: CurrentViewer,
+    briefer: Writer,
+    _: ModuleGate,
+) -> BriefOut:
+    """What the report says, in a paragraph.
+
+    Under ``on_first_open`` this is where the brief actually gets written, and
+    the first manager to open the report is the one who waits for it. Every
+    reader after them is served the stored one — a submitted report never
+    changes, so writing it twice would buy an identical paragraph.
+    """
+    try:
+        report = await service.get_for(session, report_id, viewer)
+    except ReportError as exc:
+        raise _translate(exc) from exc
+
+    settings = await service.get_settings(session)
+    if (
+        settings.brief_enabled
+        and settings.brief_mode == BriefMode.ON_FIRST_OPEN
+        and report.status == ReportStatus.SUBMITTED
+        and not report.brief
+        and not report.brief_error
+    ):
+        await _ensure_brief(session, report, settings, briefer, user=user)
+        await session.commit()
+    return _brief_out(report, settings)
+
+
+@router.post(
+    "/{report_id}/brief",
+    response_model=BriefOut,
+    summary="Write it again",
+)
+async def refresh_brief(
+    report_id: uuid.UUID,
+    user: CurrentUser,
+    session: Session,
+    viewer: CurrentViewer,
+    briefer: Writer,
+    _: ModuleGate,
+) -> BriefOut:
+    """Ask for another brief on the same report.
+
+    Not a cache bust: the report has not changed, the reader simply wants it
+    said again, usually because the first one was too short or missed what they
+    care about. It costs a model call every time, which is why the
+    administrator can switch it off with ``brief_followup``.
+
+    This one *does* report its failures. Somebody pressed a button and is
+    waiting; telling them nothing happened is worse than telling them why.
+    """
+    try:
+        report = await service.get_for(session, report_id, viewer)
+    except ReportError as exc:
+        raise _translate(exc) from exc
+
+    settings = await service.get_settings(session)
+    if settings.brief_followup == BriefFollowup.OFF:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Asking for another brief is switched off.",
+        )
+
+    assistant_settings = await assistant_service.get_settings(session)
+    try:
+        await service.write_brief(
+            session,
+            report,
+            briefer=briefer,
+            settings=settings,
+            model_key=service.brief_model_key(settings, assistant_settings.model_key),
+            user_key=str(user.id),
+            force=True,
+        )
+    except ReportError as exc:
+        await session.commit()  # keeps the recorded failure
+        raise _translate(exc) from exc
+    await session.commit()
+    return _brief_out(report, settings)
+
+
+@router.post(
+    "/{report_id}/chat",
+    response_model=BriefChatOut,
+    summary="Ask the assistant about this report",
+)
+async def chat_about_report(
+    report_id: uuid.UUID,
+    user: CurrentUser,
+    session: Session,
+    viewer: CurrentViewer,
+    briefer: Writer,
+    _: ModuleGate,
+) -> BriefChatOut:
+    """Open the box on this report, with the brief already in it.
+
+    Returns a real assistant conversation. Everything after this goes through
+    the assistant's own endpoints, which means the follow-up questions are
+    subject to the same admission rules, the same tool policies, the same cost
+    caps and the same audit log as any other chat — rather than a second, less
+    watched way to ask the model things.
+
+    Called twice by the same person, it hands back the same conversation. The
+    questions a manager asked about Tuesday's report are worth finding again on
+    Wednesday.
+    """
+    try:
+        report = await service.get_for(session, report_id, viewer)
+    except ReportError as exc:
+        raise _translate(exc) from exc
+
+    settings = await service.get_settings(session)
+    if not settings.brief_enabled or settings.brief_followup != BriefFollowup.CHAT:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Asking questions about a report is switched off.",
+        )
+
+    existing = await assistant_service.conversation_about(
+        session, user_id=user.id, subject_kind="report", subject_id=report.id
+    )
+    if existing is not None:
+        await session.commit()
+        return BriefChatOut(
+            conversation_id=existing.id,
+            created=False,
+            brief=_brief_out(report, settings),
+        )
+
+    # The chat is only worth opening with something in it, so a report nobody
+    # has briefed yet gets briefed here — whatever the mode says. The mode
+    # decides when a brief appears *by itself*; asking for one is asking.
+    if not report.brief:
+        await _ensure_brief(session, report, settings, briefer, user=user)
+    if not report.brief:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=report.brief_error or "The brief could not be written.",
+        )
+
+    label = (
+        f"{report.team.name} {report.cadence}, "
+        f"{period_label(report.cadence, report.period_start, report.period_end)}"
+    )
+    try:
+        conversation = await assistant_service.create_conversation(
+            session,
+            user=user,
+            title=f"Brief — {label}"[:200],
+            subject_kind="report",
+            subject_id=report.id,
+            subject_label=label[:200],
+        )
+    except AssistantError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+        ) from exc
+
+    # Seeded as an assistant message, so it is both the first thing the manager
+    # reads and the first thing the model sees of this conversation. The agent
+    # replays stored messages as history, which is what makes a follow-up
+    # question land against the summary rather than against nothing.
+    await assistant_service.add_message(
+        session,
+        conversation,
+        role="assistant",
+        content=report.brief,
+        run_id=None,
+    )
+    await session.commit()
+    return BriefChatOut(
+        conversation_id=conversation.id,
+        created=True,
+        brief=_brief_out(report, settings),
     )
 
 
