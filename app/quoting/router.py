@@ -30,7 +30,7 @@ import logging
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import (
     APIRouter,
@@ -275,11 +275,23 @@ async def quotable_tasks(
     user: CurrentUser,
     session: Session,
     sharepoint: SharePoint,
-    open_only: Annotated[
-        bool, Query(description="Hide tasks whose status is Completed")
-    ] = True,
+    scope: Annotated[
+        Literal["live", "open", "all"],
+        Query(
+            description=(
+                "live: not finished and the bid has not closed — what can still be "
+                "quoted for. open: everything not finished, closed bids included. "
+                "all: completed ones too."
+            )
+        ),
+    ] = "live",
 ) -> QuotableTasksOut:
     """The caller's own work, as the starting point for a quote.
+
+    **Live by default.** Most of what is assigned to anybody is a bid that
+    closed months ago and was never marked finished; listing it first buried
+    the handful that can still be quoted for. The other two scopes are one
+    click away for the person who wants them.
 
     The same rows the Proposals page shows — every field of them, so the quote
     can be started from what is already written down rather than retyped — with
@@ -300,6 +312,7 @@ async def quotable_tasks(
             in_sharepoint=False,
             total=0,
             open_count=0,
+            live_count=0,
             quoted_count=0,
             tasks=[],
         )
@@ -313,7 +326,8 @@ async def quotable_tasks(
         ) from exc
 
     open_tasks = [t for t in tasks if t.is_open]
-    shown = open_tasks if open_only else tasks
+    live_tasks = [t for t in open_tasks if t.is_active]
+    shown = {"live": live_tasks, "open": open_tasks, "all": tasks}[scope]
     # Soonest deadline first, by BCD rather than DueDate — the Proposals list
     # orders itself the same way, and for the same reason.
     shown = sorted(shown, key=lambda t: (t.deadline is None, t.deadline or ""))
@@ -325,6 +339,7 @@ async def quotable_tasks(
         in_sharepoint=True,
         total=len(tasks),
         open_count=len(open_tasks),
+        live_count=len(live_tasks),
         quoted_count=sum(1 for r in rows if r.quote_request_id is not None),
         tasks=rows,
     )
@@ -844,19 +859,33 @@ async def resolve(
 
 @router.get("", response_model=list[QuoteSummaryOut], summary="Quote requests")
 async def index(
-    _: CurrentUser,
+    user: CurrentUser,
+    roles: CurrentRoles,
     session: Session,
     team: Annotated[str | None, Query(description="Team handle or id")] = None,
     quote_status: Annotated[QuoteStatus | None, Query(alias="status")] = None,
     limit: Annotated[int, Query(ge=1, le=500)] = 100,
 ) -> list[QuoteSummaryOut]:
+    """The quotes this person may see: their own, and the ones they decide.
+
+    Not everyone's. Approvers, team leads and managers of a team see that
+    team's; a super admin, the CEO or a manager sees all. The rule is the one
+    ``may_approve`` uses, so a quote never waits on somebody who cannot see it.
+    """
     team_id = None
     if team:
         try:
             team_id = (await teams_service.get_team(session, team)).id
         except TeamError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    rows = await service.listing(session, team_id=team_id, status=quote_status, limit=limit)
+    rows = await service.listing(
+        session,
+        team_id=team_id,
+        status=quote_status,
+        viewer=user,
+        viewer_roles=roles,
+        limit=limit,
+    )
     return [_summary(r) for r in rows]
 
 

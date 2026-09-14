@@ -152,6 +152,8 @@ class StubTask:
         self.has_attachments = False
         self.attachments_url = None
         self.is_open = True
+        #: Not finished and the bid has not closed — what the picker shows first.
+        self.is_active = True
         self.deadline = "2026-09-30T00:00:00Z"
         self.__dict__.update(over)
 
@@ -305,6 +307,35 @@ async def requester(db, team):
     await teams.set_member_roles(db, team=team, user=user, role_keys=["member"])
     await db.commit()
     return user
+
+
+async def test_a_member_sees_only_their_own_quotes(
+    quoting, db, requester, approver, team
+) -> None:
+    """A quote is somebody's negotiation with a customer, not a noticeboard.
+    The people who decide it see it; a colleague on the same team does not."""
+    raised = await _as(quoting, requester).post(f"{API}?team={team.id}", json=FORM)
+    assert raised.status_code == 201, raised.text
+    quote_id = raised.json()["id"]
+
+    colleague = await upsert_user(
+        db,
+        EntraIdentity(
+            object_id="colleague@hamdaz.com",
+            email="colleague@hamdaz.com",
+            display_name="Colleague",
+        ),
+    )
+    await teams.set_member_roles(db, team=team, user=colleague, role_keys=["member"])
+    await db.commit()
+
+    def ids(response):
+        assert response.status_code == 200, response.text
+        return [q["id"] for q in response.json()]
+
+    assert quote_id in ids(await _as(quoting, requester).get(API))
+    assert quote_id in ids(await _as(quoting, approver).get(API))
+    assert quote_id not in ids(await _as(quoting, colleague).get(API))
 
 
 async def test_a_stranger_cannot_raise_a_quote(quoting, team) -> None:
@@ -634,6 +665,7 @@ async def test_the_quoting_page_lists_the_callers_own_tasks(
     body = response.json()
     assert body["in_sharepoint"] is True
     assert body["total"] == 2
+    assert body["live_count"] == 2
     assert body["quoted_count"] == 0
     # Soonest deadline first.
     assert [t["title"] for t in body["tasks"]] == ["Switch refresh", FIRST_TASK_TITLE]
@@ -648,6 +680,35 @@ async def test_the_quoting_page_lists_the_callers_own_tasks(
     assert task["web_url"].endswith("/412")
     # Nothing raised against it yet.
     assert task["quote_request_id"] is None
+
+
+async def test_the_task_list_shows_live_work_first_and_the_rest_on_request(
+    quoting, db, requester, team
+) -> None:
+    """Most of what is assigned to anybody is a bid that closed months ago and
+    was never marked finished. Listing those first buried the handful that can
+    still be quoted for."""
+    quoting._transport.app.state.sharepoint.tasks = [
+        StubTask(),
+        StubTask(
+            id="300", title="Closed bid", is_active=False, deadline="2026-03-01T00:00:00Z"
+        ),
+        StubTask(
+            id="200", title="Finished", is_active=False, is_open=False,
+            deadline="2026-02-01T00:00:00Z",
+        ),
+    ]
+    client = _as(quoting, requester)
+
+    live = (await client.get(f"{API}/tasks")).json()
+    assert [t["id"] for t in live["tasks"]] == ["412"]
+    assert (live["live_count"], live["open_count"], live["total"]) == (1, 2, 3)
+
+    opened = (await client.get(f"{API}/tasks?scope=open")).json()
+    assert sorted(t["id"] for t in opened["tasks"]) == ["300", "412"]
+
+    everything = (await client.get(f"{API}/tasks?scope=all")).json()
+    assert sorted(t["id"] for t in everything["tasks"]) == ["200", "300", "412"]
 
 
 async def test_a_task_that_already_has_a_quote_says_so(

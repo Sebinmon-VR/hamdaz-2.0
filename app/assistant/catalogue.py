@@ -3565,7 +3565,14 @@ TOOLS: Final[tuple[ToolSpec, ...]] = (
         "quote request has already been raised for it. Use it before "
         "quote_requests.from_task to find the task id, and to answer 'which of "
         "my bids still has no quote'. Only ever their own tasks.",
-        (_query("open_only", "Hide tasks whose status is Completed (default true).", BOOL),),
+        (
+            _query(
+                "scope",
+                "live (default): not finished and the bid has not closed. open: "
+                "closed bids too. all: completed ones as well.",
+                _s("string", enum=["live", "open", "all"]),
+            ),
+        ),
     ),
     ToolSpec(
         "quote_requests.from_task", "quote_requests", _WRITE, "POST",

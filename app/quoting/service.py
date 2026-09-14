@@ -707,14 +707,36 @@ async def get(session: AsyncSession, request_id: uuid.UUID) -> QuoteRequest:
     return request
 
 
+async def approver_team_ids(session: AsyncSession, user_id: uuid.UUID) -> set[uuid.UUID]:
+    """The teams whose quotes this person decides, by a role held inside them."""
+    rows = await session.scalars(
+        select(TeamMembership.team_id)
+        .join(Role, Role.id == TeamMembership.role_id)
+        .where(TeamMembership.user_id == user_id, Role.key.in_(TEAM_APPROVERS))
+    )
+    return set(rows.all())
+
+
 async def listing(
     session: AsyncSession,
     *,
     team_id: uuid.UUID | None = None,
     status: QuoteStatus | None = None,
     mine_for: uuid.UUID | None = None,
+    viewer: User | None = None,
+    viewer_roles: set[str] | frozenset[str] = frozenset(),
     limit: int = 100,
 ) -> list[QuoteRequest]:
+    """Quotes, newest first, narrowed to what ``viewer`` is allowed to see.
+
+    A quote is somebody's negotiation with a customer, and the list of them
+    is not a noticeboard. A person sees the quotes they raised or were handed,
+    and the ones they decide — the same people ``may_approve`` lets decide a
+    quote may see it in the list, so nothing waits on an approver who cannot
+    find it. Anyone approving anywhere (super admin, CEO, manager) sees all.
+    With no ``viewer`` the list is unfiltered, for callers that have already
+    settled who is asking.
+    """
     query = select(QuoteRequest).order_by(QuoteRequest.created_at.desc()).limit(limit)
     if team_id is not None:
         query = query.where(QuoteRequest.team_id == team_id)
@@ -727,6 +749,15 @@ async def listing(
                 QuoteRequest.assigned_to_id == mine_for,
             )
         )
+    if viewer is not None and not (set(viewer_roles) & GLOBAL_APPROVERS):
+        own = [
+            QuoteRequest.created_by_id == viewer.id,
+            QuoteRequest.assigned_to_id == viewer.id,
+        ]
+        decides = await approver_team_ids(session, viewer.id)
+        if decides:
+            own.append(QuoteRequest.team_id.in_(decides))
+        query = query.where(or_(*own))
     return list((await session.scalars(query)).all())
 
 

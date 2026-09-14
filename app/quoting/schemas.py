@@ -275,9 +275,12 @@ class QuotableTasksOut(BaseModel):
 
     email: str
     in_sharepoint: bool
-    #: Everything assigned to them, before the open_only filter.
+    #: Everything assigned to them, before the scope is applied.
     total: int
+    #: Not finished, closed bids included.
     open_count: int
+    #: Not finished and the bid has not closed — what can still be quoted for.
+    live_count: int
     #: How many already have a quote raised against them.
     quoted_count: int
     tasks: list[QuotableTaskOut]
