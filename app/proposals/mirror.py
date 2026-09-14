@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from typing import Any
 
-from sqlalchemy import cast, func, literal_column, or_, select
+from sqlalchemy import bindparam, cast, func, literal_column, or_, select
 from sqlalchemy.dialects.postgresql import REGCONFIG, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -225,36 +225,43 @@ def _row_values(
         "search_text": text_value,
         "deleted": False,
         "last_seen_at": datetime.now(UTC),
+        # Feeds the D-weighted part of the vector only; not a column.
+        "notes_text": f"{task.remarks or ''} {task.working_notes or ''}",
     }
 
 
-def _vector_expression(task: ProposalTask):
+def _vector_expression():
     """The tsvector, weighted by where the words came from.
 
     A hit in the title is worth more than one in somebody's working notes, and
     Postgres' own ranking understands that if the weights are set. Built in the
     application rather than as a generated column so the weighting is visible
     here and changeable without a migration.
+
+    Written against *bound parameters* rather than a row's values, so the one
+    statement serves every row and the whole list goes to Postgres in a few
+    batches. Built per row it was thirteen hundred round trips to Azure, which
+    took longer than the interval the loop runs on.
     """
     # Both constants are typed explicitly. SQLAlchemy's psycopg dialect renders
     # a plain string bind as ``'english'::VARCHAR``, and Postgres has no
     # ``to_tsvector(varchar, ...)`` nor ``setweight(tsvector, varchar)`` — the
     # sync failed on the first row with "function does not exist" until it did.
-    def w(value: str | None, weight: str):
+    def w(param: str, weight: str):
         assert weight in ("A", "B", "C", "D")
         return func.setweight(
             func.to_tsvector(
-                cast("english", REGCONFIG), func.coalesce(value or "", "")
+                cast("english", REGCONFIG), func.coalesce(bindparam(param), "")
             ),
             literal_column(f"'{weight}'"),
         )
 
     return (
-        w(task.title, "A")
-        .op("||")(w(task.quote_no, "A"))
-        .op("||")(w(task.end_user, "B"))
-        .op("||")(w(task.current_type, "C"))
-        .op("||")(w(f"{task.remarks or ''} {task.working_notes or ''}", "D"))
+        w("title", "A")
+        .op("||")(w("quote_no", "A"))
+        .op("||")(w("end_user", "B"))
+        .op("||")(w("current_type", "C"))
+        .op("||")(w("notes_text", "D"))
     )
 
 
@@ -295,37 +302,49 @@ async def sync(
         return report
 
     report.read = len(tasks)
-    existing = {
-        row.item_id: row
-        for row in (
-            await session.scalars(
-                select(ProposalIndexItem).where(
+    # Only the two columns the comparison needs: a full row here carries the
+    # embedding, and thirteen hundred of those is most of a megabyte for nothing.
+    hashes: dict[str, str | None] = dict(
+        (
+            await session.execute(
+                select(ProposalIndexItem.item_id, ProposalIndexItem.text_hash).where(
                     ProposalIndexItem.item_id.in_([str(t.id) for t in tasks])
                 )
             )
         ).all()
-    } if tasks else {}
+    ) if tasks else {}
 
     needs_embedding: list[tuple[str, str]] = []
+    rows: list[dict[str, Any]] = []
     for task in tasks:
         text_value = search_text_of(task)
         digest = _hash(text_value)
-        values = _row_values(task, text_value, people)
-        values["search_vector"] = _vector_expression(task)
+        rows.append(_row_values(task, text_value, people))
 
-        current = existing.get(str(task.id))
-        if current is None or current.text_hash != digest:
+        if str(task.id) not in hashes or hashes[str(task.id)] != digest:
             report.changed += 1
             if embed:
                 needs_embedding.append((str(task.id), text_value))
 
-        statement = insert(ProposalIndexItem).values(**values)
-        await session.execute(
-            statement.on_conflict_do_update(
-                index_elements=[ProposalIndexItem.item_id],
-                set_={k: v for k, v in values.items() if k != "item_id"},
-            )
+    if rows:
+        # One statement, many parameter sets. Every column is a bound
+        # parameter and the vector is an expression over those same
+        # parameters, so the driver ships the list in batches rather than a
+        # round trip per row.
+        columns = [k for k in rows[0] if k != "notes_text"]
+        statement = insert(ProposalIndexItem).values(
+            {**{c: bindparam(c) for c in columns}, "search_vector": _vector_expression()}
         )
+        statement = statement.on_conflict_do_update(
+            index_elements=[ProposalIndexItem.item_id],
+            set_={
+                c: getattr(statement.excluded, c)
+                for c in [*columns, "search_vector"]
+                if c != "item_id"
+            },
+        )
+        for start in range(0, len(rows), _UPSERT_BATCH):
+            await session.execute(statement, rows[start : start + _UPSERT_BATCH])
 
     # Anything we hold that the list no longer returns has gone from it.
     seen = [str(t.id) for t in tasks]
@@ -358,6 +377,10 @@ async def sync(
     await session.flush()
     return report
 
+
+#: Rows per upsert statement. Large enough that a full list is a handful of
+#: calls; small enough that one refused row is findable.
+_UPSERT_BATCH = 200
 
 #: Embedding requests are batched. One call per row would be a thousand round
 #: trips on a first sync; the API takes many inputs at once and bills the same.
@@ -569,7 +592,14 @@ async def search(
 
 
 def _iso(value: date | None) -> str | None:
-    return value.isoformat() if value is not None else None
+    """A stored date, in the shape SharePoint sends one.
+
+    The list gives ``2026-09-11T00:00:00Z`` and everything downstream parses
+    that into an aware datetime. A bare ``2026-09-11`` parses too — into a
+    naive one, which then cannot be compared with "now" and the whole
+    recompute fell over on the first deadline.
+    """
+    return f"{value.isoformat()}T00:00:00Z" if value is not None else None
 
 
 async def as_tasks(

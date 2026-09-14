@@ -23,8 +23,10 @@ from app.analytics.publisher import (
     Standing,
     _same,
     fields_for,
+    from_live,
 )
 from app.core.config import Settings
+from app.models.analytics import LiveScore
 from app.proposals.sharepoint import SharePointProposals
 
 SITE = "hamdaz1.sharepoint.com,site,web"
@@ -126,6 +128,27 @@ def test_never_assigned_has_no_recent_date() -> None:
 def test_swapcounter_and_jobcount_are_never_ours() -> None:
     assert "swapcounter" not in fields_for(who("Anyone"))
     assert "jobcount" not in fields_for(who("Anyone"))
+
+
+def test_a_live_row_gives_the_same_date_a_kept_run_would() -> None:
+    """Assigned 18:30 on the 11th, scored 07:37 on the 14th: 2.55 days. Whole
+    days would say the 12th; the timestamp says the 11th, and so must this."""
+    from datetime import UTC, datetime
+
+    live = LiveScore(
+        display_name="Haleema",
+        rank=1,
+        eligible=True,
+        active_tasks=5,
+        open_tasks=9,
+        days_since_assigned=2,
+        factors={"days_since_last_assign": {"raw": 2.5465}},
+        labels=[],
+        computed_at=datetime(2026, 9, 14, 7, 37, tzinfo=UTC),
+    )
+    [standing] = from_live([live], team="presales")
+    assert standing.last_assigned == date(2026, 9, 11)
+    assert standing.eligible and standing.rank == 1
 
 
 # ── change detection ───────────────────────────────────────────────────

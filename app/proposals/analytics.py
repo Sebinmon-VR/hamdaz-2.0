@@ -45,9 +45,12 @@ def parse_when(value: str | None) -> datetime | None:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
+    # SharePoint's are always aware. One built elsewhere without a zone is
+    # taken as UTC rather than left to blow up the first comparison.
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
 @dataclass(slots=True)

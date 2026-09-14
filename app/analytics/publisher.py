@@ -52,7 +52,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -124,8 +124,13 @@ def from_live(rows: Sequence[LiveScore], *, team: str | None) -> list[Standing]:
         # the list shows something a person can read.
         last: date | None = None
         if row.days_since_assigned is not None:
-            last = (row.computed_at or datetime.now(UTC)).date()
-            last = date.fromordinal(last.toordinal() - int(row.days_since_assigned))
+            # The row keeps whole days; the factor breakdown keeps the exact
+            # figure. Use the exact one, so the date matches what a kept run
+            # writes from the timestamp itself — or the two paths would take
+            # turns rewriting RecentDate a day apart.
+            raw = ((row.factors or {}).get("days_since_last_assign") or {}).get("raw")
+            days = float(raw) if raw is not None else float(row.days_since_assigned)
+            last = ((row.computed_at or datetime.now(UTC)) - timedelta(days=days)).date()
         out.append(
             Standing(
                 display_name=row.display_name,
