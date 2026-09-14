@@ -40,11 +40,21 @@ from app.proposals.mirror import as_tasks, last_assigned
 logger = logging.getLogger("hamdaz.analytics.live")
 
 
+async def counts(session: AsyncSession) -> tuple[dict, dict]:
+    """The mirror, counted: the workload per person and when each was last
+    given work. Read once and handed to every ``recompute`` in the same sync,
+    because the read is the expensive half and the answer is the same for
+    every team."""
+    tasks, people = await as_tasks(session)
+    return summarise(tasks, people), await last_assigned(session)
+
+
 async def recompute(
     session: AsyncSession,
     *,
     team: Team | None = None,
     reason: str = "mirror",
+    counted: tuple[dict, dict] | None = None,
 ) -> list[LiveScore]:
     """Rewrite the live standing for one team, or for everybody.
 
@@ -52,10 +62,11 @@ async def recompute(
     or who no longer holds any work, has to *stop* having a rank — and a patch
     that only touched the people whose counts moved would leave them ranked for
     ever.
+
+    ``counted`` is :func:`counts`, already taken, for a caller doing several
+    teams in a row.
     """
-    tasks, people = await as_tasks(session)
-    workload = summarise(tasks, people)
-    seen = await last_assigned(session)
+    workload, seen = counted if counted is not None else await counts(session)
 
     candidates, policy, _ = await gather(
         session,

@@ -764,6 +764,31 @@ class SharePointProposals:
             params = None
         return tasks
 
+    async def newest_modified(self) -> str | None:
+        """When anything in the Proposals list last changed, as Graph's stamp.
+
+        One row, ordered by Modified, in well under a second — cheap enough to
+        ask every few seconds, which is how the mirror notices a change without
+        a webhook. Only edits and additions move it: a deletion leaves every
+        other row as it was, which is why the full sync keeps its own timer.
+        """
+        payload = await self._get(
+            f"{self._site}/lists/{self._settings.sharepoint_proposals_list_id}/items",
+            {
+                "$orderby": "fields/Modified desc",
+                "$top": "1",
+                "$select": "id,lastModifiedDateTime",
+                "$expand": "fields($select=Modified)",
+            },
+            headers=dict(_NON_INDEXED),
+        )
+        rows = payload.get("value", [])
+        if not rows:
+            return None
+        return (rows[0].get("fields") or {}).get("Modified") or rows[0].get(
+            "lastModifiedDateTime"
+        )
+
     async def site_people(self) -> dict[str, dict[str, str]]:
         """``lookupId -> {name, email}`` — the reverse of :meth:`site_users`."""
         list_id = await self._user_information_list_id()

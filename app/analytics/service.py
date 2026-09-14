@@ -34,6 +34,7 @@ from app.assignment import service as policy_service
 from app.labels import service as labels_service
 from app.models.analytics import AnalyticsRun, UserAnalytics
 from app.models.assignment import AssignmentPolicy
+from app.models.role import Role, UserRole
 from app.models.team import Team, TeamMembership
 from app.models.user import User
 from app.proposals.analytics import WorkloadCache
@@ -155,21 +156,13 @@ async def gather(
                 matched.append(({"name": user.display_name, "email": user.email}, user))
 
     # Roles held globally and inside this team, so a manager can be kept out of
-    # the ranking. Fetched once for everybody rather than per person.
-    from app.roles.service import global_role_keys
-
+    # the ranking. Two queries for everybody, not two per person: against a
+    # database a hundred milliseconds away, per person was most of a recompute.
     excluded_roles = {str(r).casefold() for r in (policy.excluded_roles or [])}
     roles_of: dict[uuid.UUID, set[str]] = {}
     if excluded_roles:
-        for _, user in matched:
-            if user is None:
-                continue
-            held_roles = await global_role_keys(session, user.id)
-            if team is not None:
-                held_roles |= await policy_service.team_roles_of(
-                    session, team_id=team.id, user_id=user.id
-                )
-            roles_of[user.id] = held_roles
+        ids = [user.id for _, user in matched if user is not None]
+        roles_of = await _roles_held(session, ids, team_id=team.id if team else None)
 
     scored_users = [u for _, u in matched if u is not None]
     held = await labels_service.effective_labels(
@@ -244,6 +237,31 @@ async def gather(
         "now": now,
     }
     return candidates, policy, context
+
+
+async def _roles_held(
+    session: AsyncSession, user_ids: list[uuid.UUID], *, team_id: uuid.UUID | None
+) -> dict[uuid.UUID, set[str]]:
+    """Global role keys, plus the ones held inside ``team_id``, per person."""
+    held: dict[uuid.UUID, set[str]] = {uid: set() for uid in user_ids}
+    if not user_ids:
+        return held
+    rows = await session.execute(
+        select(UserRole.user_id, Role.key)
+        .join(Role, Role.id == UserRole.role_id)
+        .where(UserRole.user_id.in_(user_ids))
+    )
+    for uid, key in rows.all():
+        held[uid].add(key)
+    if team_id is not None:
+        rows = await session.execute(
+            select(TeamMembership.user_id, Role.key)
+            .join(Role, Role.id == TeamMembership.role_id)
+            .where(TeamMembership.team_id == team_id, TeamMembership.user_id.in_(user_ids))
+        )
+        for uid, key in rows.all():
+            held[uid].add(key)
+    return held
 
 
 def weights_of(policy: AssignmentPolicy) -> dict[str, Decimal]:

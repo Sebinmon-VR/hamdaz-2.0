@@ -184,6 +184,12 @@ class Settings(BaseSettings):
     #: the mirror, so this is the only thing that touches SharePoint on a timer
     #: and its cost is one list read.
     mirror_sync_seconds: int = 120
+    #: How often to ask SharePoint for the list's newest modification time —
+    #: one tiny request — and sync the moment it moves. This is what makes a
+    #: task assigned in SharePoint reach the ranking in seconds rather than at
+    #: the next full sync. The full sync above still runs on its own timer,
+    #: because a deleted row moves nothing.
+    mirror_watch_seconds: int = 10
     #: Off in development and in tests. A background loop that fires against a
     #: live SharePoint list from somebody's laptop is not what anybody meant.
     mirror_sync_enabled: bool = False

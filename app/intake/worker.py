@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select, text
@@ -37,6 +38,7 @@ from app.intake import service as intake_service
 from app.intake.classifier import Classifier
 from app.intake.graph_mail import MailReader
 from app.intake.matcher import Matcher
+from app.models.assignment import AssignmentPolicy
 from app.models.intake import IntakeSettings
 from app.models.team import Team
 from app.proposals import mirror as mirror_service
@@ -105,6 +107,11 @@ class Worker:
         #: Set by the webhook when SharePoint reports the list changed, so the
         #: mirror loop wakes now rather than at the end of its interval.
         self._kick = asyncio.Event()
+        self._kicked = False
+        self._kick_seen = False
+        #: The list's newest Modified stamp as of the last sync, so the watch
+        #: can tell "something changed" from "nothing has".
+        self._seen_modified: str | None = None
 
     # ── lifecycle ──────────────────────────────────────────────────────
 
@@ -150,24 +157,60 @@ class Worker:
         take ten; and because five notifications for one edit should cost one
         sync, which is what a flag does and a call does not.
         """
+        self._kick_seen = True
         self._kick.set()
 
     # ── the mirror ─────────────────────────────────────────────────────
 
     async def _mirror_loop(self) -> None:
+        """Keep the mirror current: on a timer, and the moment the list moves.
+
+        Between full syncs the loop asks SharePoint one small question every
+        few seconds — when did anything in the list last change — and syncs
+        as soon as the answer is new. That is what makes a task assigned in
+        SharePoint reach the ranking, and the published list, in seconds. The
+        full sync keeps its own timer because a deletion moves nothing, and
+        the webhook, where it is reachable, simply wakes this loop early.
+        """
         # A moment before the first run, so start-up is not competing with a
         # list read on a cold connection pool.
         if not await self._sleep(10):
             return
+        last_full = 0.0
         while not self._stopping.is_set():
-            interval = max(30, self._settings.mirror_sync_seconds)
+            wait = max(3, self._settings.mirror_watch_seconds)
             try:
-                await self.sync_once()
+                if not await self._mirror_wanted():
+                    wait = 60
+                else:
+                    full_due = (
+                        time.monotonic() - last_full
+                        >= max(30, self._settings.mirror_sync_seconds)
+                    )
+                    if full_due or self._kicked or await self._list_moved():
+                        self._kicked = False
+                        await self.sync_once()
+                        last_full = time.monotonic()
             except Exception:  # noqa: BLE001 - a loop must not die
                 logger.exception("mirror sync failed")
-                interval = BACKOFF_SECONDS
-            if not await self._sleep(interval, wake=self._kick):
+                wait = BACKOFF_SECONDS
+            if not await self._sleep(wait, wake=self._kick):
                 return
+            if self._kick_seen:
+                self._kick_seen = False
+                self._kicked = True
+
+    async def _list_moved(self) -> bool:
+        """Whether anything in the list changed since the last sync read it."""
+        try:
+            stamp = await self._sharepoint.newest_modified()
+        except SharePointError as exc:
+            logger.debug("could not read the list's newest change: %s", exc)
+            return False
+        if stamp is None or stamp == self._seen_modified:
+            return False
+        logger.info("proposals list moved at %s; syncing", stamp)
+        return True
 
     async def _mirror_wanted(self) -> bool:
         """Whether the mirror should be kept current at all.
@@ -207,6 +250,7 @@ class Worker:
                 logger.warning("mirror sync: %s", report.error)
                 await session.commit()
                 return
+            self._seen_modified = report.newest_modified
             await self._recompute_all(session, reason="mirror")
             # The list is written before the commit on purpose: a publish
             # failure is a warning on the report, never an exception, so the
@@ -243,13 +287,22 @@ class Worker:
         Per team as well as overall because they answer different questions —
         the least loaded person in presales is not the least loaded person in
         the company, and the intake assigns from a team's ranking.
+
+        Only teams with an enabled assignment policy of their own: that is the
+        rule for distributing work at all, and a ranking for a team that does
+        not was several seconds a cycle spent on an answer nobody reads.
         """
-        await live_scores.recompute(session, team=None, reason=reason)
+        counted = await live_scores.counts(session)
+        await live_scores.recompute(session, team=None, reason=reason, counted=counted)
         teams = (
-            await session.scalars(select(Team).where(Team.archived_at.is_(None)))
+            await session.scalars(
+                select(Team)
+                .join(AssignmentPolicy, AssignmentPolicy.team_id == Team.id)
+                .where(AssignmentPolicy.enabled.is_(True), Team.archived_at.is_(None))
+            )
         ).all()
         for team in teams:
-            await live_scores.recompute(session, team=team, reason=reason)
+            await live_scores.recompute(session, team=team, reason=reason, counted=counted)
 
     # ── the mail ───────────────────────────────────────────────────────
 

@@ -127,6 +127,9 @@ def _hash(text_value: str) -> str:
 
 @dataclass(slots=True)
 class SyncReport:
+    #: The newest Modified among the rows read, so the loop that watches the
+    #: list knows what "unchanged since the sync" means.
+    newest_modified: str | None = None
     read: int = 0
     changed: int = 0
     embedded: int = 0
@@ -302,6 +305,9 @@ async def sync(
         return report
 
     report.read = len(tasks)
+    report.newest_modified = max(
+        (t.modified_at for t in tasks if t.modified_at), default=None
+    )
     # Only the two columns the comparison needs: a full row here carries the
     # embedding, and thirteen hundred of those is most of a megabyte for nothing.
     hashes: dict[str, str | None] = dict(
@@ -615,9 +621,20 @@ async def as_tasks(
     from a cheaper source. Recounting it independently would be two
     definitions of somebody's workload, and they would disagree eventually.
     """
+    # Only the columns a count needs. The whole row carries the embedding and
+    # the search text — most of a megabyte across the list, and no part of
+    # anybody's workload — and against a database a hundred milliseconds away
+    # that was the slowest step of every recompute.
+    c = ProposalIndexItem
     rows = (
-        await session.scalars(
-            select(ProposalIndexItem).where(ProposalIndexItem.deleted.is_(False))
+        await session.execute(
+            select(
+                c.item_id, c.title, c.status, c.priority, c.assigned_lookup_id,
+                c.assigned_name, c.assigned_email, c.start_date, c.due_date,
+                c.bid_closing_date, c.end_user, c.submission_status, c.current_type,
+                c.order_status, c.negotiation, c.quote_no, c.remarks, c.working_notes,
+                c.sp_created_at, c.sp_modified_at,
+            ).where(c.deleted.is_(False))
         )
     ).all()
 
