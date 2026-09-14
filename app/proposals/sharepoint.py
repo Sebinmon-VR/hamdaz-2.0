@@ -119,11 +119,19 @@ class ProposalTask:
 
         A row with no status whose bid has *not* yet closed is left alone — that
         one really is outstanding work.
+
+        Judged on the *date*, as ``is_active`` is, and a bid closing today is
+        still live. It used to compare the timestamp with the clock as text,
+        and the same row then read differently from its two sources: SharePoint
+        sends the closing as 19:00 UTC, the mirror keeps the date alone and
+        hands it back as midnight, so from midnight the mirror said "expired"
+        and the list said "live" — one task apart, all day, on the screen
+        against the published ranking.
         """
         if (stored := (self.status or "").strip()):
             return stored
-        closing = self.bid_closing_date or self.due_date
-        if closing and closing < datetime.now(UTC).isoformat():
+        closing = self.closing_date
+        if closing is not None and closing < datetime.now(UTC).date():
             return EXPIRED
         return ""
 

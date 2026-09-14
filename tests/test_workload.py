@@ -319,3 +319,20 @@ async def test_a_scoped_call_reports_the_cache_state() -> None:
     second = await cache.get(stub, only={"15"})
     assert first["cached"] is False and first["fetch_ms"] >= 0
     assert second["cached"] is True and second["fetch_ms"] == 0
+
+
+# ── a bid closing today is live from whichever source the row came ──────
+
+
+def test_a_no_status_bid_closing_today_is_live_whatever_time_it_carries() -> None:
+    """SharePoint sends the closing as 19:00 UTC; the mirror keeps only the date
+    and hands it back as midnight. The same row must read the same either way,
+    or the screen and the published ranking sit one task apart all day."""
+    today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    from_sharepoint = _task(status=None, bcd=today + timedelta(hours=19))
+    from_mirror = _task(status=None, bcd=today)
+    yesterday = _task(status=None, bcd=today - timedelta(days=1))
+
+    assert from_sharepoint.effective_status == from_mirror.effective_status == ""
+    assert from_sharepoint.is_active and from_mirror.is_active
+    assert yesterday.effective_status == "Expired" and not yesterday.is_active
