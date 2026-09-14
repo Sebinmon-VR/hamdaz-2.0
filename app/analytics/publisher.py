@@ -6,12 +6,18 @@ takes the current standing of a team and rewrites one row per person in a
 list on the Test site, so the tools that already read that list — a flow, a
 sheet, a screen — see the same answer the app does.
 
+**The list holds the people who can take work, and nobody else.** Somebody on
+approved leave, a manager, a person over the open-work ceiling — they stay in
+this database with the reason, and the exclusion is applied here. Their row in
+the list is *removed*, not marked, because the tools that read the list take
+every row as a candidate. The day they are back, the row comes back.
+
 Three rules, each because the list is shared:
 
-* **Rows are matched by name and rewritten, never deleted.** The list is keyed
-  by ``Username`` and other things may have added rows to it. Somebody who
-  leaves the team keeps their row; it just stops being updated. A row that was
-  never ours is never touched.
+* **Rows are matched by name.** The list is keyed by ``Username`` and other
+  things may have added rows to it. A row is only ever removed for a person
+  this app scored and found ineligible; somebody who was never a candidate
+  here — not on the team, not known to this app — is never touched.
 * **A row that has not changed is not written.** Every write bumps
   ``Modified`` on a row other tools sort by, and the live standing is
   recomputed every minute. Comparing before writing is what keeps the list's
@@ -26,16 +32,17 @@ The columns are the list's, not ours, and were there before this module:
 =================  ============================================================
 ``Title``          The person's name — the list's own key column.
 ``Username``       The same name. Existing rows are matched on this first.
-``Priority``       **1 is next.** 0 means not in the queue at all — on leave,
-                   a manager, or over the open-work ceiling.
+``Priority``       **1 is next.** Always 1 or more: a person with no place in
+                   the queue has no row.
 ``ActiveTasks``    Open rows whose bid has not closed. What the score is
                    built on.
-``jobcount``       Every open row, closed bids included.
 ``RecentDate``     When they were last given work — the newest row assigned
                    to them.
-``Leave``          ``Yes`` with the return date while on approved leave,
-                   otherwise ``No``.
 ``Jobs``           The team, then the labels they hold, comma-separated.
+``Leave``          Not written. Leave is a reason to have no row, not a
+                   column; the reason itself stays in this database.
+``jobcount``       Not written. The active count is the one the score is
+                   built on, and two counts side by side get compared.
 ``swapcounter``    Not written. Left for whatever set it.
 =================  ============================================================
 """
@@ -43,7 +50,7 @@ The columns are the list's, not ours, and were there before this module:
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from typing import Any
@@ -63,9 +70,7 @@ COLUMNS: tuple[str, ...] = (
     "Username",
     "Priority",
     "ActiveTasks",
-    "jobcount",
     "RecentDate",
-    "Leave",
     "Jobs",
 )
 
@@ -79,13 +84,17 @@ class Standing:
     """
 
     display_name: str
+    #: 1 is next. 0 means not in the queue, and therefore no row.
     rank: int
     active_tasks: int
     open_tasks: int
     last_assigned: date | None
     labels: list[str]
     team: str | None
-    on_leave_until: str | None = None
+
+    @property
+    def eligible(self) -> bool:
+        return self.rank > 0
 
 
 @dataclass(slots=True)
@@ -93,24 +102,18 @@ class PublishReport:
     created: int = 0
     updated: int = 0
     unchanged: int = 0
+    #: Rows taken out because the person is no longer assignable.
+    removed: int = 0
     names: list[str] = field(default_factory=list)
     error: str | None = None
     reason: str = ""
 
     @property
     def written(self) -> int:
-        return self.created + self.updated
+        return self.created + self.updated + self.removed
 
 
 # ── building standings ─────────────────────────────────────────────────
-
-
-def _leave_until(labels: Iterable[str], reason: str | None) -> str | None:
-    if "on-leave" not in set(labels):
-        return None
-    # "On approved leave until 2026-09-30" — keep the date, drop the prose.
-    text = reason or ""
-    return text.rsplit(" ", 1)[-1] if "until" in text else "yes"
 
 
 def from_live(rows: Sequence[LiveScore], *, team: str | None) -> list[Standing]:
@@ -132,7 +135,6 @@ def from_live(rows: Sequence[LiveScore], *, team: str | None) -> list[Standing]:
                 last_assigned=last,
                 labels=labels,
                 team=team,
-                on_leave_until=_leave_until(labels, row.excluded_reason),
             )
         )
     return out
@@ -163,7 +165,6 @@ def from_run(record: AnalyticsRun, *, team: str | None = None) -> list[Standing]
                 ),
                 labels=labels,
                 team=team,
-                on_leave_until=_leave_until(labels, entry.excluded_reason),
             )
         )
     return out
@@ -181,16 +182,10 @@ def fields_for(standing: Standing) -> dict[str, Any]:
         "Username": standing.display_name,
         "Priority": standing.rank,
         "ActiveTasks": standing.active_tasks,
-        "jobcount": standing.open_tasks,
         "RecentDate": (
             f"{standing.last_assigned:%Y-%m-%d}T00:00:00Z"
             if standing.last_assigned
             else None
-        ),
-        "Leave": (
-            f"Yes, until {standing.on_leave_until}"
-            if standing.on_leave_until and standing.on_leave_until != "yes"
-            else ("Yes" if standing.on_leave_until else "No")
         ),
         "Jobs": ", ".join(jobs),
     }
@@ -276,9 +271,17 @@ class Publisher:
                     by_name[key] = item
 
         for standing in standings:
-            wanted = fields_for(standing)
             found = by_name.get(_key(standing.display_name))
             try:
+                if not standing.eligible:
+                    # Out of the queue, out of the list. The reason stays
+                    # in this database, where the exclusion is applied.
+                    if found is not None:
+                        await self._sharepoint.delete_item(site, lst, str(found["id"]))
+                        report.removed += 1
+                        report.names.append(standing.display_name)
+                    continue
+                wanted = fields_for(standing)
                 if found is None:
                     await self._sharepoint.create_item(site, lst, wanted)
                     report.created += 1
@@ -295,8 +298,8 @@ class Publisher:
                 logger.warning("publish: %s", report.error)
 
         logger.info(
-            "publish(%s): created=%d updated=%d unchanged=%d%s",
-            reason, report.created, report.updated, report.unchanged,
+            "publish(%s): created=%d updated=%d removed=%d unchanged=%d%s",
+            reason, report.created, report.updated, report.removed, report.unchanged,
             f" error={report.error}" if report.error else "",
         )
         return report

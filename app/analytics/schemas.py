@@ -78,7 +78,10 @@ class PublishOut(BaseModel):
     updated: int
     #: Rows that already said this. Not written, so ``Modified`` is untouched.
     unchanged: int
-    #: Who was written, created and updated together.
+    #: Rows taken out: the person is no longer assignable (on leave, a
+    #: manager, at the ceiling). The reason stays in this database.
+    removed: int
+    #: Who was written: created, updated and removed together.
     names: list[str]
     error: str | None = None
 

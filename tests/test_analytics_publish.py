@@ -4,8 +4,8 @@ No database and no SharePoint: the client runs against a recording transport,
 so every test can say exactly which rows were written and — more importantly —
 which were not. The rules under test are the ones that protect a shared list:
 a row that has not changed is not touched, a row we did not make is matched by
-name and rewritten rather than duplicated, nothing is ever deleted, and the
-switch being off means no request at all.
+name and rewritten rather than duplicated, only an excluded candidate's row is
+ever removed, and the switch being off means no request at all.
 """
 
 from __future__ import annotations
@@ -71,7 +71,7 @@ class ListStub:
             self.updated.append((item_id, json.loads(request.content)))
             return httpx.Response(200, json={})
         if request.method == "DELETE":
-            self.deleted.append(url)
+            self.deleted.append(url.rsplit("/", 1)[1])
             return httpx.Response(204)
         return httpx.Response(404)
 
@@ -110,27 +110,22 @@ def test_a_row_says_who_is_next_in_the_lists_own_columns() -> None:
     assert fields["Title"] == fields["Username"] == "Jasna"
     assert fields["Priority"] == 1
     assert fields["ActiveTasks"] == 3
-    assert fields["jobcount"] == 5
     assert fields["RecentDate"] == "2026-09-11T00:00:00Z"
-    assert fields["Leave"] == "No"
     assert fields["Jobs"] == "presales"
 
 
-def test_somebody_on_leave_is_out_of_the_queue_with_the_return_date() -> None:
-    fields = fields_for(
-        who("Feba", rank=0, labels=["on-leave"], on_leave_until="2026-09-30")
-    )
-    assert fields["Priority"] == 0
-    assert fields["Leave"] == "Yes, until 2026-09-30"
-    assert fields["Jobs"] == "presales, on-leave"
+def test_leave_is_not_a_column() -> None:
+    assert "Leave" not in fields_for(who("Anyone"))
+    assert not who("Feba", rank=0, labels=["on-leave"]).eligible
 
 
 def test_never_assigned_has_no_recent_date() -> None:
     assert fields_for(who("New", last_assigned=None))["RecentDate"] is None
 
 
-def test_swapcounter_is_never_ours() -> None:
+def test_swapcounter_and_jobcount_are_never_ours() -> None:
     assert "swapcounter" not in fields_for(who("Anyone"))
+    assert "jobcount" not in fields_for(who("Anyone"))
 
 
 # ── change detection ───────────────────────────────────────────────────
@@ -142,7 +137,6 @@ def test_graph_floats_and_sharepoint_times_still_count_as_the_same() -> None:
         **wanted,
         "Priority": 1.0,
         "ActiveTasks": 3.0,
-        "jobcount": 5.0,
         "RecentDate": "2026-09-11T07:00:00Z",
     }
     assert _same(have, wanted)
@@ -155,7 +149,7 @@ def test_a_moved_rank_is_a_change() -> None:
 
 def test_a_missing_column_is_a_change() -> None:
     wanted = fields_for(who("Jasna"))
-    have = {k: v for k, v in wanted.items() if k != "Leave"}
+    have = {k: v for k, v in wanted.items() if k != "Jobs"}
     assert not _same(have, wanted)
 
 
@@ -212,6 +206,25 @@ async def test_a_duplicate_row_is_left_exactly_as_it_was() -> None:
     )
     await stub.publisher().publish([who("Jasna")])
     assert [item_id for item_id, _ in stub.updated] == ["1"]
+
+
+@pytest.mark.asyncio
+async def test_somebody_on_leave_has_no_row() -> None:
+    stub = ListStub([row("352", Username="Feba", Priority=2.0)])
+    report = await stub.publisher().publish(
+        [who("Jasna", rank=1), who("Feba", rank=0, labels=["on-leave"])]
+    )
+    assert stub.deleted == ["352"]
+    assert report.removed == 1 and "Feba" in report.names
+    assert not any(f["Username"] == "Feba" for f in stub.created)
+
+
+@pytest.mark.asyncio
+async def test_an_excluded_person_with_no_row_gets_none() -> None:
+    stub = ListStub()
+    report = await stub.publisher().publish([who("Sebin", rank=0)])
+    assert not stub.created and not stub.deleted
+    assert report.written == 0 and report.unchanged == 0
 
 
 @pytest.mark.asyncio

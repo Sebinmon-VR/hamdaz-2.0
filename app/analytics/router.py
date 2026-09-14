@@ -78,6 +78,7 @@ def _publish_out(
         created=report.created,
         updated=report.updated,
         unchanged=report.unchanged,
+        removed=report.removed,
         names=report.names,
         error=report.error,
     )

@@ -576,6 +576,19 @@ class SharePointProposals:
             )
         return response.json()
 
+    async def delete_item(self, site_id: str, list_id: str, item_id: str) -> None:
+        """Remove one item. Already gone counts as done."""
+        token = await self._access_token()
+        response = await self._http.delete(
+            f"{GRAPH_BASE}/sites/{site_id}/lists/{list_id}/items/{int(item_id)}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        if response.status_code not in (200, 204, 404):
+            raise SharePointError(
+                f"SharePoint refused the delete ({response.status_code}): "
+                f"{response.text[:300]}"
+            )
+
     async def subscribe_list(
         self, site_id: str, list_id: str, *, notification_url: str, secret: str
     ) -> dict[str, Any]:
