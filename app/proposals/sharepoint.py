@@ -20,7 +20,7 @@ import base64
 import json
 import time
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Final
 from urllib.parse import quote
 
@@ -41,6 +41,9 @@ _MAX_PAGES: Final = 25
 #: AssignedToLookupId is not an indexed column, so SharePoint requires this
 #: acknowledgement before it will filter on it.
 _NON_INDEXED: Final = {"Prefer": "HonorNonIndexedQueriesWarningMayFailRandomly"}
+#: Graph allows list subscriptions up to 30 days; a little under, so a renewal
+#: a day late is still inside the window.
+LIST_SUBSCRIPTION_DAYS: Final = 28
 
 #: Statuses that mean the work is finished. "My tasks" means the rest.
 DONE_STATUSES: Final = frozenset({"completed"})
@@ -485,9 +488,9 @@ class SharePointProposals:
         return await self.task(item_id)
 
     async def create_task(self, fields: dict[str, Any]) -> ProposalTask:
-        """Add a row to the Proposals list. **The only write this app makes.**
+        """Add a row to the Proposals list. **The only write to this list.**
 
-        Everything else here reads. This exists for the mail intake, which
+        Everything else on the Proposals list reads. This exists for the mail intake, which
         raises a task when a tender arrives that is not already in the list —
         and it is called from exactly one place, behind a setting that ships
         off, because the list is live and the team works in it.
@@ -513,6 +516,110 @@ class SharePointProposals:
         # defaults and calculated columns, and the row we hand back should be
         # the row that exists.
         return await self.task(str(created.get("id")))
+
+    # ── any other list, by id ──────────────────────────────────────────
+    #
+    # The Proposals list is the team's working list and is read here; these
+    # three exist for lists this app *owns* — the priority-score list on the
+    # Test site — where rewriting a row is the point. Site and list are
+    # explicit arguments rather than settings, so a reader of the call site
+    # can see which list is being written without opening the config.
+
+    async def items_of(
+        self, site_id: str, list_id: str, *, select: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Every item of a list, ``{"id": ..., "fields": {...}}`` each."""
+        url: str | None = f"{GRAPH_BASE}/sites/{site_id}/lists/{list_id}/items"
+        params: dict[str, str] | None = {
+            "$expand": f"fields($select={select})" if select else "fields",
+            "$top": str(_PAGE_SIZE),
+        }
+        items: list[dict[str, Any]] = []
+        for _ in range(_MAX_PAGES):
+            if url is None:
+                break
+            payload = await self._get(url, params)
+            items.extend(payload.get("value", []))
+            url = payload.get("@odata.nextLink")
+            params = None
+        return items
+
+    async def create_item(
+        self, site_id: str, list_id: str, fields: dict[str, Any]
+    ) -> dict[str, Any]:
+        token = await self._access_token()
+        response = await self._http.post(
+            f"{GRAPH_BASE}/sites/{site_id}/lists/{list_id}/items",
+            json={"fields": fields},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        if response.status_code not in (200, 201):
+            raise SharePointError(
+                f"SharePoint refused the new item ({response.status_code}): "
+                f"{response.text[:300]}"
+            )
+        return response.json()
+
+    async def update_item(
+        self, site_id: str, list_id: str, item_id: str, fields: dict[str, Any]
+    ) -> dict[str, Any]:
+        token = await self._access_token()
+        response = await self._http.patch(
+            f"{GRAPH_BASE}/sites/{site_id}/lists/{list_id}/items/{int(item_id)}/fields",
+            json=fields,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        if response.status_code != 200:
+            raise SharePointError(
+                f"SharePoint refused the update ({response.status_code}): "
+                f"{response.text[:300]}"
+            )
+        return response.json()
+
+    async def subscribe_list(
+        self, site_id: str, list_id: str, *, notification_url: str, secret: str
+    ) -> dict[str, Any]:
+        """Ask Graph to post to us when any item in a list changes.
+
+        Same validation handshake as the mail subscription: Graph posts a token
+        to the URL first and refuses to create anything it cannot reach. List
+        subscriptions last up to thirty days and only carry the list id, not
+        which item moved — so the handler re-reads the list rather than trying
+        to be clever.
+        """
+        token = await self._access_token()
+        expires = datetime.now(UTC) + timedelta(days=LIST_SUBSCRIPTION_DAYS)
+        response = await self._http.post(
+            f"{GRAPH_BASE}/subscriptions",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "changeType": "updated",
+                "notificationUrl": notification_url,
+                "resource": f"/sites/{site_id}/lists/{list_id}",
+                "expirationDateTime": f"{expires:%Y-%m-%dT%H:%M:%S.0000000Z}",
+                "clientState": secret,
+            },
+        )
+        if response.status_code >= 400:
+            raise SharePointError(
+                f"Graph refused the list subscription ({response.status_code}): "
+                f"{response.text[:300]}"
+            )
+        return response.json()
+
+    async def renew_subscription(self, subscription_id: str) -> dict[str, Any]:
+        token = await self._access_token()
+        expires = datetime.now(UTC) + timedelta(days=LIST_SUBSCRIPTION_DAYS)
+        response = await self._http.patch(
+            f"{GRAPH_BASE}/subscriptions/{subscription_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"expirationDateTime": f"{expires:%Y-%m-%dT%H:%M:%S.0000000Z}"},
+        )
+        if response.status_code >= 400:
+            raise SharePointError(
+                f"Could not renew the list subscription ({response.status_code})"
+            )
+        return response.json()
 
     async def _get(self, url: str, params: dict[str, str] | None = None, **extra) -> dict:
         token = await self._access_token()

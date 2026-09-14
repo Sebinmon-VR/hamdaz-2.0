@@ -22,12 +22,13 @@ import hashlib
 import logging
 import re
 import time
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
-from typing import Any, Iterable, Sequence
+from typing import Any
 
-from sqlalchemy import func, or_, select
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy import cast, func, literal_column, or_, select
+from sqlalchemy.dialects.postgresql import REGCONFIG, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.proposal_index import MirrorState, ProposalIndexItem
@@ -235,9 +236,17 @@ def _vector_expression(task: ProposalTask):
     application rather than as a generated column so the weighting is visible
     here and changeable without a migration.
     """
+    # Both constants are typed explicitly. SQLAlchemy's psycopg dialect renders
+    # a plain string bind as ``'english'::VARCHAR``, and Postgres has no
+    # ``to_tsvector(varchar, ...)`` nor ``setweight(tsvector, varchar)`` — the
+    # sync failed on the first row with "function does not exist" until it did.
     def w(value: str | None, weight: str):
+        assert weight in ("A", "B", "C", "D")
         return func.setweight(
-            func.to_tsvector("english", func.coalesce(value or "", "")), weight
+            func.to_tsvector(
+                cast("english", REGCONFIG), func.coalesce(value or "", "")
+            ),
+            literal_column(f"'{weight}'"),
         )
 
     return (
@@ -497,7 +506,7 @@ async def candidates(
 
     words = (query_text or "").strip()
     if words:
-        query = func.websearch_to_tsquery("english", words)
+        query = func.websearch_to_tsquery(cast("english", REGCONFIG), words)
         rank = func.ts_rank(ProposalIndexItem.search_vector, query)
         statement = (
             select(ProposalIndexItem, rank.label("rank"))

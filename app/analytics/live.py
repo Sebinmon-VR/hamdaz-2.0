@@ -23,9 +23,9 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Iterable
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -121,6 +121,7 @@ async def _replace(
             rank=result.priority or 0,
             eligible=not result.excluded,
             excluded_reason=result.excluded_reason,
+            labels=sorted(person.labels),
             factors=result.factors or {},
             reason=reason,
             computed_at=now,

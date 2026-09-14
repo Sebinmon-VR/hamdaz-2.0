@@ -4,9 +4,11 @@ Where the numbers come from and go:
 
 * **in** — task counts read live from the SharePoint Proposals list on every
   call. Read-only, every request a GET.
-* **out** — Postgres. **Nothing is written to SharePoint.** The
-  ``testuseranalytics`` list is live and this module does not touch it;
-  publishing there is a separate decision for later.
+* **out** — Postgres, and, when ``ANALYTICS_PUBLISH_ENABLED`` is set, the
+  ``useranalytics`` list on the Test site: one row per person, rewritten by
+  ``/publish``, by a kept run, and by the background loop whenever the live
+  standing moves. See ``app.analytics.publisher``. The Proposals list itself
+  is never written from here.
 
 Two endpoints do the work, and the split matters. ``/preview`` computes a
 ranking and keeps nothing — that is the common case, and a history full of
@@ -24,10 +26,12 @@ import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.analytics import service
-from app.analytics.schemas import EntryOut, RunIn, RunOut, RunSummaryOut
+from app.analytics import live, service
+from app.analytics import publisher as publishing
+from app.analytics.schemas import EntryOut, PublishOut, RunIn, RunOut, RunSummaryOut
 from app.analytics.service import (
     AnalyticsError,
     AnalyticsNotFoundError,
@@ -35,8 +39,10 @@ from app.analytics.service import (
 )
 from app.assignment import service as policy_service
 from app.auth.deps import CurrentUser
+from app.core.config import Settings, get_settings
 from app.core.db import get_session
 from app.models.analytics import AnalyticsRun
+from app.models.proposal_index import ProposalIndexItem
 from app.models.team import Team
 from app.proposals.analytics import WorkloadCache
 from app.proposals.sharepoint import SharePointProposals
@@ -59,6 +65,22 @@ def get_cache(request: Request) -> WorkloadCache:
 
 SharePoint = Annotated[SharePointProposals, Depends(get_sharepoint)]
 Cache = Annotated[WorkloadCache, Depends(get_cache)]
+Config = Annotated[Settings, Depends(get_settings)]
+
+
+def _publish_out(
+    report: publishing.PublishReport, publisher: publishing.Publisher
+) -> PublishOut:
+    return PublishOut(
+        enabled=publisher.enabled,
+        list_url=publisher.list_url,
+        reason=report.reason,
+        created=report.created,
+        updated=report.updated,
+        unchanged=report.unchanged,
+        names=report.names,
+        error=report.error,
+    )
 
 
 def _translate(exc: AnalyticsError) -> HTTPException:
@@ -154,6 +176,7 @@ async def create_run(
     session: Session,
     sharepoint: SharePoint,
     cache: Cache,
+    config: Config,
     team: Annotated[str, Query(description="Team handle. Required.")],
 ) -> RunOut:
     """Store the ranking as the record of a decision.
@@ -191,7 +214,78 @@ async def create_run(
         )
     except AnalyticsError as exc:
         raise _translate(exc) from exc
-    return _out(record)
+
+    # A kept run is a decision, and the list is where the decision is read
+    # from. The report is on the response rather than raised: the run is
+    # stored either way, and a list that could not be reached is not a
+    # reason to lose the record of what was decided.
+    publisher = publishing.Publisher(config, sharepoint)
+    body = _out(record)
+    if publisher.enabled:
+        body.published = _publish_out(
+            await publisher.publish(
+                publishing.from_run(record, team=resolved.slug), reason="saved-run"
+            ),
+            publisher,
+        )
+    return body
+
+
+@router.post(
+    "/publish",
+    response_model=PublishOut,
+    summary="Write the live standing to the useranalytics list now",
+)
+async def publish_now(
+    user: CurrentUser,
+    roles: CurrentRoles,
+    session: Session,
+    sharepoint: SharePoint,
+    config: Config,
+    team: Annotated[str, Query(description="Team handle. Required.")],
+) -> PublishOut:
+    """Recompute the team's live standing from the mirror and push it.
+
+    The background loop does this on its own after every sync. This is for
+    the person who wants the list right *now* and does not want to wait a
+    minute, and for checking that publishing works at all. Same permission
+    as keeping a run: the list is read by other tools, so it should not be
+    rewritten by anyone who happens to look.
+    """
+    resolved = await _team(session, team)
+    try:
+        await service.in_scope(session, resolved)
+        await policy_service.require_edit(
+            session, user=user, roles=roles, team_id=resolved.id
+        )
+    except policy_service.PolicyError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+    except AnalyticsError as exc:
+        raise _translate(exc) from exc
+
+    publisher = publishing.Publisher(config, sharepoint)
+    if not publisher.enabled:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Publishing is off. Set ANALYTICS_PUBLISH_ENABLED=true and restart.",
+        )
+    mirrored = await session.scalar(
+        select(func.count())
+        .select_from(ProposalIndexItem)
+        .where(ProposalIndexItem.deleted.is_(False))
+    )
+    if not mirrored:
+        # An empty mirror would rank everybody at zero work and publish that.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "The Proposals mirror has never synced, so there is no live "
+                "standing to publish. Run POST /intake/mirror/sync first."
+            ),
+        )
+    await live.recompute(session, team=resolved, reason="publish")
+    report = await publishing.publish_team(session, publisher, resolved, reason="publish")
+    return _publish_out(report, publisher)
 
 
 # ── history ────────────────────────────────────────────────────────────

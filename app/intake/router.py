@@ -9,9 +9,10 @@ validation token and by checking the secret we gave Graph when we subscribed.
 
 from __future__ import annotations
 
+import contextlib
 import secrets
 import uuid
-from datetime import UTC, date, datetime, timedelta
+from datetime import datetime
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
@@ -36,6 +37,7 @@ from app.models.intake import IntakeMessage, IntakeStatus
 from app.models.proposal_index import MirrorState, ProposalIndexItem
 from app.models.team import Team
 from app.models.user import User
+from app.proposals import mirror as mirror_service
 from app.roles.catalogue import SUPER_ADMIN
 from app.roles.deps import CurrentRoles
 from app.teams import service as teams_service
@@ -238,7 +240,9 @@ async def retry_message(
 
 
 @router.get("/mirror", response_model=MirrorStatusOut, summary="Is the local copy current")
-async def mirror_status(admin: SuperAdmin, session: Session) -> MirrorStatusOut:
+async def mirror_status(
+    admin: SuperAdmin, session: Session, config: Config
+) -> MirrorStatusOut:
     state = await session.get(MirrorState, 1)
     rows = int(
         await session.scalar(
@@ -268,6 +272,10 @@ async def mirror_status(admin: SuperAdmin, session: Session) -> MirrorStatusOut:
         rows_embedded=state.rows_embedded if state else 0,
         duration_ms=state.duration_ms if state else 0,
         last_error=state.last_error if state else None,
+        subscription_id=state.subscription_id if state else None,
+        subscription_expires_at=state.subscription_expires_at if state else None,
+        publish_enabled=config.analytics_publish_enabled,
+        publish_list_url=config.analytics_list_url,
     )
 
 
@@ -285,7 +293,63 @@ async def sync_mirror(
     # Forced: somebody asked explicitly, so a background flag being off
     # is not a reason to refuse them.
     await _worker(request).sync_once(embed=embed, force=True)
-    return await mirror_status(admin, session)
+    return await mirror_status(admin, session, get_settings())
+
+
+@router.post(
+    "/mirror/subscription",
+    response_model=MirrorStatusOut,
+    summary="Ask Graph to tell us when the Proposals list changes",
+)
+async def subscribe_to_list(
+    request: Request, admin: SuperAdmin, session: Session, config: Config
+) -> MirrorStatusOut:
+    """Make a row edited in SharePoint reach the ranking in seconds.
+
+    Without this the mirror refreshes on its timer, so a task assigned by hand
+    in SharePoint is scored up to ``MIRROR_SYNC_SECONDS`` later. With it, Graph
+    posts to the webhook below as soon as the list changes and the loop wakes
+    at once. The timer keeps running either way — it is the safety net.
+
+    Graph validates the address first, so this refuses outright when the app
+    is not reachable over https from the internet. That is the honest outcome
+    and it is why this is a button and not something that runs at start-up.
+    """
+    base = (config.public_base_url or str(request.base_url)).rstrip("/")
+    if not base.startswith("https://"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Graph will only post to an https address it can reach. Set "
+                "PUBLIC_BASE_URL to this app's public URL."
+            ),
+        )
+    secret = secrets.token_urlsafe(24)
+    sharepoint = request.app.state.sharepoint
+    try:
+        created = await sharepoint.subscribe_list(
+            config.sharepoint_site_id,
+            config.sharepoint_proposals_list_id,
+            notification_url=f"{base}{config.api_prefix}/intake/notifications",
+            secret=secret,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)
+        ) from exc
+
+    state = await mirror_service.state(session)
+    state.subscription_id = created.get("id")
+    state.subscription_secret = secret
+    expires = created.get("expirationDateTime")
+    state.subscription_expires_at = None
+    if expires:
+        with contextlib.suppress(ValueError):
+            state.subscription_expires_at = datetime.fromisoformat(
+                str(expires).replace("Z", "+00:00")
+            )
+    await session.commit()
+    return await mirror_status(admin, session, config)
 
 
 @router.get(
@@ -365,14 +429,24 @@ async def graph_notification(
     except Exception:  # noqa: BLE001 - malformed is simply ignored
         return Response(status_code=status.HTTP_202_ACCEPTED)
 
-    intake = await service.get_settings(session)
-    expected = intake.subscription_secret
     worker = getattr(request.app.state, "intake_worker", None)
-    if worker is None or not intake.enabled:
+    if worker is None:
         return Response(status_code=status.HTTP_202_ACCEPTED)
 
+    intake = await service.get_settings(session)
+    mirror = await mirror_service.state(session)
+    expected = intake.subscription_secret
+    list_secret = mirror.subscription_secret
+
     for item in payload.get("value", []) or []:
-        if expected and item.get("clientState") != expected:
+        state_token = item.get("clientState")
+        # Two subscriptions post here and each carries its own secret. A list
+        # notification says only "the list changed", never which row, so the
+        # answer is to wake the mirror loop, which re-reads the whole list.
+        if list_secret and state_token == list_secret:
+            worker.kick()
+            continue
+        if not intake.enabled or (expected and state_token != expected):
             continue
         resource = str(item.get("resourceData", {}).get("id") or "")
         if resource:

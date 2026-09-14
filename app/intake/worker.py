@@ -11,8 +11,9 @@ Two jobs on two timers, both in-process:
 **Only one instance runs each loop.** On App Service there is usually more than
 one, and two copies of the mail loop would read the same inbox and race each
 other into the same work. A Postgres advisory lock settles it: whoever takes it
-runs, everybody else sleeps and tries again later, and a lock dies with the
-connection so a crashed instance releases it without anybody intervening.
+runs, everybody else sleeps and tries again later, and the lock is released by
+the commit or rollback that ends the work, so a crashed instance releases it
+without anybody intervening.
 
 Both loops are deliberately hard to notice. They log at debug when nothing
 happened, they never raise into the event loop, and an error leaves the last
@@ -24,12 +25,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.analytics import live as live_scores
+from app.analytics import publisher as publishing
 from app.core.config import Settings
 from app.intake import service as intake_service
 from app.intake.classifier import Classifier
@@ -37,8 +39,9 @@ from app.intake.graph_mail import MailReader
 from app.intake.matcher import Matcher
 from app.models.intake import IntakeSettings
 from app.models.team import Team
+from app.proposals import mirror as mirror_service
 from app.proposals.mirror import Embedder, MirrorSync
-from app.proposals.sharepoint import SharePointProposals
+from app.proposals.sharepoint import SharePointError, SharePointProposals
 
 logger = logging.getLogger("hamdaz.intake.worker")
 
@@ -46,6 +49,9 @@ logger = logging.getLogger("hamdaz.intake.worker")
 #: the two loops do not block each other and neither blocks anything else.
 MIRROR_LOCK = 812_401
 MAIL_LOCK = 812_402
+
+#: A list subscription this close to expiry is renewed at the next sync.
+RENEW_WITHIN = timedelta(days=2)
 
 #: How long a failed loop waits before trying again. Longer than the normal
 #: interval on purpose: whatever broke — SharePoint, Graph, a model — is not
@@ -56,16 +62,20 @@ BACKOFF_SECONDS = 300
 async def _take_lock(session: AsyncSession, key: int) -> bool:
     """Try to become the instance that runs this loop.
 
-    Session-scoped rather than transactional, so it is held for as long as the
-    work takes and released when the connection goes — which is what makes a
-    crashed instance recover without anybody noticing.
+    Transaction-scoped on purpose. Each loop does its work inside the one
+    transaction it opens here and ends with a commit, so the lock lasts exactly
+    as long as the work and goes away with it — on commit, on rollback, or when
+    a crashed instance's connection is dropped.
+
+    The session-scoped variant was used before and leaked: a connection here
+    comes from a pool, so after the commit the session hands it back and the
+    unlock runs on whichever connection it is given next. The lock stayed on
+    the first one, every later attempt saw "another instance holds it", and the
+    mirror quietly stopped refreshing. An error was worse still, because the
+    unlock then ran inside the aborted transaction and buried the real failure.
     """
-    got = await session.scalar(text("SELECT pg_try_advisory_lock(:k)"), {"k": key})
+    got = await session.scalar(text("SELECT pg_try_advisory_xact_lock(:k)"), {"k": key})
     return bool(got)
-
-
-async def _release(session: AsyncSession, key: int) -> None:
-    await session.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": key})
 
 
 class Worker:
@@ -89,8 +99,12 @@ class Worker:
         self._classifier = Classifier(settings)
         self._matcher = Matcher(settings, self._embedder)
         self._mirror = MirrorSync()
+        self._publisher = publishing.Publisher(settings, sharepoint)
         self._tasks: set[asyncio.Task] = set()
         self._stopping = asyncio.Event()
+        #: Set by the webhook when SharePoint reports the list changed, so the
+        #: mirror loop wakes now rather than at the end of its interval.
+        self._kick = asyncio.Event()
 
     # ── lifecycle ──────────────────────────────────────────────────────
 
@@ -114,13 +128,29 @@ class Worker:
                 pass
         self._tasks.clear()
 
-    async def _sleep(self, seconds: float) -> bool:
-        """Wait, or wake early on shutdown. False means stop."""
+    async def _sleep(self, seconds: float, *, wake: asyncio.Event | None = None) -> bool:
+        """Wait, or wake early on shutdown — or on ``wake``. False means stop."""
+        waiters = [asyncio.ensure_future(self._stopping.wait())]
+        if wake is not None:
+            waiters.append(asyncio.ensure_future(wake.wait()))
         try:
-            await asyncio.wait_for(self._stopping.wait(), timeout=seconds)
-        except TimeoutError:
-            return True
-        return False
+            await asyncio.wait(waiters, timeout=seconds, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for waiter in waiters:
+                waiter.cancel()
+        if wake is not None:
+            wake.clear()
+        return not self._stopping.is_set()
+
+    def kick(self) -> None:
+        """Sync at the next opportunity rather than at the next tick.
+
+        Called by the webhook. It sets a flag rather than running the sync,
+        because Graph gives a notification thirty seconds and a list read can
+        take ten; and because five notifications for one edit should cost one
+        sync, which is what a flag does and a call does not.
+        """
+        self._kick.set()
 
     # ── the mirror ─────────────────────────────────────────────────────
 
@@ -136,7 +166,7 @@ class Worker:
             except Exception:  # noqa: BLE001 - a loop must not die
                 logger.exception("mirror sync failed")
                 interval = BACKOFF_SECONDS
-            if not await self._sleep(interval):
+            if not await self._sleep(interval, wake=self._kick):
                 return
 
     async def _mirror_wanted(self) -> bool:
@@ -170,22 +200,42 @@ class Worker:
             if not await _take_lock(session, MIRROR_LOCK):
                 logger.debug("another instance holds the mirror lock")
                 return
-            try:
-                report = await self._mirror.run(
-                    session, self._sharepoint, self._embedder, embed=embed
-                )
-                if report.error:
-                    logger.warning("mirror sync: %s", report.error)
-                    await session.commit()
-                    return
-                await self._recompute_all(session, reason="mirror")
+            report = await self._mirror.run(
+                session, self._sharepoint, self._embedder, embed=embed
+            )
+            if report.error:
+                logger.warning("mirror sync: %s", report.error)
                 await session.commit()
-                logger.debug(
-                    "mirror: read=%d changed=%d embedded=%d in %dms",
-                    report.read, report.changed, report.embedded, report.duration_ms,
-                )
-            finally:
-                await _release(session, MIRROR_LOCK)
+                return
+            await self._recompute_all(session, reason="mirror")
+            # The list is written before the commit on purpose: a publish
+            # failure is a warning on the report, never an exception, so the
+            # ranking still lands here even when the list is unreachable.
+            await publishing.publish_live(session, self._publisher, reason="mirror")
+            await self._renew_subscription(session)
+            await session.commit()
+            logger.debug(
+                "mirror: read=%d changed=%d embedded=%d in %dms",
+                report.read, report.changed, report.embedded, report.duration_ms,
+            )
+
+    async def _renew_subscription(self, session: AsyncSession) -> None:
+        """Push the list subscription's expiry out before Graph drops it."""
+        state = await mirror_service.state(session)
+        if not state.subscription_id or state.subscription_expires_at is None:
+            return
+        if state.subscription_expires_at - datetime.now(UTC) > RENEW_WITHIN:
+            return
+        try:
+            renewed = await self._sharepoint.renew_subscription(state.subscription_id)
+        except SharePointError as exc:
+            logger.warning("list subscription not renewed: %s", exc)
+            return
+        expires = renewed.get("expirationDateTime")
+        if expires:
+            state.subscription_expires_at = datetime.fromisoformat(
+                str(expires).replace("Z", "+00:00")
+            )
 
     async def _recompute_all(self, session: AsyncSession, *, reason: str) -> None:
         """The organisation-wide ranking, and one per team that has a policy.
@@ -234,11 +284,8 @@ class Worker:
                 logger.debug("another instance holds the mail lock")
                 await session.commit()
                 return interval
-            try:
-                await self._drain(session, intake)
-                await session.commit()
-            finally:
-                await _release(session, MAIL_LOCK)
+            await self._drain(session, intake)
+            await session.commit()
             return interval
 
     async def _drain(self, session: AsyncSession, intake: IntakeSettings) -> None:
@@ -325,6 +372,10 @@ class Worker:
     @property
     def last_sync(self):
         return self._mirror.last
+
+    @property
+    def publisher(self) -> publishing.Publisher:
+        return self._publisher
 
     @property
     def embedder(self) -> Embedder:

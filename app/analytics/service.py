@@ -3,8 +3,9 @@
 Where each input comes from:
 
 * **task counts** — read live from the SharePoint Proposals list on every run.
-  Read-only, every call a GET. Nothing is written to SharePoint, and the
-  ``testuseranalytics`` list is not touched at all; results are kept in Postgres.
+  Read-only, every call a GET. Results are kept in Postgres; the only thing
+  written back out is the standing, by ``app.analytics.publisher``, to the
+  ``useranalytics`` list when publishing is switched on.
 * **labels** — from ``app.labels.service``, including the two that are derived
   rather than stored, so somebody on approved leave drops out of the ranking on
   the day their leave starts.
@@ -185,8 +186,18 @@ async def gather(
         keys = {label.key for label in held.get(user.id, [])} if user else set()
         capacity = policy_service.capacity_for(policy, keys)
         reason = policy_service.is_excluded(policy, keys)
-        if reason is None and policy.exclude_on_leave and "on-leave" in keys:
-            reason = "On approved leave today"
+        if "on-leave" in keys:
+            # The derived label carries the return date. Whether the policy
+            # caught them through ``exclude_on_leave`` or by listing the label,
+            # "on approved leave until the 30th" is the reason worth showing —
+            # and the one the published list turns into a date.
+            mine = held.get(user.id, [])
+            away = next(
+                (label.reason for label in mine if label.key == "on-leave"), None
+            ) or "On approved leave today"
+            caught_by_label = reason is not None and "on-leave" in reason
+            if (reason is None and policy.exclude_on_leave) or caught_by_label:
+                reason = away
 
         # Managers run the queue rather than stand in it.
         if reason is None and user is not None and (

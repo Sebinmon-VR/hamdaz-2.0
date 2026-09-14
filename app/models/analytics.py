@@ -5,9 +5,10 @@ combined with each person's labels and the assignment policy, producing a ranked
 score per person. Runs are kept rather than overwritten, so "why did Rahul get
 that proposal in March" has an answer in April.
 
-**Everything is stored here, in Postgres.** Nothing is written to SharePoint —
-the Proposals list is read (every call a GET) and the ``testuseranalytics`` list
-is not touched at all. Publishing there is a separate decision for later.
+**Everything is stored here, in Postgres.** The Proposals list is only read
+(every call a GET). The one thing that leaves is the live standing, which
+``app.analytics.publisher`` writes to the ``useranalytics`` list when
+publishing is switched on.
 
 Two things this table deliberately keeps that a bare score would not:
 
@@ -110,6 +111,11 @@ class LiveScore(Base, Timestamped):
         Boolean, default=True, server_default=text("true"), nullable=False
     )
     excluded_reason: Mapped[str | None] = mapped_column(String(200))
+    #: The labels that produced the capacity and any exclusion. Kept so the
+    #: row can be published without recomputing what it was built from.
+    labels: Mapped[list] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb"), nullable=False
+    )
     #: The factor breakdown, for the same reason the runs keep one: a single
     #: number nobody can decompose is a number nobody will trust.
     factors: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)

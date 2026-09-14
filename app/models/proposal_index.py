@@ -42,7 +42,6 @@ column with an HNSW index; nothing else in the funnel has to change.
 
 from __future__ import annotations
 
-import uuid
 from datetime import date, datetime
 from typing import Any
 
@@ -56,7 +55,7 @@ from sqlalchemy import (
     Text,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR, UUID
+from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, Timestamped
@@ -95,11 +94,11 @@ class ProposalIndexItem(Base, Timestamped):
     effective_status: Mapped[str | None] = mapped_column(String(80))
     priority: Mapped[str | None] = mapped_column(String(40))
     end_user: Mapped[str | None] = mapped_column(String(300))
-    quote_no: Mapped[str | None] = mapped_column(String(120))
+    quote_no: Mapped[str | None] = mapped_column(Text)
     submission_status: Mapped[str | None] = mapped_column(String(80))
     current_type: Mapped[str | None] = mapped_column(String(80))
     order_status: Mapped[str | None] = mapped_column(String(80))
-    negotiation: Mapped[str | None] = mapped_column(String(120))
+    negotiation: Mapped[str | None] = mapped_column(Text)
     remarks: Mapped[str | None] = mapped_column(Text)
     working_notes: Mapped[str | None] = mapped_column(Text)
 
@@ -196,6 +195,13 @@ class MirrorState(Base, Timestamped):
     #: What went wrong last time, if anything. A sync that fails leaves the
     #: mirror stale rather than empty, so this is the only sign it happened.
     last_error: Mapped[str | None] = mapped_column(Text)
+
+    #: Graph's change-notification subscription on the Proposals list, when
+    #: one is active. It is what makes a row edited in SharePoint reach the
+    #: ranking in seconds rather than at the next tick of the timer.
+    subscription_id: Mapped[str | None] = mapped_column(String(120))
+    subscription_secret: Mapped[str | None] = mapped_column(String(120))
+    subscription_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     def __repr__(self) -> str:
         return f"<MirrorState synced={self.last_sync_at}>"

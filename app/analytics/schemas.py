@@ -67,6 +67,22 @@ class EntryOut(BaseModel):
     factors: dict[str, FactorOut]
 
 
+class PublishOut(BaseModel):
+    """What one push to the useranalytics list did."""
+
+    enabled: bool
+    list_url: str
+    #: What triggered it: publish, saved-run, mirror, intake.
+    reason: str
+    created: int
+    updated: int
+    #: Rows that already said this. Not written, so ``Modified`` is untouched.
+    unchanged: int
+    #: Who was written, created and updated together.
+    names: list[str]
+    error: str | None = None
+
+
 class RunOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -87,6 +103,9 @@ class RunOut(BaseModel):
     #: Who should get the next task. Null if nobody is assignable.
     next_up: str | None = None
     assignable: int = 0
+    #: What reached the useranalytics list when this run was kept. Null when
+    #: publishing is off. An error here does not mean the run was not kept.
+    published: PublishOut | None = None
 
 
 class RunSummaryOut(BaseModel):

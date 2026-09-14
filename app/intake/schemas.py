@@ -128,6 +128,14 @@ class MirrorStatusOut(BaseModel):
     rows_embedded: int
     duration_ms: int
     last_error: str | None
+    #: Graph's change subscription on the Proposals list, when one is active.
+    #: With it a row edited in SharePoint reaches the ranking in seconds; without
+    #: it, at the next tick of the timer.
+    subscription_id: str | None = None
+    subscription_expires_at: datetime | None = None
+    #: Whether the live standing is written to the useranalytics list.
+    publish_enabled: bool = False
+    publish_list_url: str | None = None
 
 
 class StandingOut(BaseModel):

@@ -188,6 +188,21 @@ class Settings(BaseSettings):
     #: live SharePoint list from somebody's laptop is not what anybody meant.
     mirror_sync_enabled: bool = False
 
+    # ── publishing the priority score ──────────────────────────────────
+    #: The one place this app writes a ranking outside its own database: the
+    #: ``useranalytics`` list, one row per person, rewritten whenever the live
+    #: standing changes. Off by default for the same reason the loop above is —
+    #: a laptop running the tests must not rewrite a list other tools read.
+    analytics_publish_enabled: bool = False
+    #: A different site from the Proposals list. The ranking is not the team's
+    #: working list and does not belong beside it.
+    analytics_site_id: str = (
+        "hamdaz1.sharepoint.com,52e0ecb1-8055-49e9-b53e-0a09e104e909,"
+        "ba62d842-3d14-4a06-bdf5-ab56c9023b33"
+    )
+    analytics_list_id: str = "f5795790-d64c-4eb5-a5ff-e8312a94e618"
+    analytics_list_url: str = "https://hamdaz1.sharepoint.com/sites/Test/Lists/useranalytics"
+
     # ── careers (the public application links) ─────────────────────────
     #: The origin this API is reached at from outside, used to build the share
     #: links HR copies. Left empty the links are built from the request itself,

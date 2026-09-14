@@ -40,6 +40,7 @@ def who(
         key=name,
         display_name=name,
         open_tasks=open_tasks,
+        active_tasks=open_tasks,
         total_tasks=open_tasks,
         capacity=Decimal(capacity),
         last_assigned_at=None if days_ago is None else NOW - timedelta(days=days_ago),

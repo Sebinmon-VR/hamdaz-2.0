@@ -38,9 +38,10 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.analytics import live as live_scores
+from app.analytics import publisher as publishing
 from app.core.config import Settings
 from app.intake.classifier import Classification, Classifier, ClassifierError
-from app.intake.graph_mail import MailReader, sender_allowed, summarise_message
+from app.intake.graph_mail import sender_allowed, summarise_message
 from app.intake.matcher import Match, Matcher
 from app.models.intake import (
     IntakeAction,
@@ -573,4 +574,8 @@ async def _new_work(
     # tender arrives — which may be a minute from now.
     await live_scores.recompute(session, team=team, reason="intake")
     await session.flush()
+    if team is not None:
+        await publishing.publish_team(
+            session, publishing.Publisher(settings, sharepoint), team, reason="intake"
+        )
     return row
