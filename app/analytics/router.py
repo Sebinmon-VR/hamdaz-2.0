@@ -23,6 +23,8 @@ why; handing it to them is still a person's action.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -31,7 +33,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.analytics import live, service
 from app.analytics import publisher as publishing
-from app.analytics.schemas import EntryOut, PublishOut, RunIn, RunOut, RunSummaryOut
+from app.analytics.schemas import (
+    EntryOut,
+    FactorOut,
+    PublishOut,
+    RunIn,
+    RunOut,
+    RunSummaryOut,
+)
 from app.analytics.service import (
     AnalyticsError,
     AnalyticsNotFoundError,
@@ -41,7 +50,7 @@ from app.assignment import service as policy_service
 from app.auth.deps import CurrentUser
 from app.core.config import Settings, get_settings
 from app.core.db import get_session
-from app.models.analytics import AnalyticsRun
+from app.models.analytics import AnalyticsRun, LiveScore
 from app.models.proposal_index import ProposalIndexItem
 from app.models.team import Team
 from app.proposals.analytics import WorkloadCache
@@ -162,6 +171,112 @@ async def preview(
     except AnalyticsError as exc:
         raise _translate(exc) from exc
     return _out(record)
+
+
+@router.get(
+    "/live",
+    response_model=RunOut,
+    summary="The current standing, kept current by the mirror",
+)
+async def live_standing(
+    _: CurrentUser,
+    session: Session,
+    team: Annotated[str, Query(description="Team handle. Required.")],
+) -> RunOut:
+    """Who should get the next task, as it stands right now.
+
+    The same shape as ``/preview``, from a different source: the live table
+    the background loop rewrites whenever the Proposals list moves, which is
+    also what the useranalytics list is published from. Reading it is one
+    indexed query rather than a sweep of SharePoint, so a screen can ask every
+    few seconds and show the same answer the list holds.
+
+    404 when the loop has not yet computed this team — the mirror has never
+    synced — which is the cue to fall back to ``/preview``.
+    """
+    resolved = await _team(session, team)
+    try:
+        policy = await service.in_scope(session, resolved)
+    except AnalyticsError as exc:
+        raise _translate(exc) from exc
+
+    rows = await live.standing(session, team=resolved)
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"No live standing for {resolved.name} yet: the Proposals mirror has "
+                f"not synced. Read the preview instead."
+            ),
+        )
+    mirrored = int(
+        await session.scalar(
+            select(func.count())
+            .select_from(ProposalIndexItem)
+            .where(ProposalIndexItem.deleted.is_(False))
+        )
+        or 0
+    )
+    computed = max(r.computed_at for r in rows)
+    entries = [_live_entry(r, computed) for r in rows]
+    pool = [e for e in entries if not e.excluded]
+    top = min(pool, key=lambda e: e.priority_score or 10**6, default=None)
+    return RunOut(
+        id=uuid.uuid5(uuid.NAMESPACE_URL, f"live:{resolved.id}:{computed.isoformat()}"),
+        team_id=resolved.id,
+        team_name=resolved.name,
+        policy_snapshot=service.snapshot_of(policy),
+        source="mirror:live",
+        rows_read=mirrored,
+        excluded_note=None,
+        saved=False,
+        notes=None,
+        created_at=computed,
+        created_by_name=None,
+        entries=entries,
+        next_up=top.display_name if top else None,
+        assignable=len(pool),
+    )
+
+
+def _live_entry(row: LiveScore, computed: datetime) -> EntryOut:
+    """A live row in the shape of a run entry, so one screen reads both."""
+    last = None
+    days = row.days_since_assigned
+    if days is not None:
+        # The exact figure is in the factor breakdown; the column is whole days.
+        raw = ((row.factors or {}).get("days_since_last_assign") or {}).get("raw")
+        last = computed - timedelta(days=float(raw) if raw is not None else days)
+    capacity = Decimal(row.capacity)
+    return EntryOut(
+        user_id=row.user_id,
+        display_name=row.display_name,
+        email=row.email,
+        sharepoint_lookup_id=row.sharepoint_lookup_id,
+        total_tasks=row.total_tasks,
+        open_tasks=row.open_tasks,
+        completed_tasks=row.completed_tasks,
+        overdue_tasks=row.overdue_tasks,
+        due_soon_tasks=row.due_soon_tasks,
+        no_status_tasks=row.no_status_tasks,
+        # Not kept on the live row; the score does not depend on them.
+        expired_tasks=0,
+        bid_closed_tasks=max(row.open_tasks - row.active_tasks, 0),
+        active_tasks=row.active_tasks,
+        last_assigned_on=last,
+        days_since_last_assign=days,
+        labels=list(row.labels or []),
+        capacity=capacity,
+        effective_load=(Decimal(row.active_tasks) / max(capacity, Decimal("0.01"))).quantize(
+            Decimal("0.0001")
+        ),
+        max_open=None,
+        excluded=not row.eligible,
+        excluded_reason=row.excluded_reason,
+        priority_score=row.rank if row.eligible and row.rank else None,
+        factor_total=Decimal(row.priority_score) if row.eligible else None,
+        factors={k: FactorOut(**v) for k, v in (row.factors or {}).items()},
+    )
 
 
 @router.post(
