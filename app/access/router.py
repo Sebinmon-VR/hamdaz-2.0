@@ -32,6 +32,7 @@ from app.access.service import AccessConflictError, AccessError, AccessNotFoundE
 from app.auth.deps import CurrentUser
 from app.core.db import get_session
 from app.models.access import TeamModuleAccess
+from app.models.team import Team
 from app.models.user import User
 from app.roles.deps import CurrentRoles
 from app.roles.service import global_role_keys
@@ -197,6 +198,38 @@ async def revoke_module(
         await service.revoke_module(session, team=team, module_key=module_key)
     except (AccessError, TeamError) as exc:
         raise _translate(exc) from exc
+
+
+@router.get(
+    "/access/teams",
+    response_model=list[TeamAccessOut],
+    summary="What every team can reach, in one call",
+)
+async def all_team_access(_: CurrentUser, session: Session) -> list[TeamAccessOut]:
+    """Every live team's grants together.
+
+    The admin matrix shows modules down the side and teams across the top,
+    and building that from one request per team is a dozen round trips before
+    the screen can draw. Readable by anyone signed in, like a single team's.
+    """
+    teams = (
+        await session.scalars(
+            select(Team).where(Team.archived_at.is_(None)).order_by(Team.name)
+        )
+    ).all()
+    out: list[TeamAccessOut] = []
+    for team in teams:
+        grants = await service.team_access(session, team.id)
+        page_ids = await service.team_page_ids(session, team.id)
+        out.append(
+            TeamAccessOut(
+                team_id=team.id,
+                slug=team.slug,
+                name=team.name,
+                modules=[_grant_out(g, page_ids) for g in grants],
+            )
+        )
+    return out
 
 
 # ── what a person can actually see ─────────────────────────────────────
