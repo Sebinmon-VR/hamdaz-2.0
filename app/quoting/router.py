@@ -59,10 +59,11 @@ from app.models.comparison import QuoteSource
 from app.models.quoting import QuoteRequest, QuoteStatus
 from app.proposals.router import get_sharepoint
 from app.proposals.sharepoint import SharePointError, SharePointProposals
-from app.quoting import service
+from app.quoting import bidpack, service
 from app.quoting.mailer import QuoteMailer
 from app.quoting.probability import WinRates
 from app.quoting.schemas import (
+    BidPackOut,
     CommentIn,
     CommentOut,
     ItemOut,
@@ -167,6 +168,12 @@ async def _out(
     for out, row in zip(body.comments, request.comments, strict=True):
         out.author_name = row.author.display_name if row.author else None
 
+    # Everything derived — the landed cost, the margin ladder, what the buyer
+    # will read our price against, what is still outstanding. Computed here on
+    # every read rather than stored, so it can never disagree with the inputs
+    # it came from. See ``app.quoting.bidpack``.
+    body.bid = BidPackOut.model_validate(bidpack.build(request), from_attributes=True)
+
     body.may_edit = request.is_editable and request.created_by_id == user.id
     body.submit_reason = service.why_not_submit(request)
     body.may_submit = body.may_edit and body.submit_reason is None
@@ -191,6 +198,11 @@ def _summary(request: QuoteRequest) -> QuoteSummaryOut:
         created_by_name=request.created_by.display_name if request.created_by else None,
         assigned_to_name=request.assigned_to.display_name if request.assigned_to else None,
         open_comments=sum(1 for c in request.comments if c.is_open),
+        # What a list of bids is actually scanned for. A total says what one is
+        # worth; this says whether it can be sent.
+        blocking_issues=sum(1 for c in request.compliance if c.is_blocking),
+        rfp_number=request.rfp_number,
+        cf_bcd=request.cf_bcd,
         created_at=request.created_at,
     )
 
@@ -395,12 +407,26 @@ async def update(
     roles: CurrentRoles,
     session: Session,
 ) -> QuoteRequestOut:
-    """Only while it is yours — in draft, or after a rework."""
+    """Only while it is yours — in draft, or after a rework.
+
+    The body is the whole quote, lists included: the lines, the landed-cost
+    build-up, the compliance matrix and the portal checklist are each replaced
+    wholesale rather than merged. A partial update would need the caller to
+    track ids that only exist after a save, and the failure mode — a list
+    quietly emptied by a body that simply did not mention it — is the one people
+    notice last. The compliance and portal rows send their ids back so that when
+    a gap was closed, and when a cell was typed, survive the replace.
+    """
     request = await _load(session, request_id)
     try:
         service.require_editable(request, user=user)
         service.apply_fields(request, payload.model_dump())
         service.set_items(request, [i.model_dump() for i in payload.items])
+        service.set_cost_lines(request, [c.model_dump() for c in payload.cost_lines])
+        service.set_compliance(request, [c.model_dump() for c in payload.compliance])
+        service.set_submission_fields(
+            request, [f.model_dump() for f in payload.submission_fields]
+        )
         await session.flush()
     except QuoteError as exc:
         raise _translate(exc) from exc

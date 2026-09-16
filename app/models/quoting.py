@@ -14,7 +14,7 @@ eventual integration is a mapping rather than a translation. Where Zoho uses a
 custom field this does too, by the same key: ``cf_bcd`` is the bid closing date
 the Proposals list already calls BCD.
 
-Four tables, because four different things change at different times:
+Seven tables, because seven different things change at different times:
 
 * ``quote_requests`` — the form and where it is in the workflow.
 * ``quote_request_items`` — the priced lines, which is what a quote *is*.
@@ -23,6 +23,27 @@ Four tables, because four different things change at different times:
 * ``quote_comments`` — remarks anchored to a particular field, line or supplier
   quote, so "this rate looks wrong" points at the rate rather than floating at
   the bottom of the page.
+* ``quote_cost_lines`` — the landed-cost build-up behind the price. What it
+  costs to put the supplier's goods on the customer's floor.
+* ``quote_compliance_items`` — one RFP requirement against what the supplier
+  actually offered, and what has to be done about the gap.
+* ``quote_submission_fields`` — the values to type into the buyer's own portal.
+
+**The bid pack.** A Zoho estimate is one number against a customer name, and
+that is all a quote needs when somebody asks us for a price. A *tender* is not
+that. A tender arrives as an RFP with numbered clauses, a mandatory technical
+specification, a portal with named cells to fill, and a price that has to be
+justified line by line because the buyer will see the principal's own quotation
+next to ours. The three tables above plus the ``bid`` fields on the request are
+what turn a quote into a bid: the compliance position, the cost build-up and the
+portal answers, held beside the estimate rather than in a spreadsheet somebody
+mails around.
+
+Every derived figure — the CIF subtotal, the duty, the landed cost, the margin
+ladder, the uplift the buyer will see — is computed from the stored inputs and
+never stored itself. A saved total and the inputs it came from disagree the
+first time anybody edits one, and the one people trust is always the wrong one.
+See ``app/quoting/bidpack.py``, which does the arithmetic in one place.
 """
 
 from __future__ import annotations
@@ -108,6 +129,96 @@ class CommentTarget(StrEnum):
     SUPPLIER_QUOTE = "supplier_quote"
 
 
+class ComplianceStatus(StrEnum):
+    """Where one RFP requirement stands against what the supplier offered.
+
+    The buyer's own matrices use a traffic light, and so does this, but three
+    colours cannot say the two things that matter most: whether a gap can be
+    *priced* and whether it can be *cured*. So a deviation — priceable, and we
+    carry the cost — is a different status from non-compliance, which has to be
+    cured or formally declared before anything is submitted.
+    """
+
+    #: Offered exactly what was asked for.
+    COMPLIANT = "compliant"
+    #: A gap, but one we can price or cure. Amber.
+    DEVIATION = "deviation"
+    #: A gap that must be cured or declared before submission. Red.
+    NON_COMPLIANT = "non_compliant"
+    #: The RFP contradicts itself, or does not say. Ask the buyer.
+    CLARIFY = "clarify"
+    #: Compliant on its face and still dangerous — price disclosure, say.
+    RISK = "risk"
+    #: Ours to produce and not produced yet.
+    OPEN = "open"
+    #: Genuinely does not apply. Kept rather than deleted so the matrix still
+    #: answers "did anyone look at clause 3.7", which a missing row cannot.
+    NOT_APPLICABLE = "not_applicable"
+    #: Noted for the file — a packing spec, a tariff code. Decides nothing.
+    NOTED = "noted"
+
+
+#: Statuses that stop a submission until somebody deals with them.
+BLOCKING_COMPLIANCE = frozenset(
+    {ComplianceStatus.NON_COMPLIANT, ComplianceStatus.CLARIFY, ComplianceStatus.OPEN}
+)
+
+
+class Severity(StrEnum):
+    """How badly a compliance row wants attention before submission.
+
+    Separate from the status because they answer different questions. A row can
+    be a *deviation* (priceable, amber) and still be the single thing most
+    likely to lose the bid. The red-flag list on a bid summary is exactly the
+    rows that carry one of these, worst first — derived from the matrix rather
+    than typed a second time beside it, because two lists of the same problems
+    diverge the first week and then nobody knows which one is current.
+    """
+
+    #: Submission fails outright until this is fixed.
+    STOPPER = "stopper"
+    CRITICAL = "critical"
+    HIGH = "high"
+    MEDIUM = "medium"
+    #: Worth saying, blocks nothing.
+    NOTE = "note"
+
+
+#: Worst first. The order the red flags are read in.
+SEVERITY_ORDER: dict[str, int] = {
+    Severity.STOPPER: 0,
+    Severity.CRITICAL: 1,
+    Severity.HIGH: 2,
+    Severity.MEDIUM: 3,
+    Severity.NOTE: 4,
+}
+
+
+class ComplianceArea(StrEnum):
+    """Which part of the bid a requirement belongs to — the matrix's sections."""
+
+    TECHNICAL = "technical"
+    COMMERCIAL = "commercial"
+    #: The bid package itself: certificates, statements, the power of attorney.
+    DOCUMENTS = "documents"
+    LOGISTICS = "logistics"
+
+
+class CostStage(StrEnum):
+    """Which side of the customs border a cost element sits on.
+
+    Not decoration: duty is charged on the CIF value, so what counts towards
+    that value and what lands after it is the difference between the right duty
+    and a number somebody made up.
+    """
+
+    #: Everything up to and including arrival — goods, origin handling,
+    #: freight, insurance. Sums to the CIF value that duty is charged on.
+    ORIGIN = "origin"
+    #: Clearance, inland delivery, bank charges. After the duty base.
+    DESTINATION = "destination"
+
+
 class QuoteRequest(Base, UUIDPrimaryKey, Timestamped):
     __tablename__ = "quote_requests"
     __table_args__ = (
@@ -160,6 +271,105 @@ class QuoteRequest(Base, UUIDPrimaryKey, Timestamped):
     )
     adjustment: Mapped[Decimal] = mapped_column(
         Numeric(18, 2), default=Decimal(0), server_default=text("0"), nullable=False
+    )
+
+    # ── the bid pack ───────────────────────────────────────────────────
+    # A tender is not an estimate with a longer subject line. These are what an
+    # RFP asks for and a Zoho estimate has no room for. All nullable: a quote
+    # for a customer who rang up and asked for a price fills in none of them,
+    # and should not be nagged about it.
+
+    #: The buyer's event number — "RFP 6000149233". Theirs, not ours; every
+    #: clarification, every portal message and every eventual PO quotes it.
+    rfp_number: Mapped[str | None] = mapped_column(String(120), index=True)
+    #: Who is actually buying, which is often not who ran the tender — an
+    #: operating company inside the group the portal belongs to.
+    buying_entity: Mapped[str | None] = mapped_column(String(200))
+    #: The RFP's own numbering for the line being bid, e.g. "3.13.5 — CLOTH".
+    #: Answers to the buyer are indexed by this and nothing else.
+    line_item_ref: Mapped[str | None] = mapped_column(String(120))
+
+    # The manufacturer, as the RFP names it. A specified-brand line is won or
+    # lost on these three matching character for character, so they are held
+    # apart from the line items rather than buried in a description.
+    manufacturer_name: Mapped[str | None] = mapped_column(String(200))
+    manufacturer_part_number: Mapped[str | None] = mapped_column(String(120))
+    #: The buyer's own material/class number for the item.
+    manufacturer_class_no: Mapped[str | None] = mapped_column(String(120))
+
+    #: The Incoterm the RFP demands — DAP, DDP, CIF — and the place it names.
+    #: Held apart from ``delivery_terms``, which is prose: the gap between the
+    #: demanded term and the supplier's own is the single largest cost on most
+    #: bids, and comparing two sentences will not find it.
+    incoterm_required: Mapped[str | None] = mapped_column(String(40))
+    incoterm_place: Mapped[str | None] = mapped_column(String(200))
+    #: Where the goods are actually to be delivered, as the RFP states it. Not
+    #: always the Incoterm place, and when the two disagree somebody has to ask.
+    ship_to: Mapped[str | None] = mapped_column(String(200))
+    #: The date the buyer asked for. Frequently already past by the time the
+    #: enquiry reaches us, which is itself a deviation to declare.
+    requested_delivery_date: Mapped[date | None] = mapped_column(DateTime(timezone=True))
+    #: What we will actually commit to, in calendar days from the PO. The
+    #: number that goes in the portal.
+    delivery_days: Mapped[int | None] = mapped_column(Integer)
+    #: ISO 3166 alpha-2, because portals want the code. Defaulting it to the
+    #: bidder's own country is the most common and most expensive desk error on
+    #: a specified-brand line — the goods are made wherever the OEM makes them.
+    country_of_origin: Mapped[str | None] = mapped_column(String(2))
+    #: Air, sea, road — as the portal's own list spells it.
+    mode_of_shipment: Mapped[str | None] = mapped_column(String(60))
+    #: How long our price stands, in days. The RFP sets it; the supplier's own
+    #: validity is usually shorter, and bidding the long one against the short
+    #: one is an unhedged position rather than a rounding difference.
+    bid_validity_days: Mapped[int | None] = mapped_column(Integer)
+    #: Our own quotation reference as given to the buyer.
+    bid_reference: Mapped[str | None] = mapped_column(String(120))
+
+    #: Where the bid stands technically and commercially, in a sentence each.
+    #: Two verdicts rather than one: an offer can be the OEM's own product
+    #: against a specification copied from their catalogue — unimprovable —
+    #: and still be commercially unbiddable on payment terms.
+    technical_verdict: Mapped[str | None] = mapped_column(Text)
+    commercial_verdict: Mapped[str | None] = mapped_column(Text)
+
+    # ── the landed-cost inputs ─────────────────────────────────────────
+    # Inputs only. Every total derived from them lives in ``app.quoting.bidpack``
+    # and is computed on read.
+
+    #: The currency the supplier quoted in, when it is not ours.
+    supplier_currency: Mapped[str | None] = mapped_column(String(3))
+    #: Units of :attr:`currency` per unit of :attr:`supplier_currency`, at the
+    #: rate the bid is costed on — mid-market plus a spread, not the mid-market
+    #: rate. The bid stands for months and the money moves once, at the end.
+    fx_rate: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    #: Import duty, as a percentage of the CIF value.
+    customs_duty_percent: Mapped[Decimal] = mapped_column(
+        Numeric(6, 3), default=Decimal(0), server_default=text("0"), nullable=False
+    )
+    #: Cost of the money, per annum, while it is out of the door. Real whenever
+    #: a supplier wants paying before the customer pays us.
+    financing_rate_percent: Mapped[Decimal] = mapped_column(
+        Numeric(6, 3), default=Decimal(0), server_default=text("0"), nullable=False
+    )
+    #: How many days it is out for — payment to the supplier until settlement.
+    cash_exposure_days: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+    #: The margin the bid is built at, over landed cost. Distinct from the
+    #: markup used to price individual lines from a supplier quote: that one
+    #: sets rates, this one is the business's position on the bid as a whole.
+    target_markup_percent: Mapped[Decimal | None] = mapped_column(Numeric(7, 3))
+    #: The price actually going in, per unit — the rounded, human number. Held
+    #: rather than computed because rounding a bid up to a clean figure is a
+    #: decision somebody makes, and a recomputed price would quietly undo it.
+    submission_unit_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
+    #: The whole bid, when it is not simply unit price times quantity.
+    submission_total: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
+    #: Whether the RFP makes us attach the principal's own quotation. When it
+    #: does, the buyer sees what we paid, and the uplift needs the cost
+    #: breakdown beside it or it reads as pure margin.
+    discloses_principal_price: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
     )
 
     # ── supplier quotes behind it ──────────────────────────────────────
@@ -244,6 +454,24 @@ class QuoteRequest(Base, UUIDPrimaryKey, Timestamped):
         back_populates="request",
         cascade="all, delete-orphan",
         order_by="QuoteComment.created_at",
+        lazy="selectin",
+    )
+    cost_lines: Mapped[list[QuoteCostLine]] = relationship(
+        back_populates="request",
+        cascade="all, delete-orphan",
+        order_by="QuoteCostLine.position",
+        lazy="selectin",
+    )
+    compliance: Mapped[list[QuoteComplianceItem]] = relationship(
+        back_populates="request",
+        cascade="all, delete-orphan",
+        order_by="QuoteComplianceItem.position",
+        lazy="selectin",
+    )
+    submission_fields: Mapped[list[QuoteSubmissionField]] = relationship(
+        back_populates="request",
+        cascade="all, delete-orphan",
+        order_by="QuoteSubmissionField.position",
         lazy="selectin",
     )
 
@@ -430,3 +658,177 @@ class QuoteComment(Base, UUIDPrimaryKey, Timestamped):
 
     def __repr__(self) -> str:
         return f"<QuoteComment {self.target_type}:{self.target_ref} {self.body[:24]!r}>"
+
+
+class QuoteCostLine(Base, UUIDPrimaryKey, Timestamped):
+    """One element of what it costs to land the goods.
+
+    The build-up behind a bid price: the goods themselves, then haulage,
+    freight, certificates, insurance, duty, clearance, the bank's cut. On a
+    tender this is not bookkeeping — clause after clause makes the price
+    breakdown a mandatory attachment, because the buyer wants to see that a
+    price at twice the principal's is mostly freight and duty rather than greed.
+
+    Amounts are held twice on purpose. ``amount_source`` is the figure as it was
+    quoted or estimated, in whatever currency that was; ``amount_base`` is the
+    same money in the quote's currency. Both are stored rather than one being
+    derived, because a supplier's GBP figure is *firm* and its converted value
+    is only as firm as the rate — and when the rate is revised the record should
+    still show what was actually quoted.
+    """
+
+    __tablename__ = "quote_cost_lines"
+    __table_args__ = (Index("ix_quote_cost_lines_request", "request_id", "position"),)
+
+    request_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("quote_requests.id", ondelete="CASCADE"), nullable=False
+    )
+    position: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    #: Which side of the duty base this falls on. See :class:`CostStage`.
+    stage: Mapped[CostStage] = mapped_column(
+        String(20), default=CostStage.ORIGIN, nullable=False
+    )
+    label: Mapped[str] = mapped_column(String(300), nullable=False)
+    #: Where the number came from: "supplier quotation (firm)", "our estimate",
+    #: "forwarder's rate". A landed cost is half estimates, and which half is
+    #: the first thing an approver asks.
+    basis: Mapped[str | None] = mapped_column(String(300))
+
+    #: The figure as quoted, in ``source_currency``. Null when it was only ever
+    #: reckoned in the quote's own currency.
+    amount_source: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
+    source_currency: Mapped[str | None] = mapped_column(String(3))
+    #: The same money in the quote's currency. This is what the totals add up.
+    amount_base: Mapped[Decimal] = mapped_column(
+        Numeric(18, 4), default=Decimal(0), server_default=text("0"), nullable=False
+    )
+
+    #: Set on the supplier's own quoted goods price — the figure the buyer will
+    #: see if the principal's quotation has to be attached. Exactly one line
+    #: should carry it; it is what the disclosure exposure is measured against.
+    is_principal: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
+    )
+    #: True when the supplier has committed to it, false when we guessed. An
+    #: estimate that turns out low comes out of the margin, so the distinction
+    #: belongs on the row rather than in somebody's memory.
+    is_firm: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
+    )
+    notes: Mapped[str | None] = mapped_column(Text)
+
+    request: Mapped[QuoteRequest] = relationship(back_populates="cost_lines")
+
+    def __repr__(self) -> str:
+        return f"<QuoteCostLine {self.label[:30]!r} {self.amount_base}>"
+
+
+class QuoteComplianceItem(Base, UUIDPrimaryKey, Timestamped):
+    """One RFP requirement, what the supplier offered against it, and the gap.
+
+    A row per clause, not a summary paragraph. The reason is that every gap has
+    an owner and a deadline, and a paragraph has neither: "obtain a 90-day
+    validity confirmation" is work somebody has to do before a date, and on the
+    bids that go wrong it is almost always this that was known and unassigned
+    rather than unknown.
+
+    ``status`` is the position; ``severity``, when set, is what puts the row on
+    the red-flag list. Both, because they are different questions — see
+    :class:`Severity`.
+    """
+
+    __tablename__ = "quote_compliance_items"
+    __table_args__ = (
+        Index("ix_quote_compliance_request", "request_id", "position"),
+        Index("ix_quote_compliance_severity", "request_id", "severity"),
+    )
+
+    request_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("quote_requests.id", ondelete="CASCADE"), nullable=False
+    )
+    position: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    #: The matrix's own short handle for the row — "T4", "C11". What people say
+    #: to each other about it, and what a comment on the bid will quote.
+    ref: Mapped[str | None] = mapped_column(String(20))
+    area: Mapped[ComplianceArea] = mapped_column(
+        String(20), default=ComplianceArea.COMMERCIAL, nullable=False
+    )
+    #: What the RFP asks for, in its own words where possible.
+    requirement: Mapped[str] = mapped_column(Text, nullable=False)
+    #: Which clause of the RFP says so. Without it a disputed row turns into a
+    #: search through a hundred-page document while the deadline runs.
+    source_clause: Mapped[str | None] = mapped_column(String(120))
+    #: What the supplier's offer actually says about it.
+    supplier_position: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[ComplianceStatus] = mapped_column(
+        String(20), default=ComplianceStatus.OPEN, nullable=False
+    )
+    #: Null unless the row belongs on the red-flag list.
+    severity: Mapped[Severity | None] = mapped_column(String(12))
+    #: What has to happen, concretely. "Ask Denice for a 90-day price hold",
+    #: not "address validity".
+    action: Mapped[str | None] = mapped_column(Text)
+    #: Who is doing it. A name, free text — the people on a bid are not all
+    #: users of this system, and refusing to record a supplier contact as an
+    #: owner would push the list back into a spreadsheet.
+    owner: Mapped[str | None] = mapped_column(String(200))
+    #: When it stopped being a gap. Kept rather than deleted, because what was
+    #: cured and when is exactly what a post-mortem on a lost bid asks.
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    request: Mapped[QuoteRequest] = relationship(back_populates="compliance")
+
+    @property
+    def is_open(self) -> bool:
+        return self.resolved_at is None
+
+    @property
+    def is_blocking(self) -> bool:
+        """Unresolved, and in a state that should stop a submission."""
+        return self.is_open and (
+            self.status in BLOCKING_COMPLIANCE or self.severity == Severity.STOPPER
+        )
+
+    def __repr__(self) -> str:
+        return f"<QuoteComplianceItem {self.ref} {self.status}>"
+
+
+class QuoteSubmissionField(Base, UUIDPrimaryKey, Timestamped):
+    """One value to be typed into the buyer's portal, and where it goes.
+
+    Bids are not submitted from here — they are submitted in the buyer's own
+    system, usually by filling in a downloaded workbook and uploading it back.
+    That last step is where bids are lost: a mandatory cell left at its default,
+    an "intend to respond" flag still reading *No*, a country of origin that
+    stayed on the bidder's own country. The values are decided here, so the map
+    from decision to cell belongs here too, and the person doing the typing
+    works from a checklist rather than from memory.
+    """
+
+    __tablename__ = "quote_submission_fields"
+    __table_args__ = (Index("ix_quote_submission_request", "request_id", "position"),)
+
+    request_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("quote_requests.id", ondelete="CASCADE"), nullable=False
+    )
+    position: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    #: The RFP clause the field answers — "3.12.1".
+    clause: Mapped[str | None] = mapped_column(String(40))
+    label: Mapped[str] = mapped_column(String(300), nullable=False)
+    #: Where it goes in the buyer's workbook — a cell reference, a tab and cell,
+    #: or a field name. Free text: every portal names its own places.
+    destination: Mapped[str | None] = mapped_column(String(120))
+    value: Mapped[str | None] = mapped_column(Text)
+    note: Mapped[str | None] = mapped_column(Text)
+    #: The portal will not accept the bid without it.
+    is_mandatory: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
+    )
+    #: Ticked off by whoever did the typing.
+    entered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    request: Mapped[QuoteRequest] = relationship(back_populates="submission_fields")
+
+    def __repr__(self) -> str:
+        return f"<QuoteSubmissionField {self.clause} {self.label[:24]!r}>"

@@ -604,6 +604,10 @@ class Task:
         self.web_url = "https://hamdaz1.sharepoint.com/Lists/Proposals/412"
         self.has_attachments = False
         self.attachments_url = None
+        # The columns the bid pack reads. Present on every real row; they were
+        # missing here only because nothing used to look at them.
+        self.current_type = "Ariba"
+        self.due_date = "2026-11-01T00:00:00Z"
         self.__dict__.update(over)
 
 
@@ -618,6 +622,29 @@ def test_a_task_fills_in_what_the_list_knows() -> None:
     assert form["reference"] == "QT-00218"
     assert "Budgetary only" in form["notes"]
     assert "Waiting on Fortinet" in form["notes"]
+
+
+def test_a_task_starts_the_bid_pack_off_as_well() -> None:
+    """What the list knows that an estimate has no room for.
+
+    The buying entity comes from the same column as the customer, deliberately:
+    on a tender they are usually the same organisation, and where they are not,
+    a wrong one somebody corrects beats an empty one nobody notices.
+    """
+    form = service.payload_from_task(Task())
+
+    assert form["buying_entity"] == "ADNOC Onshore"
+    assert form["cf_portal"] == "Ariba"
+    # The date the customer asked for — kept apart from what we will offer,
+    # because on a tender the gap between them is a deviation to declare.
+    assert form["requested_delivery_date"] == "2026-11-01"
+
+
+def test_an_event_number_is_taken_out_of_the_title_when_it_is_in_there() -> None:
+    """A wrong event number is worse than none — it is quoted back everywhere."""
+    assert service.rfp_number_in("RFP 6000149233 — CLOTH") == "6000149233"
+    assert service.rfp_number_in("Tender No: ABC/2026/44 pumps") == "ABC/2026/44"
+    assert service.rfp_number_in("Supply of valves") is None
 
 
 def test_a_task_with_no_end_user_still_starts_a_quote() -> None:

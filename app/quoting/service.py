@@ -29,10 +29,11 @@ Nothing here touches Zoho. Approval puts a request in a queue and stops.
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Final
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -41,17 +42,25 @@ from app.models.comparison import SupplierQuote, SupplierQuoteItem
 from app.models.quoting import (
     EDITABLE_STATUSES,
     CommentTarget,
+    ComplianceArea,
+    ComplianceStatus,
+    CostStage,
     QuoteComment,
+    QuoteComplianceItem,
+    QuoteCostLine,
     QuoteRequest,
     QuoteRequestItem,
     QuoteReview,
     QuoteRevision,
     QuoteStatus,
+    QuoteSubmissionField,
     ReviewAction,
+    Severity,
 )
 from app.models.role import Role, UserRole
 from app.models.team import Team, TeamMembership
 from app.models.user import User
+from app.quoting import bidpack
 
 logger = logging.getLogger("hamdaz.quoting")
 
@@ -143,21 +152,58 @@ def require_editable(request: QuoteRequest, *, user: User) -> None:
 # ── building one ───────────────────────────────────────────────────────
 
 
+#: The Zoho-shaped half of the form: what an estimate is.
+_ESTIMATE_FIELDS = (
+    "title", "customer_name", "customer_id", "contact_person", "reference_number",
+    "quote_date", "expiry_date", "currency", "salesperson_name", "place_of_supply",
+    "payment_terms", "delivery_terms", "cf_bcd", "cf_portal", "subject", "notes",
+    "terms", "reference",
+)
+
+#: The bid pack's own half: what a tender asks for and an estimate has no room
+#: for. Every one of them nullable — a quote for somebody who rang up and asked
+#: for a price fills in none of these and should not be nagged about it.
+_BID_FIELDS = (
+    "rfp_number", "buying_entity", "line_item_ref", "manufacturer_name",
+    "manufacturer_part_number", "manufacturer_class_no", "incoterm_required",
+    "incoterm_place", "ship_to", "requested_delivery_date", "delivery_days",
+    "country_of_origin", "mode_of_shipment", "bid_validity_days", "bid_reference",
+    "technical_verdict", "commercial_verdict", "supplier_currency",
+)
+
+#: Money and rates. Held apart because they go through ``Decimal`` rather than
+#: being assigned as they arrive — a bid price that has been through a float is
+#: a bid price with a rounding argument attached.
+_DECIMAL_FIELDS = (
+    "discount", "shipping_charge", "adjustment", "customs_duty_percent",
+    "financing_rate_percent",
+)
+
+#: Decimals that mean "not set" when absent, rather than zero. A markup of
+#: nothing and no markup at all are different answers: the first prices the bid
+#: at cost, the second has not been decided yet.
+_NULLABLE_DECIMALS = (
+    "fx_rate", "target_markup_percent", "submission_unit_price", "submission_total",
+)
+
+
 def apply_fields(request: QuoteRequest, payload: dict[str, Any]) -> None:
-    """Copy the Zoho-shaped form fields onto the row."""
-    for field in (
-        "title", "customer_name", "customer_id", "contact_person", "reference_number",
-        "quote_date", "expiry_date", "currency", "salesperson_name", "place_of_supply",
-        "payment_terms", "delivery_terms", "cf_bcd", "cf_portal", "subject", "notes",
-        "terms", "reference",
-    ):
+    """Copy the form fields — the estimate's and the bid's — onto the row."""
+    for field in _ESTIMATE_FIELDS + _BID_FIELDS:
         if field in payload:
             setattr(request, field, payload[field])
-    for field in ("discount", "shipping_charge", "adjustment"):
+    for field in _DECIMAL_FIELDS:
         if payload.get(field) is not None:
             setattr(request, field, Decimal(str(payload[field])))
-    if payload.get("multiple_supplier_quotes") is not None:
-        request.multiple_supplier_quotes = bool(payload["multiple_supplier_quotes"])
+    for field in _NULLABLE_DECIMALS:
+        if field in payload:
+            value = payload[field]
+            setattr(request, field, Decimal(str(value)) if value is not None else None)
+    if payload.get("cash_exposure_days") is not None:
+        request.cash_exposure_days = int(payload["cash_exposure_days"])
+    for field in ("multiple_supplier_quotes", "discloses_principal_price"):
+        if payload.get(field) is not None:
+            setattr(request, field, bool(payload[field]))
 
 
 def set_items(request: QuoteRequest, items: list[dict[str, Any]]) -> None:
@@ -191,6 +237,117 @@ def set_items(request: QuoteRequest, items: list[dict[str, Any]]) -> None:
         )
         for position, item in enumerate(items)
     ]
+
+
+def set_cost_lines(request: QuoteRequest, rows: list[dict[str, Any]]) -> None:
+    """Replace the landed-cost build-up, for the same reason the items are.
+
+    Note what is *not* here. The goods are not a row — they come from the
+    priced lines, so that repricing from another supplier carries the cost with
+    it instead of leaving the old one at the top of the build-up. Duty and
+    financing are not rows either; both are arithmetic on figures the request
+    already holds. See ``app.quoting.bidpack``.
+
+    **A row quoted in the supplier's currency converts itself.** Where a caller
+    gives an amount in a foreign currency and the bid carries a rate for it, the
+    figure in the quote's own currency is worked out here rather than accepted.
+    Taking both would mean storing one number twice, and the pair would disagree
+    the first time the rate was revised — which on a bid that stands for ninety
+    days it always is. The quoted figure stays exactly as quoted; it is the
+    conversion that is derived.
+    """
+    request.cost_lines = [
+        QuoteCostLine(
+            position=position,
+            stage=row.get("stage") or CostStage.ORIGIN,
+            label=row["label"],
+            basis=row.get("basis"),
+            amount_source=_decimal_or_none(row.get("amount_source")),
+            source_currency=row.get("source_currency"),
+            amount_base=_base_amount(request, row),
+            is_principal=bool(row.get("is_principal")),
+            is_firm=bool(row.get("is_firm")),
+            notes=row.get("notes"),
+        )
+        for position, row in enumerate(rows)
+    ]
+
+
+def _base_amount(request: QuoteRequest, row: dict[str, Any]) -> Decimal:
+    """One cost row in the quote's own currency.
+
+    Converted from the quoted figure where the currencies and a rate line up,
+    and otherwise taken as given — which covers the ordinary case of a cost
+    that was only ever reckoned in our own money.
+    """
+    source = _decimal_or_none(row.get("amount_source"))
+    currency = (row.get("source_currency") or "").upper()
+    rate = request.fx_rate
+    if (
+        source is not None
+        and rate
+        and rate > 0
+        and currency
+        and currency != (request.currency or "").upper()
+    ):
+        return (source * rate).quantize(_RATE)
+    return Decimal(str(row.get("amount_base") or 0))
+
+
+def set_compliance(request: QuoteRequest, rows: list[dict[str, Any]]) -> None:
+    """Replace the compliance matrix, keeping when each gap was actually closed.
+
+    Replaced wholesale like everything else on the form, but a resolved row
+    carries a date somebody will one day want — "when did we clear the ICV
+    question" is a real question after a bid is lost. The caller sends the row's
+    id back, so the original moment survives a save that touched something else
+    entirely. A row with no id is new, and a row newly ticked is stamped now.
+    """
+    before = {row.id: row.resolved_at for row in request.compliance}
+    now = datetime.now(UTC)
+    request.compliance = [
+        QuoteComplianceItem(
+            position=position,
+            ref=row.get("ref"),
+            area=row.get("area") or ComplianceArea.COMMERCIAL,
+            requirement=row["requirement"],
+            source_clause=row.get("source_clause"),
+            supplier_position=row.get("supplier_position"),
+            status=row.get("status") or ComplianceStatus.OPEN,
+            severity=row.get("severity"),
+            action=row.get("action"),
+            owner=row.get("owner"),
+            resolved_at=(
+                (before.get(row.get("id")) or now) if row.get("resolved") else None
+            ),
+        )
+        for position, row in enumerate(rows)
+    ]
+
+
+def set_submission_fields(request: QuoteRequest, rows: list[dict[str, Any]]) -> None:
+    """Replace the portal checklist, keeping when each cell was actually typed."""
+    before = {row.id: row.entered_at for row in request.submission_fields}
+    now = datetime.now(UTC)
+    request.submission_fields = [
+        QuoteSubmissionField(
+            position=position,
+            clause=row.get("clause"),
+            label=row["label"],
+            destination=row.get("destination"),
+            value=row.get("value"),
+            note=row.get("note"),
+            is_mandatory=bool(row.get("is_mandatory")),
+            entered_at=(
+                (before.get(row.get("id")) or now) if row.get("entered") else None
+            ),
+        )
+        for position, row in enumerate(rows)
+    ]
+
+
+def _decimal_or_none(value: Any) -> Decimal | None:
+    return Decimal(str(value)) if value is not None else None
 
 
 #: Rates are stored to four places, so a markup produces a price rather than
@@ -251,6 +408,14 @@ async def select_supplier(
 
     set_items(request, [_line_from(item, quote, markup_percent) for item in quote.items])
     request.selected_supplier_quote_id = quote.id
+    # Their prices are only half of what they sent. The terms they stated are
+    # answers to the customer's own clauses, and carrying them across now is the
+    # difference between a compliance matrix built from the document and one
+    # built from somebody's memory of it a fortnight later.
+    absorb_supplier(request, quote)
+    seed_submission_checklist(request)
+    if request.target_markup_percent is None and markup_percent:
+        request.target_markup_percent = markup_percent
     await session.flush()
     logger.info(
         "quote %s priced from %s (%d lines, markup %s%%)",
@@ -282,6 +447,308 @@ def _line_from(
         "rate": (cost * (Decimal(1) + markup_percent / Decimal(100))).quantize(_RATE),
         "source_supplier_quote_id": quote.id,
     }
+
+
+#: Refs for the compliance rows this module raises by itself, from the terms a
+#: supplier stated on their own quotation. Prefixed so they are distinguishable
+#: from the rows a person wrote, which are never touched when the supplier
+#: changes. Stable, because they are matched on to avoid raising the same row
+#: twice when a quote is repriced.
+_SUPPLIER_REFS: Final = {
+    "currency": "S-CUR",
+    "validity": "S-VAL",
+    "payment": "S-PAY",
+    "warranty": "S-WAR",
+    "incoterm": "S-INC",
+    "delivery": "S-DEL",
+}
+
+#: Payment wording that means we pay before anybody pays us. Not a parser —
+#: a list of the phrases suppliers actually use, and a miss costs nothing
+#: because the row is raised either way; the match only decides whether it
+#: arrives already marked as a deviation or as a question.
+_PREPAYMENT_HINTS: Final = (
+    "advance", "pre-payment", "prepayment", "proforma", "pro forma",
+    "100% with order", "cash with order", "cwo", "before dispatch",
+)
+
+#: Wording that means there is no warranty. Deliberately narrow: a false
+#: positive here marks a compliant offer as non-compliant, which is worse than
+#: leaving a person to read the sentence themselves.
+_NO_WARRANTY_HINTS: Final = (
+    "no warranty", "not applicable", "n/a", "none", "not offered", "excluded",
+)
+
+
+def _mentions(text: str | None, hints: tuple[str, ...]) -> bool:
+    lowered = (text or "").strip().lower()
+    return bool(lowered) and any(hint in lowered for hint in hints)
+
+
+def _incoterm_matches(required: str | None, offered: str | None) -> bool | None:
+    """Whether the supplier's Incoterm is the one the RFP demands.
+
+    ``None`` when either side is unstated, which is not the same as a mismatch —
+    an unanswered question should arrive as a question.
+
+    Compared on the three-letter term alone. "EXW Telford" and "EXW" are the
+    same term and the place is a separate field; comparing the whole string
+    would call every quote a deviation.
+    """
+    if not (required or "").strip() or not (offered or "").strip():
+        return None
+    return required.strip().split()[0].upper() == offered.strip().split()[0].upper()
+
+
+def absorb_supplier(request: QuoteRequest, quote: SupplierQuote) -> None:
+    """Carry everything the chosen supplier's quotation says onto the bid.
+
+    A supplier quotation is not only prices. It states a currency, a validity, a
+    payment term, a warranty position, an Incoterm and a lead time, and every
+    one of those is a clause of the RFP that somebody has to answer. Retyping
+    them into a compliance matrix by hand is how they get answered from memory
+    two weeks later, so they are carried across the moment the supplier is
+    chosen — as rows in the matrix, with the supplier's own words in them.
+
+    Three rules keep this from being interference rather than help:
+
+    * **Only blanks are filled.** A field somebody has already answered is left
+      exactly as they answered it.
+    * **Only rows this module raised are updated.** They are marked with their
+      own refs; a row a person wrote is never rewritten when the supplier
+      changes, because their judgement is not ours to overwrite.
+    * **A status is only asserted where it can be derived.** Where the answer
+      needs a human to read a sentence, the row arrives as an open question with
+      the sentence in it rather than as a verdict that might be wrong.
+    """
+    # The money. Carried because every figure in the build-up depends on it,
+    # and a bid costed at the wrong rate is wrong in one direction only.
+    if quote.currency and quote.currency != request.currency:
+        if not request.supplier_currency:
+            request.supplier_currency = quote.currency
+        if request.fx_rate is None and quote.fx_rate and quote.fx_rate > 0:
+            request.fx_rate = quote.fx_rate
+
+    # The manufacturer, when the supplier's lines agree on one. A specified-
+    # brand line is won or lost on these matching the RFP character for
+    # character, so they are worth carrying and never worth guessing at: if the
+    # lines disagree, nothing is filled in.
+    if not request.manufacturer_name:
+        brands = {(i.brand or "").strip() for i in quote.items if (i.brand or "").strip()}
+        if len(brands) == 1:
+            request.manufacturer_name = brands.pop()[:200]
+    if not request.manufacturer_part_number:
+        parts = {
+            (i.part_number or "").strip() for i in quote.items if (i.part_number or "").strip()
+        }
+        if len(parts) == 1:
+            request.manufacturer_part_number = parts.pop()[:120]
+
+    if not request.payment_terms and (quote.payment_terms or "").strip():
+        request.payment_terms = quote.payment_terms.strip()[:200]
+    if not request.delivery_terms and (quote.delivery_time or "").strip():
+        request.delivery_terms = quote.delivery_time.strip()
+
+    _seed_supplier_compliance(request, quote)
+
+
+def _seed_supplier_compliance(request: QuoteRequest, quote: SupplierQuote) -> None:
+    """One matrix row per term the supplier stated. See :func:`absorb_supplier`."""
+    incoterm = _incoterm_matches(request.incoterm_required, quote.incoterms)
+    who = quote.supplier_name
+
+    proposed: list[dict[str, Any]] = []
+
+    if quote.currency and quote.currency != request.currency:
+        proposed.append(
+            {
+                "key": "currency",
+                "area": ComplianceArea.COMMERCIAL,
+                "requirement": f"Bid currency {request.currency}",
+                "position": f"{who} quoted in {quote.currency}.",
+                "status": ComplianceStatus.DEVIATION,
+                "severity": Severity.MEDIUM,
+                "action": (
+                    f"Converted at the rate the bid is costed on. The exchange risk "
+                    f"between {quote.currency} and {request.currency} is ours for as "
+                    f"long as the bid stands."
+                ),
+            }
+        )
+
+    if (quote.validity or "").strip():
+        proposed.append(
+            {
+                "key": "validity",
+                "area": ComplianceArea.COMMERCIAL,
+                "requirement": (
+                    f"Bid validity {request.bid_validity_days} days"
+                    if request.bid_validity_days
+                    else "Bid validity as the RFP requires"
+                ),
+                "position": f"{who} states: {quote.validity.strip()}",
+                "status": ComplianceStatus.OPEN,
+                "severity": Severity.CRITICAL if request.bid_validity_days else None,
+                "action": (
+                    "Check this against the validity we are offering. Bidding a long "
+                    "validity against a short supplier hold is an open position, not a "
+                    "rounding difference — get it confirmed in writing before sending."
+                ),
+            }
+        )
+
+    if (quote.payment_terms or "").strip():
+        early = _mentions(quote.payment_terms, _PREPAYMENT_HINTS)
+        proposed.append(
+            {
+                "key": "payment",
+                "area": ComplianceArea.COMMERCIAL,
+                "requirement": "Payment terms as the customer's conditions require",
+                "position": f"{who} requires: {quote.payment_terms.strip()}",
+                "status": ComplianceStatus.DEVIATION if early else ComplianceStatus.OPEN,
+                "severity": Severity.HIGH if early else None,
+                "action": (
+                    "We pay before we are paid. Price the cost of the money on the "
+                    "landed-cost tab and declare the term — it is not ours to hide."
+                    if early
+                    else "Check against the customer's own payment conditions."
+                ),
+            }
+        )
+
+    if (quote.warranty or "").strip():
+        none_offered = _mentions(quote.warranty, _NO_WARRANTY_HINTS)
+        proposed.append(
+            {
+                "key": "warranty",
+                "area": ComplianceArea.COMMERCIAL,
+                "requirement": "Warranty as the customer's conditions require",
+                "position": f"{who} states: {quote.warranty.strip()}",
+                "status": (
+                    ComplianceStatus.NON_COMPLIANT if none_offered else ComplianceStatus.OPEN
+                ),
+                "severity": Severity.HIGH if none_offered else None,
+                "action": (
+                    "Negotiate a warranty, or declare its absence as a deviation. A "
+                    "warranty we have not been given is one we would be giving alone."
+                    if none_offered
+                    else "Check the term against what the customer asks for."
+                ),
+            }
+        )
+
+    if incoterm is not None:
+        proposed.append(
+            {
+                "key": "incoterm",
+                "area": ComplianceArea.LOGISTICS,
+                "requirement": (
+                    f"Incoterm {request.incoterm_required}"
+                    + (f", {request.incoterm_place}" if request.incoterm_place else "")
+                ),
+                "position": f"{who} quoted {quote.incoterms.strip()}.",
+                "status": (
+                    ComplianceStatus.COMPLIANT if incoterm else ComplianceStatus.DEVIATION
+                ),
+                "severity": None if incoterm else Severity.HIGH,
+                "action": (
+                    None
+                    if incoterm
+                    else "The gap between the two terms is the freight, duty and "
+                    "documentation. Build it on the landed-cost tab — this is usually "
+                    "the largest single cost on a bid, and the easiest to forget."
+                ),
+            }
+        )
+
+    if (quote.delivery_time or "").strip():
+        proposed.append(
+            {
+                "key": "delivery",
+                "area": ComplianceArea.LOGISTICS,
+                "requirement": "Delivery, in calendar days from the order",
+                "position": f"{who} states: {quote.delivery_time.strip()}",
+                "status": ComplianceStatus.OPEN,
+                "severity": Severity.MEDIUM,
+                "action": (
+                    "Turn this into calendar days from the order and put it in the "
+                    "delivery field. A supplier's working weeks are not the customer's "
+                    "calendar days, and transit and clearance are on top of both."
+                ),
+            }
+        )
+
+    existing = {row.ref: row for row in request.compliance}
+    position = len(request.compliance)
+    for row in proposed:
+        ref = _SUPPLIER_REFS[row["key"]]
+        current = existing.get(ref)
+        if current is None:
+            request.compliance.append(
+                QuoteComplianceItem(
+                    position=position,
+                    ref=ref,
+                    area=row["area"],
+                    requirement=row["requirement"],
+                    source_clause=None,
+                    supplier_position=row["position"],
+                    status=row["status"],
+                    severity=row["severity"],
+                    action=row["action"],
+                )
+            )
+            position += 1
+            continue
+        # The row is already there from an earlier supplier. Their words change;
+        # the owner and whatever a person decided about it do not.
+        current.supplier_position = row["position"]
+        if current.resolved_at is None:
+            current.status = row["status"]
+
+
+def seed_submission_checklist(request: QuoteRequest) -> None:
+    """The fields that get filled in wrong, as a checklist to work from.
+
+    Only when the list is empty, so it never lands on top of somebody's work.
+
+    These six are not a guess at what a portal asks for — every portal asks for
+    something different. They are the ones that are decided *here*, on this
+    screen, and then typed somewhere else by somebody reading from memory: the
+    country of origin that gets left on our own country, the unit price that
+    gets entered before the rounding was agreed, the part number that has to
+    match the RFP character for character. The map from decision to cell is
+    worth having precisely because the two live in different systems.
+    """
+    if request.submission_fields:
+        return
+    request.submission_fields = [
+        QuoteSubmissionField(position=position, label=label, note=note, is_mandatory=True)
+        for position, (label, note) in enumerate(
+            (
+                (
+                    "Intend to respond",
+                    "Portals default this to no. A bid on a line still set to no is "
+                    "not a bid.",
+                ),
+                (
+                    "Unit price",
+                    "The rounded figure from the costing, not the computed one.",
+                ),
+                (
+                    "Country of origin",
+                    "Where the goods are made, which on a specified-brand line is "
+                    "wherever the manufacturer makes them — not where we are.",
+                ),
+                ("Manufacturer name", "Exactly as the RFP spells it."),
+                ("Manufacturer part number", "Exactly as the RFP spells it."),
+                (
+                    "Delivery, in calendar days",
+                    "From the order, including payment clearance, production, transit "
+                    "and customs.",
+                ),
+            )
+        )
+    ]
 
 
 def markup_of(request: QuoteRequest) -> Decimal:
@@ -324,9 +791,15 @@ async def create(
         reviews=[],
         comments=[],
         revisions=[],
+        cost_lines=[],
+        compliance=[],
+        submission_fields=[],
     )
     apply_fields(request, payload)
     set_items(request, payload.get("items") or [])
+    set_cost_lines(request, payload.get("cost_lines") or [])
+    set_compliance(request, payload.get("compliance") or [])
+    set_submission_fields(request, payload.get("submission_fields") or [])
     session.add(request)
     await session.flush()
     return request
@@ -364,6 +837,26 @@ async def quotes_for_tasks(
     return {r.source_task_id: r for r in rows if r.source_task_id}
 
 
+#: An RFP or tender number as it appears in a Proposals title. The list is
+#: typed by people, so this matches the shapes they actually use — "RFP
+#: 6000149233", "Tender No: ABC/2026/44", "ITB-1234" — and gives up rather than
+#: guessing when none of them fit. A wrong event number on a bid is worse than
+#: an empty one: it is quoted back in every clarification and on the PO.
+_RFP_PATTERN: Final = re.compile(
+    r"\b(?:RFP|RFQ|ITB|ITT|TENDER|ENQUIRY|ENQ)\b[\s:.#/-]*"
+    r"(?:NO\.?|NUMBER|#)?[\s:.#/-]*([A-Z0-9][A-Z0-9/._-]{3,})",
+    re.IGNORECASE,
+)
+
+
+def rfp_number_in(title: str | None) -> str | None:
+    """The buyer's event number out of a Proposals title, when it is in there."""
+    if not title:
+        return None
+    found = _RFP_PATTERN.search(title)
+    return found.group(1).strip(".:/-")[:120] if found else None
+
+
 def payload_from_task(task: Any) -> dict[str, Any]:
     """A Proposals row as the beginnings of a quote request.
 
@@ -375,21 +868,39 @@ def payload_from_task(task: Any) -> dict[str, Any]:
     because a column is blank would push people back to raising them by hand.
     The win probability that follows carries its own basis, so an unknown
     customer reads as an unknown customer rather than as a confident number.
+
+    On a tender the row knows more than an estimate has room for: who is buying,
+    the event number in its own title, and the date they asked for. Those go to
+    the bid pack. The buying entity and the customer are filled from the same
+    column deliberately — on a tender they are usually the same organisation,
+    and where they are not, the one that is wrong is the one somebody corrects,
+    which is cheaper than the one nobody filled in.
     """
     notes = [
         f"{label}: {text.strip()}"
         for label, text in (("Remarks", task.remarks), ("Working notes", task.working_notes))
         if (text or "").strip()
     ]
+    end_user = (task.end_user or "").strip()
     return {
         "title": task.title,
-        "customer_name": (task.end_user or "").strip() or task.title,
+        "customer_name": end_user or task.title,
         # Zoho's own custom field for the bid closing date, which the Proposals
         # list has been calling BCD all along.
         "cf_bcd": _as_date(task.bid_closing_date),
         # Their Zoho quote number when the row already has one.
         "reference": (task.quote_no or "").strip()[:60] or None,
         "notes": _BLANK_LINE.join(notes) or None,
+        # ── the bid pack's share of the row ────────────────────────────
+        "rfp_number": rfp_number_in(task.title),
+        "buying_entity": end_user or None,
+        # Which portal the enquiry came through, which the list calls the type.
+        "cf_portal": (task.current_type or "").strip()[:120] or None,
+        # What the customer asked for, not what we will offer — the two are
+        # different fields because on tenders the asked-for date has very often
+        # already passed by the time the enquiry reaches anybody, and that gap
+        # is itself a deviation somebody has to declare.
+        "requested_delivery_date": _as_date(task.due_date),
     }
 
 
@@ -462,6 +973,34 @@ def snapshot_of(request: QuoteRequest) -> dict[str, Any]:
             if request.selected_supplier_quote_id
             else None
         ),
+        # The bid position as it stood. A negotiation is an argument about what
+        # was offered before, and "we bid at 45% on a landed cost of X" is the
+        # half of that argument a list of line items cannot carry.
+        "bid": {
+            "rfp_number": request.rfp_number,
+            "line_item_ref": request.line_item_ref,
+            "target_markup_percent": (
+                str(request.target_markup_percent)
+                if request.target_markup_percent is not None
+                else None
+            ),
+            "submission_unit_price": (
+                str(request.submission_unit_price)
+                if request.submission_unit_price is not None
+                else None
+            ),
+            "submission_total": (
+                str(request.submission_total)
+                if request.submission_total is not None
+                else None
+            ),
+            "delivery_days": request.delivery_days,
+            "country_of_origin": request.country_of_origin,
+            "landed_total": str(bidpack.landed_cost(request).total),
+            # What was still outstanding when the round ended, which is usually
+            # the reason it ended the way it did.
+            "open_issues": sum(1 for c in request.compliance if c.is_blocking),
+        },
         "items": [
             {
                 "position": item.position,
