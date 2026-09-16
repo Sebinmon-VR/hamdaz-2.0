@@ -16,11 +16,14 @@ whether it went.
 
 from __future__ import annotations
 
+import logging
 from decimal import Decimal
-from typing import Any
+from typing import Any, Final
 
-from app.core.mail import GraphMailer
+from app.core.mail import Attachment, GraphMailer
 from app.models.quoting import QuoteComment, QuoteRequest, QuoteReview
+from app.quoting import workbook
+from app.quoting.workbook import XLSX_TYPE
 
 
 def _money(value: Decimal | None, currency: str) -> str:
@@ -113,18 +116,71 @@ def _link_block(link: str, label: str) -> str:
     )
 
 
+logger = logging.getLogger("hamdaz.quoting")
+
+def _is_bid(request: QuoteRequest) -> bool:
+    """Whether there is a bid pack worth attaching.
+
+    The same question the screen asks before showing the bid sheets, and asked
+    the same way: a quote raised because somebody rang up and asked for a price
+    has none of this, and should not arrive with five sheets of blanks.
+    """
+    return bool(
+        request.rfp_number
+        or request.line_item_ref
+        or request.incoterm_required
+        or request.compliance
+        or request.cost_lines
+        or request.submission_fields
+    )
+
+
 class QuoteMailer(GraphMailer):
     """Every message a quote sends, each one from the person who caused it."""
 
     async def send_for_approval(
         self, request: QuoteRequest, recipients: list[str], *, link: str
     ) -> dict[str, Any]:
-        """Tell the approvers a quote is waiting, with a way straight to it."""
+        """Tell the approvers a quote is waiting, with a way straight to it.
+
+        The bid pack goes with it as a workbook. Approvers read mail on phones
+        and between meetings, and a link that needs a sign-in is a decision
+        deferred; the attachment is the whole bid — compliance, landed cost,
+        margin ladder and the portal answers — readable without logging in
+        anywhere. The link is still the thing to act on, and the mail says so.
+
+        Only for a quote that has a bid behind it. Attaching five sheets of
+        mostly-empty workbook to an ordinary estimate would be noise, so the
+        workbook is built only when there is a bid pack to put in it.
+
+        **Generating it never stops the mail.** If the workbook fails to build,
+        the approvers are still told — being notified matters more than the copy
+        they could have opened, and a quote silently waiting because a
+        spreadsheet would not render is the worse failure by a distance.
+        """
+        attachments: list[Attachment] = []
+        if _is_bid(request):
+            try:
+                attachments.append(
+                    Attachment(
+                        name=workbook.filename_for(request),
+                        content=workbook.build(request),
+                        content_type=XLSX_TYPE,
+                    )
+                )
+            except Exception:  # noqa: BLE001 — see the docstring.
+                logger.exception(
+                    "bid workbook for quote %s could not be built; "
+                    "sending the approval mail without it",
+                    request.id,
+                )
+
         return await self.send(
             sender=request.created_by.entra_object_id if request.created_by else "",
             recipients=recipients,
             subject=_subject(request),
             html=_body(request, link),
+            attachments=attachments or None,
         )
 
     async def send_decision(

@@ -391,6 +391,27 @@ class BidPackOut(BaseModel):
     warnings: list[str]
 
 
+class QuoteDocumentOut(BaseModel):
+    """One supplier document that was uploaded against this quote.
+
+    Read off the saved supplier-quote rows rather than out of the comparison
+    analysis. The analysis is a snapshot of a computation, made from the payload
+    before anything is filed anywhere — so where a document ended up is simply
+    not known at the point it is built. The rows are, and stay, the truth about
+    the files.
+    """
+
+    supplier_quote_id: uuid.UUID
+    supplier_name: str
+    file_name: str | None
+    file_type: str | None
+    #: Where it was filed in the shared library, when filing is on and worked.
+    #: Opening it uses the viewer's own SharePoint access, never this app's.
+    drive_url: str | None
+    #: True for the offer this quote is actually priced from.
+    is_selected: bool = False
+
+
 class QuoteRequestOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -497,6 +518,9 @@ class QuoteRequestOut(BaseModel):
 
     #: The comparison of the supplier quotes behind this one, when there is one.
     comparison: dict[str, Any] | None = None
+    #: The documents people uploaded, and where each was filed. Kept apart from
+    #: ``comparison`` because that is a computation and these are files.
+    documents: list[QuoteDocumentOut] = Field(default_factory=list)
     #: Whether the caller may edit, may send it for approval, and may decide.
     may_edit: bool = False
     #: Set once it is priced from a supplier and has lines. ``submit_reason``
@@ -506,6 +530,9 @@ class QuoteRequestOut(BaseModel):
     submit_reason: str | None = None
     may_approve: bool = False
     approve_reason: str | None = None
+    #: Super admin only. A quote carries an approval history that is appended
+    #: and never edited, so removing one is not the author's to do.
+    may_delete: bool = False
 
     @field_validator("comparison", mode="before")
     @classmethod
@@ -546,6 +573,10 @@ class QuoteSummaryOut(BaseModel):
     rfp_number: str | None = None
     #: The deadline the work is actually timed against.
     cf_bcd: datetime | None = None
+    #: Super admin only, and the server's answer rather than a role check done
+    #: on the screen. Identical for every row of a given caller, but carried per
+    #: row so the list asks exactly the question the quote itself does.
+    may_delete: bool = False
     created_at: datetime
 
 

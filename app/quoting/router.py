@@ -39,6 +39,7 @@ from fastapi import (
     HTTPException,
     Query,
     Request,
+    Response,
     UploadFile,
     status,
 )
@@ -59,8 +60,10 @@ from app.models.comparison import QuoteSource
 from app.models.quoting import QuoteRequest, QuoteStatus
 from app.proposals.router import get_sharepoint
 from app.proposals.sharepoint import SharePointError, SharePointProposals
-from app.quoting import bidpack, service
+from app.quoting import bidpack, service, storage
+from app.quoting import workbook as workbook_mod
 from app.quoting.mailer import QuoteMailer
+from app.quoting.storage import QuoteDrive
 from app.quoting.probability import WinRates
 from app.quoting.schemas import (
     BidPackOut,
@@ -70,6 +73,7 @@ from app.quoting.schemas import (
     NegotiationIn,
     QuotableTaskOut,
     QuotableTasksOut,
+    QuoteDocumentOut,
     QuoteRequestIn,
     QuoteRequestOut,
     QuoteSummaryOut,
@@ -79,6 +83,7 @@ from app.quoting.schemas import (
     TaskQuoteIn,
 )
 from app.quoting.service import QuoteError, QuoteNotFoundError, QuotePermissionError
+from app.roles.catalogue import SUPER_ADMIN
 from app.roles.deps import CurrentRoles
 from app.teams import service as teams_service
 from app.teams.service import TeamError
@@ -141,11 +146,16 @@ def get_mailer(request: Request) -> QuoteMailer:
     return request.app.state.quote_mailer
 
 
+def get_drive(request: Request) -> QuoteDrive:
+    return request.app.state.quote_drive
+
+
 Extractor = Annotated[QuoteExtractor, Depends(get_extractor)]
 Zoho = Annotated[ZohoBooks, Depends(get_zoho)]
 Rates = Annotated[WinRates, Depends(get_win_rates)]
 SharePoint = Annotated[SharePointProposals, Depends(get_sharepoint)]
 Mailer = Annotated[QuoteMailer, Depends(get_mailer)]
+Drive = Annotated[QuoteDrive, Depends(get_drive)]
 
 
 def _translate(exc: QuoteError) -> HTTPException:
@@ -174,16 +184,38 @@ async def _out(
     # it came from. See ``app.quoting.bidpack``.
     body.bid = BidPackOut.model_validate(bidpack.build(request), from_attributes=True)
 
+    # The uploaded documents, from the supplier quote rows themselves. Both
+    # relationships are selectin-loaded, so this costs no extra query and — more
+    # to the point — no lazy load from inside async code.
+    if request.comparison is not None:
+        body.documents = [
+            QuoteDocumentOut(
+                supplier_quote_id=quote.id,
+                supplier_name=quote.supplier_name,
+                file_name=quote.file_name,
+                file_type=quote.file_type,
+                drive_url=quote.drive_url,
+                is_selected=quote.id == request.selected_supplier_quote_id,
+            )
+            for quote in request.comparison.quotes
+        ]
+
     body.may_edit = request.is_editable and request.created_by_id == user.id
     body.submit_reason = service.why_not_submit(request)
     body.may_submit = body.may_edit and body.submit_reason is None
     allowed, reason = await service.may_approve(session, request, user=user, roles=roles)
     body.may_approve = allowed
     body.approve_reason = None if allowed else reason
+    # Asked here rather than re-derived on the screen, like every other
+    # permission on this body. A frontend that works out for itself who may
+    # delete something is a frontend that will one day disagree with the server.
+    body.may_delete = SUPER_ADMIN in set(roles)
     return body
 
 
-def _summary(request: QuoteRequest) -> QuoteSummaryOut:
+def _summary(
+    request: QuoteRequest, roles: set[str] | frozenset[str] = frozenset()
+) -> QuoteSummaryOut:
     return QuoteSummaryOut(
         id=request.id,
         reference=request.reference,
@@ -203,6 +235,7 @@ def _summary(request: QuoteRequest) -> QuoteSummaryOut:
         blocking_issues=sum(1 for c in request.compliance if c.is_blocking),
         rfp_number=request.rfp_number,
         cf_bcd=request.cf_bcd,
+        may_delete=SUPER_ADMIN in set(roles),
         created_at=request.created_at,
     )
 
@@ -433,6 +466,71 @@ async def update(
     return await _out(session, request, user=user, roles=roles)
 
 
+@router.get(
+    "/{request_id}/workbook",
+    summary="The bid pack as an Excel workbook",
+    response_class=Response,
+    responses={200: {"content": {workbook_mod.XLSX_TYPE: {}}}},
+)
+async def download_workbook(
+    request_id: uuid.UUID,
+    user: CurrentUser,
+    roles: CurrentRoles,
+    session: Session,
+) -> Response:
+    """The five sheets presales already works in, built from the stored bid.
+
+    A rendering, not a second source of truth: every figure comes from the same
+    computation the screen draws, so the workbook and the page it came from
+    cannot disagree.
+
+    Readable by anyone who can open the quote — which the module gate and the
+    listing rules have already settled — because a bid is worked on with people
+    who are not going to sign in to look at it.
+    """
+    request = await _load(session, request_id)
+    content = workbook_mod.build(request)
+    name = workbook_mod.filename_for(request)
+    logger.info("workbook for quote %s downloaded by %s", request_id, user.email)
+    return Response(
+        content=content,
+        media_type=workbook_mod.XLSX_TYPE,
+        headers={
+            # Quoted, because the name carries spaces on a bid whose event
+            # number has them.
+            "Content-Disposition": f'attachment; filename="{name}"',
+        },
+    )
+
+
+@router.delete(
+    "/{request_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a quote request (super admin)",
+)
+async def destroy(
+    request_id: uuid.UUID,
+    user: CurrentUser,
+    roles: CurrentRoles,
+    session: Session,
+) -> None:
+    """Remove a quote request and everything hanging off it. Super admin only.
+
+    Not the author's to do, on purpose. A quote carries an appended approval
+    history whose whole value is that it cannot be rewritten, and a delete in
+    the author's hands would be a rewrite with an extra step.
+
+    Answers 204 with no body. There is nothing left to return, and a caller
+    that wants the list refreshes it.
+    """
+    request = await _load(session, request_id)
+    try:
+        await service.delete_request(session, request, roles=roles)
+    except QuoteError as exc:
+        raise _translate(exc) from exc
+    logger.info("quote %s deleted by %s", request_id, user.email)
+
+
 # ── 2. the supplier quotes behind it ───────────────────────────────────
 
 
@@ -447,6 +545,7 @@ async def attach_suppliers(
     roles: CurrentRoles,
     session: Session,
     extractor: Extractor,
+    drive: Drive,
     files: Annotated[
         list[UploadFile] | None,
         File(description="Supplier quotes: PDF, image, XLSX, CSV or DOCX"),
@@ -473,10 +572,17 @@ async def attach_suppliers(
         )
 
     readables, failures = [], []
+    # The bytes exactly as they arrived, kept beside the prepared versions.
+    # `prepare` converts a DOCX to text and leaves `Readable.data` empty, so the
+    # original is the only thing worth filing — a colleague opening the drive
+    # wants the supplier's own document, not our extraction of it.
+    originals: dict[str, tuple[bytes, str | None]] = {}
     for upload in uploads:
         name = upload.filename or "unnamed"
         try:
-            readables.append(prepare(name, await upload.read(), upload.content_type))
+            raw = await upload.read()
+            readables.append(prepare(name, raw, upload.content_type))
+            originals[name] = (raw, upload.content_type)
         except DocumentError as exc:
             failures.append(f"{name}: {exc}")
 
@@ -542,6 +648,26 @@ async def attach_suppliers(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=f"Could not compare: {exc}"
         ) from exc
+
+    # File the originals into the drive, if one is configured. Deliberately
+    # after the comparison is saved and deliberately unable to fail it: the
+    # person gets their comparison whether or not a drive was reachable, and
+    # the database copy is the system of record either way.
+    if drive.enabled:
+        folder = storage.folder_for(request.reference, request.title, request.id)
+        for saved in comparison.quotes:
+            original = originals.get(saved.file_name or "")
+            if original is None:
+                continue
+            filed = await drive.try_file(
+                folder=folder,
+                filename=saved.file_name or "supplier-quote",
+                content=original[0],
+                content_type=original[1],
+            )
+            if filed is not None:
+                saved.drive_item_id = filed.item_id
+                saved.drive_url = filed.web_url
 
     # The object, not the id: assigning it leaves the relationship loaded, so
     # the response can be built without going back to the database for it.
@@ -912,16 +1038,20 @@ async def index(
         viewer_roles=roles,
         limit=limit,
     )
-    return [_summary(r) for r in rows]
+    return [_summary(r, roles) for r in rows]
 
 
 @router.get("/mine", response_model=list[QuoteSummaryOut], summary="Quotes I raised or owe work on")
 async def mine(
     user: CurrentUser,
+    roles: CurrentRoles,
     session: Session,
     limit: Annotated[int, Query(ge=1, le=500)] = 100,
 ) -> list[QuoteSummaryOut]:
-    return [_summary(r) for r in await service.listing(session, mine_for=user.id, limit=limit)]
+    return [
+        _summary(r, roles)
+        for r in await service.listing(session, mine_for=user.id, limit=limit)
+    ]
 
 
 @router.get(
@@ -931,6 +1061,7 @@ async def mine(
 )
 async def queue(
     user: CurrentUser,
+    roles: CurrentRoles,
     session: Session,
     team: Annotated[str | None, Query(description="Team handle or id")] = None,
     mine_only: Annotated[bool, Query(description="Only the ones assigned to me")] = False,
@@ -949,7 +1080,7 @@ async def queue(
     rows = await service.queue(
         session, team_id=team_id, assignee=user.id if mine_only else None
     )
-    return [_summary(r) for r in rows]
+    return [_summary(r, roles) for r in rows]
 
 
 @router.get("/{request_id}", response_model=QuoteRequestOut, summary="One quote in full")

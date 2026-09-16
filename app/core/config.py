@@ -72,6 +72,30 @@ class Settings(BaseSettings):
         "https://hamdaz1.sharepoint.com/sites/ProposalTeam/Lists/Proposals"
     )
 
+    # ── the document library supplier quotes are filed in ──────────────
+    #: The Documents library of the **Test** site, which is the one place in
+    #: SharePoint this app is allowed to write. Everything else there is read
+    #: only — the Proposals list above most of all, and nothing here goes near
+    #: it. Configured as a literal for the same reason the site and list ids
+    #: above are: it changes only if the library is moved, and reading it from
+    #: somewhere else at startup would make the destination harder to see, not
+    #: easier.
+    #:
+    #: Set to blank to switch filing off entirely; uploads then stay in the
+    #: database, which is the system of record either way.
+    quote_drive_id: str = (
+        "b!sezgUlWA6Um1PgoJ4QTpCULYYroUPQZKvfWrVskCOzPTrTOr4BoOT6QqxrwnoBdN"
+    )
+    #: The folder within that library. One folder per quote is made inside it,
+    #: so a bid's documents stay together and somebody opening the library can
+    #: see which quote they belong to.
+    quote_drive_folder: str = "attachments2"
+
+    @property
+    def files_to_drive(self) -> bool:
+        """Whether uploaded supplier quotes are filed to the library at all."""
+        return bool(self.quote_drive_id.strip())
+
     # ── Zoho Books (quotes) ────────────────────────────────────────────
     #: READ ONLY, like SharePoint. Zoho Books is where quotes are actually
     #: written; this app only reads them. The scope on the refresh token should

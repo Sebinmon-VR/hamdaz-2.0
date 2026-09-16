@@ -78,8 +78,8 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         key="leave",
         name="Leave",
         description=(
-            "Request time off. Open to everyone; the HR team decides. Listed here "
-            "for navigation — it is not gated by team grants."
+            "Request time off; the HR team decides. Gated by team grant — "
+            "a team without it cannot book leave at all, so revoke with care."
         ),
         pages=(
             PageSpec("mine", "My leave", "/leave"),
@@ -145,8 +145,7 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         name="Quotes",
         description=(
             "Quotes read from Zoho Books, with the customer, items, sales orders "
-            "and comments attached to each. Read-only. Listed here for navigation "
-            "— like leave, it is open to everyone rather than gated by team grants."
+            "and comments attached to each. Read-only, and gated by team grant."
         ),
         pages=(
             PageSpec("list", "All quotes", "/quotes"),
@@ -187,9 +186,9 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         name="Work Assignment",
         description=(
             "User labels and the policy that decides how work is shared out — "
-            "capacity ratios, limits and who is in the pool. Listed for "
-            "navigation; who may EDIT a policy is decided by role and team "
-            "membership, not by a team grant."
+            "capacity ratios, limits and who is in the pool. Gated by team "
+            "grant; who may EDIT a policy is narrower still, decided by role "
+            "and team membership."
         ),
         pages=(
             PageSpec("labels", "Labels", "/assignment/labels"),

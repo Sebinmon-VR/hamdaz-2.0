@@ -25,7 +25,7 @@ from app.models.comparison import (
 )
 from app.models.quoting import CommentTarget, QuoteStatus, ReviewAction
 from app.quoting import service
-from app.quoting.service import QuoteError, QuotePermissionError
+from app.quoting.service import QuoteError, QuoteNotFoundError, QuotePermissionError
 from app.roles import service as roles_service
 from app.teams import service as teams
 
@@ -787,3 +787,88 @@ async def test_an_approver_switching_supplier_keeps_both_sets_of_numbers(
     assert outcomes["superseded"].snapshot["items"][0]["rate"] == "1200.0000"
     # ...and what was actually approved.
     assert outcomes["approve"].snapshot["items"][0]["rate"] == "1080.0000"
+
+# ── who may delete one ─────────────────────────────────────────────────
+
+
+async def test_only_a_super_admin_can_delete_a_quote(db, team, requester, approver) -> None:
+    """Not the author's, on purpose.
+
+    A quote carries an approval history whose whole value is that it cannot be
+    rewritten. Letting the person who raised it delete the record of a decision
+    they disliked would undo that in one click — and it would be the quotes most
+    worth keeping that went.
+    """
+    request = await service.create(db, payload=dict(FORM), author=requester, team=team)
+    await db.commit()
+
+    for roles in ({"approver"}, {"manager"}, {"ceo"}, set()):
+        with pytest.raises(QuotePermissionError):
+            await service.delete_request(db, request, roles=roles)
+
+
+async def test_a_super_admin_deletes_the_quote_and_everything_under_it(
+    db, team, requester
+) -> None:
+    request = await service.create(db, payload=dict(FORM), author=requester, team=team)
+    await service.comment(db, request, author=requester, body="a remark")
+    await db.commit()
+    request_id = request.id
+
+    await service.delete_request(db, request, roles={"super_admin"})
+    await db.commit()
+
+    with pytest.raises(QuoteNotFoundError):
+        await service.get(db, request_id)
+
+
+# ── who sees which quotes ──────────────────────────────────────────────
+
+
+async def test_the_list_shows_a_person_their_own_and_nobody_elses(
+    db, team, requester
+) -> None:
+    other = await person(db, "colleague@hamdaz.com")
+    await teams.set_member_roles(db, team=team, user=other, role_keys=["member"])
+    await service.create(
+        db, payload={**FORM, "title": "Mine"}, author=requester, team=team
+    )
+    await service.create(
+        db, payload={**FORM, "title": "Theirs"}, author=other, team=team
+    )
+    await db.commit()
+
+    titles = {r.title for r in await service.listing(db, viewer=requester, viewer_roles=set())}
+    assert titles == {"Mine"}
+
+
+async def test_an_approver_sees_what_is_waiting_not_the_teams_archive(
+    db, team, requester, approver
+) -> None:
+    """Approving is not the same as auditing.
+
+    A team lead who approves should see the queue, which is what they have to
+    act on. A colleague's untouched draft carries the cost behind every price
+    and is not theirs to read.
+    """
+    draft = await service.create(
+        db, payload={**FORM, "title": "Still a draft"}, author=requester, team=team
+    )
+    await db.commit()
+
+    titles = {r.title for r in await service.listing(db, viewer=approver, viewer_roles=set())}
+    assert "Still a draft" not in titles
+
+
+async def test_a_manager_sees_everything(db, team, requester) -> None:
+    boss = await person(db, "boss@hamdaz.com", "manager")
+    await service.create(
+        db, payload={**FORM, "title": "Not the boss's"}, author=requester, team=team
+    )
+    await db.commit()
+
+    titles = {
+        r.title for r in await service.listing(db, viewer=boss, viewer_roles={"manager"})
+    }
+    assert "Not the boss's" in titles
+

@@ -10,7 +10,10 @@ copy of a token cache is a second thing to get wrong.
 
 from __future__ import annotations
 
+import base64
+import logging
 import time
+from dataclasses import dataclass
 from typing import Any, Final
 
 import httpx
@@ -20,6 +23,23 @@ from app.core.config import Settings
 GRAPH_BASE: Final = "https://graph.microsoft.com/v1.0"
 GRAPH_SCOPE: Final = "https://graph.microsoft.com/.default"
 _TOKEN_REFRESH_BUFFER_SECONDS: Final = 120
+
+logger = logging.getLogger("hamdaz.mail")
+
+
+#: Graph takes an inline attachment up to about 4 MB, counted across the whole
+#: encoded message. Held well under it, because base64 adds a third and the body
+#: has to fit too.
+MAX_ATTACHMENT_BYTES: Final = 3_000_000
+
+
+@dataclass(frozen=True, slots=True)
+class Attachment:
+    """One file to hang on a message."""
+
+    name: str
+    content: bytes
+    content_type: str = "application/octet-stream"
 
 
 class MailError(Exception):
@@ -58,24 +78,62 @@ class GraphMailer:
         return self._token
 
     async def send(
-        self, *, sender: str, recipients: list[str], subject: str, html: str
+        self,
+        *,
+        sender: str,
+        recipients: list[str],
+        subject: str,
+        html: str,
+        attachments: list[Attachment] | None = None,
     ) -> dict[str, Any]:
+        """Send as ``sender``, optionally with files.
+
+        Attachments go inline in the sendMail body as base64, which Graph caps
+        at roughly 4 MB for the whole message. That is ample for what this sends
+        — a generated workbook is tens of kilobytes — and the alternative, an
+        upload session against a draft, is three more round trips for a case
+        nothing here has. An attachment that would blow the cap is dropped with
+        a warning rather than failing the mail: the approver being told a quote
+        is waiting matters more than the copy of it they could have opened.
+        """
         if not recipients:
             raise MailError("There is nobody to send this to")
         if not sender:
             raise MailError("There is no Entra account to send from")
 
+        message: dict[str, Any] = {
+            "subject": subject,
+            "body": {"contentType": "HTML", "content": html},
+            "toRecipients": [
+                {"emailAddress": {"address": address}} for address in recipients
+            ],
+        }
+        if attachments:
+            kept = []
+            for item in attachments:
+                if len(item.content) > MAX_ATTACHMENT_BYTES:
+                    logger.warning(
+                        "attachment %s dropped: %d bytes is over the sendMail limit",
+                        item.name,
+                        len(item.content),
+                    )
+                    continue
+                kept.append(
+                    {
+                        "@odata.type": "#microsoft.graph.fileAttachment",
+                        "name": item.name,
+                        "contentType": item.content_type,
+                        "contentBytes": base64.b64encode(item.content).decode(),
+                    }
+                )
+            if kept:
+                message["attachments"] = kept
+
         token = await self._access_token()
         response = await self._http.post(
             f"{GRAPH_BASE}/users/{sender}/sendMail",
             json={
-                "message": {
-                    "subject": subject,
-                    "body": {"contentType": "HTML", "content": html},
-                    "toRecipients": [
-                        {"emailAddress": {"address": address}} for address in recipients
-                    ],
-                },
+                "message": message,
                 # It is their own mail; it belongs in their Sent Items.
                 "saveToSentItems": True,
             },

@@ -161,6 +161,14 @@ class SupplierQuote(Base, UUIDPrimaryKey, Timestamped):
     #: price. Surfaced next to the quote so a reviewer looks there first.
     extraction_note: Mapped[str | None] = mapped_column(Text)
 
+    #: Where the document was filed in OneDrive, when it was. The bytes above
+    #: stay the system of record — this is a convenience so a colleague can open
+    #: the supplier's own PDF without an account on this system. Null when
+    #: filing is switched off, or when the drive refused and the upload carried
+    #: on regardless. See ``app/quoting/storage.py``.
+    drive_item_id: Mapped[str | None] = mapped_column(String(120))
+    drive_url: Mapped[str | None] = mapped_column(Text)
+
     comparison: Mapped[QuoteComparison] = relationship(back_populates="quotes")
     items: Mapped[list[SupplierQuoteItem]] = relationship(
         back_populates="quote",

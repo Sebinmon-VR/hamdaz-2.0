@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.assignment import service
 from app.assignment.schemas import EffectOut, PolicyIn, PolicyOut, PolicyPreviewOut
 from app.assignment.service import PolicyError, PolicyNotFoundError
+from app.access.deps import module_guard
 from app.auth.deps import CurrentUser
 from app.core.db import get_session
 from app.labels import service as labels_service
@@ -35,7 +36,11 @@ from app.roles.deps import CurrentRoles
 from app.teams import service as teams_service
 from app.teams.service import TeamError
 
-router = APIRouter(prefix="/assignment", tags=["assignment policy"])
+router = APIRouter(
+    prefix="/assignment",
+    tags=["assignment policy"],
+    dependencies=[Depends(module_guard("assignment", "Work Assignment"))],
+)
 
 Session = Annotated[AsyncSession, Depends(get_session)]
 

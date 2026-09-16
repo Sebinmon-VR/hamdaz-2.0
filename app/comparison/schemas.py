@@ -148,6 +148,10 @@ class QuoteOut(BaseModel):
     items: list[ItemOut]
     #: Present only when the original document was kept.
     document_url: str | None = None
+    #: Where the supplier's own document was filed in OneDrive, when filing is
+    #: switched on. A link a colleague can open without an account here — their
+    #: own drive access decides what they may see, not ours.
+    drive_url: str | None = None
 
 
 class ComparisonOut(BaseModel):

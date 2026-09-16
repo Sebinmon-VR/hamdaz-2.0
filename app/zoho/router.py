@@ -17,6 +17,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 
+from app.access.deps import module_guard
 from app.auth.deps import CurrentUser
 from app.core.config import get_settings
 from app.zoho import service
@@ -24,7 +25,11 @@ from app.zoho.cache import QuoteCache
 from app.zoho.client import ZohoBooks, ZohoError, ZohoRateLimitError
 from app.zoho.schemas import QuoteDetailOut, QuoteListOut, QuoteOut, RelatedOut
 
-router = APIRouter(prefix="/quotes", tags=["quotes"])
+router = APIRouter(
+    prefix="/quotes",
+    tags=["quotes"],
+    dependencies=[Depends(module_guard("quotes", "Quotes"))],
+)
 
 #: Zoho's own vocabulary, so a caller can pass what they see in the Books UI.
 _STATUSES = ("draft", "sent", "invoiced", "accepted", "declined", "expired")

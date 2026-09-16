@@ -55,6 +55,7 @@ from app.workflows.router import router as workflows_router
 from app.workflows.worker import WorkflowWorker
 from app.notifications.router import router as notifications_router
 from app.quoting.mailer import QuoteMailer
+from app.quoting.storage import QuoteDrive
 from app.reports.brief import Briefer
 from app.reports.mailer import ReportMailer
 from app.reports.router import admin_router as reports_admin_router
@@ -115,6 +116,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.win_rates = WinRates()
     # Approvers are told a quote is waiting, from the requester's own mailbox.
     app.state.quote_mailer = QuoteMailer(settings, http)
+    # Files the supplier documents people upload into OneDrive. Inert
+    # unless a drive is configured — see app/quoting/storage.py.
+    app.state.quote_drive = QuoteDrive(settings, http)
     # A filed report is mailed to whoever it goes to, from its author's mailbox.
     # A failure to send never fails the filing — see app/reports/router.py.
     app.state.report_mailer = ReportMailer(settings, http)

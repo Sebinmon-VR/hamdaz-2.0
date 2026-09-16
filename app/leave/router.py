@@ -15,6 +15,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.access.deps import module_guard
 from app.auth.deps import CurrentUser
 from app.core.db import get_session
 from app.leave import service
@@ -33,7 +34,13 @@ from app.leave.service import LeaveConflictError, LeaveError, LeaveNotFoundError
 from app.models.leave import LeaveRequest, LeaveStatus
 from app.models.user import User
 
-router = APIRouter(prefix="/leave", tags=["leave"])
+router = APIRouter(
+    prefix="/leave",
+    tags=["leave"],
+    # On the router rather than on each route, so a route added later
+    # cannot quietly miss it. See app/access/deps.py.
+    dependencies=[Depends(module_guard("leave", "Leave"))],
+)
 
 Session = Annotated[AsyncSession, Depends(get_session)]
 

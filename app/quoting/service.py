@@ -35,7 +35,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Final
 
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.comparison import SupplierQuote, SupplierQuoteItem
@@ -58,6 +58,7 @@ from app.models.quoting import (
     Severity,
 )
 from app.models.role import Role, UserRole
+from app.roles.catalogue import SUPER_ADMIN
 from app.models.team import Team, TeamMembership
 from app.models.user import User
 from app.quoting import bidpack
@@ -1190,6 +1191,45 @@ async def review(
     return record
 
 
+async def delete_request(
+    session: AsyncSession, request: QuoteRequest, *, roles: set[str] | frozenset[str]
+) -> None:
+    """Remove a quote request outright. Super admin only.
+
+    Deliberately not given to the person who raised it, and not given to
+    approvers either. A quote carries an approval history — who agreed to what,
+    and when — and the whole reason that history is appended and never edited is
+    that somebody may need to answer for it months later. Letting the author
+    delete the record of a decision they did not like would undo that in one
+    click, and it would be the quotes most worth keeping that went.
+
+    So this exists for the case it is actually needed for: a duplicate, a test
+    row, something raised against the wrong customer. One person can do it, and
+    it is the person who already administers the company.
+
+    Everything hanging off the request goes with it — the lines, the reviews,
+    the comments, the revisions, the landed-cost rows, the compliance matrix and
+    the portal checklist. That is the cascade doing what it says, and it is
+    right: half a deleted quote is worse than either outcome.
+
+    **Not reversible, and nothing here is written to Zoho or SharePoint** — a
+    quote deleted here was never in either.
+    """
+    if SUPER_ADMIN not in set(roles):
+        raise QuotePermissionError(
+            "Only a super admin can delete a quote request. A quote carries the "
+            "record of who approved what, so it is not the author's to remove."
+        )
+    logger.warning(
+        "quote %s (%s) deleted: %s",
+        request.id,
+        request.reference or request.title,
+        request.status,
+    )
+    await session.delete(request)
+    await session.flush()
+
+
 # ── comments ───────────────────────────────────────────────────────────
 
 
@@ -1268,11 +1308,22 @@ async def listing(
 ) -> list[QuoteRequest]:
     """Quotes, newest first, narrowed to what ``viewer`` is allowed to see.
 
-    A quote is somebody's negotiation with a customer, and the list of them
-    is not a noticeboard. A person sees the quotes they raised or were handed,
-    and the ones they decide — the same people ``may_approve`` lets decide a
-    quote may see it in the list, so nothing waits on an approver who cannot
-    find it. Anyone approving anywhere (super admin, CEO, manager) sees all.
+    A quote is somebody's negotiation with a customer, and the list of them is
+    not a noticeboard. Three rules, and they are deliberately narrow:
+
+    * **Your own** — raised by you, or handed to you.
+    * **Waiting on you** — a quote actually *pending approval* in a team where
+      you approve. Not that team's whole history: an approver needs to see what
+      is waiting, which is a different question from what has ever been quoted.
+      A team lead who happens to approve is not thereby an auditor of every
+      draft and every rejection their colleagues have written.
+    * **Everything** — for a super admin, the CEO or a manager, who answer for
+      the business rather than for a quote.
+
+    The narrowing matters more than it looks. These rows carry the cost behind
+    every price, so the margin on a colleague's job is readable by anyone the
+    list hands it to.
+
     With no ``viewer`` the list is unfiltered, for callers that have already
     settled who is asking.
     """
@@ -1289,14 +1340,22 @@ async def listing(
             )
         )
     if viewer is not None and not (set(viewer_roles) & GLOBAL_APPROVERS):
-        own = [
+        visible = [
             QuoteRequest.created_by_id == viewer.id,
             QuoteRequest.assigned_to_id == viewer.id,
         ]
         decides = await approver_team_ids(session, viewer.id)
         if decides:
-            own.append(QuoteRequest.team_id.in_(decides))
-        query = query.where(or_(*own))
+            # Waiting on them, rather than everything their team has ever
+            # written. An approver needs the queue; the archive is a different
+            # question and not one approving grants the right to ask.
+            visible.append(
+                and_(
+                    QuoteRequest.team_id.in_(decides),
+                    QuoteRequest.status == QuoteStatus.PENDING_APPROVAL,
+                )
+            )
+        query = query.where(or_(*visible))
     return list((await session.scalars(query)).all())
 
 
