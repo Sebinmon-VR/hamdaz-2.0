@@ -156,6 +156,15 @@ def test_the_whole_chain_lands_on_zohos_number() -> None:
     assert line["rate"] * item.quantity == Decimal("4803.00")
 
 
+def test_a_rate_typed_before_the_change_is_shown_as_it_is_stored() -> None:
+    quote = _quote()
+    item = _line("300", "16.008", None)
+    item.name, item.cost_rate = "LED panel", Decimal("13.34")
+    quote.items.append(item)
+    working = {s.label: s.working for s in calculation.steps(quote, bidpack.build(quote))}
+    assert working["LED panel"] == "cost 13.3400 + 20.00% = 16.008 each × 300"
+
+
 def test_the_bid_total_is_the_taxed_total_once_there_are_lines() -> None:
     quote = _quote()
     quote.currency = "USD"

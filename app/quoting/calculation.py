@@ -38,6 +38,18 @@ def _qty(value: Decimal) -> str:
     return _n(value, 0) if value == value.to_integral() else _n(value, 4)
 
 
+def _price(value: Decimal) -> str:
+    """As stored. A rate priced since the change is a whole cent; one typed
+    before it may be 16.008, and showing that as 16.01 beside a line total of
+    16.008 × 300 makes the working disagree with the number it explains."""
+    cents = value.quantize(Decimal("0.01"))
+    if value == cents:
+        return _n(value, 2)
+    # The column holds four places, so 16.008 is stored as 16.0080; the
+    # trailing zero is the column's, not the price's.
+    return _n(value, 4).rstrip("0")
+
+
 def steps(request: QuoteRequest, pack: BidPack) -> list[Step]:  # noqa: C901
     cur = request.currency or "AED"
     out: list[Step] = []
@@ -72,13 +84,13 @@ def steps(request: QuoteRequest, pack: BidPack) -> list[Step]:  # noqa: C901
             # 19.99% for a 20% markup.
             if request.target_markup_percent is not None:
                 parts.append(
-                    f"+ {_n(request.target_markup_percent)}% = {_n(rate)} each, to the cent"
+                    f"+ {_n(request.target_markup_percent)}% = {_price(rate)} each, to the cent"
                 )
             else:
                 markup = (rate - item.cost_rate) / item.cost_rate * Decimal(100)
-                parts.append(f"+ {_n(markup)}% = {_n(rate)} each")
+                parts.append(f"+ {_n(markup)}% = {_price(rate)} each")
         else:
-            parts.append(f"{_n(rate)} each")
+            parts.append(f"{_price(rate)} each")
         parts.append(f"× {_qty(qty)}")
         if item.discount:
             parts.append(f"− {_n(item.discount)} discount")
