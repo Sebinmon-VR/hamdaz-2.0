@@ -310,7 +310,7 @@ def _summary(ws: Worksheet, request: QuoteRequest, pack: BidPack) -> None:
         note=(
             "Suggested by the markup above — no price has been decided."
             if pack.bid_total_is_suggested
-            else f"Margin {pack.gross_margin_percent}% of the sale."
+            else f"Margin {pack.gross_margin_percent}% on the landed cost, before tax."
         ),
     )
     if pack.bid_unit_price is not None:
@@ -642,7 +642,10 @@ def _costing(ws: Worksheet, request: QuoteRequest, pack: BidPack) -> None:
     row = _row(
         ws,
         row,
-        ["", "Gross margin, as a share of the sale", "", "", "", "", pack.gross_margin_percent],
+        [
+            "", "Gross margin, on the landed cost, before tax", "", "", "", "",
+            pack.gross_margin_percent,
+        ],
         formats={7: PCT},
         fill=TOTAL,
     )

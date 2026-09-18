@@ -600,7 +600,13 @@ def build(request: QuoteRequest) -> BidPack:
     if unit is None and landed.quantity and landed.quantity > 0:
         unit = (bid_total / landed.quantity).quantize(_MONEY, rounding=ROUND_HALF_UP)
 
-    margin = bid_total - landed.total
+    # The margin, measured the way the lines measure it: what is made over the
+    # landed cost, as a share of that cost, before tax. A 20% markup on every
+    # line reads as 20% here. It was measured on the taxed selling price, so
+    # the same quote read 20.63% — which is neither what anyone typed nor a
+    # figure anyone could reconcile. Tax is collected, not earned.
+    sale = _money(request.total_excl_tax) if request.items else bid_total
+    margin = sale - landed.total
     return BidPack(
         landed=landed,
         scenarios=ladder,
@@ -610,7 +616,7 @@ def build(request: QuoteRequest) -> BidPack:
         bid_total_is_suggested=suggested_only,
         gross_margin=_money(margin),
         gross_margin_percent=(
-            _percent(margin / bid_total * Decimal(100)) if bid_total > 0 else None
+            _percent(margin / landed.total * Decimal(100)) if landed.total > 0 else None
         ),
         disclosure=disclosure(
             landed, bid_total, disclosed=request.discloses_principal_price

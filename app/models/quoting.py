@@ -491,16 +491,14 @@ class QuoteRequest(Base, UUIDPrimaryKey, Timestamped):
 
     @property
     def tax_total(self) -> Decimal:
-        """Tax across the lines, each at its own rate, on the line's own total.
-        Rounded once, at the end, to the cent."""
-        raw = sum(
-            (
-                i.line_total * (i.tax_percentage or Decimal(0)) / Decimal(100)
-                for i in self.items
-            ),
-            Decimal(0),
-        )
-        return raw.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        """Tax across the lines: each line's tax, rounded on the line, summed.
+
+        Per line rather than once at the end because that is how Zoho Books
+        computes an estimate, and the two documents are compared line by line.
+        Three lines of 0.333 come to 0.99 this way, not 1.00 — and to 0.99 in
+        Zoho too, which is the point.
+        """
+        return sum((i.tax_amount for i in self.items), Decimal("0.00"))
 
     @property
     def total(self) -> Decimal:
@@ -590,9 +588,25 @@ class QuoteRequestItem(Base, UUIDPrimaryKey, Timestamped):
 
     @property
     def line_total(self) -> Decimal:
+        """The taxable amount — what Zoho's estimate calls exactly that."""
         return (self.quantity or Decimal(0)) * (self.rate or Decimal(0)) - (
             self.discount or Decimal(0)
         )
+
+    @property
+    def tax_amount(self) -> Decimal:
+        """This line's tax, rounded to the cent on the line — as Zoho rounds
+        it. The quote's tax total is the sum of these, so the two documents
+        cannot differ by a cent of rounding."""
+        pct = self.tax_percentage or Decimal(0)
+        return (self.line_total * pct / Decimal(100)).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+
+    @property
+    def total_incl_tax(self) -> Decimal:
+        """Zoho's "Amount" column: the taxable amount plus its tax."""
+        return self.line_total + self.tax_amount
 
     @property
     def margin(self) -> Decimal | None:

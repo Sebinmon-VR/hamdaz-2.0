@@ -53,12 +53,46 @@ def test_a_quote_with_no_tax_totals_exactly_as_before() -> None:
     assert quote.total_excl_tax == quote.total == Decimal(32000 - 1000 + 250)
 
 
-def test_tax_rounds_once_to_the_cent_not_per_line() -> None:
+def test_tax_rounds_on_each_line_as_zoho_does() -> None:
     quote = _quote()
-    # 3 × 0.333... would each round to 0.33; the true sum rounds to 1.00.
+    # 3 × 0.333... each round to 0.33 on the line, so the total is 0.99 —
+    # which is what Zoho's estimate would show, and matching it is the point.
     for _ in range(3):
         quote.items.append(_line("1", "6.666666", "5"))
-    assert quote.tax_total == Decimal("1.00")
+    assert [i.tax_amount for i in quote.items] == [Decimal("0.33")] * 3
+    assert quote.tax_total == Decimal("0.99")
+
+
+def test_a_line_carries_zohos_three_columns() -> None:
+    item = _line("300", "16.008", "5")
+    assert item.line_total == Decimal("4802.4")        # taxable amount
+    assert item.tax_amount == Decimal("240.12")        # tax, to the cent
+    assert item.total_incl_tax == Decimal("5042.52")   # amount
+
+
+def test_the_headline_margin_is_the_lines_margin_before_tax() -> None:
+    """20% typed on the line reads as 20.00% at the top, not 20.63%."""
+    quote = _quote()
+    quote.currency = "USD"
+    item = _line("300", "16.008", "5")
+    item.cost_rate = Decimal("13.34")
+    quote.items.append(item)
+    pack = bidpack.build(quote)
+    assert pack.landed.total == Decimal("4002.00")
+    assert pack.gross_margin == Decimal("800.40")          # 4,802.40 − 4,002.00, before tax
+    assert pack.gross_margin_percent == Decimal("20.00")  # on the landed cost
+    assert pack.bid_total == Decimal("5042.52")            # the taxed total still leads
+
+
+def test_the_working_restates_the_totals_in_aed_as_zoho_does() -> None:
+    quote = _quote()
+    quote.currency, quote.fx_rate, quote.supplier_currency = "USD", Decimal("3.672501"), "AED"
+    quote.items.append(_line("300", "16.008", "5"))
+    by = {(s.group, s.label): s for s in calculation.steps(quote, bidpack.build(quote))}
+    # 4,802.40 × 3.672501 = 17,636.82
+    assert by[("base", "Taxable amount in AED")].result == Decimal("17636.82")
+    assert by[("base", "Tax in AED")].result == Decimal("881.84")
+    assert by[("base", "Total in AED")].result == Decimal("18518.66")
 
 
 # ── pricing from a supplier ─────────────────────────────────────────────
@@ -172,11 +206,12 @@ def test_the_working_ends_on_the_taxed_total_and_shows_every_step() -> None:
     assert by[("lines", "LED panel")].working == (
         "cost 13.34 (AED ÷ 3.672501) + 20.00% = 16.01 each, to the cent × 300"
     )
-    assert by[("tax", "VAT on LED panel")].working == "5% of 4,803.00"
+    assert by[("tax", "VAT on LED panel")].working.startswith("5% of 4,803.00")
     assert by[("tax", "Total incl. tax")].result == quote.total
     assert by[("bid", "Bid total")].result == quote.total
     assert [s.group for s in steps] == sorted(
-        (s.group for s in steps), key=["rate", "lines", "totals", "tax", "landed", "bid"].index
+        (s.group for s in steps),
+        key=["rate", "lines", "totals", "tax", "base", "landed", "bid"].index,
     )
 
 

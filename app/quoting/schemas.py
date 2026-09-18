@@ -240,7 +240,10 @@ class ItemOut(ItemIn):
 
     id: uuid.UUID
     position: int
+    #: Zoho's three columns for a line: taxable amount, tax, amount.
     line_total: Decimal
+    tax_amount: Decimal
+    total_incl_tax: Decimal
     #: Null unless a cost is known for the line.
     margin: Decimal | None
 

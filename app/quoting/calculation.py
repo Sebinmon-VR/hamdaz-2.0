@@ -12,7 +12,7 @@ so it cannot drift from them. Nothing here is stored.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
 from app.models.quoting import QuoteRequest
 from app.quoting.bidpack import BidPack
@@ -20,7 +20,7 @@ from app.quoting.bidpack import BidPack
 
 @dataclass(frozen=True, slots=True)
 class Step:
-    #: rate, lines, totals, tax, landed, bid — the order they are read in.
+    #: rate, lines, totals, tax, base, landed, bid — the order they are read in.
     group: str
     label: str
     #: The arithmetic, with the numbers in it.
@@ -125,15 +125,14 @@ def steps(request: QuoteRequest, pack: BidPack) -> list[Step]:  # noqa: C901
         out.append(Step(
             "tax",
             f"{item.tax_name or 'Tax'} on {item.name}",
-            f"{pct}% of {_n(item.line_total)}",
-            (item.line_total * item.tax_percentage / Decimal(100)).quantize(Decimal("0.0001")),
+            f"{pct}% of {_n(item.line_total)}, rounded on the line as Zoho does",
+            item.tax_amount,
             cur,
         ))
     out.append(Step(
         "tax",
         "Tax",
-        "The tax lines above, summed and rounded once to the cent"
-        if taxed else "No tax on any line",
+        "The tax lines above, summed" if taxed else "No tax on any line",
         request.tax_total,
         cur,
     ))
@@ -145,6 +144,27 @@ def steps(request: QuoteRequest, pack: BidPack) -> list[Step]:  # noqa: C901
         request.total,
         cur,
     ))
+
+    # ── in AED, as Zoho's tax summary reports it ───────────────────
+    # Zoho's estimate ends with the same three figures restated in the
+    # organisation's base currency at the estimate's rate. The quote knows
+    # that rate whenever its supplier is in AED — "1 USD = 3.672501 AED" is
+    # the same number — so the summary is shown then, and not guessed at
+    # otherwise.
+    base = "AED"
+    if cur != base and converting and foreign == base:
+        for label, value in (
+            ("Taxable amount", request.total_excl_tax),
+            ("Tax", request.tax_total),
+            ("Total", request.total),
+        ):
+            out.append(Step(
+                "base",
+                f"{label} in {base}",
+                f"{cur} {_n(value)} × {fx}, as Zoho's tax summary states it",
+                (value * fx).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+                base,
+            ))
 
     # ── the landed cost, when there is more to it than the goods ────
     landed = pack.landed
@@ -180,7 +200,8 @@ def steps(request: QuoteRequest, pack: BidPack) -> list[Step]:  # noqa: C901
         out.append(Step(
             "bid",
             "Gross margin",
-            f"{_n(pack.bid_total)} − {_n(landed.total)} landed cost",
+            f"{_n(request.total_excl_tax if request.items else pack.bid_total)} before tax "
+            f"− {_n(landed.total)} landed cost",
             pack.gross_margin,
             cur,
         ))
@@ -188,7 +209,7 @@ def steps(request: QuoteRequest, pack: BidPack) -> list[Step]:  # noqa: C901
             out.append(Step(
                 "bid",
                 "Margin",
-                f"{_n(pack.gross_margin)} ÷ {_n(pack.bid_total)} × 100",
+                f"{_n(pack.gross_margin)} ÷ {_n(landed.total)} landed cost × 100",
                 pack.gross_margin_percent,
                 None,
             ))
