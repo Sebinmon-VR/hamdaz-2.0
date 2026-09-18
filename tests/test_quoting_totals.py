@@ -104,7 +104,7 @@ from app.quoting.service import (  # noqa: E402
     _carry_over,
     _line_from,
     _pricing_rate,
-    convert_figures,
+    convert_currency,
 )
 
 ZOHO = [
@@ -157,6 +157,10 @@ def test_an_aed_offer_into_a_usd_quote_lands_on_zohos_number() -> None:
     assert line["cost_rate"] == Decimal("13.34")           # 49 ÷ 3.672501, to the cent
     assert line["rate"] == Decimal("16.07")                # 59 ÷ 3.672501, to the cent
     assert line["rate"] * item.quantity == Decimal("4821.00")
+    request.items.append(_line(str(item.quantity), str(line["rate"]), "5"))
+    assert request.total_excl_tax == Decimal("4821.00")
+    assert request.tax_total == Decimal("241.05")
+    assert request.total == Decimal("5062.05")
 
 
 def test_a_non_aed_supplier_is_rounded_to_the_cent_not_the_unit() -> None:
@@ -179,22 +183,33 @@ def test_the_same_currency_never_converts_whatever_the_rate_says() -> None:
     assert _line_from(item, quote, Decimal(20), fx=Decimal(1))["rate"] == Decimal("59.00")
 
 
-def test_switching_currency_converts_every_figure_to_the_cent() -> None:
-    """AED → USD at 1 AED = 0.272294 USD. Money moves, percentages do not."""
+def test_switching_currency_rounds_an_aed_selling_price_before_converting() -> None:
+    """Zoho turns AED 58.80 into its AED 59 item price before converting it."""
     quote = _quote(discount=100, shipping=50)
+    quote.currency = quote.supplier_currency = "AED"
     item = _line("300", "58.80", "5")
     item.cost_rate = Decimal("49")
     quote.items.append(item)
 
-    convert_figures(quote, Decimal("0.27229400"))
+    class Session:
+        async def flush(self) -> None:
+            pass
 
-    assert item.rate == Decimal("16.01")            # 58.80 × 0.272294 = 16.0109
+    async def rates(ours: str, theirs: str):
+        return rate_between(ZOHO, ours, theirs)
+
+    asyncio.run(convert_currency(Session(), quote, to_currency="USD", rates=rates))
+
+    assert item.rate == Decimal("16.07")            # AED 58.80 → 59; 59 × 0.272294 = 16.0653
     assert item.cost_rate == Decimal("13.34")       # 49 × 0.272294 = 13.3424
     assert item.tax_percentage == Decimal("5")      # 5% is 5% in any currency
     assert item.quantity == Decimal(300)
     assert quote.discount == Decimal("27.23")
     assert quote.shipping_charge == Decimal("13.61")
-    assert quote.total_excl_tax == Decimal("4789.38")  # 4,803.00 − 27.23 + 13.61
+    assert quote.total_excl_tax == Decimal("4807.38")  # 4,821.00 − 27.23 + 13.61
+    assert quote.tax_total == Decimal("241.05")
+    assert quote.currency == "USD"
+    assert quote.fx_rate == Decimal("3.672501")
 
 
 def test_the_bid_total_is_the_taxed_total_once_there_are_lines() -> None:

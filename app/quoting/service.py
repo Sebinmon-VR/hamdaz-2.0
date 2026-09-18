@@ -31,9 +31,9 @@ from __future__ import annotations
 import logging
 import re
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal
-from collections.abc import Awaitable, Callable
 from typing import Any, Final
 
 from sqlalchemy import and_, or_, select
@@ -59,11 +59,11 @@ from app.models.quoting import (
     Severity,
 )
 from app.models.role import Role, UserRole
-from app.roles.catalogue import SUPER_ADMIN
 from app.models.team import Team, TeamMembership
 from app.models.user import User
 from app.quoting import bidpack
 from app.quoting.fx import FxQuote, FxUnavailableError
+from app.roles.catalogue import SUPER_ADMIN
 
 logger = logging.getLogger("hamdaz.quoting")
 
@@ -552,7 +552,9 @@ async def select_supplier(
 _CENT = Decimal("0.01")
 
 
-def convert_figures(request: QuoteRequest, factor: Decimal) -> None:
+def convert_figures(
+    request: QuoteRequest, factor: Decimal, *, source_currency: str | None = None
+) -> None:
     """Restate every figure in another currency: multiply by ``factor`` — units
     of the new currency per one of the old — and round to the cent, once.
 
@@ -560,6 +562,12 @@ def convert_figures(request: QuoteRequest, factor: Decimal) -> None:
     The tax rates stay: 5% is 5% in any currency. The quantities stay. The
     markup stays, because cost and price move together. A supplier's own figure
     in its own currency stays, because it was never in ours.
+
+    Zoho prices sales lines in the source currency first.  In particular, an
+    AED selling price is a whole dirham: AED 58.80 is the AED 59 price that
+    Zoho converts to USD 16.07, not USD 16.01.  Normalise only the selling
+    rate at that source-currency precision before converting it; costs,
+    discounts and every other amount remain ordinary money figures.
     """
 
     def money(value: Decimal | None) -> Decimal | None:
@@ -567,8 +575,12 @@ def convert_figures(request: QuoteRequest, factor: Decimal) -> None:
             return None
         return (value * factor).quantize(_CENT, rounding=ROUND_HALF_UP)
 
+    source_sell_step = sell_step(source_currency)
     for item in request.items:
-        item.rate = money(item.rate) or Decimal(0)
+        source_rate = item.rate or Decimal(0)
+        if source_sell_step != _CENT:
+            source_rate = source_rate.quantize(source_sell_step, rounding=ROUND_HALF_UP)
+        item.rate = money(source_rate) or Decimal(0)
         item.cost_rate = money(item.cost_rate)
         item.discount = money(item.discount) or Decimal(0)
     request.discount = money(request.discount) or Decimal(0)
@@ -605,7 +617,10 @@ async def convert_currency(
         return request
     try:
         step = await rates(old, new)
-        convert_figures(request, step.rate)
+        # Zoho first rounds an item price to the precision of the currency it
+        # was quoted in (whole dirhams for AED), then converts it.  Converting
+        # an unrounded AED price is how 58.80 incorrectly became USD 16.01.
+        convert_figures(request, step.rate, source_currency=old)
         request.currency = new
         supplier = (request.supplier_currency or "").upper()
         if supplier and supplier != new:
@@ -1400,7 +1415,13 @@ async def review(
             # only surviving numbers would be the ones the approver made.
             _keep_round(request, "superseded")
             margin = markup_of(request)
-            set_items(request, [_line_from(i, quote, margin) for i in quote.items])
+            set_items(
+                request,
+                [
+                    _line_from(i, quote, margin, fx=_pricing_rate(request, quote))
+                    for i in quote.items
+                ],
+            )
             request.revision += 1
         request.selected_supplier_quote_id = chosen
 
