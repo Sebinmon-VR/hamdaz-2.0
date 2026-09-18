@@ -536,6 +536,9 @@ class QuoteRequestOut(BaseModel):
     #: that one answers about the whole document and goes false the moment a
     #: quote goes up.
     may_set_currency: bool = False
+    #: Whether the caller may re-price this quote at Zoho's rate — the same
+    #: people, in any state, and only once a supplier has been chosen.
+    may_reprice: bool = False
     #: Set once it is priced from a supplier and has lines. ``submit_reason``
     #: says what is missing while it is not, so a form can say why the button is
     #: off instead of only finding out when it is pressed.
@@ -676,6 +679,13 @@ class CalcStepOut(BaseModel):
     working: str
     result: Decimal
     currency: str | None
+
+
+class RepriceIn(BaseModel):
+    """Re-price from the chosen supplier at Zoho's rate. The markup is optional:
+    left out, the one the lines were priced at is kept."""
+
+    markup_percent: Decimal | None = Field(default=None, ge=0, le=1000)
 
 
 class CurrencyIn(BaseModel):

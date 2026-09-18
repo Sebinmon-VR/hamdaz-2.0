@@ -83,6 +83,7 @@ from app.quoting.schemas import (
     QuoteRequestIn,
     QuoteRequestOut,
     QuoteSummaryOut,
+    RepriceIn,
     ReviewIn,
     ReviewOut,
     SupplierChoiceIn,
@@ -221,6 +222,7 @@ async def _out(
     # Its own rule: whose quote it is, plus a super admin, and no status in
     # it at all. See ``service.may_set_currency``.
     body.may_set_currency = service.may_set_currency(request, user=user, roles=roles)
+    body.may_reprice = service.may_reprice(request, user=user, roles=roles)
     # Asked here rather than re-derived on the screen, like every other
     # permission on this body. A frontend that works out for itself who may
     # delete something is a frontend that will one day disagree with the server.
@@ -557,6 +559,56 @@ async def set_currency(
         )
     request.currency = payload.currency
     await session.flush()
+    return await _out(session, request, user=user, roles=roles)
+
+
+@router.post(
+    "/{request_id}/reprice",
+    response_model=QuoteRequestOut,
+    summary="Re-price from the chosen supplier at Zoho's rate, in any state",
+)
+async def reprice(
+    request_id: uuid.UUID,
+    payload: RepriceIn,
+    user: CurrentUser,
+    roles: CurrentRoles,
+    session: Session,
+    zoho: Zoho,
+) -> QuoteRequestOut:
+    """Put the figures at the rate the estimate will be converted at.
+
+    For a quote priced before the rate came from Zoho — by hand, at whatever
+    rate somebody remembered — and for one whose rate in Zoho has since moved.
+    The supplier, the lines and the markup stay what they were; only the
+    conversion changes, and Zoho's rate replaces the bid's. Allowed in every
+    state, drafts included, by whoever raised or holds the quote and by a super
+    admin, because it corrects the figures without changing a decision.
+    """
+    request = await _load(session, request_id)
+    if not service.may_reprice(request, user=user, roles=roles):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "This quote is not yours to re-price."
+                if request.selected_supplier_quote_id is not None
+                else "No supplier has been chosen for this quote, so there is nothing "
+                "to re-price from."
+            ),
+        )
+    try:
+        await service.reprice_at_rate(
+            session,
+            request,
+            rates=lambda src, dst: zoho_rate(zoho, from_currency=src, to_currency=dst),
+            markup_percent=payload.markup_percent,
+        )
+    except QuoteError as exc:
+        raise _translate(exc) from exc
+    except ZohoError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Could not read Zoho Books' currency table to re-price.",
+        ) from exc
     return await _out(session, request, user=user, roles=roles)
 
 

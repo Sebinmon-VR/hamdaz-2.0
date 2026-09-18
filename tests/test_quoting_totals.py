@@ -193,3 +193,24 @@ def test_the_working_ends_on_the_taxed_total_and_shows_every_step() -> None:
     assert [s.group for s in steps] == sorted(
         (s.group for s in steps), key=["rate", "lines", "totals", "tax", "landed", "bid"].index
     )
+
+
+# ── re-pricing what was priced by hand ──────────────────────────────────
+
+from app.quoting.service import implied_markup  # noqa: E402
+
+
+def test_the_markup_is_read_back_off_hand_priced_lines() -> None:
+    quote = _quote()
+    item = _line("300", "16.008", "5")
+    item.cost_rate = Decimal("13.34")
+    quote.items.append(item)
+    assert implied_markup(quote) == Decimal("20.00")
+    quote.target_markup_percent = Decimal("45")
+    assert implied_markup(quote) == Decimal("45")
+
+
+def test_a_quote_with_no_cost_on_any_line_implies_no_markup() -> None:
+    quote = _quote()
+    quote.items.append(_line("1", "100", None))
+    assert implied_markup(quote) == Decimal(0)

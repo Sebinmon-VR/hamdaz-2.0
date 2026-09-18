@@ -179,6 +179,18 @@ def may_set_currency(request: QuoteRequest, *, user: User, roles: set[str]) -> b
     return SUPER_ADMIN in roles
 
 
+def may_reprice(request: QuoteRequest, *, user: User, roles: set[str]) -> bool:
+    """Who may re-price a quote at Zoho's rate — the same rule as the currency,
+    and for the same reason: it is a correction of the figures to the rate the
+    estimate will actually be converted at, not a change of mind about the
+    price, and it is wanted on quotes in every state, drafts included. Whose
+    quote it is, plus a super admin; and only where a supplier has been chosen,
+    because there is nothing to re-price from otherwise."""
+    return request.selected_supplier_quote_id is not None and may_set_currency(
+        request, user=user, roles=roles
+    )
+
+
 def require_editable(request: QuoteRequest, *, user: User) -> None:
     if request.status not in EDITABLE_STATUSES:
         raise QuotePermissionError(
@@ -495,6 +507,77 @@ async def select_supplier(
         quote.supplier_name,
         len(quote.items),
         markup_percent,
+    )
+    return request
+
+
+def implied_markup(request: QuoteRequest) -> Decimal:
+    """The markup the lines were actually priced at, read back off them.
+
+    For a quote priced before the bid's own markup was recorded: the first line
+    with a cost says what was applied — 13.34 → 16.008 is 20% — and that is a
+    better answer than "0%", which would re-price the whole quote at cost.
+    """
+    if request.target_markup_percent is not None:
+        return request.target_markup_percent
+    for item in request.items:
+        if item.cost_rate and item.cost_rate > 0 and item.rate is not None:
+            return ((item.rate - item.cost_rate) / item.cost_rate * Decimal(100)).quantize(
+                Decimal("0.01")
+            )
+    return Decimal(0)
+
+
+async def reprice_at_rate(
+    session: AsyncSession,
+    request: QuoteRequest,
+    *,
+    rates: Callable[[str, str], Awaitable[FxQuote]],
+    markup_percent: Decimal | None = None,
+) -> QuoteRequest:
+    """Re-price the quote from its chosen supplier at Zoho's rate, now.
+
+    The one write that ignores the status. Everything else freezes when a quote
+    goes up; this is allowed through because it changes no decision — the
+    supplier, the markup and the lines stay what they were — it only puts the
+    figures at the rate the estimate will be converted at. A quote priced by
+    hand at a remembered rate is wrong in one direction only, and the person
+    who notices should be able to correct it without pulling it out of approval.
+
+    Zoho's rate *replaces* whatever the bid held. Choosing a supplier keeps a
+    rate somebody typed; this is the action for when that rate was the problem.
+    """
+    if request.selected_supplier_quote_id is None:
+        raise QuoteError(
+            "No supplier has been chosen for this quote, so there is nothing to re-price from."
+        )
+    quote = await session.scalar(
+        select(SupplierQuote).where(SupplierQuote.id == request.selected_supplier_quote_id)
+    )
+    if quote is None or not quote.items:
+        raise QuoteError("The chosen supplier's quote has no priced lines to re-price from.")
+
+    theirs = (quote.currency or "").upper()
+    ours = (request.currency or "").upper()
+    if theirs and ours and theirs != ours:
+        try:
+            found = await rates(theirs, ours)
+        except FxUnavailableError as exc:
+            raise QuoteError(str(exc)) from exc
+        request.fx_rate = found.rate
+        request.supplier_currency = theirs
+    else:
+        # Same currency: nothing to convert, and a stale rate on the bid would
+        # otherwise sit there looking like it applied.
+        request.fx_rate = None
+
+    markup = markup_percent if markup_percent is not None else implied_markup(request)
+    fx = _pricing_rate(request, quote)
+    set_items(request, [_line_from(item, quote, markup, fx=fx) for item in quote.items])
+    request.target_markup_percent = markup
+    await session.flush()
+    logger.info(
+        "quote %s re-priced from %s at %s, markup %s%%", request.id, quote.supplier_name, fx, markup
     )
     return request
 
