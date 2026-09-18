@@ -129,6 +129,18 @@ router = APIRouter(
 #: Each upload is a document read by a model, against a real bill.
 MAX_UPLOADS = 12
 
+#: Every row assigned to the caller, not the client's first page of them.
+#:
+#: ``tasks_assigned_to`` truncates before anything here can sort, and it
+#: truncates in SharePoint's own order — item id, so oldest first. A live bid
+#: is a recent row by definition. The busiest assignee holds 244 and every one
+#: of her ten live ones sits past row 228, so the client's default of 200 cut
+#: away precisely the enquiries this screen exists to offer: "0 live" and a
+#: total that read 200 against a real 244. The client pages through
+#: ``@odata.nextLink``, so the ceiling costs a second call only where the rows
+#: are actually there.
+TASK_LIMIT = 500
+
 
 def get_extractor(request: Request) -> QuoteExtractor:
     return request.app.state.quote_extractor
@@ -363,7 +375,7 @@ async def quotable_tasks(
         )
 
     try:
-        tasks = await sharepoint.tasks_assigned_to(lookup_id)
+        tasks = await sharepoint.tasks_assigned_to(lookup_id, limit=TASK_LIMIT)
     except SharePointError as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -418,7 +430,9 @@ async def create_from_task(
     quote and comes next, from the supplier quotes.
     """
     lookup_id = await sharepoint.lookup_id_for(user.email)
-    tasks = await sharepoint.tasks_assigned_to(lookup_id) if lookup_id else []
+    tasks = (
+        await sharepoint.tasks_assigned_to(lookup_id, limit=TASK_LIMIT) if lookup_id else []
+    )
     task = next((t for t in tasks if str(t.id) == payload.task_id), None)
     if task is None:
         raise HTTPException(
