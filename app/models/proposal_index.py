@@ -127,6 +127,15 @@ class ProposalIndexItem(Base, Timestamped):
         Boolean, default=True, server_default=text("true"), nullable=False
     )
 
+    #: Whether SharePoint holds files against the item. A boolean is all Graph
+    #: will give — see ``ProposalTask.has_attachments``. Mirrored so a reader
+    #: served from this table can answer everything a reader served from the
+    #: list answers, rather than quietly saying "no files" when it means
+    #: "I was not told".
+    has_attachments: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
+    )
+
     sp_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     sp_modified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 

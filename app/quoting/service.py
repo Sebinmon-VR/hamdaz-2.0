@@ -139,6 +139,38 @@ async def approvers_for(session: AsyncSession, team_id: uuid.UUID) -> list[User]
     return list(people.values())
 
 
+def require_owner(request: QuoteRequest, *, user: User) -> None:
+    """Whose quote it is.
+
+    Separate from the status question deliberately: the two refusals are not the
+    same refusal, and one field is allowed to move on a quote that is otherwise
+    frozen. See ``require_editable`` and ``may_set_currency``.
+    """
+    if request.created_by_id != user.id and request.assigned_to_id != user.id:
+        raise QuotePermissionError("This quote is not yours to edit.")
+
+
+def may_set_currency(request: QuoteRequest, *, user: User, roles: set[str]) -> bool:
+    """Who may state the currency.
+
+    Whose quote it is, exactly as for every other write — plus a super admin,
+    who holds every access in this module by definition and should not have to
+    ask the author to correct a label.
+
+    What is deliberately *not* in this rule is the status. Everything else on a
+    quote freezes the moment it is submitted, and should: an approver has to
+    decide on the document they were sent. The currency is outside that, because
+    nothing in this module converts between currencies — the code is a label on
+    figures that are already what they are, so setting it restates no number,
+    moves no total and invalidates no approval. Freezing it too would mean
+    pulling a quote back out of approval, and re-notifying every approver, to
+    correct three letters.
+    """
+    if user.id in (request.created_by_id, request.assigned_to_id):
+        return True
+    return SUPER_ADMIN in roles
+
+
 def require_editable(request: QuoteRequest, *, user: User) -> None:
     if request.status not in EDITABLE_STATUSES:
         raise QuotePermissionError(
@@ -146,8 +178,7 @@ def require_editable(request: QuoteRequest, *, user: User) -> None:
             f"Editing it while approvers are looking would mean they approved "
             f"something that no longer exists."
         )
-    if request.created_by_id != user.id and request.assigned_to_id != user.id:
-        raise QuotePermissionError("This quote is not yours to edit.")
+    require_owner(request, user=user)
 
 
 # ── building one ───────────────────────────────────────────────────────

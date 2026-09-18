@@ -523,6 +523,13 @@ class QuoteRequestOut(BaseModel):
     documents: list[QuoteDocumentOut] = Field(default_factory=list)
     #: Whether the caller may edit, may send it for approval, and may decide.
     may_edit: bool = False
+    #: Whether the caller may set the currency — which, unlike everything else,
+    #: is not frozen by submitting. It is a label on figures that are already
+    #: what they are, and nothing here converts, so it stays correctable for as
+    #: long as the quote is the caller's. Told apart from ``may_edit`` because
+    #: that one answers about the whole document and goes false the moment a
+    #: quote goes up.
+    may_set_currency: bool = False
     #: Set once it is priced from a supplier and has lines. ``submit_reason``
     #: says what is missing while it is not, so a form can say why the button is
     #: off instead of only finding out when it is pressed.
@@ -634,6 +641,22 @@ class TaskQuoteIn(BaseModel):
     """Which of the caller's Proposals tasks to raise a quote for."""
 
     task_id: str = Field(min_length=1, max_length=120)
+
+
+class CurrencyIn(BaseModel):
+    """The currency a quote is stated in.
+
+    Its own body, and its own route, because it is the one field allowed to move
+    on a quote that is otherwise frozen. Sending it through the ordinary edit
+    would mean opening the whole document to change the label on it.
+    """
+
+    currency: str = Field(min_length=3, max_length=3)
+
+    @field_validator("currency")
+    @classmethod
+    def _upper(cls, value: str) -> str:
+        return value.upper()
 
 
 class NegotiationIn(BaseModel):

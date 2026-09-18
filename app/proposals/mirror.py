@@ -41,7 +41,9 @@ logger = logging.getLogger("hamdaz.proposals.mirror")
 MIRROR_FIELDS = (
     "Title,Status,Priority,AssignedToLookupId,AssignedTo,StartDate,DueDate,BCD,"
     "EndUser,SubmissionStatus,CurrentType,OrderStatus,Negotiation,zohpquoteno,"
-    "Remarks,WorkingNotes,Created,Modified"
+    # Attachments is a boolean and nothing more: Graph says whether an item has
+    # files and will not say what they are called. See ProposalTask.
+    "Remarks,WorkingNotes,Created,Modified,Attachments"
 )
 
 #: How many rows the first stage hands to the second. Wide enough that the
@@ -223,6 +225,7 @@ def _row_values(
         "assigned_name": task.assigned_to_name,
         "is_open": task.is_open,
         "is_active": task.is_active,
+        "has_attachments": task.has_attachments,
         "sp_created_at": _as_datetime(task.created_at),
         "sp_modified_at": _as_datetime(task.modified_at),
         "search_text": text_value,
@@ -231,6 +234,77 @@ def _row_values(
         # Feeds the D-weighted part of the vector only; not a column.
         "notes_text": f"{task.remarks or ''} {task.working_notes or ''}",
     }
+
+
+def _iso(value: date | datetime | None) -> str | None:
+    """A stored date back as the string the task shape carries."""
+    return value.isoformat() if value is not None else None
+
+
+def to_task(row: ProposalIndexItem) -> ProposalTask:
+    """A mirror row as the shape every reader already speaks.
+
+    The inverse of :func:`_row_values`, and deliberately the only way out of
+    this table into a task: two mappings would drift the first time a column is
+    added, and they would drift silently.
+
+    **is_open and is_active are not read from their columns.** They are stored
+    for indexed filtering, but they are assertions about *today* — a bid closes
+    overnight and a row nobody edited is wrong by morning. Every sync is a full
+    read, so in practice the columns keep up; deriving them here anyway costs a
+    date comparison and means a screen served from this table and one served
+    from the list cannot disagree about a bid closing today, which they have
+    done before. See ``ProposalTask.is_active``.
+    """
+    return ProposalTask(
+        id=row.item_id,
+        title=row.title,
+        status=row.status,
+        priority=row.priority,
+        assigned_to_lookup_id=row.assigned_lookup_id,
+        assigned_to_name=row.assigned_name,
+        start_date=_iso(row.start_date),
+        due_date=_iso(row.due_date),
+        bid_closing_date=_iso(row.bid_closing_date),
+        end_user=row.end_user,
+        submission_status=row.submission_status,
+        current_type=row.current_type,
+        order_status=row.order_status,
+        negotiation=row.negotiation,
+        quote_no=row.quote_no,
+        remarks=row.remarks,
+        working_notes=row.working_notes,
+        created_at=_iso(row.sp_created_at),
+        modified_at=_iso(row.sp_modified_at),
+        has_attachments=row.has_attachments,
+    )
+
+
+async def tasks_for(session: AsyncSession, lookup_id: str) -> list[ProposalTask]:
+    """Every row assigned to this person, from the local copy.
+
+    Keyed on the SharePoint lookup id — the column SharePoint's own ``$filter``
+    uses — and not on the email. The email is denormalised onto the row for
+    scoring and is null wherever the site's people list no longer resolves the
+    assignee; matching on it would answer a slightly different question than
+    the list would.
+
+    **No limit, which is the entire reason to read this table.** The list client
+    pages and then truncates to its first few hundred rows, in SharePoint's own
+    order — item id, so oldest first — before any caller can sort. A live bid is
+    a recent row by definition, so that ceiling removed precisely the rows a
+    person is looking for. Here the filter is an indexed column and the whole
+    answer comes back.
+    """
+    rows = (
+        await session.scalars(
+            select(ProposalIndexItem).where(
+                ProposalIndexItem.deleted.is_(False),
+                ProposalIndexItem.assigned_lookup_id == str(lookup_id),
+            )
+        )
+    ).all()
+    return [to_task(row) for row in rows]
 
 
 def _vector_expression():

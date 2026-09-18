@@ -58,6 +58,7 @@ from app.core.config import get_settings
 from app.core.db import get_session
 from app.models.comparison import QuoteSource
 from app.models.quoting import QuoteRequest, QuoteStatus
+from app.proposals import mirror
 from app.proposals.router import get_sharepoint
 from app.proposals.sharepoint import SharePointError, SharePointProposals
 from app.quoting import bidpack, service, storage
@@ -69,6 +70,7 @@ from app.quoting.schemas import (
     BidPackOut,
     CommentIn,
     CommentOut,
+    CurrencyIn,
     ItemOut,
     NegotiationIn,
     QuotableTaskOut,
@@ -128,18 +130,6 @@ router = APIRouter(
 
 #: Each upload is a document read by a model, against a real bill.
 MAX_UPLOADS = 12
-
-#: Every row assigned to the caller, not the client's first page of them.
-#:
-#: ``tasks_assigned_to`` truncates before anything here can sort, and it
-#: truncates in SharePoint's own order — item id, so oldest first. A live bid
-#: is a recent row by definition. The busiest assignee holds 244 and every one
-#: of her ten live ones sits past row 228, so the client's default of 200 cut
-#: away precisely the enquiries this screen exists to offer: "0 live" and a
-#: total that read 200 against a real 244. The client pages through
-#: ``@odata.nextLink``, so the ceiling costs a second call only where the rows
-#: are actually there.
-TASK_LIMIT = 500
 
 
 def get_extractor(request: Request) -> QuoteExtractor:
@@ -218,6 +208,9 @@ async def _out(
     allowed, reason = await service.may_approve(session, request, user=user, roles=roles)
     body.may_approve = allowed
     body.approve_reason = None if allowed else reason
+    # Its own rule: whose quote it is, plus a super admin, and no status in
+    # it at all. See ``service.may_set_currency``.
+    body.may_set_currency = service.may_set_currency(request, user=user, roles=roles)
     # Asked here rather than re-derived on the screen, like every other
     # permission on this body. A frontend that works out for itself who may
     # delete something is a frontend that will one day disagree with the server.
@@ -359,8 +352,25 @@ async def quotable_tasks(
 
     Served by this module rather than read from the Proposals one, so raising a
     quote needs the quoting module and not also that one.
+
+    **From the local copy of the list, not the list.** That is what makes the
+    answer complete rather than merely quick. The list client pages and then
+    truncates to its first few hundred rows in SharePoint's own order — oldest
+    first — before any caller can sort, which removed precisely the live bids
+    this screen exists to offer: a busy assignee saw "0 live" against ten real
+    ones. The mirror is a full read of the list every sync and runs seconds
+    behind it. See app/proposals/mirror.py.
     """
-    lookup_id = await sharepoint.lookup_id_for(user.email)
+    try:
+        lookup_id = await sharepoint.lookup_id_for(user.email)
+    except SharePointError as exc:
+        # The only thing here that still asks SharePoint anything, and so
+        # the only thing that can fail this way.
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Could not read the Proposals list",
+        ) from exc
+
     if lookup_id is None:
         # No presence on that SharePoint site, so nothing could be assigned to
         # them. Not an error, and told apart from having no tasks.
@@ -374,13 +384,7 @@ async def quotable_tasks(
             tasks=[],
         )
 
-    try:
-        tasks = await sharepoint.tasks_assigned_to(lookup_id, limit=TASK_LIMIT)
-    except SharePointError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Could not read the Proposals list",
-        ) from exc
+    tasks = await mirror.tasks_for(session, lookup_id)
 
     open_tasks = [t for t in tasks if t.is_open]
     live_tasks = [t for t in open_tasks if t.is_active]
@@ -430,9 +434,7 @@ async def create_from_task(
     quote and comes next, from the supplier quotes.
     """
     lookup_id = await sharepoint.lookup_id_for(user.email)
-    tasks = (
-        await sharepoint.tasks_assigned_to(lookup_id, limit=TASK_LIMIT) if lookup_id else []
-    )
+    tasks = await mirror.tasks_for(session, lookup_id) if lookup_id else []
     task = next((t for t in tasks if str(t.id) == payload.task_id), None)
     if task is None:
         raise HTTPException(
@@ -477,6 +479,47 @@ async def update(
         await session.flush()
     except QuoteError as exc:
         raise _translate(exc) from exc
+    return await _out(session, request, user=user, roles=roles)
+
+
+@router.patch(
+    "/{request_id}/currency",
+    response_model=QuoteRequestOut,
+    summary="Set the currency, in any state the quote is in",
+)
+async def set_currency(
+    request_id: uuid.UUID,
+    payload: CurrencyIn,
+    user: CurrentUser,
+    roles: CurrentRoles,
+    session: Session,
+) -> QuoteRequestOut:
+    """The one field that still moves on a quote that has gone up.
+
+    Everything else freezes the moment a quote is submitted, and for a good
+    reason: an approver has to decide on the document they were sent, not on one
+    that changed while they read it.
+
+    The currency is deliberately outside that rule. Nothing in this module
+    converts between currencies — the code is a *label* on figures that are
+    already what they are — so changing it restates no number and invalidates no
+    approval. The alternative was worse: a quote discovered to be in the wrong
+    currency could only be corrected by pulling it back out of approval, which
+    means re-notifying every approver to fix a three-letter code.
+
+    Whose quote it is still decides, as with every other write — plus a super
+    admin, who holds every access here and should not have to ask the author to
+    correct a label. An approver who wants another currency asks the person who
+    raised it, the same as with any other correction.
+    """
+    request = await _load(session, request_id)
+    if not service.may_set_currency(request, user=user, roles=roles):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This quote is not yours to set the currency on.",
+        )
+    request.currency = payload.currency
+    await session.flush()
     return await _out(session, request, user=user, roles=roles)
 
 

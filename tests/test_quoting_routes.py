@@ -16,6 +16,8 @@ test that only checks for 201 would not notice either.
 from __future__ import annotations
 
 import io
+import uuid
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -28,6 +30,8 @@ from app.comparison.extraction import ExtractedItem, ExtractedQuote, QuoteExtrac
 from app.core.config import get_settings
 from app.core.mail import MailError
 from app.core.security import sign
+from app.models.proposal_index import ProposalIndexItem
+from app.models.quoting import QuoteRequest, QuoteStatus
 from app.quoting.mailer import QuoteMailer
 from app.quoting.probability import WinEstimate
 from app.roles import service as roles_service
@@ -121,41 +125,62 @@ class StubExtractor(QuoteExtractor):
         return list(self.results)
 
 
-class StubTask:
-    """One row of the Proposals list, in full.
+#: Where the stub site puts the caller. A seeded row has to carry this to be
+#: theirs — it is the column SharePoint's own filter uses. See StubSharePoint.
+LOOKUP_ID = "15"
+
+
+async def seed_task(db, **over) -> ProposalIndexItem:
+    """One row of the mirrored Proposals list, as a sync would have left it.
 
     Every field, because the quoting page shows the whole enquiry rather than a
     summary of it — a task with half its columns dropped on the way through is
     the thing this endpoint exists to avoid.
-    """
 
-    def __init__(self, **over):
-        self.id = "412"
-        self.title = "MR-TRJ-24-01-0790 Firewall refresh"
-        self.status = "In Progress"
-        self.priority = "High"
-        self.assigned_to_name = "Engineer"
-        self.start_date = "2026-09-01T00:00:00Z"
-        self.due_date = "2026-10-05T00:00:00Z"
-        self.bid_closing_date = "2026-09-30T00:00:00Z"
-        self.end_user = "ADNOC Onshore"
-        self.submission_status = "Not submitted"
-        self.current_type = "Tender"
-        self.order_status = None
-        self.negotiation = None
-        self.quote_no = "QT-00218"
-        self.remarks = "Budgetary only at this stage."
-        self.working_notes = "Waiting on Fortinet pricing."
-        self.created_at = "2026-08-20T09:00:00Z"
-        self.modified_at = "2026-09-02T11:30:00Z"
-        self.web_url = "https://hamdaz1.sharepoint.com/Lists/Proposals/412"
-        self.has_attachments = False
-        self.attachments_url = None
-        self.is_open = True
-        #: Not finished and the bid has not closed — what the picker shows first.
-        self.is_active = True
-        self.deadline = "2026-09-30T00:00:00Z"
-        self.__dict__.update(over)
+    **Dates are relative to today on purpose.** Whether a row is live is derived
+    from its closing date when it is read, not taken from the stored column, so
+    a fixed date would make these tests pass until that date and then quietly
+    stop testing anything. Pass ``closing`` to move the bid.
+
+    ``is_open`` and ``is_active`` are set here only because the columns are not
+    nullable. Nothing under test reads them; they are derived from the status
+    and the closing date. See ``mirror.to_task``.
+    """
+    closing = over.pop("closing", date.today() + timedelta(days=12))
+    row = ProposalIndexItem(
+        item_id="412",
+        title=FIRST_TASK_TITLE,
+        status="In Progress",
+        effective_status="In Progress",
+        priority="High",
+        assigned_lookup_id=LOOKUP_ID,
+        assigned_name="Engineer",
+        assigned_email="engineer@hamdaz.com",
+        start_date=date.today() - timedelta(days=17),
+        due_date=closing,
+        bid_closing_date=closing,
+        deadline=closing,
+        end_user="ADNOC Onshore",
+        submission_status="Not submitted",
+        current_type="Tender",
+        order_status=None,
+        negotiation=None,
+        quote_no="QT-00218",
+        remarks="Budgetary only at this stage.",
+        working_notes="Waiting on Fortinet pricing.",
+        sp_created_at=datetime.now(UTC) - timedelta(days=29),
+        sp_modified_at=datetime.now(UTC) - timedelta(days=16),
+        has_attachments=False,
+        is_open=True,
+        is_active=True,
+        search_text="",
+    )
+    for key, value in over.items():
+        setattr(row, key, value)
+    db.add(row)
+    # Committed rather than flushed: the request runs on its own session.
+    await db.commit()
+    return row
 
 
 class StubSharePoint:
@@ -166,14 +191,13 @@ class StubSharePoint:
     it.
     """
 
-    def __init__(self) -> None:
-        self.tasks: list[StubTask] = []
-
     async def lookup_id_for(self, email: str) -> str | None:
-        return "15"
+        return LOOKUP_ID
 
     async def tasks_assigned_to(self, lookup_id: str, limit: int = 200):
-        return list(self.tasks)
+        # The quoting screen reads the mirror now, and must keep doing so: this
+        # client pages and truncates, and the ceiling fell on the live rows.
+        raise AssertionError("the quoting screen reads the mirror, not the list")
 
 
 class StubMailer(QuoteMailer):
@@ -550,6 +574,70 @@ async def test_the_lines_stay_editable_after_a_supplier_is_chosen(
     assert body["may_submit"] is True
 
 
+async def test_the_currency_is_correctable_after_the_quote_has_gone_up(
+    quoting, db, requester, approver, team
+) -> None:
+    """Everything else on a submitted quote freezes, and should. The currency
+    does not.
+
+    Nothing in this module converts between currencies, so the code is a label
+    on figures that are already what they are — changing it restates no number
+    and invalidates no approval. Freezing it too would mean pulling a quote back
+    out of approval, and re-notifying every approver, to correct three letters.
+    """
+    raised = await _as(quoting, requester).post(f"{API}?team={team.id}", json=FORM)
+    assert raised.status_code == 201, raised.text
+    quote_id = raised.json()["id"]
+
+    # Put straight into the frozen state rather than submitted through the
+    # workflow: what is under test here is the rule, not the road to it.
+    quote = await db.get(QuoteRequest, uuid.UUID(quote_id))
+    quote.status = QuoteStatus.PENDING_APPROVAL
+    await db.commit()
+
+    client = _as(quoting, requester)
+
+    # The ordinary edit is refused, exactly as it was before.
+    frozen = await client.patch(f"{API}/{quote_id}", json=FORM)
+    assert frozen.status_code == 403
+    assert "cannot be edited" in frozen.json()["detail"]
+
+    # The currency still moves. Codes are codes, so it comes back upper-cased.
+    changed = await client.patch(f"{API}/{quote_id}/currency", json={"currency": "usd"})
+    assert changed.status_code == 200, changed.text
+    assert changed.json()["currency"] == "USD"
+    assert changed.json()["status"] == "pending_approval"
+    assert changed.json()["may_set_currency"] is True
+
+    # Whose quote it is still decides. An approver may decide this quote but
+    # does not own it, so they ask the person who raised it.
+    denied = await _as(quoting, approver).patch(
+        f"{API}/{quote_id}/currency", json={"currency": "EUR"}
+    )
+    assert denied.status_code == 403
+    assert "not yours" in denied.json()["detail"]
+
+    # A super admin is the exception, and holds it in any state. They should not
+    # have to message the author to correct a three-letter label.
+    boss = await upsert_user(
+        db,
+        EntraIdentity(
+            object_id="boss@hamdaz.com",
+            email="boss@hamdaz.com",
+            display_name="Boss",
+        ),
+    )
+    await roles_service.assign_role(
+        db, user_id=boss.id, role_key="super_admin", granted_by_id=None
+    )
+    await db.commit()
+    theirs = await _as(quoting, boss).patch(
+        f"{API}/{quote_id}/currency", json={"currency": "GBP"}
+    )
+    assert theirs.status_code == 200, theirs.text
+    assert theirs.json()["currency"] == "GBP"
+
+
 # ── starting from a task ───────────────────────────────────────────────
 
 
@@ -557,7 +645,7 @@ async def test_a_quote_can_be_raised_from_one_of_your_tasks(
     quoting, db, requester, team
 ) -> None:
     """The enquiry is already written down; retyping it is where errors come from."""
-    quoting._transport.app.state.sharepoint.tasks = [StubTask()]
+    task = await seed_task(db)
 
     response = await _as(quoting, requester).post(
         f"{API}/from-task?team={team.id}", json={"task_id": "412"}
@@ -568,11 +656,11 @@ async def test_a_quote_can_be_raised_from_one_of_your_tasks(
     assert body["title"] == "MR-TRJ-24-01-0790 Firewall refresh"
     assert body["customer_name"] == "ADNOC Onshore"
     assert body["reference"] == "QT-00218"
-    assert body["cf_bcd"].startswith("2026-09-30")
+    assert body["cf_bcd"].startswith(task.bid_closing_date.isoformat())
     assert "Budgetary only" in body["notes"]
     # The enquiry and the quote stay connected.
     assert body["source_task_id"] == "412"
-    assert body["source_task_url"].endswith("/412")
+    assert body["source_task_url"].endswith("ID=412")
     # A probability from the moment it was raised, with its basis.
     assert body["win_basis"]["source"] == "stub"
     # Nothing to send yet: a task has no prices on it, which is the point of
@@ -585,7 +673,7 @@ async def test_a_task_that_is_not_yours_is_not_yours_to_quote(
     quoting, db, requester, team
 ) -> None:
     """Whose tasks these are comes from the session, not from the request."""
-    quoting._transport.app.state.sharepoint.tasks = [StubTask(id="999")]
+    await seed_task(db, item_id="999")
 
     response = await _as(quoting, requester).post(
         f"{API}/from-task?team={team.id}", json={"task_id": "412"}
@@ -654,10 +742,13 @@ async def test_the_quoting_page_lists_the_callers_own_tasks(
     quoting, db, requester, team
 ) -> None:
     """The enquiry list is where a quote starts, so it is served here."""
-    quoting._transport.app.state.sharepoint.tasks = [
-        StubTask(),
-        StubTask(id="500", title="Switch refresh", deadline="2026-09-10T00:00:00Z"),
-    ]
+    await seed_task(db)
+    await seed_task(
+        db,
+        item_id="500",
+        title="Switch refresh",
+        closing=date.today() + timedelta(days=3),
+    )
 
     response = await _as(quoting, requester).get(f"{API}/tasks")
 
@@ -677,7 +768,7 @@ async def test_the_quoting_page_lists_the_callers_own_tasks(
     assert task["submission_status"] == "Not submitted"
     assert task["quote_no"] == "QT-00218"
     assert task["working_notes"] == "Waiting on Fortinet pricing."
-    assert task["web_url"].endswith("/412")
+    assert task["web_url"].endswith("ID=412")
     # Nothing raised against it yet.
     assert task["quote_request_id"] is None
 
@@ -688,16 +779,26 @@ async def test_the_task_list_shows_live_work_first_and_the_rest_on_request(
     """Most of what is assigned to anybody is a bid that closed months ago and
     was never marked finished. Listing those first buried the handful that can
     still be quoted for."""
-    quoting._transport.app.state.sharepoint.tasks = [
-        StubTask(),
-        StubTask(
-            id="300", title="Closed bid", is_active=False, deadline="2026-03-01T00:00:00Z"
-        ),
-        StubTask(
-            id="200", title="Finished", is_active=False, is_open=False,
-            deadline="2026-02-01T00:00:00Z",
-        ),
-    ]
+    await seed_task(db)
+    # Not finished, but its bid closed: open, and not live.
+    await seed_task(
+        db,
+        item_id="300",
+        title="Closed bid",
+        closing=date.today() - timedelta(days=60),
+        is_active=False,
+    )
+    # Finished, so neither.
+    await seed_task(
+        db,
+        item_id="200",
+        title="Finished",
+        status="Completed",
+        effective_status="Completed",
+        closing=date.today() - timedelta(days=90),
+        is_open=False,
+        is_active=False,
+    )
     client = _as(quoting, requester)
 
     live = (await client.get(f"{API}/tasks")).json()
@@ -715,7 +816,7 @@ async def test_a_task_that_already_has_a_quote_says_so(
     quoting, db, requester, team
 ) -> None:
     """Otherwise the list offers to raise a second quote for the same enquiry."""
-    quoting._transport.app.state.sharepoint.tasks = [StubTask()]
+    await seed_task(db)
     raised = (
         await _as(quoting, requester).post(
             f"{API}/from-task?team={team.id}", json={"task_id": "412"}
