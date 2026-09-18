@@ -62,15 +62,19 @@ from app.proposals import mirror
 from app.proposals.router import get_sharepoint
 from app.proposals.sharepoint import SharePointError, SharePointProposals
 from app.quoting import bidpack, service, storage
+from app.quoting import calculation as calc
+from app.quoting.fx import FxUnavailableError, zoho_rate
 from app.quoting import workbook as workbook_mod
 from app.quoting.mailer import QuoteMailer
 from app.quoting.storage import QuoteDrive
 from app.quoting.probability import WinRates
 from app.quoting.schemas import (
     BidPackOut,
+    CalcStepOut,
     CommentIn,
     CommentOut,
     CurrencyIn,
+    FxQuoteOut,
     ItemOut,
     NegotiationIn,
     QuotableTaskOut,
@@ -89,7 +93,7 @@ from app.roles.catalogue import SUPER_ADMIN
 from app.roles.deps import CurrentRoles
 from app.teams import service as teams_service
 from app.teams.service import TeamError
-from app.zoho.client import ZohoBooks
+from app.zoho.client import ZohoBooks, ZohoError
 
 MODULE_KEY = "quote_requests"
 
@@ -184,7 +188,13 @@ async def _out(
     # will read our price against, what is still outstanding. Computed here on
     # every read rather than stored, so it can never disagree with the inputs
     # it came from. See ``app.quoting.bidpack``.
-    body.bid = BidPackOut.model_validate(bidpack.build(request), from_attributes=True)
+    pack = bidpack.build(request)
+    body.bid = BidPackOut.model_validate(pack, from_attributes=True)
+    # And the working behind every figure, from the same pass.
+    body.calculation = [
+        CalcStepOut.model_validate(step, from_attributes=True)
+        for step in calc.steps(request, pack)
+    ]
 
     # The uploaded documents, from the supplier quote rows themselves. Both
     # relationships are selectin-loaded, so this costs no extra query and — more
@@ -314,6 +324,33 @@ async def _raise_quote(
     request.win_basis = estimate.basis
     await session.flush()
     return await _out(session, request, user=user, roles=roles)
+
+
+@router.get(
+    "/fx-rate",
+    response_model=FxQuoteOut,
+    summary="Zoho Books' exchange rate between two currencies",
+)
+async def fx_rate(
+    _user: CurrentUser,
+    zoho: Zoho,
+    from_currency: Annotated[str, Query(alias="from", min_length=3, max_length=3)],
+    to_currency: Annotated[str, Query(alias="to", min_length=3, max_length=3)],
+) -> FxQuoteOut:
+    """The rate Zoho will convert the estimate at, so the bid is costed at the
+    same one. Shown with its working — both sides against Zoho's base — so a
+    person can see it is the ratio of two figures somebody set in Zoho, not a
+    number this app made up. See ``app.quoting.fx``."""
+    try:
+        found = await zoho_rate(zoho, from_currency=from_currency, to_currency=to_currency)
+    except FxUnavailableError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ZohoError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Could not read Zoho Books' currency table.",
+        ) from exc
+    return FxQuoteOut.model_validate(found)
 
 
 @router.get(
@@ -748,6 +785,7 @@ async def select_supplier(
     user: CurrentUser,
     roles: CurrentRoles,
     session: Session,
+    zoho: Zoho,
 ) -> QuoteRequestOut:
     """Take one supplier's offer as this quote's own lines.
 
@@ -768,9 +806,17 @@ async def select_supplier(
             user=user,
             supplier_quote_id=payload.supplier_quote_id,
             markup_percent=payload.markup_percent,
+            # An offer in another currency is converted at Zoho's rate — the
+            # one the estimate will be converted at — unless the bid has one.
+            rates=lambda src, dst: zoho_rate(zoho, from_currency=src, to_currency=dst),
         )
     except QuoteError as exc:
         raise _translate(exc) from exc
+    except ZohoError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Could not read Zoho Books' currency table to convert the offer.",
+        ) from exc
     return await _out(session, request, user=user, roles=roles)
 
 

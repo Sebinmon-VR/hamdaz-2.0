@@ -105,3 +105,82 @@ def test_the_same_currency_never_converts_whatever_the_bid_rate_says() -> None:
     quote, item = _offer("AED", "49")
     assert _pricing_rate(request, quote) == Decimal(1)
     assert _line_from(item, quote, Decimal(0), fx=Decimal(1))["rate"] == Decimal("49.00")
+
+
+# ── Zoho's rate, and the working ────────────────────────────────────────
+
+import asyncio  # noqa: E402
+
+from app.quoting import bidpack, calculation  # noqa: E402
+from app.quoting.fx import FxUnavailableError, rate_between, zoho_rate  # noqa: E402
+
+ZOHO = [
+    {"currency_code": "AED", "exchange_rate": 0.0, "is_base_currency": True},
+    {"currency_code": "USD", "exchange_rate": 3.672501, "effective_date": "2026-09-01"},
+    {"currency_code": "GBP", "exchange_rate": 4.93, "effective_date": "2026-08-15"},
+    {"currency_code": "SAR", "exchange_rate": 0.0},
+]
+
+
+def test_zohos_table_gives_the_rate_the_estimate_will_use() -> None:
+    aed_usd = rate_between(ZOHO, "AED", "USD")
+    assert aed_usd.rate == Decimal("0.27229400")        # 1 / 3.672501, to the bid's precision
+    assert aed_usd.effective_date.isoformat() == "2026-09-01"
+    assert rate_between(ZOHO, "USD", "AED").rate == Decimal("3.672501")
+    assert rate_between(ZOHO, "GBP", "USD").rate == (
+        Decimal("4.93") / Decimal("3.672501")
+    ).quantize(Decimal("0.00000001"))
+    assert rate_between(ZOHO, "usd", "usd").rate == Decimal(1)
+
+
+def test_a_currency_zoho_has_not_priced_is_refused_not_zeroed() -> None:
+    import pytest
+    with pytest.raises(FxUnavailableError, match="no exchange rate for SAR"):
+        rate_between(ZOHO, "SAR", "AED")
+    with pytest.raises(FxUnavailableError, match="does not list JPY"):
+        rate_between(ZOHO, "JPY", "AED")
+
+
+def test_the_whole_chain_lands_on_zohos_number() -> None:
+    """AED 49 from the supplier → Zoho's rate → +20% → 300 units, in cents."""
+    class Zoho:
+        async def currencies(self):
+            return ZOHO
+    found = asyncio.run(zoho_rate(Zoho(), from_currency="AED", to_currency="USD"))
+    request = _quote()
+    request.currency, request.fx_rate = "USD", found.rate
+    quote, item = _offer("AED", "49")
+    line = _line_from(item, quote, Decimal(20), fx=_pricing_rate(request, quote))
+    assert line["cost_rate"] == Decimal("13.3424")
+    assert line["rate"] == Decimal("16.01")
+    assert line["rate"] * item.quantity == Decimal("4803.00")
+
+
+def test_the_bid_total_is_the_taxed_total_once_there_are_lines() -> None:
+    quote = _quote()
+    quote.currency = "USD"
+    quote.items.append(_line("300", "16.01", "5"))
+    pack = bidpack.build(quote)
+    assert pack.bid_total == quote.total == Decimal("5043.15")
+    assert pack.bid_total_is_suggested is False
+
+
+def test_the_working_ends_on_the_taxed_total_and_shows_every_step() -> None:
+    quote = _quote(discount=10)
+    quote.currency, quote.fx_rate, quote.supplier_currency = "USD", Decimal("0.27229400"), "AED"
+    quote.target_markup_percent = Decimal(20)
+    item = _line("300", "16.01", "5")
+    item.name, item.cost_rate, item.tax_name = "LED panel", Decimal("13.3424"), "VAT"
+    quote.items.append(item)
+    steps = calculation.steps(quote, bidpack.build(quote))
+    by = {(s.group, s.label): s for s in steps}
+    assert by[("rate", "1 AED in USD")].result == Decimal("0.27229400")
+    assert by[("lines", "LED panel")].working == (
+        "cost 13.3424 (AED × 0.27229400) + 20.00% = 16.01 each, to the cent × 300"
+    )
+    assert by[("tax", "VAT on LED panel")].working == "5% of 4,803.00"
+    assert by[("tax", "Total incl. tax")].result == quote.total
+    assert by[("bid", "Bid total")].result == quote.total
+    assert [s.group for s in steps] == sorted(
+        (s.group for s in steps), key=["rate", "lines", "totals", "tax", "landed", "bid"].index
+    )

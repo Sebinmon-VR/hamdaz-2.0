@@ -524,6 +524,9 @@ class QuoteRequestOut(BaseModel):
     #: The documents people uploaded, and where each was filed. Kept apart from
     #: ``comparison`` because that is a computation and these are files.
     documents: list[QuoteDocumentOut] = Field(default_factory=list)
+    #: Every sum on the quote, written out in the order it runs. See
+    #: ``app.quoting.calculation``.
+    calculation: list[CalcStepOut] = Field(default_factory=list)
     #: Whether the caller may edit, may send it for approval, and may decide.
     may_edit: bool = False
     #: Whether the caller may set the currency — which, unlike everything else,
@@ -644,6 +647,35 @@ class TaskQuoteIn(BaseModel):
     """Which of the caller's Proposals tasks to raise a quote for."""
 
     task_id: str = Field(min_length=1, max_length=120)
+
+
+class FxQuoteOut(BaseModel):
+    """Zoho Books' rate between two currencies, with its working."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    from_currency: str
+    to_currency: str
+    #: Units of ``to_currency`` per unit of ``from_currency`` — the shape of
+    #: ``fx_rate`` on the bid, so it can be written straight in.
+    rate: Decimal
+    base_currency: str
+    from_in_base: Decimal
+    to_in_base: Decimal
+    effective_date: date | None
+    source: str
+
+
+class CalcStepOut(BaseModel):
+    """One line of the working behind a quote's figures."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    group: str
+    label: str
+    working: str
+    result: Decimal
+    currency: str | None
 
 
 class CurrencyIn(BaseModel):

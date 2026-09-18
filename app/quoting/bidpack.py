@@ -579,7 +579,14 @@ def build(request: QuoteRequest) -> BidPack:
     # it is showing rather than presenting a suggestion as a decision.
     suggested = target.total_sell if target else _money(landed.total)
     unit = request.submission_unit_price
-    if request.submission_total is not None:
+    if request.items:
+        # The priced document itself, tax included. Once a quote has lines,
+        # that is the bid — the ladder below is a suggestion for one that has
+        # none yet, and a bid total that disagreed with the quote's own total
+        # was two numbers for one price.
+        bid_total = _money(request.total)
+        suggested_only = False
+    elif request.submission_total is not None:
         bid_total = _money(request.submission_total)
         suggested_only = False
     elif unit is not None and landed.quantity:

@@ -460,6 +460,11 @@ class ZohoBooks:
     # by name. Everything below is the rest of Zoho Books, reached through
     # ``app.zoho.catalogue`` — see that module for why the surface is a table.
 
+    async def currencies(self) -> list[dict]:
+        """The organisation's currency table: each code with its rate to the
+        base currency, as Zoho itself converts at. See ``app.quoting.fx``."""
+        return (await self._get("/settings/currencies")).get("currencies", [])
+
     async def list_rows(
         self,
         endpoint: Endpoint,

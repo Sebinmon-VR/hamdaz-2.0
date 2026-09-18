@@ -33,6 +33,7 @@ import re
 import uuid
 from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal
+from collections.abc import Awaitable, Callable
 from typing import Any, Final
 
 from sqlalchemy import and_, or_, select
@@ -62,6 +63,7 @@ from app.roles.catalogue import SUPER_ADMIN
 from app.models.team import Team, TeamMembership
 from app.models.user import User
 from app.quoting import bidpack
+from app.quoting.fx import FxQuote, FxUnavailableError
 
 logger = logging.getLogger("hamdaz.quoting")
 
@@ -408,6 +410,7 @@ async def select_supplier(
     user: User,
     supplier_quote_id: uuid.UUID,
     markup_percent: Decimal = Decimal(0),
+    rates: Callable[[str, str], Awaitable[FxQuote]] | None = None,
 ) -> QuoteRequest:
     """Price the quote from one supplier's offer, line by line.
 
@@ -446,6 +449,30 @@ async def select_supplier(
         raise QuoteError(
             f"{quote.supplier_name} has no priced lines, so there is nothing to "
             f"quote from. Check what was read from their document."
+        )
+
+    # An offer in another currency needs a rate before it can be a cost, and
+    # the rate comes from Zoho — the same table the estimate will be converted
+    # at — unless somebody already put one on the bid. It used to price at 1
+    # and say nothing, which is how AED figures came to wear a dollar sign.
+    theirs = (quote.currency or "").upper()
+    ours = (request.currency or "").upper()
+    if theirs and ours and theirs != ours and not (request.fx_rate and request.fx_rate > 0):
+        if rates is None:
+            raise QuoteError(
+                f"{quote.supplier_name} quoted in {theirs} and this quote is in "
+                f"{ours}, and no exchange rate is set on the bid. Set one on the "
+                f"landed cost sheet and choose the supplier again."
+            )
+        try:
+            found = await rates(theirs, ours)
+        except FxUnavailableError as exc:
+            raise QuoteError(str(exc)) from exc
+        request.fx_rate = found.rate
+        request.supplier_currency = theirs
+        logger.info(
+            "quote %s: %s to %s at %s from %s",
+            request.id, theirs, ours, found.rate, found.source,
         )
 
     fx = _pricing_rate(request, quote)
