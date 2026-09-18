@@ -214,3 +214,25 @@ def test_a_quote_with_no_cost_on_any_line_implies_no_markup() -> None:
     quote = _quote()
     quote.items.append(_line("1", "100", None))
     assert implied_markup(quote) == Decimal(0)
+
+
+def test_re_pricing_keeps_the_tax_typed_on_each_line() -> None:
+    """A supplier's document has no VAT per item. Rebuilding the lines from it
+    must not quietly un-tax the quote."""
+    from app.quoting.service import _carry_over
+
+    quote = _quote()
+    item = _line("300", "16.008", "5")
+    item.name, item.cost_rate = "LED panel", Decimal("13.34")
+    item.tax_name, item.position = "VAT", 0
+    quote.items.append(item)
+    def rebuilt():
+        return {"name": "LED panel", "quantity": Decimal(300),
+                "cost_rate": Decimal("13.3424"), "rate": Decimal("16.01")}
+
+    kept = _carry_over(quote, [rebuilt()])
+
+    assert kept[0]["tax_name"] == "VAT"
+    assert kept[0]["tax_percentage"] == Decimal("5")
+    # A different supplier with a different number of lines carries nothing.
+    assert "tax_name" not in _carry_over(quote, [rebuilt(), rebuilt()])[0]

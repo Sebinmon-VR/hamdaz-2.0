@@ -488,9 +488,8 @@ async def select_supplier(
         )
 
     fx = _pricing_rate(request, quote)
-    set_items(
-        request, [_line_from(item, quote, markup_percent, fx=fx) for item in quote.items]
-    )
+    lines = [_line_from(item, quote, markup_percent, fx=fx) for item in quote.items]
+    set_items(request, _carry_over(request, lines))
     request.selected_supplier_quote_id = quote.id
     # Their prices are only half of what they sent. The terms they stated are
     # answers to the customer's own clauses, and carrying them across now is the
@@ -573,13 +572,38 @@ async def reprice_at_rate(
 
     markup = markup_percent if markup_percent is not None else implied_markup(request)
     fx = _pricing_rate(request, quote)
-    set_items(request, [_line_from(item, quote, markup, fx=fx) for item in quote.items])
+    lines = [_line_from(item, quote, markup, fx=fx) for item in quote.items]
+    set_items(request, _carry_over(request, lines))
     request.target_markup_percent = markup
     await session.flush()
     logger.info(
         "quote %s re-priced from %s at %s, markup %s%%", request.id, quote.supplier_name, fx, markup
     )
     return request
+
+
+#: What a person typed on a line that the supplier's document cannot know.
+#: Tax is the one that matters: a supplier quote has no VAT per item, so
+#: rebuilding the lines from it silently un-taxed a quote — 5,042.52 became
+#: 4,803.00 and nothing said why.
+_TYPED_ON_THE_LINE = ("tax_name", "tax_percentage", "discount")
+
+
+def _carry_over(request: QuoteRequest, lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep what was typed on the existing lines when they are rebuilt from the
+    supplier's. Matched line for line, in order, when the supplier still has
+    the same number of lines — which a re-price from the same supplier always
+    does. A different supplier with a different count is a different quote,
+    and nothing is carried."""
+    old = sorted(request.items, key=lambda i: i.position or 0)
+    if len(old) != len(lines):
+        return lines
+    for was, now in zip(old, lines, strict=True):
+        for key in _TYPED_ON_THE_LINE:
+            value = getattr(was, key)
+            if value is not None and key not in now:
+                now[key] = value
+    return lines
 
 
 def _pricing_rate(request: QuoteRequest, quote: SupplierQuote) -> Decimal:
