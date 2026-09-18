@@ -147,13 +147,17 @@ async def approvers_for(session: AsyncSession, team_id: uuid.UUID) -> list[User]
     return list(people.values())
 
 
-def require_owner(request: QuoteRequest, *, user: User) -> None:
-    """Whose quote it is.
+def require_owner(
+    request: QuoteRequest, *, user: User, roles: set[str] | frozenset[str] = frozenset()
+) -> None:
+    """Whose quote it is — plus a super admin, who holds every access here.
 
     Separate from the status question deliberately: the two refusals are not the
     same refusal, and one field is allowed to move on a quote that is otherwise
     frozen. See ``require_editable`` and ``may_set_currency``.
     """
+    if SUPER_ADMIN in roles:
+        return
     if request.created_by_id != user.id and request.assigned_to_id != user.id:
         raise QuotePermissionError("This quote is not yours to edit.")
 
@@ -179,26 +183,16 @@ def may_set_currency(request: QuoteRequest, *, user: User, roles: set[str]) -> b
     return SUPER_ADMIN in roles
 
 
-def may_reprice(request: QuoteRequest, *, user: User, roles: set[str]) -> bool:
-    """Who may re-price a quote at Zoho's rate — the same rule as the currency,
-    and for the same reason: it is a correction of the figures to the rate the
-    estimate will actually be converted at, not a change of mind about the
-    price, and it is wanted on quotes in every state, drafts included. Whose
-    quote it is, plus a super admin; and only where a supplier has been chosen,
-    because there is nothing to re-price from otherwise."""
-    return request.selected_supplier_quote_id is not None and may_set_currency(
-        request, user=user, roles=roles
-    )
-
-
-def require_editable(request: QuoteRequest, *, user: User) -> None:
+def require_editable(
+    request: QuoteRequest, *, user: User, roles: set[str] | frozenset[str] = frozenset()
+) -> None:
     if request.status not in EDITABLE_STATUSES:
         raise QuotePermissionError(
             f"This quote is {request.status.replace('_', ' ')} and cannot be edited. "
             f"Editing it while approvers are looking would mean they approved "
             f"something that no longer exists."
         )
-    require_owner(request, user=user)
+    require_owner(request, user=user, roles=roles)
 
 
 # ── building one ───────────────────────────────────────────────────────
@@ -342,7 +336,8 @@ def _base_amount(request: QuoteRequest, row: dict[str, Any]) -> Decimal:
         and currency
         and currency != (request.currency or "").upper()
     ):
-        return (source * rate).quantize(_RATE)
+        # 1 USD = 3.672501 AED, so an AED figure becomes USD by division.
+        return (source / rate).quantize(_PRICE, rounding=ROUND_HALF_UP)
     return Decimal(str(row.get("amount_base") or 0))
 
 
@@ -423,6 +418,7 @@ async def select_supplier(
     supplier_quote_id: uuid.UUID,
     markup_percent: Decimal = Decimal(0),
     rates: Callable[[str, str], Awaitable[FxQuote]] | None = None,
+    roles: set[str] | frozenset[str] = frozenset(),
 ) -> QuoteRequest:
     """Price the quote from one supplier's offer, line by line.
 
@@ -440,7 +436,7 @@ async def select_supplier(
     The lines are replaced, not merged: choosing a supplier means taking their
     prices, and a merge of two suppliers' offers is not a quote from either.
     """
-    require_editable(request, user=user)
+    require_editable(request, user=user, roles=roles)
     if request.comparison_id is None:
         raise QuoteError(
             "No supplier quotes are attached to this request yet, so there is "
@@ -477,14 +473,13 @@ async def select_supplier(
                 f"landed cost sheet and choose the supplier again."
             )
         try:
-            found = await rates(theirs, ours)
+            found = await rates(ours, theirs)
         except FxUnavailableError as exc:
             raise QuoteError(str(exc)) from exc
         request.fx_rate = found.rate
         request.supplier_currency = theirs
         logger.info(
-            "quote %s: %s to %s at %s from %s",
-            request.id, theirs, ours, found.rate, found.source,
+            "quote %s: 1 %s = %s %s, from %s", request.id, ours, found.rate, theirs, found.source
         )
 
     fx = _pricing_rate(request, quote)
@@ -510,75 +505,76 @@ async def select_supplier(
     return request
 
 
-def implied_markup(request: QuoteRequest) -> Decimal:
-    """The markup the lines were actually priced at, read back off them.
+#: The figures on a quote that are money in the quote's currency. Everything
+#: here converts when the currency changes; a percentage, a quantity and a
+#: supplier's own figure in its own currency do not.
+_CENT = Decimal("0.01")
 
-    For a quote priced before the bid's own markup was recorded: the first line
-    with a cost says what was applied — 13.34 → 16.008 is 20% — and that is a
-    better answer than "0%", which would re-price the whole quote at cost.
+
+def convert_figures(request: QuoteRequest, factor: Decimal) -> None:
+    """Restate every figure in another currency: multiply by ``factor`` — units
+    of the new currency per one of the old — and round to the cent, once.
+
+    Pure arithmetic on the object, so it can be tested without a rate source.
+    The tax rates stay: 5% is 5% in any currency. The quantities stay. The
+    markup stays, because cost and price move together. A supplier's own figure
+    in its own currency stays, because it was never in ours.
     """
-    if request.target_markup_percent is not None:
-        return request.target_markup_percent
+
+    def money(value: Decimal | None) -> Decimal | None:
+        if value is None:
+            return None
+        return (value * factor).quantize(_CENT, rounding=ROUND_HALF_UP)
+
     for item in request.items:
-        if item.cost_rate and item.cost_rate > 0 and item.rate is not None:
-            return ((item.rate - item.cost_rate) / item.cost_rate * Decimal(100)).quantize(
-                Decimal("0.01")
-            )
-    return Decimal(0)
+        item.rate = money(item.rate) or Decimal(0)
+        item.cost_rate = money(item.cost_rate)
+        item.discount = money(item.discount) or Decimal(0)
+    request.discount = money(request.discount) or Decimal(0)
+    request.shipping_charge = money(request.shipping_charge) or Decimal(0)
+    request.adjustment = money(request.adjustment) or Decimal(0)
+    request.submission_unit_price = money(request.submission_unit_price)
+    request.submission_total = money(request.submission_total)
+    for row in request.cost_lines:
+        row.amount_base = money(row.amount_base) or Decimal(0)
 
 
-async def reprice_at_rate(
+async def convert_currency(
     session: AsyncSession,
     request: QuoteRequest,
     *,
+    to_currency: str,
     rates: Callable[[str, str], Awaitable[FxQuote]],
-    markup_percent: Decimal | None = None,
 ) -> QuoteRequest:
-    """Re-price the quote from its chosen supplier at Zoho's rate, now.
+    """Switch the quote to another currency, converting everything on it.
 
-    The one write that ignores the status. Everything else freezes when a quote
-    goes up; this is allowed through because it changes no decision — the
-    supplier, the markup and the lines stay what they were — it only puts the
-    figures at the rate the estimate will be converted at. A quote priced by
-    hand at a remembered rate is wrong in one direction only, and the person
-    who notices should be able to correct it without pulling it out of approval.
+    Changing the code on a quote and leaving the numbers alone is not a change
+    of currency, it is a mislabelling — 4,802.40 does not stop being dirhams
+    because a dropdown now says USD. So the switch converts, at Zoho's rate,
+    because Zoho's is the rate the estimate will be converted at, and rounds to
+    the cent, because a customer is quoted cents.
 
-    Zoho's rate *replaces* whatever the bid held. Choosing a supplier keeps a
-    rate somebody typed; this is the action for when that rate was the problem.
+    ``rates(a, b)`` is one unit of ``a`` in ``b``. The factor from old to new
+    is one old unit in new units; the supplier rate is restated afterwards so
+    "1 USD = 3.672501 AED" stays true of the new currency.
     """
-    if request.selected_supplier_quote_id is None:
-        raise QuoteError(
-            "No supplier has been chosen for this quote, so there is nothing to re-price from."
-        )
-    quote = await session.scalar(
-        select(SupplierQuote).where(SupplierQuote.id == request.selected_supplier_quote_id)
-    )
-    if quote is None or not quote.items:
-        raise QuoteError("The chosen supplier's quote has no priced lines to re-price from.")
-
-    theirs = (quote.currency or "").upper()
-    ours = (request.currency or "").upper()
-    if theirs and ours and theirs != ours:
-        try:
-            found = await rates(theirs, ours)
-        except FxUnavailableError as exc:
-            raise QuoteError(str(exc)) from exc
-        request.fx_rate = found.rate
-        request.supplier_currency = theirs
-    else:
-        # Same currency: nothing to convert, and a stale rate on the bid would
-        # otherwise sit there looking like it applied.
-        request.fx_rate = None
-
-    markup = markup_percent if markup_percent is not None else implied_markup(request)
-    fx = _pricing_rate(request, quote)
-    lines = [_line_from(item, quote, markup, fx=fx) for item in quote.items]
-    set_items(request, _carry_over(request, lines))
-    request.target_markup_percent = markup
+    old = (request.currency or "").upper()
+    new = to_currency.strip().upper()
+    if old == new:
+        return request
+    try:
+        step = await rates(old, new)
+        convert_figures(request, step.rate)
+        request.currency = new
+        supplier = (request.supplier_currency or "").upper()
+        if supplier and supplier != new:
+            request.fx_rate = (await rates(new, supplier)).rate
+        else:
+            request.fx_rate = None
+    except FxUnavailableError as exc:
+        raise QuoteError(str(exc)) from exc
     await session.flush()
-    logger.info(
-        "quote %s re-priced from %s at %s, markup %s%%", request.id, quote.supplier_name, fx, markup
-    )
+    logger.info("quote %s: %s to %s at %s", request.id, old, new, step.rate)
     return request
 
 
@@ -607,7 +603,8 @@ def _carry_over(request: QuoteRequest, lines: list[dict[str, Any]]) -> list[dict
 
 
 def _pricing_rate(request: QuoteRequest, quote: SupplierQuote) -> Decimal:
-    """Units of the quote's currency per unit of the supplier's, for pricing.
+    """Units of the supplier's currency per one unit of the quote's — "1 USD =
+    3.672501 AED" — to divide their prices by.
 
     **The bid's own rate wins.** ``fx_rate`` on the request is the rate the bid
     is costed on — the landed-cost build-up already converts every foreign cost
@@ -619,21 +616,22 @@ def _pricing_rate(request: QuoteRequest, quote: SupplierQuote) -> Decimal:
     heads, at whatever rate they remembered, and two documents for one job
     disagreed by exactly the difference between 3.66 and 3.6725.
 
-    Same currency, or no rate set anywhere: as before, the supplier quote's own
-    rate, which is 1 unless the comparison converted it.
+    Same currency, or no rate set anywhere: 1, and their price is our cost.
     """
     theirs = (quote.currency or "").upper()
     ours = (request.currency or "").upper()
     if theirs and ours and theirs != ours and request.fx_rate and request.fx_rate > 0:
         return request.fx_rate
-    return quote.fx_rate or Decimal(1)
+    return Decimal(1)
 
 
 def _line_from(
     item: SupplierQuoteItem, quote: SupplierQuote, markup_percent: Decimal, *, fx: Decimal
 ) -> dict[str, Any]:
-    """One supplier line as a line of ours, in the request's own currency."""
-    cost = ((item.unit_price or Decimal(0)) * fx).quantize(_RATE)
+    """One supplier line as a line of ours, in the request's own currency.
+    Their price divided by the rate, to the cent: a cost of 13.3424 is not a
+    number anybody can check against anything."""
+    cost = ((item.unit_price or Decimal(0)) / fx).quantize(_PRICE, rounding=ROUND_HALF_UP)
     name = (item.description or "").strip() or "Unnamed line"
     return {
         "name": name[:_NAME_LIMIT],

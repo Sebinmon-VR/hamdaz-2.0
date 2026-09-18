@@ -63,6 +63,19 @@ FORM = {
 }
 
 
+class StubZoho:
+    """Only what the quoting routes ask Zoho for: its currency table, so a
+    currency switch can convert. Base AED, as the real organisation is."""
+
+    async def currencies(self):
+        return [
+            {"currency_code": "AED", "exchange_rate": 0.0, "is_base_currency": True},
+            {"currency_code": "USD", "exchange_rate": 3.672501, "effective_date": "2026-09-01"},
+            {"currency_code": "EUR", "exchange_rate": 4.3, "effective_date": "2026-09-01"},
+            {"currency_code": "GBP", "exchange_rate": 4.93, "effective_date": "2026-08-15"},
+        ]
+
+
 class StubWinRates:
     """Stands in for the estimate history.
 
@@ -226,7 +239,7 @@ class StubMailer(QuoteMailer):
 def quoting(client):
     """Zoho stubbed out. Nothing in this module writes to it, and no test reads it."""
     client._transport.app.state.win_rates = StubWinRates()
-    client._transport.app.state.zoho = object()
+    client._transport.app.state.zoho = StubZoho()
     client._transport.app.state.quote_extractor = StubExtractor()
     client._transport.app.state.sharepoint = StubSharePoint()
     client._transport.app.state.quote_mailer = StubMailer()
@@ -602,12 +615,17 @@ async def test_the_currency_is_correctable_after_the_quote_has_gone_up(
     assert frozen.status_code == 403
     assert "cannot be edited" in frozen.json()["detail"]
 
-    # The currency still moves. Codes are codes, so it comes back upper-cased.
+    # The currency still moves — and everything on the quote converts with it,
+    # at Zoho's rate, to the cent. Codes are codes, so it comes back upper-cased.
     changed = await client.patch(f"{API}/{quote_id}/currency", json={"currency": "usd"})
     assert changed.status_code == 200, changed.text
-    assert changed.json()["currency"] == "USD"
-    assert changed.json()["status"] == "pending_approval"
-    assert changed.json()["may_set_currency"] is True
+    body = changed.json()
+    assert body["currency"] == "USD"
+    assert body["status"] == "pending_approval"
+    assert body["may_set_currency"] is True
+    # FORM's first line is 2 × 12,000 AED; 12,000 ÷ 3.672501 = 3,267.53.
+    assert Decimal(body["items"][0]["rate"]) == Decimal("3267.53")
+    assert Decimal(body["items"][0]["cost_rate"]) == Decimal("2450.65")   # 9,000 ÷ 3.672501
 
     # Whose quote it is still decides. An approver may decide this quote but
     # does not own it, so they ask the person who raised it.

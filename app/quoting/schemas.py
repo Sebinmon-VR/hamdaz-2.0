@@ -201,8 +201,9 @@ class QuoteRequestIn(BaseModel):
 
     # The landed-cost inputs. Inputs only — every total is computed on read.
     supplier_currency: str | None = Field(default=None, min_length=3, max_length=3)
-    #: Units of ``currency`` per unit of ``supplier_currency``, at the rate the
-    #: bid is costed on rather than the mid-market rate.
+    #: One unit of ``currency`` in ``supplier_currency`` — "1 USD = 3.672501
+    #: AED" — as Zoho Books states it, which is the rate the estimate will be
+    #: converted at.
     fx_rate: Decimal | None = Field(default=None, gt=0)
     customs_duty_percent: Decimal = Field(default=Decimal(0), ge=0, le=100)
     financing_rate_percent: Decimal = Field(default=Decimal(0), ge=0, le=100)
@@ -536,9 +537,6 @@ class QuoteRequestOut(BaseModel):
     #: that one answers about the whole document and goes false the moment a
     #: quote goes up.
     may_set_currency: bool = False
-    #: Whether the caller may re-price this quote at Zoho's rate — the same
-    #: people, in any state, and only once a supplier has been chosen.
-    may_reprice: bool = False
     #: Set once it is priced from a supplier and has lines. ``submit_reason``
     #: says what is missing while it is not, so a form can say why the button is
     #: off instead of only finding out when it is pressed.
@@ -657,14 +655,14 @@ class FxQuoteOut(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
-    from_currency: str
-    to_currency: str
-    #: Units of ``to_currency`` per unit of ``from_currency`` — the shape of
-    #: ``fx_rate`` on the bid, so it can be written straight in.
+    quote_currency: str
+    supplier_currency: str
+    #: One unit of the quote's currency in the supplier's — "1 USD = 3.672501
+    #: AED" is 3.672501 — the shape of ``fx_rate``, written in unchanged.
     rate: Decimal
     base_currency: str
-    from_in_base: Decimal
-    to_in_base: Decimal
+    quote_in_base: Decimal
+    supplier_in_base: Decimal
     effective_date: date | None
     source: str
 
@@ -681,19 +679,12 @@ class CalcStepOut(BaseModel):
     currency: str | None
 
 
-class RepriceIn(BaseModel):
-    """Re-price from the chosen supplier at Zoho's rate. The markup is optional:
-    left out, the one the lines were priced at is kept."""
-
-    markup_percent: Decimal | None = Field(default=None, ge=0, le=1000)
-
-
 class CurrencyIn(BaseModel):
     """The currency a quote is stated in.
 
     Its own body, and its own route, because it is the one field allowed to move
-    on a quote that is otherwise frozen. Sending it through the ordinary edit
-    would mean opening the whole document to change the label on it.
+    on a quote that is otherwise frozen — and because switching it converts
+    every figure at Zoho's rate, which is not a field edit.
     """
 
     currency: str = Field(min_length=3, max_length=3)

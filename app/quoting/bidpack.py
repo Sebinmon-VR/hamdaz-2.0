@@ -262,7 +262,8 @@ def landed_cost(request: QuoteRequest) -> LandedCost:
             stage=CostStage.ORIGIN,
             label="Goods, as priced from the supplier",
             basis="The quote's own lines",
-            amount_source=(goods / fx).quantize(Decimal("0.0001")) if fx else None,
+            # 1 USD = 3.672501 AED: our goods figure, in their currency.
+            amount_source=(goods * fx).quantize(Decimal("0.01")) if fx else None,
             source_currency=request.supplier_currency if fx else None,
             amount_base=_money(goods),
             is_principal=True,

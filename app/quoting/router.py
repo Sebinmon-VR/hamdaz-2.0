@@ -83,7 +83,6 @@ from app.quoting.schemas import (
     QuoteRequestIn,
     QuoteRequestOut,
     QuoteSummaryOut,
-    RepriceIn,
     ReviewIn,
     ReviewOut,
     SupplierChoiceIn,
@@ -213,7 +212,11 @@ async def _out(
             for quote in request.comparison.quotes
         ]
 
-    body.may_edit = request.is_editable and request.created_by_id == user.id
+    # Whoever raised it, or a super admin — while it is in a state that can be
+    # edited at all. Submitting still freezes it for everyone.
+    body.may_edit = request.is_editable and (
+        request.created_by_id == user.id or SUPER_ADMIN in set(roles)
+    )
     body.submit_reason = service.why_not_submit(request)
     body.may_submit = body.may_edit and body.submit_reason is None
     allowed, reason = await service.may_approve(session, request, user=user, roles=roles)
@@ -222,7 +225,6 @@ async def _out(
     # Its own rule: whose quote it is, plus a super admin, and no status in
     # it at all. See ``service.may_set_currency``.
     body.may_set_currency = service.may_set_currency(request, user=user, roles=roles)
-    body.may_reprice = service.may_reprice(request, user=user, roles=roles)
     # Asked here rather than re-derived on the screen, like every other
     # permission on this body. A frontend that works out for itself who may
     # delete something is a frontend that will one day disagree with the server.
@@ -336,15 +338,17 @@ async def _raise_quote(
 async def fx_rate(
     _user: CurrentUser,
     zoho: Zoho,
-    from_currency: Annotated[str, Query(alias="from", min_length=3, max_length=3)],
-    to_currency: Annotated[str, Query(alias="to", min_length=3, max_length=3)],
+    quote: Annotated[str, Query(min_length=3, max_length=3, description="The quote's currency")],
+    supplier: Annotated[
+        str, Query(min_length=3, max_length=3, description="The supplier's currency")
+    ],
 ) -> FxQuoteOut:
-    """The rate Zoho will convert the estimate at, so the bid is costed at the
-    same one. Shown with its working — both sides against Zoho's base — so a
-    person can see it is the ratio of two figures somebody set in Zoho, not a
-    number this app made up. See ``app.quoting.fx``."""
+    """One unit of the quote's currency in the supplier's — "1 USD = 3.672501
+    AED" — as Zoho will convert the estimate at. Shown with its working, both
+    sides against Zoho's base, so a person can see it is the ratio of two
+    figures somebody set in Zoho and not a number this app made up."""
     try:
-        found = await zoho_rate(zoho, from_currency=from_currency, to_currency=to_currency)
+        found = await zoho_rate(zoho, quote_currency=quote, supplier_currency=supplier)
     except FxUnavailableError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except ZohoError as exc:
@@ -507,7 +511,7 @@ async def update(
     """
     request = await _load(session, request_id)
     try:
-        service.require_editable(request, user=user)
+        service.require_editable(request, user=user, roles=roles)
         service.apply_fields(request, payload.model_dump())
         service.set_items(request, [i.model_dump() for i in payload.items])
         service.set_cost_lines(request, [c.model_dump() for c in payload.cost_lines])
@@ -532,19 +536,20 @@ async def set_currency(
     user: CurrentUser,
     roles: CurrentRoles,
     session: Session,
+    zoho: Zoho,
 ) -> QuoteRequestOut:
-    """The one field that still moves on a quote that has gone up.
+    """Switch the currency, converting every figure at Zoho's rate.
 
-    Everything else freezes the moment a quote is submitted, and for a good
-    reason: an approver has to decide on the document they were sent, not on one
-    that changed while they read it.
+    A quote in the wrong currency is not fixed by relabelling it: 4,802.40 does
+    not stop being dirhams because the dropdown says USD. So the switch
+    converts — lines, discounts, shipping, the landed-cost rows, the
+    submission figures — at the rate Zoho Books will convert the estimate at,
+    and rounds to the cent, once. Tax rates, quantities and margins are not
+    money and do not move.
 
-    The currency is deliberately outside that rule. Nothing in this module
-    converts between currencies — the code is a *label* on figures that are
-    already what they are — so changing it restates no number and invalidates no
-    approval. The alternative was worse: a quote discovered to be in the wrong
-    currency could only be corrected by pulling it back out of approval, which
-    means re-notifying every approver to fix a three-letter code.
+    Allowed in any state, by whoever raised or holds the quote and by a super
+    admin, because a quote discovered to be in the wrong currency should not
+    need pulling out of approval to correct.
 
     Whose quote it is still decides, as with every other write — plus a super
     admin, who holds every access here and should not have to ask the author to
@@ -557,57 +562,21 @@ async def set_currency(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="This quote is not yours to set the currency on.",
         )
-    request.currency = payload.currency
-    await session.flush()
-    return await _out(session, request, user=user, roles=roles)
-
-
-@router.post(
-    "/{request_id}/reprice",
-    response_model=QuoteRequestOut,
-    summary="Re-price from the chosen supplier at Zoho's rate, in any state",
-)
-async def reprice(
-    request_id: uuid.UUID,
-    payload: RepriceIn,
-    user: CurrentUser,
-    roles: CurrentRoles,
-    session: Session,
-    zoho: Zoho,
-) -> QuoteRequestOut:
-    """Put the figures at the rate the estimate will be converted at.
-
-    For a quote priced before the rate came from Zoho — by hand, at whatever
-    rate somebody remembered — and for one whose rate in Zoho has since moved.
-    The supplier, the lines and the markup stay what they were; only the
-    conversion changes, and Zoho's rate replaces the bid's. Allowed in every
-    state, drafts included, by whoever raised or holds the quote and by a super
-    admin, because it corrects the figures without changing a decision.
-    """
-    request = await _load(session, request_id)
-    if not service.may_reprice(request, user=user, roles=roles):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=(
-                "This quote is not yours to re-price."
-                if request.selected_supplier_quote_id is not None
-                else "No supplier has been chosen for this quote, so there is nothing "
-                "to re-price from."
-            ),
-        )
     try:
-        await service.reprice_at_rate(
+        await service.convert_currency(
             session,
             request,
-            rates=lambda src, dst: zoho_rate(zoho, from_currency=src, to_currency=dst),
-            markup_percent=payload.markup_percent,
+            to_currency=payload.currency,
+            rates=lambda ours, theirs: zoho_rate(
+                zoho, quote_currency=ours, supplier_currency=theirs
+            ),
         )
     except QuoteError as exc:
         raise _translate(exc) from exc
     except ZohoError as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Could not read Zoho Books' currency table to re-price.",
+            detail="Could not read Zoho Books' currency table to convert the quote.",
         ) from exc
     return await _out(session, request, user=user, roles=roles)
 
@@ -860,7 +829,10 @@ async def select_supplier(
             markup_percent=payload.markup_percent,
             # An offer in another currency is converted at Zoho's rate — the
             # one the estimate will be converted at — unless the bid has one.
-            rates=lambda src, dst: zoho_rate(zoho, from_currency=src, to_currency=dst),
+            rates=lambda ours, theirs: zoho_rate(
+                zoho, quote_currency=ours, supplier_currency=theirs
+            ),
+            roles=roles,
         )
     except QuoteError as exc:
         raise _translate(exc) from exc

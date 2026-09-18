@@ -61,8 +61,9 @@ def steps(request: QuoteRequest, pack: BidPack) -> list[Step]:  # noqa: C901
     if converting:
         out.append(Step(
             "rate",
-            f"1 {foreign} in {cur}",
-            f"The bid's exchange rate. Every {foreign} figure below is multiplied by it.",
+            "Exchange rate",
+            f"1 {cur} = {fx} {foreign}, as Zoho Books has it. Every {foreign} figure "
+            f"below is divided by it.",
             fx,
             None,
         ))
@@ -76,9 +77,9 @@ def steps(request: QuoteRequest, pack: BidPack) -> list[Step]:  # noqa: C901
             # The stored cost, not a source figure worked backwards from it:
             # 13.3424 ÷ 0.27229447 is 48.9999, and a working that shows 48.9999
             # for a supplier who quoted 49 is a working nobody trusts.
-            parts.append(f"cost {_n(item.cost_rate, 4)}")
+            parts.append(f"cost {_price(item.cost_rate)}")
             if converting:
-                parts.append(f"({foreign} × {fx})")
+                parts.append(f"({foreign} ÷ {fx})")
             # The markup the bid is built at, where one is set; the selling rate
             # is rounded to the cent afterwards, so the implied figure would read
             # 19.99% for a 20% markup.
@@ -151,7 +152,7 @@ def steps(request: QuoteRequest, pack: BidPack) -> list[Step]:  # noqa: C901
         for el in landed.elements:
             source_side = (el.source_currency or "").upper()
             if el.amount_source is not None and converting and source_side and source_side != cur:
-                working = f"{source_side} {_n(el.amount_source, 4)} × {fx}"
+                working = f"{source_side} {_n(el.amount_source)} ÷ {fx}"
             else:
                 working = el.basis or (
                     "Worked out from the rows above" if el.computed else "As entered"
