@@ -16,6 +16,7 @@ from decimal import ROUND_HALF_UP, Decimal
 
 from app.models.quoting import QuoteRequest
 from app.quoting.bidpack import BidPack
+from app.quoting.service import sell_step, supplier_prices
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,11 +70,29 @@ def steps(request: QuoteRequest, pack: BidPack) -> list[Step]:  # noqa: C901
         ))
 
     # ── the lines ───────────────────────────────────────────────────
+    sources = supplier_prices(request)
     for item in request.items:
         qty = item.quantity or Decimal(0)
         rate = item.rate or Decimal(0)
         parts: list[str] = []
-        if item.cost_rate is not None and item.cost_rate > 0:
+        source = sources.get(str(item.id))
+        markup = request.target_markup_percent
+        if source is not None and markup is not None and source[1] != cur:
+            # Zoho's order, spelled out: mark up in their currency, round there
+            # the way Zoho's item price is rounded, then convert.
+            unit, theirs = source
+            raw = unit * (Decimal(1) + markup / Decimal(100))
+            step = sell_step(theirs)
+            rounded = raw.quantize(step, rounding=ROUND_HALF_UP)
+            rounding = (
+                f" → {_n(rounded, 0)} (whole {theirs}, as Zoho prices items)"
+                if step == Decimal(1) and rounded != raw else ""
+            )
+            parts.append(
+                f"{theirs} {_n(unit)} + {_n(markup)}% = {_n(raw)}{rounding}"
+                f" ÷ {fx if fx else '?'} = {_price(rate)} each"
+            )
+        elif item.cost_rate is not None and item.cost_rate > 0:
             # The stored cost, not a source figure worked backwards from it:
             # 13.3424 ÷ 0.27229447 is 48.9999, and a working that shows 48.9999
             # for a supplier who quoted 49 is a working nobody trusts.

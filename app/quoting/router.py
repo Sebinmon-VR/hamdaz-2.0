@@ -188,6 +188,15 @@ async def _out(
     # will read our price against, what is still outstanding. Computed here on
     # every read rather than stored, so it can never disagree with the inputs
     # it came from. See ``app.quoting.bidpack``.
+    # Where each line's price came from, so the editor can rebuild a price the
+    # way it was built — in the supplier's currency first — when the margin is
+    # retyped, rather than marking up a converted cost and drifting a cent.
+    sources = service.supplier_prices(request)
+    for out in body.items:
+        found = sources.get(str(out.id))
+        if found is not None:
+            out.supplier_unit_price, out.supplier_currency = found
+
     pack = bidpack.build(request)
     body.bid = BidPackOut.model_validate(pack, from_attributes=True)
     # And the working behind every figure, from the same pass.

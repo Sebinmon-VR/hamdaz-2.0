@@ -143,7 +143,9 @@ def test_a_currency_zoho_has_not_priced_is_refused_not_zeroed() -> None:
 
 
 def test_an_aed_offer_into_a_usd_quote_lands_on_zohos_number() -> None:
-    """AED 49 ÷ 3.672501 = 13.34 → +20% = 16.01 → 300 units = 4,803.00."""
+    """Zoho's order: AED 49 + 20% = 58.80, is 59 (a whole dirham, as Zoho's
+    item price is), ÷ 3.672501 = USD 16.07 → 300 units = 4,821.00. Exactly the
+    estimate QT-001701 that this was checked against."""
     class Zoho:
         async def currencies(self):
             return ZOHO
@@ -152,9 +154,19 @@ def test_an_aed_offer_into_a_usd_quote_lands_on_zohos_number() -> None:
     request.currency, request.fx_rate = "USD", found.rate
     quote, item = _offer("AED", "49")
     line = _line_from(item, quote, Decimal(20), fx=_pricing_rate(request, quote))
-    assert line["cost_rate"] == Decimal("13.34")
-    assert line["rate"] == Decimal("16.01")
-    assert line["rate"] * item.quantity == Decimal("4803.00")
+    assert line["cost_rate"] == Decimal("13.34")           # 49 ÷ 3.672501, to the cent
+    assert line["rate"] == Decimal("16.07")                # 59 ÷ 3.672501, to the cent
+    assert line["rate"] * item.quantity == Decimal("4821.00")
+
+
+def test_a_non_aed_supplier_is_rounded_to_the_cent_not_the_unit() -> None:
+    """The whole-unit rounding is Zoho's AED practice, not a general rule."""
+    request = _quote()
+    request.currency, request.fx_rate = "GBP", Decimal("0.74")   # 1 GBP = 0.74 USD, say
+    quote, item = _offer("USD", "10")
+    line = _line_from(item, quote, Decimal(25), fx=_pricing_rate(request, quote))
+    assert line["rate"] == Decimal("16.89")                # 12.50 ÷ 0.74
+    assert line["cost_rate"] == Decimal("13.51")
 
 
 def test_the_same_currency_never_converts_whatever_the_rate_says() -> None:
@@ -163,6 +175,8 @@ def test_the_same_currency_never_converts_whatever_the_rate_says() -> None:
     quote, item = _offer("AED", "49")
     assert _pricing_rate(request, quote) == Decimal(1)
     assert _line_from(item, quote, Decimal(0), fx=Decimal(1))["rate"] == Decimal("49.00")
+    # And an AED quote from an AED supplier prices to the dirham, as Zoho does.
+    assert _line_from(item, quote, Decimal(20), fx=Decimal(1))["rate"] == Decimal("59.00")
 
 
 def test_switching_currency_converts_every_figure_to_the_cent() -> None:

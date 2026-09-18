@@ -400,10 +400,51 @@ def _decimal_or_none(value: Any) -> Decimal | None:
 #: Rates are stored to four places, so a markup produces a price rather than
 #: whatever a multiplication happens to leave behind.
 _RATE = Decimal("0.0001")
-#: A selling price is quoted to the cent. Costs keep four places — a rate
-#: converted from another currency is not yet a price — but the number a
-#: customer sees, and Zoho multiplies, is two.
+#: A selling price is quoted to the cent — the number a customer sees, and
+#: the number Zoho multiplies.
 _PRICE = Decimal("0.01")
+
+#: How a selling price is rounded *in the supplier's currency*, before it is
+#: converted. Zoho's item prices are set in the base currency, and the one
+#: this was checked against is a whole dirham: purchase 49, sale 59 — not
+#: 58.80. Converting that at 3.672501 is what gives Zoho's 16.07, and marking
+#: up the converted cost instead gave 16.01 for months. So a price is built
+#: where Zoho builds it, and rounded there the way Zoho's is: to the dirham in
+#: AED, to the cent anywhere else, where no such practice has been observed.
+_SELL_STEP: Final = {"AED": Decimal("1")}
+
+
+def sell_step(currency: str | None) -> Decimal:
+    return _SELL_STEP.get((currency or "").upper(), _PRICE)
+
+
+def supplier_prices(request: QuoteRequest) -> dict[str, tuple[Decimal, str]]:
+    """Each line's price on the supplier's own document, in the supplier's
+    currency — keyed by the line's id.
+
+    A line remembers which supplier quote it was priced from but not which of
+    its rows; the rows are paired in order, and only when the supplier still
+    has exactly as many rows as were priced from it, which is what a quote
+    priced from one supplier always has. A line added by hand has no supplier
+    price and is left out.
+    """
+    if request.comparison is None:
+        return {}
+    quotes = {str(q.id): q for q in request.comparison.quotes}
+    out: dict[str, tuple[Decimal, str]] = {}
+    by_source: dict[str, list[QuoteRequestItem]] = {}
+    for item in sorted(request.items, key=lambda i: i.position or 0):
+        if item.source_supplier_quote_id is not None:
+            by_source.setdefault(str(item.source_supplier_quote_id), []).append(item)
+    for source_id, ours in by_source.items():
+        quote = quotes.get(source_id)
+        if quote is None or len(quote.items) != len(ours) or not quote.currency:
+            continue
+        theirs = sorted(quote.items, key=lambda i: i.position or 0)
+        for mine, row in zip(ours, theirs, strict=True):
+            if row.unit_price is not None:
+                out[str(mine.id)] = (row.unit_price, quote.currency.upper())
+    return out
 
 #: The quote's own ``name`` is a single line; a supplier's description can be a
 #: paragraph. The rest goes to ``description`` rather than being cut off.
@@ -629,9 +670,19 @@ def _line_from(
     item: SupplierQuoteItem, quote: SupplierQuote, markup_percent: Decimal, *, fx: Decimal
 ) -> dict[str, Any]:
     """One supplier line as a line of ours, in the request's own currency.
-    Their price divided by the rate, to the cent: a cost of 13.3424 is not a
-    number anybody can check against anything."""
-    cost = ((item.unit_price or Decimal(0)) / fx).quantize(_PRICE, rounding=ROUND_HALF_UP)
+
+    Built in Zoho's order: the markup goes on in the supplier's currency and
+    the price is rounded there — to the dirham, for an AED supplier, as Zoho's
+    item prices are — and only then converted, to the cent. AED 49 + 20% is
+    58.80, is 59, is USD 16.07. The other order — convert the cost, then mark
+    up — gives 16.01, and a quote and its estimate that disagree by a cent a
+    unit on every line.
+    """
+    unit = item.unit_price or Decimal(0)
+    sell_theirs = (unit * (Decimal(1) + markup_percent / Decimal(100))).quantize(
+        sell_step(quote.currency), rounding=ROUND_HALF_UP
+    )
+    cost = (unit / fx).quantize(_PRICE, rounding=ROUND_HALF_UP)
     name = (item.description or "").strip() or "Unnamed line"
     return {
         "name": name[:_NAME_LIMIT],
@@ -641,12 +692,10 @@ def _line_from(
         "unit": item.unit,
         "quantity": item.quantity,
         "cost_rate": cost,
-        # To the cent, and rounded before it is ever multiplied by a quantity:
-        # a quote of 300 at 16.0653 and one of 300 at 16.07 differ by a dollar
-        # and a half, and only the second can be typed into Zoho.
-        "rate": (cost * (Decimal(1) + markup_percent / Decimal(100))).quantize(
-            _PRICE, rounding=ROUND_HALF_UP
-        ),
+        # The supplier-currency price, converted, to the cent — rounded before
+        # it is ever multiplied by a quantity, since only a price in cents can
+        # be typed into Zoho.
+        "rate": (sell_theirs / fx).quantize(_PRICE, rounding=ROUND_HALF_UP),
         "source_supplier_quote_id": quote.id,
     }
 

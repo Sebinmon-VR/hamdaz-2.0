@@ -246,6 +246,11 @@ class ItemOut(ItemIn):
     total_incl_tax: Decimal
     #: Null unless a cost is known for the line.
     margin: Decimal | None
+    #: The line's price on the supplier's own document, in their currency —
+    #: what a markup is applied to before converting, Zoho's way. Null on a
+    #: line typed by hand. Set by the router, not read off the row.
+    supplier_unit_price: Decimal | None = None
+    supplier_currency: str | None = None
 
 
 class ReviewOut(BaseModel):
