@@ -309,3 +309,95 @@ async def test_can_reach_is_true_for_a_super_admin(db, seeded) -> None:
         )
         is True
     )
+
+# ── modules a grant alone does not open ────────────────────────────────
+#
+# Most modules reach everybody in a team that was granted them, which is right:
+# a module is a part of the product and the team decides which parts it uses.
+# Quotes is not like that. What a customer was charged is sensitive *inside* a
+# team as well as between teams, so the grant says the team may use it and the
+# role says who in the team may see it — the same standing it takes to approve
+# a quote.
+
+
+async def _member_of(db, team, email: str, role_key: str):
+    user = await _user(db, email)
+    await teams.set_member_roles(db, team=team, user=user, role_keys=[role_key])
+    await db.commit()
+    return user
+
+
+async def _keys(db, user, global_roles=frozenset()):
+    access = await service.effective_access(
+        db, user_id=user.id, global_roles=global_roles
+    )
+    return {m["key"] for m in access["modules"]}
+
+
+@pytest.fixture
+async def team_with_quotes(db, team):
+    await service.grant_module(db, team=team, module_key="quotes", granted_by_id=None)
+    await service.grant_module(db, team=team, module_key="teams", granted_by_id=None)
+    await db.commit()
+    return team
+
+
+async def test_a_plain_member_does_not_get_quotes_even_when_the_team_has_it(
+    db, team_with_quotes
+) -> None:
+    person = await _member_of(db, team_with_quotes, "plain@hamdaz.com", "member")
+
+    keys = await _keys(db, person)
+    assert "quotes" not in keys
+    # The rest of the team's grants are untouched — this withholds one module,
+    # it does not withhold the team.
+    assert "teams" in keys
+
+
+async def test_an_approver_does_get_quotes(db, team_with_quotes) -> None:
+    person = await _member_of(db, team_with_quotes, "approves@hamdaz.com", "approver")
+
+    assert "quotes" in await _keys(db, person)
+
+
+async def test_a_team_manager_does_get_quotes(db, team_with_quotes) -> None:
+    person = await _member_of(db, team_with_quotes, "runs@hamdaz.com", "team_manager")
+
+    assert "quotes" in await _keys(db, person)
+
+
+async def test_a_team_lead_does_not(db, team_with_quotes) -> None:
+    """Deliberately the same bar as approving, which a lead no longer meets."""
+    person = await _member_of(db, team_with_quotes, "leads@hamdaz.com", "team_lead")
+
+    assert "quotes" not in await _keys(db, person)
+
+
+async def test_a_global_manager_gets_it_without_any_team_role(
+    db, team_with_quotes
+) -> None:
+    """They answer for the business rather than for a team."""
+    person = await _member_of(db, team_with_quotes, "boss@hamdaz.com", "member")
+
+    assert "quotes" in await _keys(db, person, global_roles={"manager"})
+
+
+async def test_the_role_must_be_held_in_the_team_that_granted_it(db, seeded) -> None:
+    """Approving in one team does not open a module another team granted.
+
+    The pair is the unit of authority, not the role on its own — otherwise
+    holding `approver` anywhere would quietly unlock every team's quotes.
+    """
+    granting = await teams.create_team(db, name="Has Quotes")
+    other = await teams.create_team(db, name="No Quotes")
+    await db.commit()
+    await service.grant_module(db, team=granting, module_key="quotes", granted_by_id=None)
+    await db.commit()
+
+    person = await _user(db, "elsewhere@hamdaz.com")
+    await teams.set_member_roles(db, team=granting, user=person, role_keys=["member"])
+    await teams.set_member_roles(db, team=other, user=person, role_keys=["approver"])
+    await db.commit()
+
+    assert "quotes" not in await _keys(db, person)
+

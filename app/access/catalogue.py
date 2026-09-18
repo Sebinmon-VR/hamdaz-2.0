@@ -43,6 +43,18 @@ class ModuleSpec:
     pages: tuple[PageSpec, ...] = field(default_factory=tuple)
     #: Gated by a global admin role rather than by team grants.
     admin_only: bool = False
+    #: Team roles that a grant additionally requires.
+    #:
+    #: A team grant normally reaches everybody in the team, which is the right
+    #: default: a module is a part of the product, and teams decide which parts
+    #: they use. A few modules are not like that — what they show is sensitive
+    #: *within* a team, not just between teams — and for those the grant says
+    #: the team may use it while this says who in the team may see it.
+    #:
+    #: Empty means the ordinary rule: everybody in a granted team. Holding one
+    #: of these roles in *the team that granted it* is what counts; a global
+    #: manager, CEO or super admin passes regardless.
+    requires_team_roles: frozenset[str] = frozenset()
 
 
 MODULES: Final[tuple[ModuleSpec, ...]] = (
@@ -145,8 +157,12 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         name="Quotes",
         description=(
             "Quotes read from Zoho Books, with the customer, items, sales orders "
-            "and comments attached to each. Read-only, and gated by team grant."
+            "and comments attached to each. Read-only. Gated by team grant AND "
+            "by role: what a customer was charged is not ordinary reading, so "
+            "seeing the history takes the same standing as approving a quote — "
+            "an approver or team manager, or a manager, CEO or super admin."
         ),
+        requires_team_roles=frozenset({"approver", "team_manager"}),
         pages=(
             PageSpec("list", "All quotes", "/quotes"),
             PageSpec("detail", "Quote detail", "/quotes/[id]"),

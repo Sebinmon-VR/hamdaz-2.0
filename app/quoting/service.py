@@ -68,7 +68,13 @@ logger = logging.getLogger("hamdaz.quoting")
 #: Organisation-wide roles that may approve anywhere.
 GLOBAL_APPROVERS = frozenset({"super_admin", "ceo", "manager"})
 #: Roles held inside the team that may approve its quotes.
-TEAM_APPROVERS = frozenset({"approver", "team_manager", "team_lead"})
+#:
+#: **Leading a team is not the same as approving its prices.** ``team_lead`` was
+#: here and was removed: a lead runs the work, which is a different authority
+#: from committing the business to a number in front of a customer. Approving
+#: is given deliberately — ``approver`` is the role that exists to say so — or
+#: it comes with managing the team. A plain ``member`` never had it.
+TEAM_APPROVERS = frozenset({"approver", "team_manager"})
 
 
 class QuoteError(Exception):

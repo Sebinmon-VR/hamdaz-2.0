@@ -872,3 +872,55 @@ async def test_a_manager_sees_everything(db, team, requester) -> None:
     }
     assert "Not the boss's" in titles
 
+# ── who may decide a quote ─────────────────────────────────────────────
+
+
+async def test_leading_a_team_does_not_let_you_approve_its_quotes(
+    db, team, requester
+) -> None:
+    """Running the work and committing the business to a price are different.
+
+    ``team_lead`` used to be an approver and is not one any more. A lead leads;
+    approving a quote is a separate authority, given deliberately through the
+    ``approver`` role or by managing the team.
+    """
+    lead = await person(db, "lead@hamdaz.com")
+    await teams.set_member_roles(db, team=team, user=lead, role_keys=["team_lead"])
+    request = await service.create(db, payload=dict(FORM), author=requester, team=team)
+    await db.commit()
+
+    allowed, reason = await service.may_approve(db, request, user=lead, roles=set())
+    assert allowed is False
+    assert "approver" in reason
+
+
+async def test_a_plain_member_may_not_approve(db, team, requester) -> None:
+    colleague = await person(db, "colleague-member@hamdaz.com")
+    await teams.set_member_roles(db, team=team, user=colleague, role_keys=["member"])
+    request = await service.create(db, payload=dict(FORM), author=requester, team=team)
+    await db.commit()
+
+    allowed, _ = await service.may_approve(db, request, user=colleague, roles=set())
+    assert allowed is False
+
+
+async def test_an_approver_and_a_team_manager_both_may(db, team, requester) -> None:
+    boss = await person(db, "teamboss@hamdaz.com")
+    await teams.set_member_roles(db, team=team, user=boss, role_keys=["team_manager"])
+    request = await service.create(db, payload=dict(FORM), author=requester, team=team)
+    await db.commit()
+
+    allowed, _ = await service.may_approve(db, request, user=boss, roles=set())
+    assert allowed is True
+
+
+async def test_a_team_lead_is_not_emailed_as_an_approver(db, team, requester) -> None:
+    """The notification list follows the same rule, so nobody is told to do
+    something the system will then refuse them."""
+    lead = await person(db, "lead2@hamdaz.com")
+    await teams.set_member_roles(db, team=team, user=lead, role_keys=["team_lead"])
+    await db.commit()
+
+    people = await service.approvers_for(db, team.id)
+    assert lead.id not in {p.id for p in people}
+

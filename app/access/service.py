@@ -22,7 +22,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.access.catalogue import ACCESS_ADMINS, MODULES
+from app.roles.catalogue import ADMIN_ROLES
 from app.models.access import Module, ModulePage, TeamModuleAccess, TeamPageAccess
+from app.models.role import Role
 from app.models.team import Team, TeamMembership
 
 
@@ -305,6 +307,40 @@ async def effective_access(
             )
         ).all()
     )
+
+    # A few modules ask for more than membership of a granted team — what they
+    # show is sensitive inside a team, not only between teams. For those, the
+    # grant says the team may use the module and the role says who in that team
+    # may see it. See ``ModuleSpec.requires_team_roles``.
+    restricted = {
+        spec.key: spec.requires_team_roles for spec in MODULES if spec.requires_team_roles
+    }
+    if restricted:
+        # Held per team, because holding `approver` in one team should not open
+        # a restricted module that a different team granted. The pair is the
+        # unit of authority here, not the role on its own.
+        held: set[tuple[uuid.UUID, str]] = {
+            (team_id, key)
+            for team_id, key in (
+                await session.execute(
+                    select(TeamMembership.team_id, Role.key)
+                    .join(Role, Role.id == TeamMembership.role_id)
+                    .where(TeamMembership.user_id == user_id)
+                )
+            ).all()
+        }
+        # A global manager, CEO or super admin answers for the business rather
+        # than for a team, and is not filtered by a team role they never hold.
+        privileged = bool(roles & ADMIN_ROLES)
+        if not privileged:
+            grants = [
+                grant
+                for grant in grants
+                if grant.module_key not in restricted
+                or any(
+                    (grant.team_id, key) in held for key in restricted[grant.module_key]
+                )
+            ]
     page_rows = list(
         (
             await session.scalars(
