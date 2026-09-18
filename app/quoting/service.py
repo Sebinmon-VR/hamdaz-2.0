@@ -990,6 +990,8 @@ def snapshot_of(request: QuoteRequest) -> dict[str, Any]:
         "currency": request.currency,
         "status": str(request.status),
         "sub_total": str(request.sub_total),
+        "total_excl_tax": str(request.total_excl_tax),
+        "tax_total": str(request.tax_total),
         "total": str(request.total),
         "discount": str(request.discount or 0),
         "shipping_charge": str(request.shipping_charge or 0),

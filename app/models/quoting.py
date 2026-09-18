@@ -50,7 +50,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from enum import StrEnum
 
 from sqlalchemy import (
@@ -484,10 +484,30 @@ class QuoteRequest(Base, UUIDPrimaryKey, Timestamped):
         return sum((i.line_total for i in self.items), Decimal(0))
 
     @property
+    def total_excl_tax(self) -> Decimal:
+        """The figure before tax: lines, less the discount, plus shipping and the
+        adjustment. Shown on its own because a customer reads both numbers."""
+        return self.sub_total - self.discount + self.shipping_charge + self.adjustment
+
+    @property
+    def tax_total(self) -> Decimal:
+        """Tax across the lines, each at its own rate, on the line's own total.
+        Rounded once, at the end, to the cent."""
+        raw = sum(
+            (
+                i.line_total * (i.tax_percentage or Decimal(0)) / Decimal(100)
+                for i in self.items
+            ),
+            Decimal(0),
+        )
+        return raw.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    @property
     def total(self) -> Decimal:
         """Computed here, never accepted from a caller — see the comparison
-        module for the same rule and the same reason."""
-        return self.sub_total - self.discount + self.shipping_charge + self.adjustment
+        module for the same rule and the same reason. Tax included: this is the
+        number the customer pays."""
+        return self.total_excl_tax + self.tax_total
 
     def __repr__(self) -> str:
         return f"<QuoteRequest {self.reference or self.title!r} {self.status}>"

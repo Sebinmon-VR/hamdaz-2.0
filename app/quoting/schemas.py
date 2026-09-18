@@ -442,7 +442,10 @@ class QuoteRequestOut(BaseModel):
     shipping_charge: Decimal
     adjustment: Decimal
     sub_total: Decimal
-    #: Computed here, never accepted from the caller.
+    #: Before tax, and the tax on its own — a customer reads all three numbers.
+    total_excl_tax: Decimal
+    tax_total: Decimal
+    #: Computed here, never accepted from the caller. Tax included.
     total: Decimal
 
     # ── the bid pack, as stored ────────────────────────────────────────
