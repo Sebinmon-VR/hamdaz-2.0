@@ -32,7 +32,7 @@ import logging
 import re
 import uuid
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Final
 
 from sqlalchemy import and_, or_, select
@@ -391,6 +391,10 @@ def _decimal_or_none(value: Any) -> Decimal | None:
 #: Rates are stored to four places, so a markup produces a price rather than
 #: whatever a multiplication happens to leave behind.
 _RATE = Decimal("0.0001")
+#: A selling price is quoted to the cent. Costs keep four places — a rate
+#: converted from another currency is not yet a price — but the number a
+#: customer sees, and Zoho multiplies, is two.
+_PRICE = Decimal("0.01")
 
 #: The quote's own ``name`` is a single line; a supplier's description can be a
 #: paragraph. The rest goes to ``description`` rather than being cut off.
@@ -444,7 +448,10 @@ async def select_supplier(
             f"quote from. Check what was read from their document."
         )
 
-    set_items(request, [_line_from(item, quote, markup_percent) for item in quote.items])
+    fx = _pricing_rate(request, quote)
+    set_items(
+        request, [_line_from(item, quote, markup_percent, fx=fx) for item in quote.items]
+    )
     request.selected_supplier_quote_id = quote.id
     # Their prices are only half of what they sent. The terms they stated are
     # answers to the customer's own clauses, and carrying them across now is the
@@ -465,14 +472,34 @@ async def select_supplier(
     return request
 
 
+def _pricing_rate(request: QuoteRequest, quote: SupplierQuote) -> Decimal:
+    """Units of the quote's currency per unit of the supplier's, for pricing.
+
+    **The bid's own rate wins.** ``fx_rate`` on the request is the rate the bid
+    is costed on — the landed-cost build-up already converts every foreign cost
+    row at it — and the lines it is priced from must use the same one, or the
+    goods and the freight would be in the same currency at two different rates.
+    It used to take the supplier quote's rate alone, which stays at 1 until
+    somebody sets it on the comparison, so an AED offer priced a USD quote at
+    AED figures wearing a dollar sign; people then converted by hand, in their
+    heads, at whatever rate they remembered, and two documents for one job
+    disagreed by exactly the difference between 3.66 and 3.6725.
+
+    Same currency, or no rate set anywhere: as before, the supplier quote's own
+    rate, which is 1 unless the comparison converted it.
+    """
+    theirs = (quote.currency or "").upper()
+    ours = (request.currency or "").upper()
+    if theirs and ours and theirs != ours and request.fx_rate and request.fx_rate > 0:
+        return request.fx_rate
+    return quote.fx_rate or Decimal(1)
+
+
 def _line_from(
-    item: SupplierQuoteItem, quote: SupplierQuote, markup_percent: Decimal
+    item: SupplierQuoteItem, quote: SupplierQuote, markup_percent: Decimal, *, fx: Decimal
 ) -> dict[str, Any]:
     """One supplier line as a line of ours, in the request's own currency."""
-    # The comparison converted every supplier into one currency to compare them;
-    # the same rate carries the cost across, or the totals would be a mixture of
-    # currencies that happen to look like numbers.
-    cost = ((item.unit_price or Decimal(0)) * (quote.fx_rate or Decimal(1))).quantize(_RATE)
+    cost = ((item.unit_price or Decimal(0)) * fx).quantize(_RATE)
     name = (item.description or "").strip() or "Unnamed line"
     return {
         "name": name[:_NAME_LIMIT],
@@ -482,7 +509,12 @@ def _line_from(
         "unit": item.unit,
         "quantity": item.quantity,
         "cost_rate": cost,
-        "rate": (cost * (Decimal(1) + markup_percent / Decimal(100))).quantize(_RATE),
+        # To the cent, and rounded before it is ever multiplied by a quantity:
+        # a quote of 300 at 16.0653 and one of 300 at 16.07 differ by a dollar
+        # and a half, and only the second can be typed into Zoho.
+        "rate": (cost * (Decimal(1) + markup_percent / Decimal(100))).quantize(
+            _PRICE, rounding=ROUND_HALF_UP
+        ),
         "source_supplier_quote_id": quote.id,
     }
 

@@ -58,3 +58,50 @@ def test_tax_rounds_once_to_the_cent_not_per_line() -> None:
     for _ in range(3):
         quote.items.append(_line("1", "6.666666", "5"))
     assert quote.tax_total == Decimal("1.00")
+
+
+# ── pricing from a supplier ─────────────────────────────────────────────
+
+from app.models.comparison import SupplierQuote, SupplierQuoteItem  # noqa: E402
+from app.quoting.service import _line_from, _pricing_rate  # noqa: E402
+
+
+def _offer(
+    currency: str, unit_price: str, fx: str = "1"
+) -> tuple[SupplierQuote, SupplierQuoteItem]:
+    quote = SupplierQuote(supplier_name="Deluxe", currency=currency, fx_rate=Decimal(fx))
+    item = SupplierQuoteItem(
+        description="LED panel", quantity=Decimal(300), unit_price=Decimal(unit_price)
+    )
+    return quote, item
+
+
+def test_a_foreign_offer_is_priced_at_the_rate_the_bid_is_costed_on() -> None:
+    """AED 49 into a USD quote at the bid's own rate — not at the supplier
+    quote's, which nobody set and which is therefore 1."""
+    request = _quote()
+    request.currency = "USD"
+    request.fx_rate = Decimal("0.27322")            # 1 / 3.66
+    quote, item = _offer("AED", "49")
+
+    line = _line_from(item, quote, Decimal(20), fx=_pricing_rate(request, quote))
+
+    assert line["cost_rate"] == Decimal("13.3878")  # 49 × 0.27322, four places
+    assert line["rate"] == Decimal("16.07")         # +20%, to the cent — Zoho's number
+    assert line["rate"] * item.quantity == Decimal("4821.00")
+
+
+def test_without_a_bid_rate_the_supplier_quotes_own_rate_still_applies() -> None:
+    request = _quote()
+    request.currency = "USD"
+    quote, item = _offer("AED", "49", fx="0.2723")
+    assert _pricing_rate(request, quote) == Decimal("0.2723")
+
+
+def test_the_same_currency_never_converts_whatever_the_bid_rate_says() -> None:
+    request = _quote()
+    request.currency = "AED"
+    request.fx_rate = Decimal("0.27")
+    quote, item = _offer("AED", "49")
+    assert _pricing_rate(request, quote) == Decimal(1)
+    assert _line_from(item, quote, Decimal(0), fx=Decimal(1))["rate"] == Decimal("49.00")
