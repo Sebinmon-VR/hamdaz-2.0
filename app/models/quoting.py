@@ -219,6 +219,26 @@ class CostStage(StrEnum):
     DESTINATION = "destination"
 
 
+class DocumentKind(StrEnum):
+    """What a document uploaded against a quote is.
+
+    The kind decides two things: which reader tries to pull facts out of it
+    (an RFQ gives a reference and a closing date; a courier quote gives a
+    freight figure) and how it is named in the task's folder. ``other`` is
+    filed and nothing more.
+    """
+
+    SUPPLIER_QUOTE = "supplier_quote"
+    CUSTOMER_RFQ = "customer_rfq"
+    END_USER_PO = "end_user_po"
+    TECHNICAL_SPEC = "technical_spec"
+    COMPLIANCE = "compliance"
+    FREIGHT_QUOTE = "freight_quote"
+    #: The selling & costing report the system rendered on submit.
+    COSTING_REPORT = "costing_report"
+    OTHER = "other"
+
+
 class QuoteRequest(Base, UUIDPrimaryKey, Timestamped):
     __tablename__ = "quote_requests"
     __table_args__ = (
@@ -355,9 +375,10 @@ class QuoteRequest(Base, UUIDPrimaryKey, Timestamped):
     cash_exposure_days: Mapped[int] = mapped_column(
         Integer, default=0, server_default=text("0"), nullable=False
     )
-    #: The margin the bid is built at, over landed cost. Distinct from the
-    #: markup used to price individual lines from a supplier quote: that one
-    #: sets rates, this one is the business's position on the bid as a whole.
+    #: The margin the bid is built at, as a share of the selling price: the
+    #: price is the landed cost ÷ (1 − this). Set from the margin typed when a
+    #: supplier is chosen, where nobody has set it by hand. The column keeps
+    #: its old name; the number in it is a margin, not a markup on cost.
     target_markup_percent: Mapped[Decimal | None] = mapped_column(Numeric(7, 3))
     #: The price actually going in, per unit — the rounded, human number. Held
     #: rather than computed because rounding a bid up to a clean figure is a
@@ -371,6 +392,39 @@ class QuoteRequest(Base, UUIDPrimaryKey, Timestamped):
     discloses_principal_price: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default=text("false"), nullable=False
     )
+
+    # ── the selling & costing report ───────────────────────────────────
+    # What the approver reads. The figures on it are all derived — see
+    # ``app/quoting/report.py`` — and these are the few facts it states that
+    # nothing else on the quote holds: who the goods come from and how they
+    # travel, who they finally go to, and where the business draws its lines
+    # in a negotiation.
+
+    #: The supplier, as the report names them. Filled from the chosen supplier
+    #: quote when there is one; typed when the price came from a web shop or
+    #: a phone call and no document was uploaded.
+    supplier_name: Mapped[str | None] = mapped_column(String(200))
+    #: How the goods are bought — "online purchase", "distributor", "OEM
+    #: direct", "local stock". Printed beside the supplier's name.
+    supplier_basis: Mapped[str | None] = mapped_column(String(120))
+    #: How they travel — "Express courier to Abu Dhabi", "Sea freight, Jebel
+    #: Ali". Prose; the costed freight line is on the landed cost sheet.
+    supplier_route: Mapped[str | None] = mapped_column(String(200))
+    #: Who finally uses the goods, when that is not the customer being
+    #: invoiced — a contractor buying for ADNOC names ADNOC here.
+    end_user_name: Mapped[str | None] = mapped_column(String(200))
+    #: The margin, as a share of the selling price, below which the quote is
+    #: not to be sold without management approval. Null reads as the house
+    #: default in ``report.py``.
+    walk_away_margin_percent: Mapped[Decimal | None] = mapped_column(Numeric(6, 3))
+    #: The margin above which a discount needs nobody's blessing.
+    comfortable_margin_percent: Mapped[Decimal | None] = mapped_column(Numeric(6, 3))
+    #: What to say to the customer, in a sentence. Generated from the ladder
+    #: when blank; typed over when somebody knows better.
+    recommendation: Mapped[str | None] = mapped_column(Text)
+    #: Footnotes for the approver, one per line — "confirm HPE warranty and
+    #: COO before PO". Printed under the tables after the generated ones.
+    report_notes: Mapped[str | None] = mapped_column(Text)
 
     # ── supplier quotes behind it ──────────────────────────────────────
     #: Set when several suppliers quoted the same requirement. Turning it on is
@@ -420,6 +474,20 @@ class QuoteRequest(Base, UUIDPrimaryKey, Timestamped):
         DateTime(timezone=True)
     )
     notify_error: Mapped[str | None] = mapped_column(Text)
+
+    # ── where its documents are filed ──────────────────────────────────
+    #: The folder in the Proposal Team Channel library that this quote's
+    #: documents go into: ``<task folder>/<quote folder>``, relative to the
+    #: library's root folder. Resolved once, on the first filing, and kept
+    #: so every later upload and the report land in the same place even if
+    #: the task is renamed. See ``app/quoting/filing.py``.
+    drive_folder: Mapped[str | None] = mapped_column(Text)
+    drive_folder_url: Mapped[str | None] = mapped_column(Text)
+    #: What the last filing that failed said. Cleared by the next success.
+    #: A report that could not be filed on submit is recorded here rather than
+    #: stopping the submission — see ``filing.file_report``.
+    filing_error: Mapped[str | None] = mapped_column(Text)
+
     #: How many times it has been round the review loop. Worth seeing: a quote
     #: on its fourth rework is telling you something a status cannot.
     revision: Mapped[int] = mapped_column(
@@ -474,6 +542,20 @@ class QuoteRequest(Base, UUIDPrimaryKey, Timestamped):
         order_by="QuoteSubmissionField.position",
         lazy="selectin",
     )
+    documents: Mapped[list[QuoteDocument]] = relationship(
+        back_populates="request",
+        cascade="all, delete-orphan",
+        order_by="QuoteDocument.created_at",
+        lazy="selectin",
+    )
+
+    #: The tax on the quote, applied once to the total before tax — the
+    #: lines less the discount, plus shipping and the adjustment — and rounded
+    #: once. VAT 5% on a UAE quote; blank on one with no tax. On the quote and
+    #: not on each line, because that is how the business charges it: one rate
+    #: on what the customer pays, not a rate per row rounded row by row.
+    tax_name: Mapped[str | None] = mapped_column(String(60))
+    tax_percentage: Mapped[Decimal | None] = mapped_column(Numeric(6, 3))
 
     @property
     def is_editable(self) -> bool:
@@ -491,14 +573,17 @@ class QuoteRequest(Base, UUIDPrimaryKey, Timestamped):
 
     @property
     def tax_total(self) -> Decimal:
-        """Tax across the lines: each line's tax, rounded on the line, summed.
-
-        Per line rather than once at the end because that is how Zoho Books
-        computes an estimate, and the two documents are compared line by line.
-        Three lines of 0.333 come to 0.99 this way, not 1.00 — and to 0.99 in
-        Zoho too, which is the point.
+        """The tax, worked out once on the total before tax and rounded once
+        to the cent. 5% of 91,110.00 is 4,555.50: the discount comes off and
+        the shipping goes on before the tax is applied, since the tax is on
+        what the customer pays. Nothing when the quote carries no rate.
         """
-        return sum((i.tax_amount for i in self.items), Decimal("0.00"))
+        pct = self.tax_percentage or Decimal(0)
+        if pct <= 0:
+            return Decimal("0.00")
+        return (self.total_excl_tax * pct / Decimal(100)).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
 
     @property
     def total(self) -> Decimal:
@@ -573,8 +658,6 @@ class QuoteRequestItem(Base, UUIDPrimaryKey, Timestamped):
     discount: Mapped[Decimal] = mapped_column(
         Numeric(18, 2), default=Decimal(0), server_default=text("0"), nullable=False
     )
-    tax_name: Mapped[str | None] = mapped_column(String(60))
-    tax_percentage: Mapped[Decimal | None] = mapped_column(Numeric(6, 3))
 
     #: What this line costs the business, when it came from a supplier quote.
     #: Kept so margin is visible while the quote is being reviewed.
@@ -588,25 +671,12 @@ class QuoteRequestItem(Base, UUIDPrimaryKey, Timestamped):
 
     @property
     def line_total(self) -> Decimal:
-        """The taxable amount — what Zoho's estimate calls exactly that."""
+        """Quantity × rate, less the line's discount: the taxable amount. The
+        tax itself is on the quote's total (``QuoteRequest.tax_total``), not
+        on the line."""
         return (self.quantity or Decimal(0)) * (self.rate or Decimal(0)) - (
             self.discount or Decimal(0)
         )
-
-    @property
-    def tax_amount(self) -> Decimal:
-        """This line's tax, rounded to the cent on the line — as Zoho rounds
-        it. The quote's tax total is the sum of these, so the two documents
-        cannot differ by a cent of rounding."""
-        pct = self.tax_percentage or Decimal(0)
-        return (self.line_total * pct / Decimal(100)).quantize(
-            Decimal("0.01"), rounding=ROUND_HALF_UP
-        )
-
-    @property
-    def total_incl_tax(self) -> Decimal:
-        """Zoho's "Amount" column: the taxable amount plus its tax."""
-        return self.line_total + self.tax_amount
 
     @property
     def margin(self) -> Decimal | None:
@@ -738,6 +808,13 @@ class QuoteCostLine(Base, UUIDPrimaryKey, Timestamped):
         Numeric(18, 4), default=Decimal(0), server_default=text("0"), nullable=False
     )
 
+    #: A cost stated as a rate rather than a figure — insurance at 1% of the
+    #: goods, bank charges at 3%. When set, the amount is worked out on read
+    #: from ``percent_of`` (``goods`` or ``cif``) and the amounts above are
+    #: ignored, so the row follows the goods when the supplier changes.
+    percent: Mapped[Decimal | None] = mapped_column(Numeric(7, 3))
+    percent_of: Mapped[str | None] = mapped_column(String(12))
+
     #: Set on the supplier's own quoted goods price — the figure the buyer will
     #: see if the principal's quotation has to be attached. Exactly one line
     #: should carry it; it is what the disclosure exposure is measured against.
@@ -866,3 +943,66 @@ class QuoteSubmissionField(Base, UUIDPrimaryKey, Timestamped):
 
     def __repr__(self) -> str:
         return f"<QuoteSubmissionField {self.clause} {self.label[:24]!r}>"
+
+
+class QuoteDocument(Base, UUIDPrimaryKey, Timestamped):
+    """One file uploaded against a quote, and where it was filed.
+
+    The file itself lives in the task's folder in the Proposal Team Channel
+    library — that is the store, and a colleague opens it there with their own
+    access. This row is what the system knows about it: what kind of document
+    it is, who put it there, the link, and what was read out of it.
+
+    No bytes are kept here. A document that could not be filed is not
+    attached; the upload fails and says why, because there is nowhere else for
+    the file to be.
+    """
+
+    __tablename__ = "quote_documents"
+    __table_args__ = (Index("ix_quote_documents_request", "request_id", "kind"),)
+
+    request_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("quote_requests.id", ondelete="CASCADE"), nullable=False
+    )
+    kind: Mapped[DocumentKind] = mapped_column(
+        String(30), default=DocumentKind.OTHER, nullable=False
+    )
+    file_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    content_type: Mapped[str | None] = mapped_column(String(100))
+    size: Mapped[int | None] = mapped_column(Integer)
+    #: Of the bytes as uploaded, so a re-upload of the same file is recognisable.
+    sha256: Mapped[str | None] = mapped_column(String(64))
+
+    #: Where it is. Null when no library is configured (a development box).
+    drive_item_id: Mapped[str | None] = mapped_column(String(120))
+    drive_url: Mapped[str | None] = mapped_column(Text)
+    drive_path: Mapped[str | None] = mapped_column(Text)
+
+    uploaded_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    notes: Mapped[str | None] = mapped_column(Text)
+
+    #: For a supplier quote: the comparison row it was read into, so the
+    #: document and the prices read from it stay connected.
+    supplier_quote_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("supplier_quotes.id", ondelete="SET NULL")
+    )
+    #: For the costing report: the pass it was rendered at.
+    revision: Mapped[int | None] = mapped_column(Integer)
+
+    #: What the reader for this kind pulled out, as it found it — the raw
+    #: facts, with the page each came from. See ``app/quoting/reading.py``.
+    extracted: Mapped[dict | None] = mapped_column(JSONB)
+    #: Those facts as proposed values for named quote fields, each marked
+    #: applied or not. A suggestion is never written onto the quote by itself;
+    #: a person applies it, and this remembers that they did.
+    suggestions: Mapped[dict | None] = mapped_column(JSONB)
+
+    request: Mapped[QuoteRequest] = relationship(back_populates="documents")
+    uploaded_by: Mapped[User | None] = relationship(
+        foreign_keys=[uploaded_by_id], lazy="joined"
+    )
+
+    def __repr__(self) -> str:
+        return f"<QuoteDocument {self.kind} {self.file_name!r}>"

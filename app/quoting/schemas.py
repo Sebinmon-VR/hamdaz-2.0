@@ -17,10 +17,11 @@ from __future__ import annotations
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.comparison.schemas import QuoteIn as SupplierQuoteIn
 from app.models.quoting import (
     CommentTarget,
     ComplianceArea,
@@ -31,6 +32,9 @@ from app.models.quoting import (
     Severity,
 )
 from app.proposals.schemas import TaskOut
+
+#: What a percentage cost row is charged on.
+PercentBasis = Literal["goods", "cif"]
 
 
 class ItemIn(BaseModel):
@@ -44,8 +48,6 @@ class ItemIn(BaseModel):
     quantity: Decimal = Field(default=Decimal(1), ge=0)
     rate: Decimal = Field(default=Decimal(0), ge=0)
     discount: Decimal = Field(default=Decimal(0), ge=0)
-    tax_name: str | None = Field(default=None, max_length=60)
-    tax_percentage: Decimal | None = Field(default=None, ge=0, le=100)
     #: What the line costs us, so margin is visible during review.
     cost_rate: Decimal | None = Field(default=None, ge=0)
     source_supplier_quote_id: uuid.UUID | None = None
@@ -77,6 +79,12 @@ class CostLineIn(BaseModel):
     #: The supplier or forwarder has committed to it, rather than us guessing.
     is_firm: bool = False
     notes: str | None = None
+    #: A rate instead of a figure: 1 means "1% of ``percent_of``". The amount is
+    #: derived on read and the amounts above are ignored while this is set.
+    percent: Decimal | None = Field(default=None, ge=0, le=1000)
+    #: What the rate is charged on: the goods, or the CIF value (goods plus
+    #: everything before arrival). Destination rows only may use ``cif``.
+    percent_of: PercentBasis | None = None
 
 
 class CostLineOut(CostLineIn):
@@ -172,6 +180,11 @@ class QuoteRequestIn(BaseModel):
     discount: Decimal = Field(default=Decimal(0), ge=0)
     shipping_charge: Decimal = Field(default=Decimal(0), ge=0)
     adjustment: Decimal = Decimal(0)
+    #: The tax on the quote, applied once to the total before tax. "VAT" at 5
+    #: on a UAE quote; null on one with no tax. Seeded at the house rate when a
+    #: supplier is chosen, where nobody has set one.
+    tax_name: str | None = Field(default=None, max_length=60)
+    tax_percentage: Decimal | None = Field(default=None, ge=0, le=100)
 
     # ── the bid pack ───────────────────────────────────────────────────
     # All optional. A quote for somebody who rang up and asked for a price fills
@@ -208,8 +221,10 @@ class QuoteRequestIn(BaseModel):
     customs_duty_percent: Decimal = Field(default=Decimal(0), ge=0, le=100)
     financing_rate_percent: Decimal = Field(default=Decimal(0), ge=0, le=100)
     cash_exposure_days: int = Field(default=0, ge=0, le=3650)
-    #: The margin the bid as a whole is built at, over landed cost.
-    target_markup_percent: Decimal | None = Field(default=None, ge=0, le=1000)
+    #: The margin the bid as a whole is built at, as a share of the selling
+    #: price: price = landed cost ÷ (1 − margin). The field keeps its old name
+    #: on the wire and in the column; the number in it is a margin.
+    target_markup_percent: Decimal | None = Field(default=None, ge=0, lt=100)
     #: The rounded price somebody decided on. Held rather than recomputed —
     #: rounding a bid up to a clean figure is a decision, not an accident.
     submission_unit_price: Decimal | None = Field(default=None, ge=0)
@@ -217,6 +232,17 @@ class QuoteRequestIn(BaseModel):
     #: The RFP makes the principal's own quotation a mandatory attachment, so
     #: the buyer will see what we paid.
     discloses_principal_price: bool = False
+
+    # ── the selling & costing report's own facts ───────────────────────
+    supplier_name: str | None = Field(default=None, max_length=200)
+    supplier_basis: str | None = Field(default=None, max_length=120)
+    supplier_route: str | None = Field(default=None, max_length=200)
+    end_user_name: str | None = Field(default=None, max_length=200)
+    #: Margin as a share of the selling price. Null reads as the house default.
+    walk_away_margin_percent: Decimal | None = Field(default=None, ge=0, lt=100)
+    comfortable_margin_percent: Decimal | None = Field(default=None, ge=0, lt=100)
+    recommendation: str | None = None
+    report_notes: str | None = None
 
     #: Turn on when several suppliers quoted the same requirement. The comparison
     #: and the "which supplier won" decision only mean anything when it is set.
@@ -240,10 +266,9 @@ class ItemOut(ItemIn):
 
     id: uuid.UUID
     position: int
-    #: Zoho's three columns for a line: taxable amount, tax, amount.
+    #: Quantity × rate, less the line's discount: the taxable amount. The tax
+    #: is on the quote's total, not on the line.
     line_total: Decimal
-    tax_amount: Decimal
-    total_incl_tax: Decimal
     #: Null unless a cost is known for the line.
     margin: Decimal | None
     #: The line's price on the supplier's own document, in their currency —
@@ -319,6 +344,9 @@ class CostElementOut(BaseModel):
     #: Null on the derived goods, duty and financing rows — there is nothing
     #: to edit on a row that is arithmetic.
     id: str | None = None
+    #: Set on a row stated as a rate; the amount is then worked out.
+    percent: Decimal | None = None
+    percent_of: str | None = None
 
 
 class LandedCostOut(BaseModel):
@@ -337,15 +365,22 @@ class LandedCostOut(BaseModel):
     #: The share the supplier or forwarder has committed to. The rest is our
     #: estimate, and every point of it that comes in high costs us margin.
     firm_percent: Decimal
+    #: Landed cost ÷ goods cost, to eight places. A line's landed cost is its
+    #: cost × this, and its selling price is that ÷ (1 − margin).
+    uplift: Decimal
     principal_value: Decimal
 
 
 class MarkupScenarioOut(BaseModel):
+    """One rung of the ladder: the landed cost priced at one margin."""
+
+    #: The markup on cost this rung amounts to — what was added, as a share of
+    #: the cost. Shown beside the margin because a buyer reading our price
+    #: against the supplier's sees this number, not the margin.
     markup_percent: Decimal
     unit_sell: Decimal | None
     total_sell: Decimal
-    #: Margin as a share of the selling price — which is what "margin" means to
-    #: everybody except the person who applied the markup.
+    #: The rung itself: the margin, as a share of the selling price.
     margin_percent: Decimal
     is_target: bool
 
@@ -401,24 +436,49 @@ class BidPackOut(BaseModel):
 
 
 class QuoteDocumentOut(BaseModel):
-    """One supplier document that was uploaded against this quote.
+    """One document uploaded against this quote, and where it was filed.
 
-    Read off the saved supplier-quote rows rather than out of the comparison
-    analysis. The analysis is a snapshot of a computation, made from the payload
-    before anything is filed anywhere — so where a document ended up is simply
-    not known at the point it is built. The rows are, and stay, the truth about
-    the files.
+    Read off the ``quote_documents`` rows. A supplier quotation attached before
+    that table existed has no row, and is listed from its comparison row
+    instead, with no id — it can still be opened, not deleted.
     """
 
-    supplier_quote_id: uuid.UUID
-    supplier_name: str
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID | None = None
+    kind: str
+    #: Defaulted so a row validates straight off the ORM object, which has no
+    #: such attribute; the router fills it in from the kind.
+    kind_label: str = ""
     file_name: str | None
-    file_type: str | None
+    content_type: str | None = None
+    size: int | None = None
     #: Where it was filed in the shared library, when filing is on and worked.
     #: Opening it uses the viewer's own SharePoint access, never this app's.
     drive_url: str | None
+    drive_path: str | None = None
+    uploaded_by_name: str | None = None
+    created_at: datetime | None = None
+    notes: str | None = None
+    #: For a supplier quotation: the comparison row it was read into.
+    supplier_quote_id: uuid.UUID | None = None
+    supplier_name: str | None = None
     #: True for the offer this quote is actually priced from.
     is_selected: bool = False
+    #: For the costing report: the pass it was rendered at.
+    revision: int | None = None
+    #: What the reader for this kind proposes for the quote's fields, each
+    #: marked applied or not. See ``app/quoting/reading.py``.
+    suggestions: dict[str, Any] | None = None
+
+
+class ApplySuggestionsIn(BaseModel):
+    """Which of a document's suggestions to write onto the quote."""
+
+    fields: list[str] = Field(min_length=1)
+    #: Write over a field somebody already typed. Off by default: a suggestion
+    #: fills blanks, and replacing a person's answer is a decision they make.
+    overwrite: bool = False
 
 
 class QuoteRequestOut(BaseModel):
@@ -450,6 +510,9 @@ class QuoteRequestOut(BaseModel):
     discount: Decimal
     shipping_charge: Decimal
     adjustment: Decimal
+    #: The tax on the quote, applied once to the total before tax.
+    tax_name: str | None
+    tax_percentage: Decimal | None
     sub_total: Decimal
     #: Before tax, and the tax on its own — a customer reads all three numbers.
     total_excl_tax: Decimal
@@ -484,6 +547,14 @@ class QuoteRequestOut(BaseModel):
     submission_unit_price: Decimal | None = None
     submission_total: Decimal | None = None
     discloses_principal_price: bool = False
+    supplier_name: str | None = None
+    supplier_basis: str | None = None
+    supplier_route: str | None = None
+    end_user_name: str | None = None
+    walk_away_margin_percent: Decimal | None = None
+    comfortable_margin_percent: Decimal | None = None
+    recommendation: str | None = None
+    report_notes: str | None = None
 
     multiple_supplier_quotes: bool
     comparison_id: uuid.UUID | None
@@ -508,6 +579,13 @@ class QuoteRequestOut(BaseModel):
     #: and the person who sent it should be able to see that.
     approvers_notified_at: datetime | None = None
     notify_error: str | None = None
+    #: The folder in the shared library this quote's documents are filed in,
+    #: once one has been. ``filing_error`` is what the last failed filing
+    #: said — a report that could not be filed on submit lands here rather
+    #: than stopping the submission.
+    drive_folder: str | None = None
+    drive_folder_url: str | None = None
+    filing_error: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -713,10 +791,13 @@ class SupplierChoiceIn(BaseModel):
     """Which supplier's offer this quote is priced from."""
 
     supplier_quote_id: uuid.UUID
-    #: Added to the supplier's cost to get the selling rate. 0 prices the job at
-    #: cost, which is a real answer and a visible one — every rate can be edited
-    #: line by line afterwards.
-    markup_percent: Decimal = Field(default=Decimal(0), ge=0, le=1000)
+    #: The margin each line keeps, as a share of its selling price: the rate is
+    #: the supplier's cost ÷ (1 − this). 0 prices the job at cost, which is a
+    #: real answer and a visible one — every rate can be edited line by line
+    #: afterwards. Under 100, since a price that is all margin has no cost in
+    #: it. Named ``markup_percent`` on the wire for the clients already sending
+    #: it; the number is a margin.
+    markup_percent: Decimal = Field(default=Decimal(0), ge=0, lt=100)
 
 
 class ReviewIn(BaseModel):
@@ -727,6 +808,150 @@ class ReviewIn(BaseModel):
     #: Required when approving a quote with several supplier offers: choosing the
     #: supplier is the decision being approved.
     selected_supplier_quote_id: uuid.UUID | None = None
+
+
+class TypedSupplierQuotesIn(BaseModel):
+    """Supplier quotes typed in rather than uploaded.
+
+    For the offer that arrived as a photograph, a screenshot of a web shop's
+    basket, or a price read out over the phone — anything the document reader
+    cannot read. The same shape the comparison module takes, so what was typed
+    and what was read are compared by one piece of code.
+    """
+
+    quotes: list[SupplierQuoteIn] = Field(min_length=1, max_length=12)
+
+
+# ── the selling & costing report ───────────────────────────────────────
+# Computed on read from the quote — see ``app/quoting/report.py`` — and
+# rendered three ways from this one shape: the screen, the PDF, the mail.
+
+
+class FigureOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    amount: Decimal
+    #: In the base currency, when the report has a rate. Null otherwise.
+    base: Decimal | None
+
+
+class ReportLineOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    position: int
+    part_number: str | None
+    description: str
+    quantity: Decimal
+    unit: str | None
+    supplier_amount: Decimal | None
+    supplier_currency: str | None
+    landed: FigureOut | None
+    selling: FigureOut
+    margin: FigureOut | None
+    #: Of the selling price.
+    margin_percent: Decimal | None
+
+
+class ReportCostRowOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    label: str
+    amount: FigureOut
+    is_estimate: bool
+    computed: bool
+
+
+class WalkAwayRungOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    margin_percent: Decimal
+    price: FigureOut
+    max_discount_percent: Decimal | None
+
+
+class NegotiationStepOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    discount_percent: Decimal
+    total_incl_tax: FigureOut
+    selling: FigureOut
+    margin: FigureOut
+    margin_percent: Decimal | None
+    #: comfortable, acceptable, needs_approval or loss — decided from the
+    #: walk-away and comfortable margins, never typed.
+    status: str
+
+
+class ReportCustomerOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    name: str
+    end_user: str | None
+    reference: str | None
+    portal: str | None
+    place_of_supply: str | None
+    valid_from: date | None
+    valid_until: date | None
+
+
+class ReportSupplierOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    name: str | None
+    basis: str | None
+    route: str | None
+    currency: str | None
+    quote_number: str | None
+    creator: str | None
+
+
+class CostingReportOut(BaseModel):
+    """The selling & costing report, as the screen draws it and the PDF prints it."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    reference: str
+    title: str
+    prepared_on: date
+    prepared_by: str | None
+    #: From the review trail: who last decided, and who approved. Null until
+    #: somebody has.
+    reviewed_by: str | None
+    approved_by: str | None
+    currency: str
+    base_currency: str
+    base_rate: Decimal | None
+    rate_source: str | None
+
+    customer: ReportCustomerOut
+    supplier: ReportSupplierOut
+
+    quoted_price: FigureOut
+    landed_total: FigureOut
+    gross_margin: FigureOut
+    gross_margin_percent: Decimal | None
+    walk_away_margin_percent: Decimal
+    comfortable_margin_percent: Decimal
+    walk_away_price: FigureOut
+
+    lines: list[ReportLineOut]
+    total_quantity: Decimal
+    total_supplier_amount: Decimal | None
+    supplier_currency: str | None
+
+    cost_rows: list[ReportCostRowOut]
+
+    tax_label: str
+    sub_total: FigureOut
+    tax_total: FigureOut
+    total_incl_tax: FigureOut
+
+    walk_away_ladder: list[WalkAwayRungOut]
+    negotiation: list[NegotiationStepOut]
+
+    recommendation: str
+    notes: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
 
 
 class CommentIn(BaseModel):

@@ -21,3 +21,7 @@ pdfplumber>=0.11
 # disappears takes a feature with it, and pure Python is why this is the
 # PDF writer rather than one with native libraries to install.
 reportlab>=4.0
+# Optional: reads scanned and photographed documents (supplier quotes, RFQs)
+# through local OCR — no model, no network, about 10–40 s a page on a CPU.
+# Uncomment to install; without it a scan is declined with "type it in".
+# rapidocr-onnxruntime>=1.3

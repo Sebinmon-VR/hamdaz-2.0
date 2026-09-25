@@ -3625,6 +3625,14 @@ TOOLS: Final[tuple[ToolSpec, ...]] = (
             _body("discount", "Quote-level discount. Defaults to 0.", _s("number")),
             _body("shipping_charge", "Shipping charge. Defaults to 0.", _s("number")),
             _body("adjustment", "A final adjustment to the total. Defaults to 0.", _s("number")),
+            _body("tax_name", "The tax on the quote, by name: 'VAT'. Null for none."),
+            _body(
+                "tax_percentage",
+                "The tax rate, applied once to the total before tax (lines less the "
+                "discount, plus shipping and the adjustment). 0-100; null for none. "
+                "Not per line.",
+                _s("number"),
+            ),
             _body(
                 "multiple_supplier_quotes",
                 "True when several suppliers quoted the same requirement and the "
@@ -3645,8 +3653,6 @@ TOOLS: Final[tuple[ToolSpec, ...]] = (
                         "quantity": _s("number"),
                         "rate": _s("number", description="Unit selling price."),
                         "discount": _s("number"),
-                        "tax_name": STR,
-                        "tax_percentage": _s("number", description="0-100."),
                         "cost_rate": _s("number", description="What the line costs us, per unit."),
                         "source_supplier_quote_id": _s(
                             "string", description="The supplier quote the line was priced from."
@@ -3662,8 +3668,9 @@ TOOLS: Final[tuple[ToolSpec, ...]] = (
         "quote_requests.select_supplier", "quote_requests", _WRITE, "POST",
         "/quote-requests/{request_id}/select-supplier", "Price a quote from a supplier",
         "Take one supplier's offer as the quote's own lines: their items become "
-        "the priced lines, each at the supplier's cost plus the markup. A "
-        "markup of 0 prices the job at cost, which is allowed and visible. "
+        "the priced lines, each priced to keep the margin: selling price = the "
+        "supplier's cost ÷ (1 − margin), so a 20% margin on 100 is 125. A "
+        "margin of 0 prices the job at cost, which is allowed and visible. "
         "Every rate can still be edited line by line afterwards with "
         "quote_requests.update. The supplier quote ids are on the quote from "
         "quote_requests.get. Only while the quote is the caller's to edit.",
@@ -3676,12 +3683,13 @@ TOOLS: Final[tuple[ToolSpec, ...]] = (
             ),
             _body(
                 "markup_percent",
-                "Percentage added to the supplier's cost to get the selling rate. "
-                "0 to 1000; defaults to 0.",
+                "The margin each line keeps, as a share of its selling price: the "
+                "rate is the supplier's cost ÷ (1 − this). 0 to under 100; defaults "
+                "to 0. The field keeps its old name; the number is a margin.",
                 _s("number"),
             ),
         ),
-        warning="Replaces the quote's priced lines with that supplier's, marked up.",
+        warning="Replaces the quote's priced lines with that supplier's, priced at the margin.",
     ),
     ToolSpec(
         "quote_requests.negotiate", "quote_requests", _WRITE, "POST",
@@ -4001,6 +4009,12 @@ TOOLS: Final[tuple[ToolSpec, ...]] = (
             ),
             _body("update_negotiation", "Mark a matched task's Negotiation column.", BOOL),
             _body("negotiation_value", "What to write into that column."),
+            _body(
+                "update_order_status",
+                "Set a matched task's OrderStatus column when a purchase order arrives.",
+                BOOL,
+            ),
+            _body("order_status_value", "What to write into OrderStatus. Usually Received."),
             _body("assign_team_id", "The team whose ranking picks the assignee, by id."),
             _body(
                 "match_threshold",

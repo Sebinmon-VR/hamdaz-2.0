@@ -39,6 +39,7 @@ from typing import Any, Final
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.models.comparison import SupplierQuote, SupplierQuoteItem
 from app.models.quoting import (
     EDITABLE_STATUSES,
@@ -61,7 +62,7 @@ from app.models.quoting import (
 from app.models.role import Role, UserRole
 from app.models.team import Team, TeamMembership
 from app.models.user import User
-from app.quoting import bidpack
+from app.quoting import bidpack, costing
 from app.quoting.fx import FxQuote, FxUnavailableError
 from app.roles.catalogue import SUPER_ADMIN
 
@@ -203,7 +204,7 @@ _ESTIMATE_FIELDS = (
     "title", "customer_name", "customer_id", "contact_person", "reference_number",
     "quote_date", "expiry_date", "currency", "salesperson_name", "place_of_supply",
     "payment_terms", "delivery_terms", "cf_bcd", "cf_portal", "subject", "notes",
-    "terms", "reference",
+    "terms", "reference", "tax_name",
 )
 
 #: The bid pack's own half: what a tender asks for and an estimate has no room
@@ -215,6 +216,9 @@ _BID_FIELDS = (
     "incoterm_place", "ship_to", "requested_delivery_date", "delivery_days",
     "country_of_origin", "mode_of_shipment", "bid_validity_days", "bid_reference",
     "technical_verdict", "commercial_verdict", "supplier_currency",
+    # The selling & costing report's own facts. See ``app/quoting/report.py``.
+    "supplier_name", "supplier_basis", "supplier_route", "end_user_name",
+    "recommendation", "report_notes",
 )
 
 #: Money and rates. Held apart because they go through ``Decimal`` rather than
@@ -225,11 +229,12 @@ _DECIMAL_FIELDS = (
     "financing_rate_percent",
 )
 
-#: Decimals that mean "not set" when absent, rather than zero. A markup of
-#: nothing and no markup at all are different answers: the first prices the bid
+#: Decimals that mean "not set" when absent, rather than zero. A margin of
+#: nothing and no margin at all are different answers: the first prices the bid
 #: at cost, the second has not been decided yet.
 _NULLABLE_DECIMALS = (
     "fx_rate", "target_markup_percent", "submission_unit_price", "submission_total",
+    "walk_away_margin_percent", "comfortable_margin_percent", "tax_percentage",
 )
 
 
@@ -270,12 +275,6 @@ def set_items(request: QuoteRequest, items: list[dict[str, Any]]) -> None:
             quantity=Decimal(str(item.get("quantity", 1))),
             rate=Decimal(str(item.get("rate", 0))),
             discount=Decimal(str(item.get("discount", 0))),
-            tax_name=item.get("tax_name"),
-            tax_percentage=(
-                Decimal(str(item["tax_percentage"]))
-                if item.get("tax_percentage") is not None
-                else None
-            ),
             cost_rate=(
                 Decimal(str(item["cost_rate"])) if item.get("cost_rate") is not None else None
             ),
@@ -314,6 +313,10 @@ def set_cost_lines(request: QuoteRequest, rows: list[dict[str, Any]]) -> None:
             is_principal=bool(row.get("is_principal")),
             is_firm=bool(row.get("is_firm")),
             notes=row.get("notes"),
+            # A rate rather than a figure. The amount is derived on read — see
+            # ``bidpack.landed_cost`` — so nothing stored can go stale.
+            percent=_decimal_or_none(row.get("percent")),
+            percent_of=(row.get("percent_of") or None) if row.get("percent") is not None else None,
         )
         for position, row in enumerate(rows)
     ]
@@ -397,8 +400,8 @@ def _decimal_or_none(value: Any) -> Decimal | None:
     return Decimal(str(value)) if value is not None else None
 
 
-#: Rates are stored to four places, so a markup produces a price rather than
-#: whatever a multiplication happens to leave behind.
+#: Rates are stored to four places, so a margin produces a price rather than
+#: whatever a division happens to leave behind.
 _RATE = Decimal("0.0001")
 #: A selling price is quoted to the cent — the number a customer sees, and
 #: the number Zoho multiplies.
@@ -457,7 +460,7 @@ async def select_supplier(
     *,
     user: User,
     supplier_quote_id: uuid.UUID,
-    markup_percent: Decimal = Decimal(0),
+    margin_percent: Decimal = Decimal(0),
     rates: Callable[[str, str], Awaitable[FxQuote]] | None = None,
     roles: set[str] | frozenset[str] = frozenset(),
 ) -> QuoteRequest:
@@ -469,13 +472,19 @@ async def select_supplier(
     approver to approve.
 
     **What a supplier charges is a cost, not a price.** Their unit price becomes
-    ``cost_rate`` and the selling ``rate`` is that plus the margin, so the two
-    are never confused and the margin stays visible on every line while the
-    quote is being reviewed. A markup of nothing is a real answer — it prices
-    the job at cost — and every rate can be edited afterwards.
+    ``cost_rate`` and the selling ``rate`` is that divided by one less the
+    margin — ``margin_percent`` is a share of the selling price, so a line
+    bought at 100 and sold at 20% is 125, not 120 — and the margin stays
+    visible on every line while the quote is being reviewed. A margin of
+    nothing is a real answer — it prices the job at cost — and every rate can
+    be edited afterwards.
 
     The lines are replaced, not merged: choosing a supplier means taking their
     prices, and a merge of two suppliers' offers is not a quote from either.
+
+    **The quote takes the supplier's currency.** Priced from a dollar offer,
+    it is a dollar quote, with their prices as the costs exactly as written;
+    whatever else was on it is restated at Zoho's rate.
     """
     require_editable(request, user=user, roles=roles)
     if request.comparison_id is None:
@@ -500,31 +509,19 @@ async def select_supplier(
             f"quote from. Check what was read from their document."
         )
 
-    # An offer in another currency needs a rate before it can be a cost, and
-    # the rate comes from Zoho — the same table the estimate will be converted
-    # at — unless somebody already put one on the bid. It used to price at 1
-    # and say nothing, which is how AED figures came to wear a dollar sign.
+    # The quote takes the supplier's currency. A supplier who quotes in
+    # dollars is bought in dollars, and a quote priced from them is in dollars
+    # — the reference report was, and the user asked for it outright. What
+    # was already on the quote is restated at Zoho's rate; the lines are then
+    # priced in the supplier's own currency, with no rate in the way. It used
+    # to convert their prices into whatever the quote happened to be in.
     theirs = (quote.currency or "").upper()
     ours = (request.currency or "").upper()
-    if theirs and ours and theirs != ours and not (request.fx_rate and request.fx_rate > 0):
-        if rates is None:
-            raise QuoteError(
-                f"{quote.supplier_name} quoted in {theirs} and this quote is in "
-                f"{ours}, and no exchange rate is set on the bid. Set one on the "
-                f"landed cost sheet and choose the supplier again."
-            )
-        try:
-            found = await rates(ours, theirs)
-        except FxUnavailableError as exc:
-            raise QuoteError(str(exc)) from exc
-        request.fx_rate = found.rate
-        request.supplier_currency = theirs
-        logger.info(
-            "quote %s: 1 %s = %s %s, from %s", request.id, ours, found.rate, theirs, found.source
-        )
+    if theirs and ours and theirs != ours:
+        await _adopt_currency(session, request, theirs, rates=rates, who=quote.supplier_name)
 
     fx = _pricing_rate(request, quote)
-    lines = [_line_from(item, quote, markup_percent, fx=fx) for item in quote.items]
+    lines = [_line_from(item, quote, margin_percent, fx=fx) for item in quote.items]
     set_items(request, _carry_over(request, lines))
     request.selected_supplier_quote_id = quote.id
     # Their prices are only half of what they sent. The terms they stated are
@@ -533,15 +530,24 @@ async def select_supplier(
     # built from somebody's memory of it a fortnight later.
     absorb_supplier(request, quote)
     seed_submission_checklist(request)
-    if request.target_markup_percent is None and markup_percent:
-        request.target_markup_percent = markup_percent
+    # And the costing that follows from the choice: the freight they quoted,
+    # VAT on the lines, duty and insurance on an import, the bank's cut on a
+    # card purchase — into the empty places only, labelled as what they are.
+    house = get_settings()
+    costing.seed_tax(request, house)
+    costing.seed_costing(request, quote, house)
+    # Now that the freight, insurance, duty and bank charges are on the quote,
+    # the prices are built on the landed cost, so the margin typed is the
+    # gross margin the quote keeps — not a margin over the supplier's price
+    # that the landing costs then eat into.
+    reprice_at_margin(request, margin_percent)
     await session.flush()
     logger.info(
-        "quote %s priced from %s (%d lines, markup %s%%)",
+        "quote %s priced from %s (%d lines, margin %s%%)",
         request.id,
         quote.supplier_name,
         len(quote.items),
-        markup_percent,
+        margin_percent,
     )
     return request
 
@@ -560,7 +566,7 @@ def convert_figures(
 
     Pure arithmetic on the object, so it can be tested without a rate source.
     The tax rates stay: 5% is 5% in any currency. The quantities stay. The
-    markup stays, because cost and price move together. A supplier's own figure
+    margin stays, because cost and price move together. A supplier's own figure
     in its own currency stays, because it was never in ours.
 
     Zoho prices sales lines in the source currency first.  In particular, an
@@ -634,11 +640,10 @@ async def convert_currency(
     return request
 
 
-#: What a person typed on a line that the supplier's document cannot know.
-#: Tax is the one that matters: a supplier quote has no VAT per item, so
-#: rebuilding the lines from it silently un-taxed a quote — 5,042.52 became
-#: 4,803.00 and nothing said why.
-_TYPED_ON_THE_LINE = ("tax_name", "tax_percentage", "discount")
+#: What a person typed on a line that the supplier's document cannot know,
+#: so rebuilding the lines from it does not quietly drop it. The tax used to
+#: be here too; it is on the quote now, and a re-price never touches it.
+_TYPED_ON_THE_LINE = ("discount",)
 
 
 def _carry_over(request: QuoteRequest, lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -681,20 +686,123 @@ def _pricing_rate(request: QuoteRequest, quote: SupplierQuote) -> Decimal:
     return Decimal(1)
 
 
+async def _adopt_currency(
+    session: AsyncSession,
+    request: QuoteRequest,
+    theirs: str,
+    *,
+    rates: Callable[[str, str], Awaitable[FxQuote]] | None,
+    who: str,
+) -> None:
+    """Switch the quote to the currency of the supplier it is being priced from.
+
+    Relabelled when nothing but the lines — which are about to be replaced —
+    is priced on it. Converted at Zoho's rate otherwise, so a freight row
+    typed in dirhams is the same money in dollars; that needs a rate source,
+    and without one the switch is refused rather than mislabelled.
+    """
+    ours = (request.currency or "").upper()
+    priced = bool(request.cost_lines) or any(
+        (value or Decimal(0)) != 0
+        for value in (
+            request.discount,
+            request.shipping_charge,
+            request.adjustment,
+            request.submission_unit_price,
+            request.submission_total,
+        )
+    )
+    if not priced:
+        request.currency = theirs
+        request.fx_rate = None
+        request.supplier_currency = None
+        logger.info("quote %s: now in %s, as %s quotes", request.id, theirs, who)
+        return
+    if rates is None:
+        raise QuoteError(
+            f"{who} quoted in {theirs} and this quote is in {ours} with figures already "
+            f"on it, and no exchange rate is available to restate them. Switch the "
+            f"quote to {theirs} on the summary sheet first."
+        )
+    await convert_currency(session, request, to_currency=theirs, rates=rates)
+
+
+def reprice_at_margin(request: QuoteRequest, margin_percent: Decimal) -> int:
+    """Price every costed line so the quote keeps ``margin_percent`` of its
+    selling price *after the landed cost*.
+
+    The margin somebody types is the gross margin — the one the report, the
+    walk-away line and the ladder are built on — so it has to be over
+    everything it takes to deliver, not over the supplier's price alone, or
+    the freight and the duty eat into it and a quote priced "at 25%" keeps
+    20. Each line's landed cost is its cost × (landed total ÷ goods): the
+    freight, insurance, duty and bank charges shared out in proportion to what
+    each line cost, the way the report shares them. Then
+
+        selling price = landed cost ÷ (1 − margin)
+
+    rounded the way Zoho rounds an item price in the quote's currency. Costs
+    are untouched; only selling rates move, and a line with no cost keeps the
+    price somebody typed. Returns how many lines were priced.
+    """
+    # Built on the models, not on this module, so the import is safe; local
+    # because bidpack is the heavier half and most callers never need it.
+    from app.quoting import bidpack
+
+    if margin_percent >= Decimal(100):
+        raise QuoteError(
+            f"A margin of {margin_percent}% has no selling price: the margin is a "
+            f"share of the price, so it has to be under 100%."
+        )
+    request.target_markup_percent = margin_percent
+    if bidpack.goods_cost(request) <= 0:
+        return 0
+    uplift = bidpack.landed_cost(request).uplift
+    step = sell_step(request.currency)
+    priced = 0
+    for item in request.items:
+        if item.cost_rate is None or item.cost_rate <= 0:
+            continue
+        item.rate = sell_at(item.cost_rate * uplift, margin_percent).quantize(
+            step, rounding=ROUND_HALF_UP
+        )
+        priced += 1
+    return priced
+
+
+def sell_at(cost: Decimal, margin_percent: Decimal) -> Decimal:
+    """The selling price that keeps ``margin_percent`` of itself:
+    ``cost ÷ (1 − margin)``.
+
+    The margin is a share of the selling price — the number a salesperson
+    quotes and the one a discount eats into — not a markup on cost. A line
+    bought at 100 and sold at a 20% margin is 125: a fifth of 125 is 25, which
+    is what was added. Marking up by 20% gives 120, which keeps only 16.67%,
+    and a bid priced one way and read the other is short by that difference
+    on every line. A margin of 100% or more has no price, so it is refused.
+    """
+    if margin_percent >= Decimal(100):
+        raise QuoteError(
+            f"A margin of {margin_percent}% has no selling price: the margin is a "
+            f"share of the price, so it has to be under 100%."
+        )
+    return cost * Decimal(100) / (Decimal(100) - margin_percent)
+
+
 def _line_from(
-    item: SupplierQuoteItem, quote: SupplierQuote, markup_percent: Decimal, *, fx: Decimal
+    item: SupplierQuoteItem, quote: SupplierQuote, margin_percent: Decimal, *, fx: Decimal
 ) -> dict[str, Any]:
     """One supplier line as a line of ours, in the request's own currency.
 
-    Built in Zoho's order: the markup goes on in the supplier's currency and
+    Built in Zoho's order: the margin goes on in the supplier's currency and
     the price is rounded there — to the dirham, for an AED supplier, as Zoho's
-    item prices are — and only then converted, to the cent. AED 49 + 20% is
-    58.80, is 59, is USD 16.07. The other order — convert the cost, then mark
-    up — gives 16.01, and a quote and its estimate that disagree by a cent a
-    unit on every line.
+    item prices are — and only then converted, to the cent. AED 49 at a 20%
+    margin is 61.25, is 61, is USD 16.61. The other order — convert the cost,
+    then price — lands a cent a unit away, and a quote and its estimate that
+    disagree by a cent a unit on every line.
     """
     unit = item.unit_price or Decimal(0)
-    sell_theirs = (unit * (Decimal(1) + markup_percent / Decimal(100))).quantize(
+    sell_theirs = sell_at(unit, margin_percent).quantize(
         sell_step(quote.currency), rounding=ROUND_HALF_UP
     )
     cost = (unit / fx).quantize(_PRICE, rounding=ROUND_HALF_UP)
@@ -1017,25 +1125,27 @@ def seed_submission_checklist(request: QuoteRequest) -> None:
     ]
 
 
-def markup_of(request: QuoteRequest) -> Decimal:
-    """The margin already on this quote, as a percentage of its cost.
+def margin_of(request: QuoteRequest) -> Decimal:
+    """The margin already on this quote, as a share of its selling price.
 
     Taken over the whole quote rather than per line, because that is what it is:
     one quote priced at one margin, whatever the individual lines do. Used when
     an approver switches supplier, so the quote is repriced at the margin the
-    business chose rather than dropped to cost.
+    business chose rather than dropped to cost. In the same terms as the margin
+    typed when the supplier was chosen, so pricing the other supplier at it
+    gives the quote the same margin it had.
     """
     cost = sum(
         ((i.cost_rate or Decimal(0)) * (i.quantity or Decimal(0)) for i in request.items),
         Decimal(0),
     )
-    if cost <= 0:
-        return Decimal(0)
     sell = sum(
         ((i.rate or Decimal(0)) * (i.quantity or Decimal(0)) for i in request.items),
         Decimal(0),
     )
-    return ((sell - cost) / cost * Decimal(100)).quantize(Decimal("0.01"))
+    if cost <= 0 or sell <= 0:
+        return Decimal(0)
+    return max(((sell - cost) / sell * Decimal(100)).quantize(Decimal("0.01")), Decimal(0))
 
 
 async def create(
@@ -1060,6 +1170,9 @@ async def create(
         cost_lines=[],
         compliance=[],
         submission_fields=[],
+        # Every collection given at birth, so the response built before the
+        # commit never lazy-loads one — see the MissingGreenlet note.
+        documents=[],
     )
     apply_fields(request, payload)
     set_items(request, payload.get("items") or [])
@@ -1226,6 +1339,10 @@ def snapshot_of(request: QuoteRequest) -> dict[str, Any]:
         "sub_total": str(request.sub_total),
         "total_excl_tax": str(request.total_excl_tax),
         "tax_total": str(request.tax_total),
+        "tax_name": request.tax_name,
+        "tax_percentage": (
+            str(request.tax_percentage) if request.tax_percentage is not None else None
+        ),
         "total": str(request.total),
         "discount": str(request.discount or 0),
         "shipping_charge": str(request.shipping_charge or 0),
@@ -1414,7 +1531,11 @@ async def review(
             # What was submitted, before it was repriced. Kept first, or the
             # only surviving numbers would be the ones the approver made.
             _keep_round(request, "superseded")
-            margin = markup_of(request)
+            margin = (
+                request.target_markup_percent
+                if request.target_markup_percent is not None
+                else margin_of(request)
+            )
             set_items(
                 request,
                 [
@@ -1422,6 +1543,8 @@ async def review(
                     for i in quote.items
                 ],
             )
+            costing.seed_tax(request, get_settings())
+            reprice_at_margin(request, margin)
             request.revision += 1
         request.selected_supplier_quote_id = chosen
 

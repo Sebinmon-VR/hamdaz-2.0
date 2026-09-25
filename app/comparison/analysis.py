@@ -2,14 +2,18 @@
 
 The work splits in two, and the split is the whole design:
 
-**Matching is a language problem**, so Claude does it. "Filter element FX-200",
-"FX200 Filter Elm." and "Element, filter, FX 200" are one item, and no amount of
-string distance reliably says so while also keeping FX-200 apart from FX-200H.
+**Matching is done by the identifiers and the words.** "Filter element FX-200",
+"FX200 Filter Elm." and "Element, filter, FX 200" are one item, and the thing
+that says so is the part number — normalised so that FX-200, FX 200 and FX200
+are one code, while FX-200H stays apart. Where there is no part number the
+descriptions are compared word for word, conservatively: two groups that should
+have been one is a visible, harmless result, and one group that should have
+been two is a wrong price comparison. A model used to make this call. It is
+gone, and the rules below are written to be wrong in the harmless direction.
 
 **Everything numeric is a Python problem**, so Python does it. Totals, spreads,
 the split-award figure and every saving in here are computed from the matched
-groups in ``Decimal``. A model is never asked to add up, because a number a model
-produced is a number nobody can check — and these numbers go to a supplier.
+groups in ``Decimal``.
 
 The insights are deliberately blunt about *incomparability*. The most expensive
 mistake in a quote comparison is not picking the wrong supplier, it is comparing
@@ -21,12 +25,11 @@ supplier who did not quote everything is flagged rather than ranked.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Final
-
-from pydantic import BaseModel, Field
 
 from app.comparison.extraction import ExtractionError, QuoteExtractor
 
@@ -41,41 +44,6 @@ _OUTLIER_RATIO: Final = Decimal("2.0")
 
 #: Below this the spread on a line is noise rather than a finding.
 _NOTABLE_SPREAD_PCT: Final = Decimal("15")
-
-_MATCH_SYSTEM: Final = """\
-You group line items from competing supplier quotations so a procurement team can \
-compare like with like.
-
-Put items in the same group only when a buyer would accept either one for the \
-same requirement. Judge by what the item IS — part number, brand, specification, \
-size — not by how the wording looks.
-
-Be conservative. Two groups that should have been one is a visible, harmless \
-result: the team sees both lines. One group that should have been two is a wrong \
-price comparison and can lose real money. When two items are similar but you are \
-not certain they are interchangeable, keep them apart.
-
-Watch specifically for: part numbers differing by a suffix that denotes a real \
-variant (FX-200 vs FX-200H); the same item quoted per-piece by one supplier and \
-per-pack by another; and accessories or spares that merely mention the main item \
-in their description.
-
-Every item id you were given must appear in exactly one group. Give each group a \
-short neutral label a buyer would recognise.
-"""
-
-
-class _Group(BaseModel):
-    label: str = Field(description="Short neutral name for the item")
-    item_ids: list[str] = Field(description="Ids of the line items that are this item")
-    note: str | None = Field(
-        default=None, description="Only if something about this grouping is uncertain"
-    )
-
-
-class _Grouping(BaseModel):
-    groups: list[_Group]
-
 
 @dataclass(slots=True)
 class Offer:
@@ -131,97 +99,119 @@ def _out(value: Decimal | None) -> float | None:
     return None if value is None else float(_money(value))
 
 
-# ── matching (the model's half) ────────────────────────────────────────
+# ── matching ───────────────────────────────────────────────────────────
+
+#: Descriptions are compared on their words. Below this share of words in
+#: common two descriptions are different things, however alike they look.
+_SAME_WORDS: Final = 0.6
+
+#: Words that say nothing about what an item is. Left out of the comparison so
+#: "Supply of filter" and "Filter, supply and delivery" compare on "filter".
+_NOISE: Final = frozenset(
+    {
+        "a", "an", "and", "the", "of", "for", "with", "to", "in", "or", "per",
+        "supply", "supplying", "delivery", "installation", "each", "pcs", "pc",
+        "nos", "no", "set", "sets", "unit", "units", "item", "items", "type",
+    }
+)
+
+
+def normalise_code(code: str | None) -> str:
+    """A part number as an identifier: case, spaces and punctuation gone.
+
+    FX-200, "FX 200" and fx200 are one code. FX-200H is another — the suffix
+    survives, which is the whole point of comparing codes rather than words.
+    """
+    return re.sub(r"[^a-z0-9]", "", (code or "").casefold())
+
+
+def _words(description: str) -> tuple[set[str], set[str]]:
+    """The words of a description, and the ones among them that carry a model
+    number. ``fx-200`` and ``fx 200`` both become ``fx200`` first, so a code
+    written two ways is one word."""
+    text = description.casefold()
+    text = re.sub(r"(?<=[a-z])[\s\-/](?=\d)", "", text)
+    text = re.sub(r"(?<=\d)[\s\-/](?=[a-z])", "", text)
+    tokens = {t for t in re.split(r"[^a-z0-9.]+", text) if t and t not in _NOISE}
+    tokens = {t.strip(".") for t in tokens if t.strip(".")}
+    coded = {t for t in tokens if any(c.isdigit() for c in t)}
+    return tokens, coded
+
+
+def _same_item(a: Offer, b: Offer) -> bool:
+    """Whether two lines from different suppliers are the same requirement.
+
+    Part numbers decide when both have one. Otherwise the descriptions must
+    agree on every model number they mention and share most of their words.
+    Conservative on purpose: a miss shows as two rows, a false match as a wrong
+    price comparison, and only one of those loses money.
+    """
+    code_a, code_b = normalise_code(a.part_number), normalise_code(b.part_number)
+    if code_a and code_b:
+        return code_a == code_b
+    words_a, coded_a = _words(a.description)
+    words_b, coded_b = _words(b.description)
+    if not words_a or not words_b:
+        return False
+    # One side's part number may be in the other's description — "FX-200" in
+    # "Filter element FX-200" — which is as good as a code on both.
+    if code_a and code_a in {normalise_code(w) for w in words_b}:
+        return True
+    if code_b and code_b in {normalise_code(w) for w in words_a}:
+        return True
+    if coded_a != coded_b:
+        return False
+    shared = len(words_a & words_b)
+    return shared / len(words_a | words_b) >= _SAME_WORDS
+
+
+def match_locally(quotes: list[Quote]) -> list[dict[str, Any]]:
+    """Group equivalent line items across suppliers, by the rules above.
+
+    A line is only ever grouped with lines from *other* suppliers — two lines on
+    one quote are two things the supplier is selling, whatever they are called.
+    Groups are built greedily in document order, and a line that matches
+    nothing stays on its own, which is the honest result for a line only one
+    supplier bid on.
+    """
+    groups: list[dict[str, Any]] = []
+    members: list[list[Offer]] = []
+    for quote in quotes:
+        for offer in quote.items:
+            placed = False
+            for index, group in enumerate(members):
+                if any(m.quote_id == offer.quote_id for m in group):
+                    continue
+                if all(_same_item(offer, m) for m in group):
+                    group.append(offer)
+                    groups[index]["item_ids"].append(offer.item_id)
+                    placed = True
+                    break
+            if not placed:
+                members.append([offer])
+                groups.append(
+                    {"label": offer.description[:120], "item_ids": [offer.item_id], "note": None}
+                )
+    for group, offers in zip(groups, members, strict=True):
+        if len(offers) > 1 and not all(normalise_code(o.part_number) for o in offers):
+            group["note"] = (
+                "Matched on the description rather than a part number. "
+                "Check the lines are for the same item."
+            )
+    return groups
 
 
 async def match_items(extractor: QuoteExtractor, quotes: list[Quote]) -> list[dict[str, Any]]:
     """Group equivalent line items across suppliers.
 
-    Falls back to grouping by exact part number, then by normalised description,
-    if Claude is unavailable. The fallback is worse — it will not see that
-    "FX200 Filter Elm." is the same item — but a degraded comparison beats none,
-    and the manual path must keep working without an API key.
+    ``extractor`` is accepted for the callers written when a model did this,
+    and ignored. Async for the same reason — the shape of the call did not
+    change when what it does did.
     """
-    catalogue = [
-        {
-            "id": offer.item_id,
-            "supplier": quote.supplier_name,
-            "description": offer.description,
-            "part_number": offer.part_number,
-            "quantity": str(offer.quantity),
-        }
-        for quote in quotes
-        for offer in quote.items
-    ]
-    if not catalogue:
+    del extractor
+    if not any(quote.items for quote in quotes):
         return []
-
-    if not extractor.configured:
-        logger.info("no Claude key; matching line items by part number and description")
-        return _fallback_groups(quotes)
-
-    if _part_numbers_settle_it(quotes):
-        # Every line carries a part number and they already line up across
-        # suppliers. Exact identifiers are better evidence than any judgement a
-        # model could add, so this saves a whole Opus call for nothing lost.
-        logger.info("part numbers match across suppliers; skipping the matching call")
-        return _fallback_groups(quotes)
-
-    import json
-
-    try:
-        client = extractor._anthropic()  # noqa: SLF001 - same package, one client
-        response = await client.messages.parse(
-            model=extractor._settings.anthropic_model,  # noqa: SLF001
-            max_tokens=16000,
-            system=[
-                {"type": "text", "text": _MATCH_SYSTEM, "cache_control": {"type": "ephemeral"}}
-            ],
-            # Deciding equivalence is the judgement call in this module, and the
-            # one place where thinking earns its cost.
-            output_config={"effort": "high"},
-            messages=[
-                {
-                    "role": "user",
-                    "content": (
-                        "Group these line items from competing quotations.\n\n"
-                        + json.dumps(catalogue, indent=1)
-                    ),
-                }
-            ],
-            output_format=_Grouping,
-        )
-    except Exception as exc:  # noqa: BLE001 - any failure falls back, never fails the comparison
-        logger.warning("item matching failed, falling back to part numbers: %s", exc)
-        return _fallback_groups(quotes)
-
-    grouping = response.parsed_output
-    if grouping is None:
-        return _fallback_groups(quotes)
-
-    known = {offer.item_id for quote in quotes for offer in quote.items}
-    groups: list[dict[str, Any]] = []
-    placed: set[str] = set()
-    for group in grouping.groups:
-        ids = [i for i in group.item_ids if i in known and i not in placed]
-        if not ids:
-            continue
-        placed.update(ids)
-        groups.append({"label": group.label, "item_ids": ids, "note": group.note})
-
-    # The prompt asks for every id exactly once; trusting that without checking
-    # would silently drop a priced line from the comparison.
-    for item_id in known - placed:
-        offer = _find(quotes, item_id)
-        if offer is not None:
-            groups.append(
-                {
-                    "label": offer.description[:120],
-                    "item_ids": [item_id],
-                    "note": "Not placed in any group by the matcher; left on its own.",
-                }
-            )
-    return groups
+    return match_locally(quotes)
 
 
 def _find(quotes: list[Quote], item_id: str) -> Offer | None:
@@ -236,10 +226,10 @@ def _part_numbers_settle_it(quotes: list[Quote]) -> bool:
     """Whether part numbers alone already produce a trustworthy grouping.
 
     Two conditions, and both are needed. Every line must carry a part number —
-    one bare description and the model has real work to do. And the part numbers
-    must actually overlap between suppliers, because a set that groups nothing
-    is not agreement, it is three suppliers using their own internal codes, which
-    is precisely the case that needs judgement.
+    one bare description and the words have real work to do. And the part
+    numbers must actually overlap between suppliers, because a set that groups
+    nothing is not agreement, it is three suppliers using their own internal
+    codes, which is precisely the case that needs the descriptions.
     """
     if len(quotes) < 2:
         return False
@@ -248,10 +238,7 @@ def _part_numbers_settle_it(quotes: list[Quote]) -> bool:
     for quote in quotes:
         if not quote.items:
             continue
-        numbers = {
-            (o.part_number or "").strip().casefold().replace(" ", "").replace("-", "")
-            for o in quote.items
-        }
+        numbers = {normalise_code(o.part_number) for o in quote.items}
         if "" in numbers:
             return False
         per_supplier.append(numbers)
@@ -264,12 +251,13 @@ def _part_numbers_settle_it(quotes: list[Quote]) -> bool:
 
 
 def _fallback_groups(quotes: list[Quote]) -> list[dict[str, Any]]:
-    """Group by part number, else by squashed description. No model involved."""
+    """Group by part number, else by squashed description. The bluntest rule,
+    kept for the tests that pin the arithmetic to a known grouping."""
     buckets: dict[str, list[str]] = {}
     labels: dict[str, str] = {}
     for quote in quotes:
         for offer in quote.items:
-            key = (offer.part_number or "").strip().casefold().replace(" ", "").replace("-", "")
+            key = normalise_code(offer.part_number)
             if not key:
                 key = "d:" + "".join(c for c in offer.description.casefold() if c.isalnum())
             buckets.setdefault(key, []).append(offer.item_id)

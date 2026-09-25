@@ -2,7 +2,7 @@
 
 The flow this serves, in the order an engineer actually works:
 
-1. ``POST /comparisons/extract`` — upload the quotes that came in. Claude reads
+1. ``POST /comparisons/extract`` — upload the quotes that came in. The parser reads
    them and hands back drafts. **Nothing is saved.**
 2. Correct whatever was misread. Or skip 1 and 2 entirely and type the numbers
    in: the same shapes go to the next step either way.
@@ -22,6 +22,7 @@ attributed to a person, requires a session.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from typing import Annotated
@@ -168,7 +169,8 @@ async def extract(
     for upload in files:
         name = upload.filename or "unnamed"
         try:
-            readables.append(prepare(name, await upload.read(), upload.content_type))
+            content = await upload.read()
+            readables.append(await asyncio.to_thread(prepare, name, content, upload.content_type))
         except DocumentError as exc:
             failed.append(ExtractionFailure(file_name=name, error=str(exc)))
 
@@ -224,7 +226,9 @@ async def extract(
         )
 
     return ExtractionOut(
-        quotes=quotes, failed=failed, model=get_settings().extract_model
+        # No model reads these any more; the field is kept for the callers
+        # that show what did, and says so.
+        quotes=quotes, failed=failed, model=None
     )
 
 

@@ -705,7 +705,10 @@ async def test_wait_email_gives_up_when_the_deadline_passes_with_nothing(db, own
 # ── compare ────────────────────────────────────────────────────────────
 
 
-async def test_compare_reads_the_reply_and_marks_up_the_cheapest(db, owner, switches) -> None:
+async def test_compare_reads_the_reply_and_prices_the_cheapest_at_the_margin(
+    db, owner, switches
+) -> None:
+    """100 at a 10% margin is 111.11 — cost ÷ 0.9 — not 110."""
     extractor = FakeExtractor([quote("Acme", 100.0, 40.0)])
     svc = services(extractor=extractor)
     flow = await make_flow(
@@ -728,7 +731,7 @@ async def test_compare_reads_the_reply_and_marks_up_the_cheapest(db, owner, swit
     assert out["single"] is True and out["unreadable"] == []
     assert out["chosen"]["supplier_name"] == "Acme"
     assert [(i["name"], i["rate"], i["cost_rate"], i["quantity"], i["item_code"]) for i in out["items"]] == [
-        ("Line 1", 110.0, 100.0, 2.0, "PN-1"), ("Line 2", 44.0, 40.0, 2.0, "PN-2"),
+        ("Line 1", 111.11, 100.0, 2.0, "PN-1"), ("Line 2", 44.44, 40.0, 2.0, "PN-2"),
     ]
     saved = await db.scalar(select(QuoteComparison).where(QuoteComparison.id == uuid.UUID(out["comparison_id"])))
     assert saved is not None

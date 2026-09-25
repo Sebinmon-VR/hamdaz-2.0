@@ -464,20 +464,21 @@ async def test_choosing_a_supplier_prices_the_quote_from_their_lines(
     cheaper = comparison.quotes[1]
 
     await service.select_supplier(
-        db, request, user=requester, supplier_quote_id=cheaper.id, markup_percent=Decimal(20)
+        db, request, user=requester, supplier_quote_id=cheaper.id, margin_percent=Decimal(20)
     )
 
     assert [i.name for i in request.items] == ["FortiGate 201G", "3yr subscription"]
     # What the supplier charges is the cost...
     assert request.items[0].cost_rate == Decimal("900.0000")
-    # ...and the price is that plus the margin, which stays visible on the line.
-    assert request.items[0].rate == Decimal("1080.0000")
-    assert request.items[0].margin == Decimal("360.0000")
+    # ...and the price keeps a fifth of itself as margin: 900 ÷ 0.8, not
+    # 900 × 1.2. The margin stays visible on the line.
+    assert request.items[0].rate == Decimal("1125.0000")
+    assert request.items[0].margin == Decimal("450.0000")
     assert request.items[0].source_supplier_quote_id == cheaper.id
     assert request.selected_supplier_quote_id == cheaper.id
 
 
-async def test_no_markup_prices_the_job_at_cost(db, requester, team) -> None:
+async def test_no_margin_prices_the_job_at_cost(db, requester, team) -> None:
     """A real answer, and a visible one — not a quote with no prices in it."""
     request = await draft(db, requester, team)
     comparison = await with_suppliers(db, request, requester)
@@ -490,18 +491,25 @@ async def test_no_markup_prices_the_job_at_cost(db, requester, team) -> None:
     assert request.items[0].margin == 0
 
 
-async def test_a_supplier_quoting_in_another_currency_is_converted(
+async def test_the_quote_takes_the_currency_of_the_supplier_it_is_priced_from(
     db, requester, team
 ) -> None:
-    """Otherwise the total is a mixture of currencies that looks like a number."""
+    """A dollar offer makes a dollar quote: their price is the cost exactly as
+    they wrote it, not converted into whatever the quote happened to be in."""
     request = await draft(db, requester, team)
-    comparison = await with_suppliers(db, request, requester, rates=(100,), fx="3.6725")
+    comparison = await with_suppliers(db, request, requester, rates=(100,))
+    comparison.quotes[0].currency = "USD"
+    assert request.currency != "USD"
 
     await service.select_supplier(
-        db, request, user=requester, supplier_quote_id=comparison.quotes[0].id
+        db, request, user=requester, supplier_quote_id=comparison.quotes[0].id,
+        margin_percent=Decimal(20),
     )
 
-    assert request.items[0].cost_rate == Decimal("367.2500")
+    assert request.currency == "USD"
+    assert request.fx_rate is None
+    assert request.items[0].cost_rate == Decimal("100.0000")
+    assert request.items[0].rate == Decimal("125.0000")   # 100 ÷ 0.8, to the cent
 
 
 async def test_choosing_a_different_supplier_replaces_the_lines(
@@ -564,7 +572,7 @@ async def test_an_approver_choosing_another_supplier_reprices_the_quote(
     comparison = await with_suppliers(db, request, requester)
     await service.select_supplier(
         db, request, user=requester, supplier_quote_id=comparison.quotes[0].id,
-        markup_percent=Decimal(20),
+        margin_percent=Decimal(20),
     )
     await service.submit(db, request, user=requester)
     was = request.revision
@@ -582,7 +590,7 @@ async def test_an_approver_choosing_another_supplier_reprices_the_quote(
     assert request.selected_supplier_quote_id == comparison.quotes[1].id
     # Repriced from the cheaper supplier, at the margin the business chose.
     assert request.items[0].cost_rate == Decimal("900.0000")
-    assert request.items[0].rate == Decimal("1080.0000")
+    assert request.items[0].rate == Decimal("1125.0000")
     # And what was approved is visibly not what was submitted.
     assert request.revision == was + 1
 
@@ -669,7 +677,7 @@ async def approved(db, requester, approver, team):
     comparison = await with_suppliers(db, request, requester)
     await service.select_supplier(
         db, request, user=requester, supplier_quote_id=comparison.quotes[0].id,
-        markup_percent=Decimal(20),
+        margin_percent=Decimal(20),
     )
     request.win_probability = Decimal("0.4200")
     await service.submit(db, request, user=requester)
@@ -687,7 +695,7 @@ async def test_a_decision_keeps_the_round_it_decided(db, requester, approver, te
     kept = request.revisions[0]
     assert kept.revision == 1
     assert kept.outcome == "approve"
-    assert kept.snapshot["items"][0]["rate"] == "1200.0000"
+    assert Decimal(kept.snapshot["items"][0]["rate"]) == Decimal(1250)
     assert kept.snapshot["win_probability"] == "0.4200"
     assert kept.snapshot["total"] == str(request.total)
 
@@ -726,12 +734,12 @@ async def test_the_reprice_after_a_negotiation_leaves_the_old_one_standing(
 
     await service.select_supplier(
         db, request, user=requester, supplier_quote_id=comparison.quotes[1].id,
-        markup_percent=Decimal(10),
+        margin_percent=Decimal(10),
     )
     await service.submit(db, request, user=requester)
 
-    assert request.items[0].rate == Decimal("990.0000")
-    assert request.revisions[0].snapshot["items"][0]["rate"] == "1200.0000"
+    assert request.items[0].rate == Decimal("1000.0000")
+    assert Decimal(request.revisions[0].snapshot["items"][0]["rate"]) == Decimal(1250)
     assert Decimal(request.revisions[0].snapshot["total"]) > request.total
 
 
@@ -772,7 +780,7 @@ async def test_an_approver_switching_supplier_keeps_both_sets_of_numbers(
     comparison = await with_suppliers(db, request, requester)
     await service.select_supplier(
         db, request, user=requester, supplier_quote_id=comparison.quotes[0].id,
-        markup_percent=Decimal(20),
+        margin_percent=Decimal(20),
     )
     await service.submit(db, request, user=requester)
 
@@ -784,9 +792,9 @@ async def test_an_approver_switching_supplier_keeps_both_sets_of_numbers(
     outcomes = {r.outcome: r for r in request.revisions}
     assert set(outcomes) == {"superseded", "approve"}
     # What was sent up...
-    assert outcomes["superseded"].snapshot["items"][0]["rate"] == "1200.0000"
+    assert Decimal(outcomes["superseded"].snapshot["items"][0]["rate"]) == Decimal(1250)
     # ...and what was actually approved.
-    assert outcomes["approve"].snapshot["items"][0]["rate"] == "1080.0000"
+    assert Decimal(outcomes["approve"].snapshot["items"][0]["rate"]) == Decimal(1125)
 
 # ── who may delete one ─────────────────────────────────────────────────
 

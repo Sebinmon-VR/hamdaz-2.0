@@ -6,6 +6,7 @@ so there is exactly one place to look when a deployment misbehaves.
 
 from __future__ import annotations
 
+from decimal import Decimal
 from functools import lru_cache
 from typing import Annotated, Literal
 
@@ -83,18 +84,41 @@ class Settings(BaseSettings):
     #:
     #: Set to blank to switch filing off entirely; uploads then stay in the
     #: database, which is the system of record either way.
+    #: The Documents library of the ProposalTeam site, where the proposal team
+    #: keeps a folder per task under "Proposal Team Channel". Chosen by the
+    #: user on 2026-09-25 to replace the Test site's attachments2 folder: the
+    #: paperwork for a bid belongs with the bid.
     quote_drive_id: str = (
-        "b!sezgUlWA6Um1PgoJ4QTpCULYYroUPQZKvfWrVskCOzPTrTOr4BoOT6QqxrwnoBdN"
+        "b!GUSLy45PyUGtJDd3J89eeYaH7Z2XFJ9IpTydMWvJt-eWH0ljFA62TbLTydbo8eBd"
     )
-    #: The folder within that library. One folder per quote is made inside it,
-    #: so a bid's documents stay together and somebody opening the library can
-    #: see which quote they belong to.
-    quote_drive_folder: str = "attachments2"
+    #: The folder within that library that holds one folder per task. A
+    #: quote's documents go into ``<task folder>/Quote request <ref>/``.
+    quote_drive_folder: str = "Proposal Team Channel"
+    #: Where a quote raised with no task behind it files its documents —
+    #: a folder beside the task folders, so nothing is invented as a task.
+    quote_drive_unlinked_folder: str = "_Quotes without a task"
 
     @property
     def files_to_drive(self) -> bool:
-        """Whether uploaded supplier quotes are filed to the library at all."""
+        """Whether uploaded documents are filed to the library at all. Blank
+        switches filing off; the rows are then recorded unfiled and say so."""
         return bool(self.quote_drive_id.strip())
+
+    # ── costing defaults ───────────────────────────────────────────────
+    # What the house puts on a quote the moment a supplier is chosen, where
+    # the documents left a gap. All of it lands as editable rows and cells,
+    # labelled as defaults; a zero switches that default off. See
+    # ``app/quoting/costing.py``.
+    #: VAT on every line that has none. UAE standard rate.
+    costing_default_tax_name: str = "VAT"
+    costing_default_tax_percent: Decimal = Decimal("5")
+    #: Import duty on the CIF value, set on a bid that imports and has none.
+    costing_default_duty_percent: Decimal = Decimal("5")
+    #: Cargo insurance, as a rated row over the goods, on an import.
+    costing_default_insurance_percent: Decimal = Decimal("1")
+    #: The bank's or the card's cut, as a rated row over the goods, when the
+    #: supplier is paid up front or online.
+    costing_default_bank_charge_percent: Decimal = Decimal("3")
 
     # ── Zoho Books (quotes) ────────────────────────────────────────────
     #: READ ONLY, like SharePoint. Zoho Books is where quotes are actually
@@ -174,6 +198,36 @@ class Settings(BaseSettings):
     @property
     def claude_configured(self) -> bool:
         return bool(self.anthropic_api_key)
+
+    # ── a text model for the documents, optional ───────────────────────
+    #: The deterministic readers do the work. A model is the second pass for
+    #: what they cannot settle, tried in this order with fallback: Anthropic
+    #: first while its credit lasts (the user's call, for testing), then the
+    #: free tiers, which ration by the day. A refusal of any kind — a rate
+    #: limit, an empty credit balance — moves to the next name, so one
+    #: running dry never fails an upload. Names: anthropic, groq, cerebras,
+    #: openrouter, ollama. A provider with no key is skipped, so a blank .env
+    #: means no model.
+    llm_providers: str = "anthropic,groq,cerebras,openrouter"
+    groq_api_key: str = ""
+    groq_model: str = "openai/gpt-oss-120b"
+    cerebras_api_key: str = ""
+    cerebras_model: str = "gpt-oss-120b"
+    openrouter_api_key: str = ""
+    openrouter_model: str = "nvidia/nemotron-3.5-lightning:free"
+    #: A machine of ours running Ollama, e.g. http://192.168.1.20:11434/v1.
+    ollama_base_url: str = ""
+    ollama_model: str = "nemotron-3.5-lightning"
+    llm_timeout_seconds: float = 60.0
+    #: Roughly 6,000 tokens: under the free tiers' per-minute allowance with
+    #: room for the answer. Longer documents keep their head and tail.
+    llm_max_input_chars: int = 24_000
+
+    @property
+    def text_model_configured(self) -> bool:
+        from app.core.llm import providers_from
+
+        return bool(providers_from(self))
 
     # ── OpenAI (the assistant) ─────────────────────────────────────────
     #: The assistant's chat agent runs on the OpenAI API; Claude above is used

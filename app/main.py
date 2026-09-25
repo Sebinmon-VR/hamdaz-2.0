@@ -7,10 +7,12 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app.access.router import router as access_router
+from app.admin.router import router as admin_router
 from app.analytics.router import router as analytics_router
 from app.assignment.router import router as assignment_router
 from app.assistant.agent import Assistant
@@ -25,6 +27,7 @@ from app.comparison.extraction import QuoteExtractor
 from app.comparison.router import router as comparison_router
 from app.core.config import get_settings
 from app.core.db import dispose_engine, get_session_factory, init_engine
+from app.core.llm import TextModel
 from app.dashboards.router import router as dashboards_router
 from app.directory.graph import GraphDirectory
 from app.directory.router import router as directory_router
@@ -33,37 +36,36 @@ from app.finance.router import router as finance_router
 from app.forms.router import router as templates_router
 from app.hr.public import router as careers_router
 from app.hr.router import router as hr_router
+from app.intake.graph_mail import MailReader
+from app.intake.router import router as intake_router
+from app.intake.router import webhook_router as intake_webhook_router
+from app.intake.worker import Worker
 from app.labels.router import router as labels_router
 from app.leave.mailer import LeaveMailer
 from app.leave.router import router as leave_router
 from app.meetings.calendar import GraphCalendar
 from app.meetings.router import router as meetings_router
+from app.notifications.router import router as notifications_router
 from app.profiles.router import router as profiles_router
 from app.projects.router import router as projects_router
 from app.proposals.analytics import WorkloadCache
 from app.proposals.oversight import TeamTasksCache
 from app.proposals.router import router as proposals_router
 from app.proposals.sharepoint import SharePointProposals
-from app.admin.router import router as admin_router
-from app.intake.graph_mail import MailReader
-from app.intake.router import router as intake_router
-from app.intake.router import webhook_router as intake_webhook_router
-from app.intake.worker import Worker
-from app.workflows.engine import Services as WorkflowServices
-from app.workflows.router import admin_router as workflows_admin_router
-from app.workflows.router import router as workflows_router
-from app.workflows.worker import WorkflowWorker
-from app.notifications.router import router as notifications_router
 from app.quoting.mailer import QuoteMailer
+from app.quoting.probability import WinRates
+from app.quoting.router import router as quoting_router
 from app.quoting.storage import QuoteDrive
 from app.reports.brief import Briefer
 from app.reports.mailer import ReportMailer
 from app.reports.router import admin_router as reports_admin_router
 from app.reports.router import router as reports_router
-from app.quoting.probability import WinRates
-from app.quoting.router import router as quoting_router
 from app.roles.router import router as roles_router
 from app.teams.router import router as teams_router
+from app.workflows.engine import Services as WorkflowServices
+from app.workflows.router import admin_router as workflows_admin_router
+from app.workflows.router import router as workflows_router
+from app.workflows.worker import WorkflowWorker
 from app.zoho.cache import QuoteCache
 from app.zoho.client import ZohoBooks
 from app.zoho.router import router as zoho_router
@@ -98,10 +100,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Reads the signed-in person's own calendar, and only theirs — the
     # mailbox is never named by a request. See app/meetings/router.py.
     app.state.calendar = GraphCalendar(settings, http)
-    # Reads supplier quote documents. Holds no connection of its own; the
-    # Anthropic SDK manages that, and an unset key fails at the endpoint rather
-    # than at boot so the manual entry path keeps working without one.
-    app.state.quote_extractor = QuoteExtractor(settings)
+    # The optional second pass for documents the parsers cannot settle: a
+    # text model behind whichever free endpoint has a key, with fallback.
+    # No key configured means no model, and everything still reads.
+    app.state.text_model = TextModel(settings, http)
+    # Reads supplier quote documents: a parser over the document's own table,
+    # OCR when an engine is installed, and the model above when the table
+    # reader declines.
+    app.state.quote_extractor = QuoteExtractor(settings, model=app.state.text_model)
     # Read-only over Zoho Books. Its access token is shared through Postgres
     # rather than held per process — see app/zoho/tokens.py for why.
     app.state.zoho = ZohoBooks(settings, http, get_session_factory())
@@ -230,6 +236,33 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.exception_handler(Exception)
+    async def unhandled(request: Request, exc: Exception) -> JSONResponse:
+        """A failure nobody caught, said out loud — with CORS headers.
+
+        Starlette answers these from outside the CORS middleware, so the
+        browser gets a 500 with no allow-origin header, refuses to read it,
+        and the screen says the API could not be reached. That is what the
+        person then reports, and it is wrong: the API answered, with a
+        reason. So the reason travels, on a response the browser will read,
+        and the traceback goes to the log as it always did.
+        """
+        logger.exception("unhandled error on %s %s", request.method, request.url.path)
+        headers: dict[str, str] = {}
+        origin = request.headers.get("origin")
+        if origin and origin in settings.cors_origins:
+            headers = {
+                "Access-Control-Allow-Origin": origin,
+                "Access-Control-Allow-Credentials": "true",
+                "Vary": "Origin",
+            }
+        reason = f"{type(exc).__name__}: {exc}".strip(": ")[:600]
+        return JSONResponse(
+            {"detail": f"The server hit an error it did not expect. {reason}"},
+            status_code=500,
+            headers=headers,
+        )
 
     app.include_router(auth_router, prefix=settings.api_prefix)
     app.include_router(directory_router, prefix=settings.api_prefix)

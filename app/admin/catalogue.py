@@ -63,7 +63,9 @@ SECTIONS: Final[tuple[Section, ...]] = (
         caution=(
             "create_in_sharepoint ships off. Turning it on is the moment this "
             "starts writing rows into the live Proposals list the team works "
-            "in — the only thing here that cannot be undone."
+            "in — the only thing here that cannot be undone. update_negotiation "
+            "and update_order_status each set one column on a task that already "
+            "exists; both ship off too."
         ),
         endpoints=(
             _e("GET", "/intake/settings", "What is watched, and what it may do"),

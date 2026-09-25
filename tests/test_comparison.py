@@ -1,8 +1,8 @@
 """The comparison maths, and reading the files it starts from.
 
-Neither of these touches Claude. That is the point of the split: matching items
-is the model's job, but every number a buyer acts on is computed in Python, so
-every number a buyer acts on can be tested without a network call or a bill.
+Nothing here touches a model — there is none. Matching items is done by part
+numbers and words, and every number a buyer acts on is computed in Python, so
+all of it can be tested without a network call or a bill.
 
 The tests that matter most are the incomparability ones. A supplier who quoted
 eight of ten lines has a smaller total than one who quoted all ten, and treating
@@ -17,7 +17,8 @@ from decimal import Decimal
 import pytest
 
 from app.comparison.analysis import _fallback_groups, analyse
-from app.comparison.documents import DocumentError, Readable, prepare, resolve_type
+from app.comparison.documents import DocumentError, prepare, resolve_type
+from app.comparison.parsing import parse
 from app.comparison.schemas import ItemIn, QuoteIn
 from app.comparison.service import line_total, to_domain
 
@@ -347,16 +348,24 @@ def test_a_pdf_with_a_text_layer_is_sent_as_text() -> None:
     assert len(readable.text) < 2000
 
 
-def test_a_scan_still_goes_to_the_model_as_a_document() -> None:
-    """No text layer to recover, so accuracy wins over cost."""
+def test_a_scan_with_no_ocr_engine_is_handed_back_as_a_document(monkeypatch) -> None:
+    """No text layer, and nothing installed to read one: the file is carried as
+    it is, and the extractor says to type it in."""
+    from app.comparison import documents
+
     pytest.importorskip("reportlab")
+    monkeypatch.setattr(documents, "ocr_available", lambda: False)
     readable = prepare("scan.pdf", _pdf([""]))
     assert readable.kind == "document"
 
 
-def test_force_native_overrides_the_cheap_path() -> None:
-    """The escape hatch for a layout the text path mangled."""
+def test_force_native_skips_the_text_layer(monkeypatch) -> None:
+    """The escape hatch for a layout the text path mangled: the text layer is
+    ignored, and without an OCR engine the file is carried as a document."""
+    from app.comparison import documents
+
     pytest.importorskip("reportlab")
+    monkeypatch.setattr(documents, "ocr_available", lambda: False)
     body = "\n".join(["Supplier: Alpha", "Filter FX-200 10 120.00"] * 8)
     assert prepare("quote.pdf", _pdf([body]), force_native=True).kind == "document"
 
@@ -381,7 +390,7 @@ def test_agreeing_part_numbers_skip_the_matching_call() -> None:
     assert _part_numbers_settle_it(agreed) is True
 
 
-def test_a_missing_part_number_needs_the_model() -> None:
+def test_a_missing_part_number_needs_the_words() -> None:
     from app.comparison.analysis import _part_numbers_settle_it
 
     partial = to_domain(
@@ -393,7 +402,7 @@ def test_a_missing_part_number_needs_the_model() -> None:
     assert _part_numbers_settle_it(partial) is False
 
 
-def test_part_numbers_that_never_overlap_need_the_model() -> None:
+def test_part_numbers_that_never_overlap_need_the_words() -> None:
     """Each supplier using their own internal codes is the hard case, not the easy one."""
     from app.comparison.analysis import _part_numbers_settle_it
 
@@ -545,114 +554,148 @@ def test_every_extraction_field_is_required() -> None:
     assert '"anyOf"' not in whole
     assert len(whole) < 6000
 
+EMAIL_QUOTE = b"""Outlook
+Re: Enquiry for Toner
+From Yalla LLC <info@yallallc.com>
+Date Tue 9/22/2026 12:09 PM
+To Jasna <jasna@hamdaz.com>
 
-def test_the_prompt_and_the_schema_agree_on_blanks() -> None:
-    """Required fields force "" and 0 to mean absent. The model must be told so.
+Hello,
 
-    They drifted once: the schema said blanks while the instruction still said
-    "leave it null", and the model returned zero line items without explanation.
-    """
-    from app.comparison.extraction import _SYSTEM, QuoteExtractor
-    from app.core.config import get_settings
+Hope you are doing well
 
-    instruction = QuoteExtractor(get_settings())._content(
-        Readable("text", "text/csv", "q.csv", text="x")
-    )[-1]["text"]
+Black Cartridge- 410A (CF410A)@300
+Magenta Cartridge- 410A (CF413A)@370
+Cyan Cartridge- 508A (CF361A) @530
+Yellow Cartridge- 508A (CF362A) @670
 
-    assert "null" not in instruction.lower()
-    assert '""' in instruction and "0" in instruction
-    assert "null" not in _SYSTEM.lower()
+Regards
+Diya
+
+On Tue, Sep 22, 2026 at 11:13 AM Jasna <jasna@hamdaz.com> wrote:
+Dear Team,
+Kindly provide the proposal for the following.
+Black Cartridge- 410A (CF410A)-1 Unit
+Magenta Cartridge- 410A (CF413A)-1 Unit
+Cyan Cartridge- 508A (CF361A)-1 Unit
+Yellow Cartridge- 508A (CF362A)-2 Unit
+Tel : +971 23090211
+"""
 
 
-async def test_a_refused_schema_falls_back_to_plain_json() -> None:
-    """A grammar the compiler will not build must not cost us the extraction."""
-    import anthropic
-    import httpx
+def test_a_quotation_typed_into_an_email_is_read() -> None:
+    """The supplier answered the enquiry by writing a price after each item.
+    No table, no quantity column: the quantities are in the enquiry quoted
+    underneath, and the part numbers are in brackets."""
+    from app.comparison.documents import Readable
 
-    from app.comparison.extraction import ExtractedQuote, QuoteExtractor
-    from app.core.config import get_settings
+    quote = parse(Readable("text", "text/plain", "Toner_Quote.pdf", text=EMAIL_QUOTE.decode()))
 
-    settings = get_settings().model_copy()
-    settings.anthropic_api_key = "sk-ant-test"
-    extractor = QuoteExtractor(settings)
+    assert quote is not None
+    assert quote.supplier_name == "Yalla LLC"
+    assert [(i.part_number, i.unit_price, i.quantity) for i in quote.items] == [
+        ("CF410A", 300.0, 1.0),
+        ("CF413A", 370.0, 1.0),
+        ("CF361A", 530.0, 1.0),
+        ("CF362A", 670.0, 2.0),
+    ]
+    assert quote.items[0].description == "Black Cartridge- 410A (CF410A)"
+    # The phone number and the date are not prices.
+    assert all("Tel" not in i.description and "Date" not in i.description for i in quote.items)
+    assert "currency" in quote.note
 
-    calls: list[str] = []
 
-    class FakeMessages:
-        async def parse(self, **kwargs):
-            calls.append("parse")
-            raise anthropic.BadRequestError(
-                "Schema is too complex.",
-                response=httpx.Response(400, request=httpx.Request("POST", "http://x")),
-                body={"error": {"message": "Schema is too complex."}},
-            )
+def test_a_lone_colon_line_is_not_a_quote() -> None:
+    """"Total: 1,200.00" on its own, or "Ref: 4471" twice, is not a quotation."""
+    from app.comparison.documents import Readable
 
-        async def create(self, **kwargs):
-            calls.append("create")
-            payload = {
-                **dict.fromkeys(
-                    ("quote_number", "quote_date", "currency", "validity",
-                     "delivery_time", "payment_terms", "warranty", "incoterms",
-                     "contact", "note"),
-                    "",
-                ),
-                **dict.fromkeys(("discount", "freight", "tax", "quoted_total"), 0),
-                "supplier_name": "Alpha Trading LLC",
-                "items": [{
-                    "description": "Filter", "part_number": "", "brand": "",
-                    "unit": "", "quantity": 10, "unit_price": 120,
-                    "line_total": 1200, "lead_time": "",
-                }],
-            }
-            block = type("B", (), {
-                "type": "text", "text": ExtractedQuote(**payload).model_dump_json()
-            })()
-            usage = type("U", (), {
-                "input_tokens": 100, "output_tokens": 50, "cache_read_input_tokens": 0
-            })()
-            return type("R", (), {"content": [block], "usage": usage})()
+    text = "Quotation\nRef: 4471\nDate: 22/09/2026\nValidity: 30 days\n"
+    assert parse(Readable("text", "text/plain", "x.pdf", text=text)) is None
 
-    extractor._client = type("C", (), {"messages": FakeMessages()})()
+# ── what the model is not trusted to decide ───────────────────────────
 
-    quote = await extractor.read_with_model(
-        Readable("text", "application/pdf", "q.pdf", text="Alpha Trading LLC")
+
+def _modelled(**overrides):
+    from app.comparison.extraction import ExtractedItem, ExtractedQuote
+
+    fields = dict(
+        supplier_name="Redington", quote_number="", quote_date="", currency="",
+        validity="", delivery_time="", payment_terms="", warranty="", incoterms="",
+        contact="", discount=0, freight=0, tax=0, quoted_total=0, note="",
+        items=[
+            ExtractedItem(description="Pro Flex KB", part_number="Y8U-00015", brand="",
+                          unit="", quantity=0, unit_price=120.5, line_total=0, lead_time=""),
+            ExtractedItem(description="MS Pro CM EHS+", part_number="EP2-19400", brand="",
+                          unit="", quantity=0, unit_price=0, line_total=482.0, lead_time=""),
+        ],
     )
-
-    # Tried the guaranteed path first, then rescued it.
-    assert calls == ["parse", "create"]
-    assert quote.supplier_name == "Alpha Trading LLC"
-    assert quote.items[0].unit_price == 120
+    fields.update(overrides)
+    return ExtractedQuote(**fields)
 
 
-async def test_an_unrelated_400_is_not_retried() -> None:
-    """Only a grammar failure earns a second call. Everything else is reported."""
-    import anthropic
-    import httpx
+def test_a_model_reading_with_no_quantities_means_one_unit_each() -> None:
+    """The model follows "0 when not printed" to the letter and every line
+    multiplies to nothing. A quote with no quantities is one of each."""
+    from app.comparison.extraction import settle_model_reading
 
-    from app.comparison.extraction import ExtractionError, QuoteExtractor
+    quote = _modelled()
+    settled = settle_model_reading(quote, "Prices in $ per unit")
+
+    assert [i.quantity for i in quote.items] == [1, 1]
+    assert quote.items[0].line_total == 120.5
+    # A unit price of nothing beside a line total is the total divided out.
+    assert quote.items[1].unit_price == 482.0
+    assert "quantity" in settled and "unit price" in settled
+    assert "one unit" in quote.note
+
+
+def test_a_blank_currency_is_read_off_the_documents_symbols() -> None:
+    from app.comparison.extraction import settle_model_reading
+
+    quote = _modelled(currency="")
+    settle_model_reading(quote, "Total $ 1,200.00 excl. VAT")
+    assert quote.currency == "USD"
+    assert "USD" in quote.note
+
+    stated = _modelled(currency="EUR")
+    settle_model_reading(stated, "Total $ 1,200.00")
+    assert stated.currency == "EUR"
+
+
+async def test_the_model_pass_settles_what_it_read() -> None:
+    """End to end through the extractor: a stub model answers like the real
+    one did — quantities 0, currency blank — and the quote comes out priced."""
+    from app.comparison.documents import Readable
+    from app.comparison.extraction import JSON_SHAPE, QuoteExtractor
     from app.core.config import get_settings
 
-    settings = get_settings().model_copy()
-    settings.anthropic_api_key = "sk-ant-test"
-    extractor = QuoteExtractor(settings)
-    calls: list[str] = []
+    class StubModel:
+        configured = True
 
-    class FakeMessages:
-        async def parse(self, **kwargs):
-            calls.append("parse")
-            raise anthropic.BadRequestError(
-                "anthropic-workspace-id is required",
-                response=httpx.Response(400, request=httpx.Request("POST", "http://x")),
-                body={"error": {"message": "anthropic-workspace-id is required"}},
+        async def extract(self, *, instructions, text, shape, max_tokens=4000):
+            assert shape is JSON_SHAPE and "1 when the quote prints none" in instructions
+            return (
+                {
+                    "supplier_name": "Redington", "quote_number": "", "quote_date": "",
+                    "currency": "", "validity": "", "delivery_time": "", "payment_terms": "",
+                    "warranty": "", "incoterms": "", "contact": "", "discount": 0,
+                    "freight": 0, "tax": 0, "quoted_total": 0,
+                    "items": [
+                        {"description": "Pro Flex KB", "part_number": "Y8U-00015", "brand": "",
+                         "unit": "", "quantity": 0, "unit_price": 120.5, "line_total": 0,
+                         "lead_time": ""},
+                    ],
+                    "note": "Currency inferred from $ as USD.",
+                },
+                "stub:model",
             )
 
-        async def create(self, **kwargs):  # pragma: no cover - must not run
-            calls.append("create")
+    extractor = QuoteExtractor(get_settings(), model=StubModel())
+    readable = Readable("text", "text/plain", "redington.pdf",
+                        text="RE: RFQ-9033\nPro Flex KB Y8U-00015 $120.50\n")
+    quote = await extractor.read(readable)
 
-    extractor._client = type("C", (), {"messages": FakeMessages()})()
-
-    with pytest.raises(ExtractionError, match="identity-linked"):
-        await extractor.read_with_model(
-            Readable("text", "application/pdf", "q.pdf", text="x")
-        )
-    assert calls == ["parse"]
+    assert quote.currency == "USD"
+    assert quote.items[0].quantity == 1
+    assert quote.items[0].line_total == 120.5
+    assert quote.note.startswith("Read by a model (stub:model)")

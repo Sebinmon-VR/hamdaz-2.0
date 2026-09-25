@@ -53,6 +53,9 @@ def request_with(**overrides) -> QuoteRequest:
         "cash_exposure_days": 0,
         "discloses_principal_price": False,
         "multiple_supplier_quotes": False,
+        "discount": Decimal(0),
+        "shipping_charge": Decimal(0),
+        "adjustment": Decimal(0),
         **overrides,
     }
     request = QuoteRequest(**fields)
@@ -248,28 +251,50 @@ def test_no_priced_lines_says_so_rather_than_dividing_by_nothing():
 # ── the ladder ─────────────────────────────────────────────────────────
 
 
-def test_the_ladder_carries_the_bids_own_markup_in_its_place(cloth):
+def test_the_ladder_carries_the_bids_own_margin_in_its_place(cloth):
     cloth.target_markup_percent = Decimal("27")
     ladder = bidpack.scenarios(bidpack.landed_cost(cloth), Decimal("27"))
-    rungs = [s.markup_percent for s in ladder]
+    rungs = [s.margin_percent for s in ladder]
 
     assert Decimal("27.00") in rungs
     assert rungs == sorted(rungs)
     assert sum(1 for s in ladder if s.is_target) == 1
 
 
-def test_markup_and_margin_are_not_the_same_number(cloth):
-    """A 45% markup is a 31% margin, and quoting one as the other underprices."""
-    target = next(
-        s for s in bidpack.scenarios(bidpack.landed_cost(cloth), Decimal("45")) if s.is_target
-    )
+def test_a_rung_is_a_margin_and_says_what_markup_it_amounts_to(cloth):
+    """Price = landed ÷ (1 − margin). A 45% margin is an 82% markup on cost,
+    and the rung states both so nobody reads one as the other."""
+    landed = bidpack.landed_cost(cloth)
+    target = next(s for s in bidpack.scenarios(landed, Decimal("45")) if s.is_target)
 
-    assert target.markup_percent == Decimal("45.00")
-    assert target.margin_percent == Decimal("31.03")
-    assert target.unit_sell == Decimal("3013.96")
+    assert target.margin_percent == Decimal("45.00")
+    assert target.markup_percent == Decimal("81.82")
+    assert target.total_sell == (landed.total / Decimal("0.55")).quantize(Decimal("0.01"))
+    assert target.unit_sell == (landed.per_unit / Decimal("0.55")).quantize(Decimal("0.01"))
+    # And 45% of what the customer pays is what is kept.
+    assert ((target.total_sell - landed.total) / target.total_sell * 100).quantize(
+        Decimal("0.1")
+    ) == Decimal("45.0")
 
 
-def test_a_markup_of_nothing_prices_the_bid_at_cost(cloth):
+def test_the_bids_margin_is_measured_on_the_price_like_the_lines():
+    """A quote priced at a 20% margin, with nothing landed beyond the goods,
+    reads 20% here — not the 25% it is as a markup on cost."""
+    request = request_with()
+    request.items = [
+        QuoteRequestItem(
+            position=0, name="Goods", quantity=Decimal(2),
+            cost_rate=Decimal("1000"), rate=Decimal("1250"), discount=Decimal(0),
+        )
+    ]
+    pack = bidpack.build(request)
+
+    assert pack.landed.total == Decimal("2000.00")
+    assert pack.gross_margin == Decimal("500.00")
+    assert pack.gross_margin_percent == Decimal("20.00")
+
+
+def test_a_margin_of_nothing_prices_the_bid_at_cost(cloth):
     landed = bidpack.landed_cost(cloth)
     at_cost = bidpack._scenario(landed, Decimal(0), target=True)
 

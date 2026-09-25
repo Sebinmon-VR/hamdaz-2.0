@@ -292,12 +292,12 @@ def _summary(ws: Worksheet, request: QuoteRequest, pack: BidPack) -> None:
     row = _fact(
         ws,
         row,
-        "Recommended markup",
+        "Recommended margin",
         request.target_markup_percent,
         width=width,
         number_format=PCT,
         editable=True,
-        note="On landed cost. Not the same number as the margin.",
+        note="Share of the selling price: price = landed cost ÷ (1 − margin).",
     )
     row = _fact(
         ws,
@@ -308,9 +308,9 @@ def _summary(ws: Worksheet, request: QuoteRequest, pack: BidPack) -> None:
         number_format=MONEY,
         bold=True,
         note=(
-            "Suggested by the markup above — no price has been decided."
+            "Suggested by the margin above — no price has been decided."
             if pack.bid_total_is_suggested
-            else f"Margin {pack.gross_margin_percent}% on the landed cost, before tax."
+            else f"Margin {pack.gross_margin_percent}% of the price, before tax."
         ),
     )
     if pack.bid_unit_price is not None:
@@ -519,7 +519,7 @@ def _landed(ws: Worksheet, request: QuoteRequest, pack: BidPack) -> None:
     row = _fact(
         ws,
         row,
-        "Markup on landed cost",
+        "Margin on the bid",
         request.target_markup_percent,
         width=width,
         number_format=PCT,
@@ -643,7 +643,7 @@ def _costing(ws: Worksheet, request: QuoteRequest, pack: BidPack) -> None:
         ws,
         row,
         [
-            "", "Gross margin, on the landed cost, before tax", "", "", "", "",
+            "", "Gross margin after landed cost, a share of the price, before tax", "", "", "", "",
             pack.gross_margin_percent,
         ],
         formats={7: PCT},
@@ -670,25 +670,25 @@ def _costing(ws: Worksheet, request: QuoteRequest, pack: BidPack) -> None:
         width=width,
         number_format=MONEY,
         bold=True,
-        note="Suggested by the markup — no price decided."
+        note="Suggested by the margin — no price decided."
         if pack.bid_total_is_suggested
         else "",
     )
     row += 1
 
-    row = _band(ws, row, width, "Markup sensitivity")
+    row = _band(ws, row, width, "Margin sensitivity")
     row = _header_row(
-        ws, row, ["Markup", "Unit sell", "Total sell", "Margin", "", "", "Comment"]
+        ws, row, ["Margin", "Unit sell", "Total sell", "Markup on cost", "", "", "Comment"]
     )
     for scenario in pack.scenarios:
         row = _row(
             ws,
             row,
             [
-                scenario.markup_percent,
+                scenario.margin_percent,
                 scenario.unit_sell,
                 scenario.total_sell,
-                scenario.margin_percent,
+                scenario.markup_percent,
                 "",
                 "",
                 "THIS BID" if scenario.is_target else "",

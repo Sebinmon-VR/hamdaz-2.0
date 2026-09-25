@@ -97,6 +97,10 @@ class IntakeAction(StrEnum):
     #: something outside this system now knows.
     MARKED_NEGOTIATION = "marked_negotiation"
     ORDER_NOTICE = "order_notice"
+    #: The matched task's ``OrderStatus`` column was set — the column the team
+    #: keeps by hand to say a purchase order came in. As with the negotiation
+    #: mark, something outside this system now knows.
+    MARKED_ORDER = "marked_order"
     #: Matched something, and the message added nothing worth telling anybody.
     DUPLICATE = "duplicate"
 
@@ -108,7 +112,9 @@ class IntakeSettings(Base, Timestamped):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
 
-    #: The master switch. Off means the loops do not run at all.
+    #: The master switch. Off means the loops do not run at all. Turning it on
+    #: starts from that moment — see ``service.start_from_now`` — so a week
+    #: off is not a week of mail run through on the first poll.
     enabled: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default=text("false"), nullable=False
     )
@@ -154,6 +160,19 @@ class IntakeSettings(Base, Timestamped):
     #: the list's business and can be changed without touching this code.
     negotiation_value: Mapped[str] = mapped_column(
         String(60), default="Yes", server_default=text("'Yes'"), nullable=False
+    )
+    #: The third write, and the third switch. When a purchase order arrives for
+    #: a task, set that task's ``OrderStatus`` column — the one the team already
+    #: fills in by hand to say an order came in, and the one a report or a flow
+    #: reads for it. Off, the pipeline still finds the task and tells whoever
+    #: holds it; only the column is left alone.
+    update_order_status: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
+    )
+    #: What to write there. The list's choices are the list's business — today
+    #: it offers Received and Awaited — so this is a setting, not a constant.
+    order_status_value: Mapped[str] = mapped_column(
+        String(80), default="Received", server_default=text("'Received'"), nullable=False
     )
     #: Which team's ranking decides who a new task goes to. Presales, normally.
     assign_team_id: Mapped[uuid.UUID | None] = mapped_column(

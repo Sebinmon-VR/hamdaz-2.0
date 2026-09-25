@@ -358,7 +358,7 @@ class Worker:
         for raw in messages:
             if raw.get("isDraft"):
                 continue
-            row = await intake_service.record(session, raw)
+            row = await intake_service.record(session, raw, not_before=intake.watch_from)
             if row is None:
                 continue
             fresh += 1
@@ -407,7 +407,7 @@ class Worker:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("could not read message %s: %s", message_id, exc)
                 return
-            row = await intake_service.record(session, raw)
+            row = await intake_service.record(session, raw, not_before=intake.watch_from)
             if row is None:
                 await session.commit()
                 return

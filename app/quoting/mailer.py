@@ -18,11 +18,13 @@ from __future__ import annotations
 
 import logging
 from decimal import Decimal
-from typing import Any, Final
+from typing import Any
 
 from app.core.mail import Attachment, GraphMailer
 from app.models.quoting import QuoteComment, QuoteRequest, QuoteReview
-from app.quoting import workbook
+from app.quoting import report_pdf, workbook
+from app.quoting.report import CostingReport
+from app.quoting.report_pdf import PDF_TYPE
 from app.quoting.workbook import XLSX_TYPE
 
 
@@ -46,16 +48,42 @@ def _subject(request: QuoteRequest) -> str:
     return f"Quote approval needed — {what} — {request.customer_name}"
 
 
-def _body(request: QuoteRequest, link: str) -> str:
+def _figure(figure, report: CostingReport) -> str:
+    text = f"{report.currency} {figure.amount:,.2f}"
+    if figure.base is not None:
+        text += f" / {report.base_currency} {figure.base:,.2f}"
+    return text
+
+
+def _body(request: QuoteRequest, link: str, report: CostingReport | None = None) -> str:
     who = request.created_by.display_name if request.created_by else "Somebody"
     rows = [
         ("Customer", request.customer_name),
         ("Title", request.title),
-        ("Total", _money(request.total, request.currency)),
-        ("Lines", str(len(request.items))),
     ]
+    if report is not None:
+        # The four figures the attached report leads with, so an approver on a
+        # phone has the answer before opening anything.
+        margin = _figure(report.gross_margin, report)
+        if report.gross_margin_percent is not None:
+            margin += f" ({report.gross_margin_percent:.1f}% of the selling price)"
+        rows += [
+            ("Quoted price (ex-VAT)", _figure(report.quoted_price, report)),
+            ("Total landed cost", _figure(report.landed_total, report)),
+            ("Gross margin", margin),
+            (
+                f"Walk-away ({report.walk_away_margin_percent:.0f}% margin)",
+                _figure(report.walk_away_price, report),
+            ),
+            ("Total incl. tax", _figure(report.total_incl_tax, report)),
+        ]
+        if report.supplier.name:
+            rows.append(("Supplier", report.supplier.name))
+    else:
+        rows.append(("Total", _money(request.total, request.currency)))
+    rows.append(("Lines", str(len(request.items))))
     supplier = _supplier_name(request)
-    if supplier:
+    if supplier and not (report and report.supplier.name):
         rows.append(("Priced from", supplier))
     if request.win_probability is not None:
         # The probability travels with the count it came from, here as
@@ -139,26 +167,49 @@ class QuoteMailer(GraphMailer):
     """Every message a quote sends, each one from the person who caused it."""
 
     async def send_for_approval(
-        self, request: QuoteRequest, recipients: list[str], *, link: str
+        self,
+        request: QuoteRequest,
+        recipients: list[str],
+        *,
+        link: str,
+        report: CostingReport | None = None,
     ) -> dict[str, Any]:
         """Tell the approvers a quote is waiting, with a way straight to it.
 
-        The bid pack goes with it as a workbook. Approvers read mail on phones
-        and between meetings, and a link that needs a sign-in is a decision
-        deferred; the attachment is the whole bid — compliance, landed cost,
-        margin ladder and the portal answers — readable without logging in
-        anywhere. The link is still the thing to act on, and the mail says so.
+        The selling & costing report goes with it as a PDF — what we are
+        charging, what it costs landed, what that leaves, and how far a
+        discount can go — and its four headline figures are in the body.
+        Approvers read mail on phones and between meetings, and a link that
+        needs a sign-in is a decision deferred; the attachment is the whole
+        case, readable without logging in anywhere. The link is still the
+        thing to act on, and the mail says so.
 
-        Only for a quote that has a bid behind it. Attaching five sheets of
-        mostly-empty workbook to an ordinary estimate would be noise, so the
-        workbook is built only when there is a bid pack to put in it.
+        On a bid the workbook goes too, as it always has. On an ordinary
+        estimate five sheets of mostly-empty workbook would be noise, so it is
+        built only when there is a bid pack to put in it.
 
-        **Generating it never stops the mail.** If the workbook fails to build,
-        the approvers are still told — being notified matters more than the copy
-        they could have opened, and a quote silently waiting because a
-        spreadsheet would not render is the worse failure by a distance.
+        **Generating either never stops the mail.** If the report or the
+        workbook fails to build, the approvers are still told — being notified
+        matters more than the copy they could have opened, and a quote silently
+        waiting because a document would not render is the worse failure by a
+        distance.
         """
         attachments: list[Attachment] = []
+        if report is not None:
+            try:
+                attachments.append(
+                    Attachment(
+                        name=report_pdf.filename_for(request),
+                        content=report_pdf.render(report),
+                        content_type=PDF_TYPE,
+                    )
+                )
+            except Exception:  # noqa: BLE001 — see the docstring.
+                logger.exception(
+                    "costing report for quote %s could not be rendered; "
+                    "sending the approval mail without it",
+                    request.id,
+                )
         if _is_bid(request):
             try:
                 attachments.append(
@@ -179,7 +230,7 @@ class QuoteMailer(GraphMailer):
             sender=request.created_by.entra_object_id if request.created_by else "",
             recipients=recipients,
             subject=_subject(request),
-            html=_body(request, link),
+            html=_body(request, link, report),
             attachments=attachments or None,
         )
 

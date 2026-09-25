@@ -11,9 +11,18 @@ dependencies = { file = ["requirements.txt"] }
 [tool.setuptools.packages.find]
 include = ["app*"]
 
+[tool.setuptools.package-data]
+# The letterhead and the certification strip on the selling & costing report.
+"app.quoting" = ["assets/*.png"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "UP", "B", "SIM", "ASYNC"]
+
+[tool.ruff.lint.per-file-ignores]
+# Route tests import the fixtures they use by name, and pytest hands them
+# back as parameters of the same name.
+"tests/*" = ["F811"]

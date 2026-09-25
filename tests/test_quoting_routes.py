@@ -213,6 +213,16 @@ class StubSharePoint:
         raise AssertionError("the quoting screen reads the mirror, not the list")
 
 
+class StubDrive:
+    """No drive configured, so nothing is filed. The database is the record
+    either way; the lifespan that wires the real one does not run here."""
+
+    enabled = False
+
+    async def try_file(self, **_):
+        return None
+
+
 class StubMailer(QuoteMailer):
     """Everything except the network.
 
@@ -226,11 +236,17 @@ class StubMailer(QuoteMailer):
         self.sent: list[dict] = []
         self.fail: Exception | None = None
 
-    async def send(self, *, sender, recipients, subject, html):
+    async def send(self, *, sender, recipients, subject, html, attachments=None):
         if self.fail is not None:
             raise self.fail
         self.sent.append(
-            {"sender": sender, "recipients": recipients, "subject": subject, "html": html}
+            {
+                "sender": sender,
+                "recipients": recipients,
+                "subject": subject,
+                "html": html,
+                "attachments": [a.name for a in attachments or []],
+            }
         )
         return {"sent": True, "recipients": recipients}
 
@@ -243,6 +259,7 @@ def quoting(client):
     client._transport.app.state.quote_extractor = StubExtractor()
     client._transport.app.state.sharepoint = StubSharePoint()
     client._transport.app.state.quote_mailer = StubMailer()
+    client._transport.app.state.quote_drive = StubDrive()
     return client
 
 
@@ -536,10 +553,15 @@ async def test_choosing_a_supplier_prices_the_quote_and_opens_approval(
     assert response.status_code == 200, response.text
     body = response.json()
     assert [i["name"] for i in body["items"]] == ["FortiGate 201G"]
-    # Their price is our cost, and the rate is that plus the margin.
+    # Their price is our cost, and the rate keeps 15% of itself: 11,000 ÷
+    # 0.85 = 12,941.18, to the whole dirham as Zoho prices an AED item.
     assert Decimal(body["items"][0]["cost_rate"]) == Decimal(11000)
-    assert Decimal(body["items"][0]["rate"]) == Decimal(12650)
-    assert Decimal(body["total"]) == Decimal(12650) * 2
+    assert Decimal(body["items"][0]["rate"]) == Decimal(12941)
+    # Choosing a supplier also puts the house VAT on every line, so the
+    # taxed total is the lines plus 5%; the figure before tax is the lines.
+    assert Decimal(body["total_excl_tax"]) == Decimal(12941) * 2
+    assert Decimal(body["tax_total"]) == Decimal(12941) * 2 * Decimal("0.05")
+    assert Decimal(body["total"]) == Decimal(12941) * 2 * Decimal("1.05")
     assert body["selected_supplier_quote_id"] == beta["quote_id"]
     assert body["may_submit"] is True
     assert body["submit_reason"] is None
@@ -732,7 +754,7 @@ async def test_a_negotiation_reopens_the_quote_with_the_approved_round_attached(
     assert len(body["revisions"]) == 1
     kept = body["revisions"][0]
     assert kept["outcome"] == "approve"
-    assert Decimal(kept["snapshot"]["items"][0]["rate"]) == Decimal(12650)
+    assert Decimal(kept["snapshot"]["items"][0]["rate"]) == Decimal(12941)
     assert kept["snapshot"]["win_probability"] is not None
     # And what the customer asked for, in the history beside it.
     assert body["reviews"][-1]["action"] == "negotiate"
@@ -892,6 +914,9 @@ async def test_submitting_mails_the_approvers_a_link_to_the_quote(
     # The link is the point of the message.
     assert f"/quote-requests/{quote_id}" in mail["html"]
     assert "AED 25,300.00" in mail["html"]
+    # The case goes with the ask: the selling & costing report, as a PDF.
+    assert any(name.endswith("Selling_and_Costing_Report.pdf") for name in mail["attachments"])
+    assert "Walk-away" in mail["html"]
     # And the quote records that it went.
     body = response.json()
     assert body["approvers_notified_at"] is not None

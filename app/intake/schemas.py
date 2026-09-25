@@ -24,6 +24,10 @@ class IntakeSettingsOut(BaseModel):
     #: is what a Power Automate flow watching the list triggers on.
     update_negotiation: bool
     negotiation_value: str
+    #: The third write: set the matched task's OrderStatus column when a
+    #: purchase order arrives. Its own switch; ships off.
+    update_order_status: bool
+    order_status_value: str
     assign_team_id: uuid.UUID | None
     match_threshold: float
     classify_threshold: float
@@ -53,6 +57,8 @@ class IntakeSettingsIn(BaseModel):
     create_in_sharepoint: bool | None = None
     update_negotiation: bool | None = None
     negotiation_value: str | None = Field(default=None, max_length=60)
+    update_order_status: bool | None = None
+    order_status_value: str | None = Field(default=None, max_length=80)
     assign_team_id: uuid.UUID | None = None
     match_threshold: float | None = Field(default=None, ge=0, le=1)
     classify_threshold: float | None = Field(default=None, ge=0, le=1)

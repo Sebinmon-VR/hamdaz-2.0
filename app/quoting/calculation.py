@@ -16,7 +16,7 @@ from decimal import ROUND_HALF_UP, Decimal
 
 from app.models.quoting import QuoteRequest
 from app.quoting.bidpack import BidPack
-from app.quoting.service import sell_step, supplier_prices
+from app.quoting.service import sell_at, sell_step, supplier_prices
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,12 +76,18 @@ def steps(request: QuoteRequest, pack: BidPack) -> list[Step]:  # noqa: C901
         rate = item.rate or Decimal(0)
         parts: list[str] = []
         source = sources.get(str(item.id))
-        markup = request.target_markup_percent
-        if source is not None and markup is not None and source[1] != cur:
-            # Zoho's order, spelled out: mark up in their currency, round there
-            # the way Zoho's item price is rounded, then convert.
+        margin = request.target_markup_percent
+        if (
+            source is not None
+            and margin is not None
+            and margin < Decimal(100)
+            and source[1] != cur
+        ):
+            # Zoho's order, spelled out: price in their currency — cost ÷
+            # (1 − margin) — round there the way Zoho's item price is rounded,
+            # then convert.
             unit, theirs = source
-            raw = unit * (Decimal(1) + markup / Decimal(100))
+            raw = sell_at(unit, margin)
             step = sell_step(theirs)
             rounded = raw.quantize(step, rounding=ROUND_HALF_UP)
             rounding = (
@@ -89,7 +95,7 @@ def steps(request: QuoteRequest, pack: BidPack) -> list[Step]:  # noqa: C901
                 if step == Decimal(1) and rounded != raw else ""
             )
             parts.append(
-                f"{theirs} {_n(unit)} + {_n(markup)}% = {_n(raw)}{rounding}"
+                f"{theirs} {_n(unit)} ÷ (1 − {_n(margin)}% margin) = {_n(raw)}{rounding}"
                 f" ÷ {fx if fx else '?'} = {_price(rate)} each"
             )
         elif item.cost_rate is not None and item.cost_rate > 0:
@@ -99,16 +105,29 @@ def steps(request: QuoteRequest, pack: BidPack) -> list[Step]:  # noqa: C901
             parts.append(f"cost {_price(item.cost_rate)}")
             if converting:
                 parts.append(f"({foreign} ÷ {fx})")
-            # The markup the bid is built at, where one is set; the selling rate
+            # The line's share of the landing costs: freight, insurance, duty
+            # and bank charges, in proportion to what it cost. The price is
+            # built on this, so the margin typed is the gross margin.
+            landed_each = item.cost_rate
+            uplift = pack.landed.uplift
+            if uplift != 1:
+                landed_each = item.cost_rate * uplift
+                parts.append(
+                    f"× {_n(uplift, 4)} (landed cost ÷ goods) = {_n(landed_each)} landed"
+                )
+            # The margin the bid is built at, where one is set; the selling rate
             # is rounded to the cent afterwards, so the implied figure would read
-            # 19.99% for a 20% markup.
+            # 19.99% for a 20% margin.
             if request.target_markup_percent is not None:
                 parts.append(
-                    f"+ {_n(request.target_markup_percent)}% = {_price(rate)} each, to the cent"
+                    f"÷ (1 − {_n(request.target_markup_percent)}% margin) = {_price(rate)} "
+                    f"each, to the cent"
                 )
+            elif rate > 0:
+                margin = (rate - landed_each) / rate * Decimal(100)
+                parts.append(f"÷ (1 − {_n(margin)}% margin) = {_price(rate)} each")
             else:
-                markup = (rate - item.cost_rate) / item.cost_rate * Decimal(100)
-                parts.append(f"+ {_n(markup)}% = {_price(rate)} each")
+                parts.append(f"= {_price(rate)} each")
         else:
             parts.append(f"{_price(rate)} each")
         parts.append(f"× {_qty(qty)}")
@@ -138,23 +157,22 @@ def steps(request: QuoteRequest, pack: BidPack) -> list[Step]:  # noqa: C901
     ))
 
     # ── the tax ─────────────────────────────────────────────────────
-    taxed = [i for i in request.items if i.tax_percentage]
-    for item in taxed:
-        pct = _n(item.tax_percentage, 3).rstrip("0").rstrip(".")
+    # Once, on the total before tax, rounded once: the discount is off and
+    # the shipping is on before the rate is applied, since the tax is on what
+    # the customer pays. Not per line, and not rounded per line.
+    tax_pct = request.tax_percentage or Decimal(0)
+    if tax_pct > 0:
+        pct = _n(tax_pct, 3).rstrip("0").rstrip(".")
         out.append(Step(
             "tax",
-            f"{item.tax_name or 'Tax'} on {item.name}",
-            f"{pct}% of {_n(item.line_total)}, rounded on the line as Zoho does",
-            item.tax_amount,
+            f"{request.tax_name or 'Tax'} {pct}%",
+            f"{pct}% of {_n(request.total_excl_tax)} (the total before tax), rounded "
+            f"once to the cent",
+            request.tax_total,
             cur,
         ))
-    out.append(Step(
-        "tax",
-        "Tax",
-        "The tax lines above, summed" if taxed else "No tax on any line",
-        request.tax_total,
-        cur,
-    ))
+    else:
+        out.append(Step("tax", "Tax", "No tax on this quote", request.tax_total, cur))
     out.append(Step(
         "tax",
         "Total incl. tax",
@@ -225,10 +243,12 @@ def steps(request: QuoteRequest, pack: BidPack) -> list[Step]:  # noqa: C901
             cur,
         ))
         if pack.gross_margin_percent is not None:
+            sale = request.total_excl_tax if request.items else pack.bid_total
             out.append(Step(
                 "bid",
                 "Margin",
-                f"{_n(pack.gross_margin)} ÷ {_n(landed.total)} landed cost × 100",
+                f"{_n(pack.gross_margin)} ÷ {_n(sale)} selling price × 100 — a share of "
+                f"the price, the way the lines are priced",
                 pack.gross_margin_percent,
                 None,
             ))

@@ -9,7 +9,7 @@ thank-you note.
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -17,7 +17,14 @@ import pytest
 
 from app.intake.classifier import Classification
 from app.intake.graph_mail import BODY_LIMIT, sender_allowed, summarise_message
-from app.intake.service import _mark_negotiation, _task_fields
+from app.intake.service import (
+    _mark_negotiation,
+    _mark_order,
+    _task_fields,
+    record,
+    update_settings,
+    within_watch,
+)
 from app.models.intake import (
     CREATING_CATEGORIES,
     IntakeAction,
@@ -290,6 +297,8 @@ def _settings(**kw) -> IntakeSettings:
     row = IntakeSettings(id=1)
     row.update_negotiation = kw.get("update_negotiation", False)
     row.negotiation_value = kw.get("negotiation_value", "Yes")
+    row.update_order_status = kw.get("update_order_status", False)
+    row.order_status_value = kw.get("order_status_value", "Received")
     return row
 
 
@@ -360,6 +369,210 @@ async def test_the_value_written_is_configurable(db_free_session) -> None:
         sharepoint=sharepoint,
     )
     assert sharepoint.updated == [("42", {"Negotiation": "In negotiation"})]
+
+
+# ── marking the task when an order arrives ─────────────────────────────
+#
+# A purchase order is the same shape as a negotiation: the task exists, the
+# holder is told, and the list's own column for it — OrderStatus — may be set.
+# The rules are shared with the negotiation mark and pinned again here because
+# the switch is a different one, and a switch that turned on the wrong write
+# would be the worst kind of wrong.
+
+
+async def test_an_order_writes_nothing_while_its_switch_is_off(db_free_session) -> None:
+    sharepoint = _FakeSharePoint()
+    row, item = _row(), _item(item_id="42")
+    action = await _mark_order(
+        db_free_session, row, item, intake=_settings(), sharepoint=sharepoint
+    )
+    assert sharepoint.updated == [], "nothing reached SharePoint"
+    assert row.would_update == {"item_id": "42", "fields": {"OrderStatus": "Received"}}
+    assert row.status == IntakeStatus.SIMULATED
+    assert action == IntakeAction.ORDER_NOTICE
+
+
+async def test_the_negotiation_switch_does_not_let_an_order_through(db_free_session) -> None:
+    """Three switches, three acts. Turning one on must not turn on another."""
+    sharepoint = _FakeSharePoint()
+    action = await _mark_order(
+        db_free_session, _row(), _item(item_id="42"),
+        intake=_settings(update_negotiation=True), sharepoint=sharepoint,
+    )
+    assert sharepoint.updated == []
+    assert action == IntakeAction.ORDER_NOTICE
+
+
+async def test_with_its_switch_on_the_order_status_is_set(db_free_session) -> None:
+    sharepoint = _FakeSharePoint()
+    row, item = _row(), _item(item_id="42")
+    action = await _mark_order(
+        db_free_session, row, item,
+        intake=_settings(update_order_status=True), sharepoint=sharepoint,
+    )
+    assert sharepoint.updated == [("42", {"OrderStatus": "Received"})]
+    assert action == IntakeAction.MARKED_ORDER
+    assert item.order_status == "Received", "kept locally so the next mail sees it"
+
+
+async def test_a_task_already_received_is_not_written_again(db_free_session) -> None:
+    """The order, its acknowledgement and the thread under it all classify as
+    an order. One write, not one per reply."""
+    sharepoint = _FakeSharePoint()
+    row, item = _row(), _item(item_id="42")
+    item.order_status = "received"  # whatever case the list happens to hold
+    action = await _mark_order(
+        db_free_session, row, item,
+        intake=_settings(update_order_status=True), sharepoint=sharepoint,
+    )
+    assert sharepoint.updated == []
+    assert action == IntakeAction.ORDER_NOTICE
+    assert "already" in (row.match_reason or "").lower()
+
+
+async def test_a_refused_order_write_still_leaves_the_notice(db_free_session) -> None:
+    sharepoint = _FakeSharePoint()
+    sharepoint.fail = True
+    row = _row()
+    action = await _mark_order(
+        db_free_session, row, _item(item_id="42"),
+        intake=_settings(update_order_status=True), sharepoint=sharepoint,
+    )
+    assert action == IntakeAction.ORDER_NOTICE
+    assert "Could not set OrderStatus" in (row.error or "")
+
+
+async def test_the_order_status_written_is_configurable(db_free_session) -> None:
+    """The list offers Received and Awaited today; tomorrow it may offer more."""
+    sharepoint = _FakeSharePoint()
+    await _mark_order(
+        db_free_session, _row(), _item(item_id="42"),
+        intake=_settings(update_order_status=True, order_status_value="Awaited"),
+        sharepoint=sharepoint,
+    )
+    assert sharepoint.updated == [("42", {"OrderStatus": "Awaited"})]
+
+
+# ── starting from now ──────────────────────────────────────────────────
+#
+# Switching the intake on means "from now", not "from wherever it got to".
+# A cursor kept from before, or a backlog recorded and never decided, would
+# otherwise run through on the first poll — a week off as a week of tasks.
+# The log is kept: it is the history, and only the backlog is set aside.
+
+
+class _SettingsSession:
+    """Enough of a session for the settings rules: hands back the one row,
+    and keeps what was executed against it so the sweep can be seen to happen."""
+
+    def __init__(self, row: IntakeSettings) -> None:
+        self.row = row
+        self.executed: list[Any] = []
+
+    async def get(self, model, key):
+        return self.row if model is IntakeSettings else None
+
+    async def flush(self) -> None:
+        return None
+
+    async def scalar(self, statement):
+        return None
+
+    def add(self, obj) -> None:
+        return None
+
+    async def execute(self, statement):
+        self.executed.append(statement)
+
+        class _Result:
+            rowcount = 3
+
+        return _Result()
+
+
+_OLD_MARK = datetime(2026, 9, 8, 12, 0, tzinfo=UTC)
+
+
+def _sql(statement: Any) -> str:
+    return " ".join(str(statement).split())
+
+
+def _running(**kw) -> IntakeSettings:
+    row = _settings()
+    row.enabled = kw.get("enabled", True)
+    row.mailbox = kw.get("mailbox", "tenders@hamdaz.com")
+    row.delta_link = "https://graph.microsoft.com/…/delta?$deltatoken=abc"
+    row.watch_from = _OLD_MARK
+    return row
+
+
+async def test_switching_on_starts_from_now() -> None:
+    row = _running(enabled=False)
+    session = _SettingsSession(row)
+    before = datetime.now(UTC)
+    await update_settings(session, actor_id=None, changes={"enabled": True})
+    assert row.delta_link is None, "the cursor from before is forgotten"
+    assert row.watch_from is not None and row.watch_from >= before
+    assert len(session.executed) == 1, "the backlog was set aside"
+    assert _sql(session.executed[0]).startswith("UPDATE intake_messages SET"), (
+        "set aside, not deleted — the log is the history"
+    )
+
+
+async def test_a_save_while_running_keeps_its_place() -> None:
+    """The settings screen sends every field on every save. Starting over on
+    each one dropped the cursor while it was running, which lost whatever
+    arrived between the last poll and the save."""
+    row = _running()
+    session = _SettingsSession(row)
+    await update_settings(
+        session, actor_id=None,
+        changes={"enabled": True, "mailbox": "tenders@hamdaz.com", "poll_seconds": 30},
+    )
+    assert row.delta_link is not None
+    assert row.watch_from == _OLD_MARK
+    assert session.executed == []
+    assert row.poll_seconds == 30, "the change that was asked for still happened"
+
+
+async def test_switching_off_leaves_the_cursor_alone() -> None:
+    row = _running()
+    session = _SettingsSession(row)
+    await update_settings(session, actor_id=None, changes={"enabled": False})
+    assert row.enabled is False
+    assert row.delta_link is not None
+    assert session.executed == []
+
+
+async def test_a_different_mailbox_starts_from_now() -> None:
+    row = _running()
+    session = _SettingsSession(row)
+    await update_settings(session, actor_id=None, changes={"mailbox": "Bids@Hamdaz.com"})
+    assert row.mailbox == "bids@hamdaz.com"
+    assert row.delta_link is None
+    assert row.watch_from > _OLD_MARK
+    assert len(session.executed) == 1
+    assert _sql(session.executed[0]).startswith("UPDATE intake_messages SET")
+
+
+def test_the_watch_mark_decides_what_is_recent() -> None:
+    mark = datetime(2026, 9, 23, 12, 0, tzinfo=UTC)
+    assert within_watch(None, mark) is True, "an undated message is kept, not dropped"
+    assert within_watch(mark, None) is True, "no mark means everything"
+    assert within_watch(mark - timedelta(seconds=1), mark) is False
+    assert within_watch(mark, mark) is True
+    assert within_watch(mark.replace(tzinfo=None), mark) is True, "naive is read as UTC"
+
+
+async def test_a_message_from_before_the_watch_is_not_recorded() -> None:
+    """Graph is asked not to send them; this is for when it does anyway."""
+    session = _SettingsSession(_settings())
+    mark = datetime(2026, 9, 23, 12, 0, tzinfo=UTC)
+    old = {"id": "m-old", "subject": "PO 1", "receivedDateTime": "2026-09-01T10:00:00Z"}
+    new = {"id": "m-new", "subject": "PO 2", "receivedDateTime": "2026-09-23T12:00:01Z"}
+    assert await record(session, old, not_before=mark) is None
+    kept = await record(session, new, not_before=mark)
+    assert kept is not None and kept.graph_message_id == "m-new"
 
 
 # ── which categories may raise work ────────────────────────────────────

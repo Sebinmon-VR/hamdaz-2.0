@@ -623,13 +623,17 @@ async def compare(step: StepContext) -> Any:
     ]
     priced = [s for s in suppliers if s.get("total") is not None]
     chosen = min(priced, key=lambda s: Decimal(str(s["total"]))) if priced else (suppliers[0] if suppliers else None)
-    markup = Decimal(str(step.config.get("markup_percent") or 0))
+    # A margin, as a share of the selling price — the same rule the quote
+    # module prices by. The config key keeps its name for the flows already
+    # saved with it. At 100% or more there is no price, so it prices at cost.
+    margin = Decimal(str(step.config.get("markup_percent") or 0))
+    share = (Decimal(100) - margin) if margin < Decimal(100) else Decimal(100)
     items: list[dict[str, Any]] = []
     if chosen is not None:
         row = next((q for q in comparison.quotes if str(q.id) == str(chosen["quote_id"])), None)
         for line in (row.items if row else []):
             cost = Decimal(line.unit_price or 0)
-            rate = (cost * (Decimal(100) + markup) / Decimal(100)).quantize(Decimal("0.01"))
+            rate = (cost * Decimal(100) / share).quantize(Decimal("0.01"))
             items.append(
                 {
                     "name": (line.description or "Item")[:500],

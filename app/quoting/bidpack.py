@@ -2,8 +2,8 @@
 
 Everything in here is **computed from the stored inputs and never stored**. The
 inputs are the supplier's prices, the freight and duty estimates somebody typed,
-the FX rate the bid is costed at and the markup the business wants. The outputs
-— the CIF value, the duty, the landed cost, the price at each markup, the uplift
+the FX rate the bid is costed at and the margin the business wants. The outputs
+— the CIF value, the duty, the landed cost, the price at each margin, the uplift
 the buyer will read off our bid against the principal's quotation — are all
 derived here, on read.
 
@@ -52,11 +52,13 @@ _ZERO = Decimal(0)
 #: counted in calendar days because that is how long the money is actually gone.
 _YEAR = Decimal(365)
 
-#: The ladder shown beside whatever markup the bid is actually built at, so the
+#: The ladder shown beside whatever margin the bid is actually built at, so the
 #: person deciding sees what the neighbouring positions are worth rather than
-#: having to ask for each one. The recommended markup is merged in, so a bid at
-#: 27% shows 27% in its place in the ladder rather than not at all.
-DEFAULT_MARKUP_LADDER: tuple[Decimal, ...] = (
+#: having to ask for each one. Margins, as shares of the selling price — the
+#: terms the report's walk-away line is in. The recommended margin is merged
+#: in, so a bid at 27% shows 27% in its place in the ladder rather than not at
+#: all.
+DEFAULT_MARGIN_LADDER: tuple[Decimal, ...] = (
     Decimal(15),
     Decimal(25),
     Decimal(35),
@@ -96,6 +98,21 @@ class CostElement:
     #: Present on stored rows only. Null on the derived goods, duty and
     #: financing rows, which have nothing to edit.
     id: str | None = None
+    #: Set on a stored row stated as a rate — "insurance, 1% of the goods".
+    #: The amount is then worked out here rather than read off the row.
+    percent: Decimal | None = None
+    percent_of: str | None = None
+
+
+def _rated(row, base: Decimal) -> Decimal | None:
+    """A row's amount when it is a rate over ``base``, else ``None``."""
+    if getattr(row, "percent", None) is None:
+        return None
+    return base * Decimal(str(row.percent)) / Decimal(100)
+
+
+def _rate_basis(row, what: str) -> str:
+    return f"{_percent(Decimal(str(row.percent)))}% of the {what}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +139,12 @@ class LandedCost:
     #: to. The rest is our estimate, and every point of it that comes in high
     #: comes out of the margin.
     firm_percent: Decimal
+    #: The landed cost per unit of goods cost — total ÷ goods, to eight
+    #: places; 1 when nothing is costed. A line's landed cost is its cost ×
+    #: this: freight, insurance, duty and the bank's cut shared out in
+    #: proportion to what each line cost. Selling prices are built on it, so
+    #: the margin typed is the margin kept after everything is paid.
+    uplift: Decimal
     #: The supplier's own quoted goods value — what the buyer sees if the RFP
     #: makes the principal's quotation a mandatory attachment.
     principal_value: Decimal
@@ -129,12 +152,17 @@ class LandedCost:
 
 @dataclass(frozen=True, slots=True)
 class MarkupScenario:
+    """The landed cost priced at one margin: ``landed ÷ (1 − margin)``."""
+
+    #: What that adds to the cost, as a share of the cost — the number a buyer
+    #: sees when they read our price against the supplier's. A 45% margin is
+    #: an 82% markup.
     markup_percent: Decimal
     unit_sell: Decimal | None
     total_sell: Decimal
-    #: The margin retained at this price, as a share of the selling price.
+    #: The rung: the margin kept, as a share of the selling price.
     margin_percent: Decimal
-    #: True on the markup the bid is actually being built at.
+    #: True on the margin the bid is actually being built at.
     is_target: bool
 
 
@@ -182,7 +210,7 @@ class BidPack:
 
     landed: LandedCost
     scenarios: list[MarkupScenario]
-    #: The scenario at the bid's own markup, when one is set.
+    #: The scenario at the bid's own margin, when one is set.
     target: MarkupScenario | None
     #: What is actually going in — the rounded price somebody decided, falling
     #: back to the target scenario when nobody has rounded anything yet.
@@ -284,8 +312,19 @@ def landed_cost(request: QuoteRequest) -> LandedCost:
     destination = [c for c in stored if c.stage == CostStage.DESTINATION]
     origin = [c for c in stored if c.stage != CostStage.DESTINATION]
 
+    # A row stated as a rate is worked out on the goods: everything before
+    # arrival is charged on what was bought, and the CIF value is not known
+    # until these rows are summed.
+    origin_amounts = {
+        id(row): (
+            rated if (rated := _rated(row, goods)) is not None else (row.amount_base or _ZERO)
+        )
+        for row in origin
+    }
+
     for row in origin:
         ref += 1
+        rated = getattr(row, "percent", None) is not None
         elements.append(
             CostElement(
                 ref=ref,
@@ -294,10 +333,10 @@ def landed_cost(request: QuoteRequest) -> LandedCost:
                 # put the customs boundary in the wrong place.
                 stage=CostStage.ORIGIN,
                 label=row.label,
-                basis=row.basis,
-                amount_source=row.amount_source,
-                source_currency=row.source_currency,
-                amount_base=_money(row.amount_base),
+                basis=_rate_basis(row, "supplier price") if rated else row.basis,
+                amount_source=None if rated else row.amount_source,
+                source_currency=None if rated else row.source_currency,
+                amount_base=_money(origin_amounts[id(row)]),
                 # Coerced rather than passed through. A column default is
                 # applied by the database at insert, so a row added in this
                 # session and not yet flushed reads ``None`` here — and the
@@ -308,10 +347,12 @@ def landed_cost(request: QuoteRequest) -> LandedCost:
                 computed=False,
                 notes=row.notes,
                 id=str(row.id),
+                percent=row.percent if rated else None,
+                percent_of="goods" if rated else None,
             )
         )
 
-    cif = goods + sum((c.amount_base or _ZERO for c in origin), _ZERO)
+    cif = goods + sum(origin_amounts.values(), _ZERO)
 
     # Duty, on the CIF value, because that is what customs charges it on.
     duty = cif * (request.customs_duty_percent or _ZERO) / Decimal(100)
@@ -365,28 +406,44 @@ def landed_cost(request: QuoteRequest) -> LandedCost:
             )
         )
 
+    # After arrival a rate may be over the goods or over the CIF value; the
+    # bank's cut is on what was paid, a clearance agent's on what arrived.
+    destination_amounts = {}
+    for row in destination:
+        on_cif = (getattr(row, "percent_of", None) or "goods") == "cif"
+        rated_amount = _rated(row, cif if on_cif else goods)
+        destination_amounts[id(row)] = (
+            rated_amount if rated_amount is not None else (row.amount_base or _ZERO)
+        )
+
     for row in destination:
         ref += 1
+        rated = getattr(row, "percent", None) is not None
+        on_cif = (getattr(row, "percent_of", None) or "goods") == "cif"
         elements.append(
             CostElement(
                 ref=ref,
                 stage=CostStage.DESTINATION,
                 label=row.label,
-                basis=row.basis,
-                amount_source=row.amount_source,
-                source_currency=row.source_currency,
-                amount_base=_money(row.amount_base),
+                basis=(
+                    _rate_basis(row, "CIF value" if on_cif else "supplier price")
+                    if rated
+                    else row.basis
+                ),
+                amount_source=None if rated else row.amount_source,
+                source_currency=None if rated else row.source_currency,
+                amount_base=_money(destination_amounts[id(row)]),
                 is_principal=bool(row.is_principal),
                 is_firm=bool(row.is_firm),
                 computed=False,
                 notes=row.notes,
                 id=str(row.id),
+                percent=row.percent if rated else None,
+                percent_of=("cif" if on_cif else "goods") if rated else None,
             )
         )
 
-    destination_total = (
-        duty + financing + sum((c.amount_base or _ZERO for c in destination), _ZERO)
-    )
+    destination_total = duty + financing + sum(destination_amounts.values(), _ZERO)
     total = cif + destination_total
 
     quantity, note = _bid_quantity(request)
@@ -411,6 +468,11 @@ def landed_cost(request: QuoteRequest) -> LandedCost:
         per_unit=per_unit,
         per_unit_note=note,
         firm_percent=_percent(firm / total * Decimal(100)) if total > 0 else _ZERO,
+        uplift=(
+            (total / goods).quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP)
+            if goods > 0 and total > 0
+            else Decimal(1)
+        ),
         principal_value=_money(principal),
     )
 
@@ -418,36 +480,45 @@ def landed_cost(request: QuoteRequest) -> LandedCost:
 # ── what to charge for it ──────────────────────────────────────────────
 
 
-def _scenario(landed: LandedCost, markup: Decimal, *, target: bool) -> MarkupScenario:
-    factor = Decimal(1) + markup / Decimal(100)
+def _scenario(landed: LandedCost, margin: Decimal, *, target: bool) -> MarkupScenario:
+    """The landed cost priced to keep ``margin`` percent of the price.
+
+    Selling price = cost ÷ (1 − margin): a margin is a share of what the
+    customer pays, so a 20% margin on 100 is 125, not 120. A margin of 100%
+    or more has no price; the ladder never holds one, and a bid typed at one
+    is refused before it gets here, so it is simply priced at cost.
+    """
+    share = Decimal(1) - margin / Decimal(100)
+    factor = Decimal(1) / share if share > 0 else Decimal(1)
     total = landed.total * factor
     return MarkupScenario(
-        markup_percent=_percent(markup),
+        # What was added, as a share of the cost. A buyer who is shown the
+        # supplier's quotation reads our price against it and sees this
+        # number, so it is stated rather than left to be worked out wrong.
+        markup_percent=(
+            _percent((total - landed.total) / landed.total * Decimal(100))
+            if landed.total > 0
+            else _ZERO
+        ),
         unit_sell=(
             (landed.per_unit * factor).quantize(_MONEY, rounding=ROUND_HALF_UP)
             if landed.per_unit is not None
             else None
         ),
         total_sell=_money(total),
-        # Margin as a share of the selling price, which is what "margin" means
-        # to everyone except the person who applied the markup. A 45% markup is
-        # a 31% margin, and quoting the first as the second is how a bid ends up
-        # cheaper than anybody intended.
-        margin_percent=(
-            _percent((total - landed.total) / total * Decimal(100)) if total > 0 else _ZERO
-        ),
+        margin_percent=_percent(margin),
         is_target=target,
     )
 
 
-def scenarios(landed: LandedCost, target_markup: Decimal | None) -> list[MarkupScenario]:
-    """The ladder, with the bid's own markup merged into its place."""
-    rungs = {_percent(m) for m in DEFAULT_MARKUP_LADDER}
-    if target_markup is not None:
-        rungs.add(_percent(target_markup))
-    wanted = _percent(target_markup) if target_markup is not None else None
+def scenarios(landed: LandedCost, target_margin: Decimal | None) -> list[MarkupScenario]:
+    """The ladder, with the bid's own margin merged into its place."""
+    rungs = {_percent(m) for m in DEFAULT_MARGIN_LADDER}
+    if target_margin is not None and target_margin < Decimal(100):
+        rungs.add(_percent(target_margin))
+    wanted = _percent(target_margin) if target_margin is not None else None
     return [
-        _scenario(landed, markup, target=markup == wanted) for markup in sorted(rungs)
+        _scenario(landed, margin, target=margin == wanted) for margin in sorted(rungs)
     ]
 
 
@@ -600,9 +671,10 @@ def build(request: QuoteRequest) -> BidPack:
     if unit is None and landed.quantity and landed.quantity > 0:
         unit = (bid_total / landed.quantity).quantize(_MONEY, rounding=ROUND_HALF_UP)
 
-    # The margin, measured the way the lines measure it: what is made over the
-    # landed cost, as a share of that cost, before tax. A 20% markup on every
-    # line reads as 20% here. It was measured on the taxed selling price, so
+    # The margin, measured the way the lines are priced: what is made over the
+    # landed cost, as a share of the selling price, before tax. A quote priced
+    # at a 20% margin on every line, with nothing landed beyond the goods,
+    # reads as 20% here. It was measured on the taxed selling price once, so
     # the same quote read 20.63% — which is neither what anyone typed nor a
     # figure anyone could reconcile. Tax is collected, not earned.
     sale = _money(request.total_excl_tax) if request.items else bid_total
@@ -616,7 +688,7 @@ def build(request: QuoteRequest) -> BidPack:
         bid_total_is_suggested=suggested_only,
         gross_margin=_money(margin),
         gross_margin_percent=(
-            _percent(margin / landed.total * Decimal(100)) if landed.total > 0 else None
+            _percent(margin / sale * Decimal(100)) if landed.total > 0 and sale > 0 else None
         ),
         disclosure=disclosure(
             landed, bid_total, disclosed=request.discloses_principal_price

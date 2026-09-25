@@ -254,7 +254,12 @@ BLOCKS: Final[tuple[Block, ...]] = (
         "keeps the comparison. With one reply there is nothing to compare and "
         "that one is taken.",
         (
-            ConfigField("markup_percent", "Mark up the chosen prices by (%)", "number", default=0),
+            ConfigField(
+                "markup_percent",
+                "Margin on the chosen prices (%) — a share of the selling price",
+                "number",
+                default=0,
+            ),
             _SAVE_AS,
         ),
     ),

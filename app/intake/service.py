@@ -9,7 +9,9 @@ do the one thing that follows:
   mail says it has reopened, tell whoever holds it; otherwise it is a duplicate
   and nobody needs waking;
 * a **negotiation or order** always concerns work that exists. Never raise a
-  task; find the row, find who holds it, tell them;
+  task; find the row, find who holds it, tell them — and, where a super admin
+  has switched it on, mark the row's own column (``Negotiation``,
+  ``OrderStatus``) so the list says what the mail said;
 * **general** is a circular. Record it and leave it.
 
 Two things are worth stating plainly.
@@ -34,7 +36,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import httpx
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.analytics import live as live_scores
@@ -85,25 +87,70 @@ def _clean_list(values: list[str] | None) -> list[str]:
     return out
 
 
+async def start_from_now(
+    session: AsyncSession, row: IntakeSettings, *, because: str
+) -> int:
+    """Make the next poll begin at this moment, with nothing carried over.
+
+    Called when the intake is switched on and when the mailbox changes — the
+    two moments a person means "from now" rather than "from wherever it got
+    to". Three things carry a past into the present, and all three go:
+
+    * the delta cursor, which would otherwise hand over everything since the
+      last poll — weeks of mail, if it was off for weeks;
+    * the watch mark, which the first cursorless poll filters on, so Graph is
+      not even asked for anything older;
+    * the backlog — messages recorded but never taken to a decision, usually
+      because the model or the loop failed mid-run. Marked ignored with the
+      reason, so the next poll does not run them through as if they had just
+      arrived.
+
+    The log itself is kept. It is the history, and a person switching the
+    intake back on after fixing a setting expects last week's decisions to
+    still be there. (The one-off clear before the first live run was a data
+    migration, done once and written down there.) Returns how many backlog
+    rows were set aside.
+    """
+    now = datetime.now(UTC)
+    row.delta_link = None
+    row.watch_from = now
+    swept = await session.execute(
+        update(IntakeMessage)
+        .where(IntakeMessage.status == IntakeStatus.RECEIVED)
+        .values(
+            status=IntakeStatus.IGNORED,
+            action=IntakeAction.NONE,
+            reasoning=f"Set aside when {because}: recorded earlier and never looked at.",
+            processed_at=now,
+        )
+    )
+    return int(getattr(swept, "rowcount", 0) or 0)
+
+
 async def update_settings(
     session: AsyncSession, *, actor_id: uuid.UUID | None, changes: dict[str, Any]
 ) -> IntakeSettings:
     """Change what is watched and what may happen. Only the keys given change."""
     row = await get_settings(session)
+    was_on = bool(row.enabled)
+    fresh_start: str | None = None
 
     for field in (
         "enabled", "create_in_sharepoint", "update_negotiation",
-        "notify_in_app", "notify_teams",
+        "update_order_status", "notify_in_app", "notify_teams",
     ):
         if changes.get(field) is not None:
             setattr(row, field, bool(changes[field]))
 
     if (mailbox := changes.get("mailbox")) is not None:
-        row.mailbox = str(mailbox).strip().lower()
-        # A new mailbox starts from now. Replaying somebody's inbox from the
-        # beginning would, with creation on, mean a year of tasks.
-        row.delta_link = None
-        row.watch_from = datetime.now(UTC)
+        wanted = str(mailbox).strip().lower()
+        # Only a *change* of mailbox starts over. The settings screen sends
+        # every field on every save, and starting over on each one dropped
+        # the cursor while it was running — which lost whatever arrived
+        # between the last poll and the save.
+        if wanted != (row.mailbox or ""):
+            row.mailbox = wanted
+            fresh_start = "the mailbox changed"
     if "allowed_senders" in changes:
         row.allowed_senders = _clean_list(changes["allowed_senders"])
     if "allowed_domains" in changes:
@@ -120,6 +167,8 @@ async def update_settings(
         row.allowed_domains = wanted
     if (value := changes.get("negotiation_value")) is not None:
         row.negotiation_value = str(value).strip() or "Yes"
+    if (value := changes.get("order_status_value")) is not None:
+        row.order_status_value = str(value).strip() or "Received"
     if "teams_webhook_url" in changes:
         url = (changes["teams_webhook_url"] or "").strip()
         row.teams_webhook_url = url or None
@@ -136,6 +185,14 @@ async def update_settings(
     if changes.get("poll_seconds") is not None:
         row.poll_seconds = max(15, int(changes["poll_seconds"]))
 
+    # Switching on starts from now. Whatever arrived while it was off — and
+    # whatever it recorded before and never got to — is not run through on
+    # the first poll; a week off must not become a week of tasks at once.
+    if row.enabled and not was_on:
+        fresh_start = "the intake was switched on"
+    if fresh_start:
+        await start_from_now(session, row, because=fresh_start)
+
     row.updated_by_id = actor_id
     await session.flush()
     return row
@@ -144,15 +201,41 @@ async def update_settings(
 # ── recording what arrived ─────────────────────────────────────────────
 
 
-async def record(session: AsyncSession, raw: dict[str, Any]) -> IntakeMessage | None:
+def within_watch(received_at: datetime | None, watch_from: datetime | None) -> bool:
+    """Whether a message is recent enough to be the intake's business.
+
+    No watch mark means everything is. No date on the message means it is
+    given the benefit of the doubt and recorded, because the alternative is
+    silently dropping mail Graph did not date — and the log exists so that
+    nothing is dropped silently.
+    """
+    if watch_from is None or received_at is None:
+        return True
+    if received_at.tzinfo is None:
+        received_at = received_at.replace(tzinfo=UTC)
+    if watch_from.tzinfo is None:
+        watch_from = watch_from.replace(tzinfo=UTC)
+    return received_at >= watch_from
+
+
+async def record(
+    session: AsyncSession, raw: dict[str, Any], *, not_before: datetime | None = None
+) -> IntakeMessage | None:
     """Store one message if it is new. ``None`` when we have seen it.
 
     Graph will deliver the same message twice — a notification and a poll
     racing, or a webhook retried. Returning None on the second is what keeps
     that from becoming two tasks.
+
+    ``not_before`` is the watch mark. A message received before it is not the
+    intake's business: Graph is asked not to send those, and this is the
+    check for when something does anyway — a cursor kept from before the
+    watch moved, or a notification for an old message.
     """
     summary = summarise_message(raw)
     if not summary["graph_message_id"]:
+        return None
+    if not within_watch(summary["received_at"], not_before):
         return None
     seen = await session.scalar(
         select(IntakeMessage).where(
@@ -365,6 +448,72 @@ async def _process(
     )
 
 
+async def _mark_column(
+    session: AsyncSession,
+    row: IntakeMessage,
+    item: ProposalIndexItem,
+    *,
+    sharepoint: SharePointProposals,
+    column: str,
+    attribute: str,
+    wanted: str,
+    switched_on: bool,
+    notice: str,
+    marked: str,
+) -> str:
+    """Set one column on the matched task, if allowed, and say what happened.
+
+    The one mechanism behind both marks the intake makes on a row that already
+    exists — ``Negotiation`` for a price coming back, ``OrderStatus`` for a
+    purchase order. They differ only in which column, what goes in it, and
+    which switch guards it, so they share the rules:
+
+    **The payload is recorded first, whatever happens next.** ``would_update``
+    is filled before the switch is looked at, so a super admin reading the row
+    with writing off sees exactly the change that would have been made.
+
+    **Skipped when the column already says so.** Both kinds of mail arrive as
+    threads and this runs per message: re-writing the same value on every
+    reply would bump the row's Modified on every reply and re-fire any flow
+    watching the column. The cost is that a second round on the same task does
+    not raise a second trigger — worth knowing, and the thing to change if that
+    turns out to be the wrong trade.
+
+    **Never raises.** Failing to mark the column must not lose the notification
+    that goes with it; the failure lands on the row instead.
+
+    ``attribute`` is the mirror's name for the column, kept current locally
+    after a write so the next mail in the thread sees the new value without
+    waiting for the next sync. Returns the action to record: ``marked`` when
+    the column was written, ``notice`` in every other case.
+    """
+    fields = {column: wanted}
+    row.would_update = {"item_id": item.item_id, "fields": fields}
+
+    if (getattr(item, attribute) or "").strip().casefold() == wanted.casefold():
+        row.match_reason = (
+            f"{row.match_reason or ''} ({column} already {wanted}; not written again)"
+        ).strip()
+        return notice
+
+    if not switched_on:
+        # The switch, off. Everything is decided and the payload is on the row;
+        # only the write is missing.
+        row.status = IntakeStatus.SIMULATED
+        return notice
+
+    try:
+        await sharepoint.update_task(item.item_id, fields)
+    except Exception as exc:  # noqa: BLE001 - the notice still goes out
+        logger.warning("could not set %s on %s: %s", column, item.item_id, exc)
+        row.error = f"Could not set {column}: {exc}"
+        return notice
+
+    setattr(item, attribute, wanted)
+    await session.flush()
+    return marked
+
+
 async def _mark_negotiation(
     session: AsyncSession,
     row: IntakeMessage,
@@ -375,51 +524,50 @@ async def _mark_negotiation(
 ) -> str:
     """Set ``Negotiation`` on the matched task, so a flow watching the list fires.
 
-    This is the one place a negotiation reaches anything outside this system.
     A negotiation never creates a task — the work already exists — so nothing
     changes in SharePoint on its own, and a flow triggered by "an item was
     created or modified" has nothing to react to. Marking the column gives it
-    one.
-
-    **Skipped when the column already says so.** A negotiation is usually a
-    thread, and this runs per message: re-writing the same value on every reply
-    would re-fire the flow each time and fill the row's history with changes
-    that changed nothing. The cost is that a second round of negotiation on the
-    same bid does not raise a second trigger — worth knowing, and the setting
-    to change if that turns out to be the wrong trade.
-
-    Returns the action to record. Never raises: failing to mark the column must
-    not lose the notification that goes with it.
+    one. Guarded by ``update_negotiation``, which ships off.
     """
-    wanted = (intake.negotiation_value or "Yes").strip()
-    fields = {"Negotiation": wanted}
-    row.would_update = {"item_id": item.item_id, "fields": fields}
+    return await _mark_column(
+        session, row, item,
+        sharepoint=sharepoint,
+        column="Negotiation",
+        attribute="negotiation",
+        wanted=(intake.negotiation_value or "Yes").strip(),
+        switched_on=bool(intake.update_negotiation),
+        notice=IntakeAction.NEGOTIATION_NOTICE,
+        marked=IntakeAction.MARKED_NEGOTIATION,
+    )
 
-    if (item.negotiation or "").strip().casefold() == wanted.casefold():
-        row.match_reason = (
-            f"{row.match_reason or ''} "
-            f"(Negotiation already {wanted}; not written again)"
-        ).strip()
-        return IntakeAction.NEGOTIATION_NOTICE
 
-    if not intake.update_negotiation:
-        # The switch, off. Everything is decided and the payload is on the row;
-        # only the write is missing.
-        row.status = IntakeStatus.SIMULATED
-        return IntakeAction.NEGOTIATION_NOTICE
+async def _mark_order(
+    session: AsyncSession,
+    row: IntakeMessage,
+    item: ProposalIndexItem,
+    *,
+    intake: IntakeSettings,
+    sharepoint: SharePointProposals,
+) -> str:
+    """Set ``OrderStatus`` on the matched task when a purchase order arrives.
 
-    try:
-        await sharepoint.update_task(item.item_id, fields)
-    except Exception as exc:  # noqa: BLE001 - the notice still goes out
-        logger.warning("could not mark %s as negotiation: %s", item.item_id, exc)
-        row.error = f"Could not set Negotiation: {exc}"
-        return IntakeAction.NEGOTIATION_NOTICE
-
-    # Kept locally too, so a second email in the same thread sees the new value
-    # without waiting for the next mirror sync.
-    item.negotiation = wanted
-    await session.flush()
-    return IntakeAction.MARKED_NEGOTIATION
+    The team records an order by hand in that column today, and it is what a
+    report or a flow reads to know one came in. The mail that carries the
+    order rarely uses the task's exact title, which is why the matcher
+    searched the whole list for it before this is reached. Guarded by
+    ``update_order_status``, which ships off: whoever holds the task is told
+    either way, and only the column waits on the switch.
+    """
+    return await _mark_column(
+        session, row, item,
+        sharepoint=sharepoint,
+        column="OrderStatus",
+        attribute="order_status",
+        wanted=(intake.order_status_value or "Received").strip(),
+        switched_on=bool(intake.update_order_status),
+        notice=IntakeAction.ORDER_NOTICE,
+        marked=IntakeAction.MARKED_ORDER,
+    )
 
 
 async def _known_work(
@@ -438,14 +586,20 @@ async def _known_work(
 
     reopened = found.is_reopened
     if found.category == MailCategory.NEGOTIATION:
-        kind, action = NotificationKind.NEGOTIATION, IntakeAction.NEGOTIATION_NOTICE
+        kind = NotificationKind.NEGOTIATION
         headline = f"Negotiation update — {item.title}"
         action = await _mark_negotiation(
             session, row, item, intake=intake, sharepoint=sharepoint
         )
     elif found.category == MailCategory.ORDER:
-        kind, action = NotificationKind.ORDER, IntakeAction.ORDER_NOTICE
+        kind = NotificationKind.ORDER
         headline = f"Order received — {item.title}"
+        # The task was quoted and the mail says the customer ordered. The
+        # list's own column for that is set here, behind its switch; whoever
+        # holds the task is told below whether or not the column was written.
+        action = await _mark_order(
+            session, row, item, intake=intake, sharepoint=sharepoint
+        )
     elif reopened:
         kind, action = NotificationKind.TASK_REOPENED, IntakeAction.REOPENED_NOTICE
         headline = f"Reopened — {item.title}"
@@ -467,6 +621,11 @@ async def _known_work(
         "Holder": item.assigned_name,
         "From": row.sender_email,
     }
+    if found.category == MailCategory.ORDER:
+        # What the list says now — the value just written, or whatever it
+        # already held. The holder should not have to open the list to know
+        # whether the column moved.
+        facts["Order status in list"] = item.order_status or "not set"
     made = await notifications.notify_and_post(
         session,
         http,
@@ -484,9 +643,9 @@ async def _known_work(
     )
 
     row.action = action
-    # Not overwritten when the negotiation branch already marked this as a
-    # withheld write: the notice went out, but a write did not, and "simulated"
-    # is the more honest of the two things that happened.
+    # Not overwritten when a marking branch already recorded a withheld write:
+    # the notice went out, but the column was not written, and "simulated" is
+    # the more honest of the two things that happened.
     if row.status != IntakeStatus.SIMULATED:
         row.status = IntakeStatus.ACTIONED
     row.assigned_user_id = holder.id if holder else None
