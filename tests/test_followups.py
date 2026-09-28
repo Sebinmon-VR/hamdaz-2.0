@@ -383,3 +383,15 @@ def test_due_today_finds_a_question_by_its_task_whatever_due_time_it_holds() -> 
         [(person, [task()])], now=DUE, grace_minutes=20, asked={"901": asked},
     )
     assert rows[0]["followup_status"] == FollowupStatus.PENDING
+
+
+
+def test_a_blank_submission_status_asks_to_update_it_and_says_why_if_missed() -> None:
+    blank = row(status_at_ask=None)
+    body = mailer.ask_body(blank, "https://x/followups/abc")
+    assert "Submission status not set" in body
+    assert "The bid was submitted" in body and "The bid was missed" in body
+    assert "Submit Reason" in body and "Already Updated" in body
+    assert mailer.ask_subject(blank).startswith("Action Required: Submission Status Not Set")
+    # A task marked Not Submitted keeps the plain reason email.
+    assert "Reason Required" in mailer.ask_subject(row())

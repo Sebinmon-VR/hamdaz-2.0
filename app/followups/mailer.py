@@ -189,7 +189,15 @@ def page(body: str) -> str:
 # ── the ask ────────────────────────────────────────────────────────────
 
 
+def status_not_set(row: TaskFollowup) -> bool:
+    """Nobody filled in the Submission Status — a different ask from "Not
+    Submitted": first update it, and only if the bid was missed, say why."""
+    return not (row.status_at_ask or "").strip()
+
+
 def ask_subject(row: TaskFollowup, *, early: bool = False) -> str:
+    if status_not_set(row) and not early:
+        return f"Action Required: Submission Status Not Set — {row.task_title[:100]}"
     what = "Not Submitted" if early else "Past Due, Not Submitted"
     return f"Reason Required: {row.task_title[:100]} ({what})"
 
@@ -197,6 +205,8 @@ def ask_subject(row: TaskFollowup, *, early: bool = False) -> str:
 def ask_body(row: TaskFollowup, link: str, *, early: bool = False) -> str:
     """``early``: asked before the due time, because it was marked Not Submitted."""
     first = ((row.assignee.display_name if row.assignee else "").split() or ["there"])[0]
+    if status_not_set(row) and not early:
+        return _ask_status_not_set(row, link, first)
     lead = (
         "This task is marked <b>Not Submitted</b> on the Proposals list."
         if early
@@ -226,6 +236,42 @@ def ask_body(row: TaskFollowup, link: str, *, early: bool = False) -> str:
             if row.task_url
             else ""
         )
+    )
+    return page(body)
+
+
+def _ask_status_not_set(row: TaskFollowup, link: str, first: str) -> str:
+    """The bid's closing time passed with no Submission Status at all.
+
+    Two things are asked, in this order: put the status on the task — which
+    is usually all that is missing — and, if the bid really was missed, give
+    the reason. "Already Updated" closes it for the first case.
+    """
+    details = [("Task", row.task_title)]
+    if row.end_user:
+        details.append(("End user", row.end_user))
+    details += [("Bid closing", _when(row.due_at)), ("Submission status", "Not set")]
+    open_task = (
+        f"<a href='{escape(row.task_url)}' style='color:{_NAVY}'>open the task in SharePoint</a>"
+        if row.task_url
+        else "open the task in SharePoint"
+    )
+    body = (
+        heading("Submission status not set", eyebrow="Proposals")
+        + f"<p style='margin:0 0 14px'>Hi {escape(first)},<br>The bid closing time for this task "
+        f"has passed, and no <b>Submission Status</b> is set on the Proposals list.</p>"
+        + facts(details)
+        + f"<p style='margin:18px 0 6px;font-weight:600'>Please do one of the following:</p>"
+        + f"<table role='presentation' cellpadding='0' cellspacing='0' width='100%' "
+        f"style='border-collapse:collapse;border:1px solid {_LINE}'>"
+        f"<tr><td style='padding:10px 12px;border-bottom:1px solid {_LINE};font-size:13px'>"
+        f"<b>1. The bid was submitted</b> — {open_task}, set the Submission Status to "
+        f"<b>Submitted</b>, then press <b>Already Updated</b>.</td></tr>"
+        f"<tr><td style='padding:10px 12px;font-size:13px'>"
+        f"<b>2. The bid was missed</b> — set the Submission Status to <b>Not Submitted</b> and "
+        f"press <b>Submit Reason</b> to say why.</td></tr></table>"
+        + f"<p style='margin:20px 0 6px'>{button(link, 'Submit Reason')}&nbsp;&nbsp;"
+        f"{button(link + '?false-positive=1', 'Already Updated', primary=False)}</p>"
     )
     return page(body)
 

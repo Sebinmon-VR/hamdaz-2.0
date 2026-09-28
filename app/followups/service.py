@@ -489,10 +489,15 @@ async def _ask(
         title=(
             f"Marked not submitted: {followup.task_title[:200]}"
             if early
+            else f"Submission status not set: {followup.task_title[:200]}"
+            if not followup.status_at_ask
             else f"Past its due date: {followup.task_title[:200]}"
         ),
         body=(
-            "This bid is not marked submitted. Tell your manager why — or, if "
+            "No Submission Status is set. Update it in SharePoint — and if the bid "
+            "was missed, give the reason."
+            if not early and not followup.status_at_ask
+            else "This bid is not marked submitted. Tell your manager why — or, if "
             "you have already updated it, mark this as a false positive."
         ),
         link=f"{FORM_PATH}/{followup.id}",
