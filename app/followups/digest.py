@@ -857,7 +857,7 @@ async def send(
             result["sent"] = True
         except Exception as exc:  # noqa: BLE001 - recorded, and tried again tomorrow
             result["error"] = f"{type(exc).__name__}: {exc}"[:2000]
-            logger.warning("end-of-day report for %s not sent: %s", day, exc)
+            logger.warning("%s for %s not sent: %s", digest.kind, day, exc)
     if not preview:
         # Recorded even when the mail failed, so the send is not repeated on
         # every tick — the error on the settings says it needs resending.
