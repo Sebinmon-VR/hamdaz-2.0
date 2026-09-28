@@ -24,6 +24,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Any, Final
 
 from sqlalchemy import select
@@ -173,12 +174,33 @@ class Decision:
     why: str
 
 
+def _zones() -> tuple[ZoneInfo, ZoneInfo]:
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    return ZoneInfo(settings.sharepoint_site_timezone), ZoneInfo(settings.sharepoint_meant_timezone)
+
+
+def as_typed(stored: datetime) -> datetime:
+    """A time from the list, as the person who typed it meant it.
+
+    The site is set to US Pacific, so SharePoint stored what was typed as a
+    Pacific time. Its wall clock there *is* what was typed; the person meant
+    that clock in the UAE. So: to the site's clock, then that clock in the
+    UAE. See ``Settings.sharepoint_site_timezone``.
+    """
+    site, meant = _zones()
+    wall = stored.astimezone(site).replace(tzinfo=None)
+    return wall.replace(tzinfo=meant).astimezone(UTC)
+
+
 def due_of(task: ProposalTask) -> datetime | None:
     """The moment the task was due: the bid closing, else the end of the due day.
 
     **BCD leads.** It is the "BCD UAE Time" column, a real date *and time* —
     the moment the bid must be in — and submission is what the follow-up asks
-    about. SharePoint hands it over in UTC; 13:51Z is 5:51 PM in the UAE.
+    about. It is read as the person typed it (:func:`as_typed`): 8:29 AM in
+    SharePoint is 8:29 AM in the UAE, however the site's zone stored it.
 
     **DueDate is a date only**, with no time, so it is read as the end of that
     day in the UAE — 23:59:59 — rather than its midnight, which would have
@@ -186,14 +208,14 @@ def due_of(task: ProposalTask) -> datetime | None:
     """
     closing = parse_when(task.bid_closing_date)
     if closing is not None:
-        return closing
+        return as_typed(closing)
     due = parse_when(task.due_date)
     if due is None:
         return None
-    # A date-only column arrives as that day's midnight in the site's zone,
-    # converted to UTC; read in UAE time it lands back on the right day.
-    day = due.astimezone(GULF).date()
-    return datetime(day.year, day.month, day.day, 23, 59, 59, tzinfo=GULF).astimezone(UTC)
+    # A date-only column is that day's midnight on the site's clock.
+    site, meant = _zones()
+    day = due.astimezone(site).date()
+    return datetime(day.year, day.month, day.day, 23, 59, 59, tzinfo=meant).astimezone(UTC)
 
 
 def is_submitted(value: str | None) -> bool:

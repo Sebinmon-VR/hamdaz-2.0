@@ -18,11 +18,20 @@ DUE = datetime(2026, 9, 28, 10, 0, tzinfo=UTC)
 WATCH = datetime(2026, 9, 28, 9, 0, tzinfo=UTC)
 
 
+def stored(meant: datetime) -> str:
+    """How SharePoint stores a time typed in the UAE: the site is on US Pacific
+    time, so the typed clock is taken as Pacific and kept in UTC."""
+    from zoneinfo import ZoneInfo
+
+    wall = meant.astimezone(ZoneInfo("Asia/Dubai")).replace(tzinfo=None)
+    return wall.replace(tzinfo=ZoneInfo("America/Los_Angeles")).astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
 def task(**overrides) -> ProposalTask:
     fields = dict(
         id="901", title="test — overdue follow-up", status="In Progress", priority=None,
         assigned_to_lookup_id="12", assigned_to_name="Sebin", start_date=None,
-        due_date=None, bid_closing_date=DUE.isoformat().replace("+00:00", "Z"),
+        due_date=None, bid_closing_date=stored(DUE),
         end_user="ADNOC", submission_status=None, current_type=None, order_status=None,
         negotiation=None, quote_no=None, remarks=None, working_notes=None,
         created_at=None, modified_at=None,
@@ -67,7 +76,7 @@ def test_a_task_with_no_status_is_asked_about_because_that_is_the_point() -> Non
 
 
 def test_nothing_due_before_the_watch_began_is_asked_about() -> None:
-    old = task(bid_closing_date="2025-11-27T00:00:00Z")
+    old = task(bid_closing_date=stored(datetime(2025, 11, 27, tzinfo=UTC)))
     ruled = decide(old, now=at(60), grace_minutes=20, watch_from=WATCH)
     assert not ruled.ask and ruled.why == "due before the watch began"
     assert not decide(task(), now=at(60), grace_minutes=20, watch_from=None).ask
@@ -79,13 +88,23 @@ def test_the_title_filter_keeps_a_trial_to_the_test_tasks() -> None:
     assert decide(task(), now=at(60), grace_minutes=20, watch_from=WATCH, title_contains="TEST").ask
 
 
+def test_the_bid_closing_time_is_read_as_it_was_typed() -> None:
+    """The case from the list: SharePoint shows BCD UAE Time 8:29 AM and holds
+    15:29 UTC, because the site is on Pacific time. The bid closes at 8:29 AM
+    in the UAE — 04:29 UTC — not at 19:29 as a plain UTC reading had it."""
+    rameesa = task(bid_closing_date="2026-09-28T15:29:00Z")
+    assert due_of(rameesa) == datetime(2026, 9, 28, 4, 29, tzinfo=UTC)
+    # And the two that were missing from today: 1:00 PM and 1:30 PM UAE.
+    assert due_of(task(bid_closing_date="2026-09-28T20:00:00Z")) == datetime(2026, 9, 28, 9, 0, tzinfo=UTC)
+    assert due_of(task(bid_closing_date="2026-09-28T20:30:00Z")) == datetime(2026, 9, 28, 9, 30, tzinfo=UTC)
+
+
 def test_the_bid_closing_time_leads_and_a_due_date_means_the_end_of_that_day() -> None:
-    # BCD UAE Time 5:51 PM arrives as 13:51Z, and that is the moment.
-    both = task(due_date="2026-09-27T20:00:00Z", bid_closing_date="2026-09-28T13:51:46Z")
-    assert due_of(both) == datetime(2026, 9, 28, 13, 51, 46, tzinfo=UTC)
-    # A date-only Due Date (midnight in the UAE, stored as 20:00Z the day
-    # before) is due at 23:59:59 UAE time that day, not at its midnight.
-    assert due_of(task(due_date="2026-09-27T20:00:00Z", bid_closing_date=None)) == datetime(
+    both = task(due_date="2026-09-27T07:00:00Z", bid_closing_date="2026-09-28T13:51:46Z")
+    assert due_of(both) == datetime(2026, 9, 28, 2, 51, 46, tzinfo=UTC)
+    # A date-only Due Date is midnight on the site's clock (07:00Z in Pacific
+    # summer time); it is due at 23:59:59 UAE time that day.
+    assert due_of(task(due_date="2026-09-28T07:00:00Z", bid_closing_date=None)) == datetime(
         2026, 9, 28, 19, 59, 59, tzinfo=UTC
     )
     assert due_of(task(due_date=None, bid_closing_date=None)) is None
@@ -175,9 +194,10 @@ def test_due_today_lists_todays_tasks_soonest_first_with_the_ask_time() -> None:
     from app.followups.service import due_today_rows
 
     person = User(email="sebin@hamdaz.com", display_name="Sebin", entra_object_id="x")
-    later = task(id="902", bid_closing_date="2026-09-28T15:00:00Z")
-    done = task(id="903", submission_status="Submitted", bid_closing_date="2026-09-28T06:00:00Z")
-    tomorrow = task(id="904", bid_closing_date="2026-09-29T21:00:00Z")
+    later = task(id="902", bid_closing_date=stored(datetime(2026, 9, 28, 15, 0, tzinfo=UTC)))
+    done = task(id="903", submission_status="Submitted",
+                bid_closing_date=stored(datetime(2026, 9, 28, 6, 0, tzinfo=UTC)))
+    tomorrow = task(id="904", bid_closing_date=stored(datetime(2026, 9, 29, 21, 0, tzinfo=UTC)))
     rows = due_today_rows(
         [(person, [later, task(), done, tomorrow])],
         now=datetime(2026, 9, 28, 8, 0, tzinfo=UTC), grace_minutes=20, asked={},

@@ -58,6 +58,17 @@ class Settings(BaseSettings):
         "9ded8786-1497-489f-a53c-9d316bc9b7e7"
     )
     sharepoint_proposals_list_id: str = "58ac33c7-f42e-4b27-afb0-4af09d90b397"
+    #: The timezone the Proposals **site** is set to, which is not the UAE.
+    #: It is SharePoint's default, US Pacific, so a "BCD UAE Time" typed as
+    #: 8:29 AM is stored as 8:29 AM Pacific — 15:29 UTC — and read as UTC it
+    #: comes out eleven hours late (found 2026-09-28: bids closing at 9, 10,
+    #: 12 and 1 read as 8 PM to 12:30 AM). The list's times are the clock
+    #: people typed on this zone, and they meant ``sharepoint_meant_timezone``.
+    #: Change this only if the site's regional settings are changed — and
+    #: then the times already stored would need re-typing, so better not to.
+    sharepoint_site_timezone: str = "America/Los_Angeles"
+    #: The timezone the people typing the list's times mean.
+    sharepoint_meant_timezone: str = "Asia/Dubai"
     #: The list as a person opens it. Every link to a task is this plus the
     #: item id, which is the only construction SharePoint actually documents:
     #:
