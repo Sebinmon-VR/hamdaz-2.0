@@ -659,12 +659,33 @@ def today_bounds(now: datetime) -> tuple[datetime, datetime]:
     return start.astimezone(UTC), (start + timedelta(days=1)).astimezone(UTC)
 
 
+def watches(row: FollowupSettings | None, user: User, task: ProposalTask) -> str | None:
+    """Why the follow-up will *not* ask about this task, or None if it will.
+
+    The same filters the sweep applies, said in words, so a screen can tell a
+    task that is waiting for its question from one that will never get one.
+    """
+    if row is None or not row.enabled:
+        return "The follow-up is switched off."
+    only = set(row.only_emails or [])
+    if only and (user.email or "").casefold() not in only:
+        return "This person is outside the trial — only the people named in the settings are asked."
+    word = (row.only_title_contains or "").strip().casefold()
+    if word and word not in (task.title or "").casefold():
+        return f"Outside the trial — only tasks with “{row.only_title_contains}” in the title are asked about."
+    due = due_of(task)
+    if row.watch_from is None or (due is not None and due < row.watch_from):
+        return "Due before the follow-up was switched on."
+    return None
+
+
 def due_today_rows(
     people: list[tuple[User, list[ProposalTask]]],
     *,
     now: datetime,
     grace_minutes: int,
     asked: dict[tuple[str, datetime], TaskFollowup],
+    settings_row: FollowupSettings | None = None,
 ) -> list[dict[str, Any]]:
     """Every task due today, finished or not, soonest first.
 
@@ -698,6 +719,11 @@ def due_today_rows(
                     "ask_at": now if reason_now else due + timedelta(minutes=max(0, grace_minutes)),
                     "followup_id": followup.id if followup else None,
                     "followup_status": followup.status if followup else None,
+                    # Whether the mail reached them — the in-app notice and
+                    # the banner stand either way.
+                    "mailed": bool(followup and followup.asked_at),
+                    "mail_error": followup.ask_error if followup else None,
+                    "not_watched": watches(settings_row, user, task),
                 }
             )
     out.sort(key=lambda r: (r["finished"], r["due_at"]))

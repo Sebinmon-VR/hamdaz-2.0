@@ -152,6 +152,24 @@ def test_today_is_the_gulfs_day_not_utcs() -> None:
     assert end == datetime(2026, 9, 28, 20, 0, tzinfo=UTC)
 
 
+def test_the_screen_says_when_a_task_is_outside_the_trial() -> None:
+    from app.followups.service import watches
+    from app.models.followup import FollowupSettings
+
+    trial = FollowupSettings(
+        enabled=True, only_emails=["sebin@hamdaz.com"], only_title_contains="test",
+        watch_from=WATCH,
+    )
+    sebin = User(email="sebin@hamdaz.com", display_name="Sebin", entra_object_id="x")
+    fasna = User(email="fasna@hamdaz.com", display_name="Fasna", entra_object_id="y")
+
+    assert watches(trial, sebin, task()) is None
+    assert "outside the trial" in watches(trial, fasna, task())
+    assert "in the title" in watches(trial, sebin, task(title="RFQ 6000151129"))
+    trial.enabled = False
+    assert watches(trial, sebin, task()) == "The follow-up is switched off."
+
+
 def test_due_today_lists_todays_tasks_soonest_first_with_the_ask_time() -> None:
     from app.followups.service import due_today_rows
 

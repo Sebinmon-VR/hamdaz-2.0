@@ -261,7 +261,7 @@ async def due_today(
         grace_minutes=fs.grace_minutes,
         generated_at=now,
         tasks=service.due_today_rows(
-            people, now=now, grace_minutes=fs.grace_minutes, asked=asked
+            people, now=now, grace_minutes=fs.grace_minutes, asked=asked, settings_row=fs
         ),
     )
 

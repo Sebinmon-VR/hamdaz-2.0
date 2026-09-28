@@ -116,6 +116,12 @@ class DueTodayTaskOut(BaseModel):
     ask_at: datetime
     followup_id: uuid.UUID | None
     followup_status: str | None
+    #: The question's email went out. False with ``mail_error`` when it did not.
+    mailed: bool = False
+    mail_error: str | None = None
+    #: Why this task will never be asked about under the current settings —
+    #: the trial filters, or the follow-up being off. Null when it is watched.
+    not_watched: str | None = None
 
 
 class DueTodayOut(BaseModel):
