@@ -608,62 +608,60 @@ def build_xlsx(digest: Digest) -> bytes:
 # ── the mail ───────────────────────────────────────────────────────────
 
 
+def _follow_up_state(text: str) -> str:
+    """The follow-up column, without the reason itself — that is in the attachment."""
+    if not text:
+        return "Not asked yet"
+    return text.split(":", 1)[0]
+
+
 def mail_html(digest: Digest, link: str) -> str:
+    """The body: the day's numbers, then the tasks not submitted, in one table.
+
+    Only what somebody decides on from an inbox — who, what, when, and where
+    the follow-up stands. The reasons in full, the submitted list and every
+    other column are in the PDF and the workbook attached.
+    """
     from app.followups import mailer as m
 
-    counts = [
-        ("Submitted", len(digest.submitted)),
-        ("Not submitted", len(digest.not_submitted)),
-        ("Reason given", digest.count(FollowupStatus.ANSWERED)),
-        ("Not responded", digest.count(FollowupStatus.NO_RESPONSE)),
-    ]
-    tiles = "".join(
-        f"<td style='padding:10px 12px;background:#f7fbfd;border:1px solid #e2e9ef;"
-        f"text-align:center'><div style='font-size:20px;font-weight:700;"
-        f"color:{'#d62d7d' if label in ('Not responded', 'Not submitted') and n else '#22303f'}'>{n}</div>"
-        f"<div style='font-size:11.5px;color:#64727f'>{label}</div></td>"
-        for label, n in counts
-    )
-    pending_html = ""
+    body = m.heading(digest.title, eyebrow=f"Proposals · {digest.team or 'All teams'}")
+    body += m.counts([
+        ("Due today", len(digest.submitted) + len(digest.not_submitted), False),
+        ("Submitted", len(digest.submitted), False),
+        ("Not submitted", len(digest.not_submitted), True),
+        ("Not responded", digest.count(FollowupStatus.NO_RESPONSE), True),
+    ])
     if digest.not_submitted:
-        items = "".join(
-            f"<li style='margin:3px 0'><b>{escape(t.person)}</b> — {escape(t.task)} "
-            f"<span style='color:#64727f'>(due {escape(t.due)}; {escape(t.followup or 'not asked')})</span></li>"
-            for t in digest.not_submitted[:20]
+        rows = [
+            [str(i), t.person, t.task, t.due.split(", ")[-1], _follow_up_state(t.followup)]
+            for i, t in enumerate(digest.not_submitted, start=1)
+        ]
+        colours = [None, None, None, None, None]
+        body += (
+            f"<p style='margin:20px 0 8px;font-weight:600'>Not submitted</p>"
+            + m.grid(["#", "Person", "Task", "Due (UAE)", "Follow-up"], rows, colours=colours)
         )
-        pending_html = (
-            f"<p style='margin:18px 0 6px;font-weight:600'>Not submitted today</p>"
-            f"<ul style='margin:0;padding-left:18px'>{items}</ul>"
-        )
+    else:
+        body += "<p style='margin:20px 0 0'>Every task due today was submitted.</p>"
     missing = [line for line in digest.lines if line.status == STATUS_LABELS[FollowupStatus.NO_RESPONSE]]
-    missing_html = ""
     if missing:
-        items = "".join(
-            f"<li style='margin:3px 0'><b>{escape(line.person)}</b> — {escape(line.task)}</li>"
-            for line in missing[:15]
+        body += (
+            f"<p style='margin:20px 0 8px;font-weight:600'>No reason given by the closing time</p>"
+            + m.grid(
+                ["Person", "Task"],
+                [[line.person, line.task] for line in missing],
+            )
         )
-        missing_html = (
-            f"<p style='margin:18px 0 6px;font-weight:600'>Not responded by the end of the day</p>"
-            f"<ul style='margin:0;padding-left:18px'>{items}</ul>"
-        )
-    body = (
-        f"<p style='margin:0 0 14px'>Today's tasks, submitted and not, and the reasons "
-        f"given for the ones that were late — attached in full as PDF and Excel.</p>"
-        f"<table role='presentation' cellpadding='0' cellspacing='6' width='100%'><tr>{tiles}</tr></table>"
-        f"{pending_html}{missing_html}"
-        f"<p style='margin:22px 0 0'>{m._button(link, 'Open in Hamdaz ERP')}</p>"
+    body += (
+        f"<p style='margin:18px 0 0;font-size:12.5px;color:#5f6b77'>The full report — every task "
+        f"with its details, and every reason given — is attached as PDF and Excel.</p>"
+        f"<p style='margin:16px 0 0'>{m.button(link, 'View Report')}</p>"
     )
-    return m._card(
-        eyebrow="Proposals · End of day",
-        heading=digest.title,
-        accent=m._NAVY,
-        body=body,
-        footer="Sent by Hamdaz ERP once a day at the closing time set by the super admin.",
-    )
+    return m.page(body)
 
 
 def attachments(digest: Digest, formats: list[str]) -> list[Attachment]:
-    stem = f"overdue-task-reasons-{digest.day:%Y-%m-%d}"
+    stem = f"end-of-day-report-{digest.day:%Y-%m-%d}"
     out: list[Attachment] = []
     if "pdf" in formats:
         out.append(Attachment(f"{stem}.pdf", build_pdf(digest), PDF_TYPE))
@@ -705,16 +703,18 @@ async def send(
     if not to:
         result["error"] = "Nobody to send the report to — add an address in the settings."
     else:
+        from app.followups import mailer as m
+
         sender = (row.digest_sender_email or to[0]).strip()
         try:
             await mailer.send(
                 sender=sender,
                 recipients=to,
-                subject=f"{digest.title} — {len(digest.submitted)} submitted, "
-                f"{len(digest.not_submitted)} not submitted, "
-                f"{digest.count(FollowupStatus.NO_RESPONSE)} not responded",
+                subject=f"End of Day Report — {digest.day:%d %b %Y} — "
+                f"{len(digest.submitted)} Submitted, {len(digest.not_submitted)} Not Submitted",
                 html=mail_html(digest, link),
-                attachments=attachments(digest, list(row.digest_formats or ["pdf", "xlsx"])),
+                attachments=attachments(digest, list(row.digest_formats or ["pdf", "xlsx"]))
+                + m.logo_attachment(),
             )
             result["sent"] = True
         except Exception as exc:  # noqa: BLE001 - recorded, and tried again tomorrow

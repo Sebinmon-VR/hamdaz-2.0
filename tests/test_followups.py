@@ -110,19 +110,20 @@ def test_the_ask_offers_the_way_out_for_a_task_already_updated() -> None:
     link = "https://calm-sky-08cea4100.6.azurestaticapps.net/followups/abc"
     body = mailer.ask_body(row(), link)
 
-    assert "ignore this mail" in body
+    assert "ignore this email" in body
     assert f"{link}?false-positive=1" in body
-    assert "Give the reason" in body
+    assert "Submit Reason" in body and "Already Updated" in body
     # In the Gulf's own time: 10:00 UTC is 14:00 in Dubai.
     assert "14:00 UAE" in body
-    assert "due time has passed" in body
-    assert "Not submitted by the due time" in mailer.ask_subject(row())
+    assert "past its due time" in body
+    assert "AI-generated" in body and "cid:hamdaz-logo" in body
+    assert mailer.ask_subject(row()).startswith("Reason Required:")
 
 
 def test_an_early_ask_says_it_was_marked_not_submitted() -> None:
     body = mailer.ask_body(row(), "https://x/followups/abc", early=True)
     assert "marked <b>Not Submitted</b>" in body
-    assert "Marked Not Submitted" in mailer.ask_subject(row(), early=True)
+    assert "(Not Submitted)" in mailer.ask_subject(row(), early=True)
 
 
 def test_mail_links_point_at_production_not_localhost() -> None:
@@ -139,7 +140,7 @@ def test_the_reason_mail_carries_what_was_said_and_escapes_it() -> None:
     answered = row(reason="Waiting on <supplier> pricing\nsince Friday", answered_at=at(90))
     body = mailer.reason_body(answered, "Sebin", "http://localhost:3000/followups/abc")
 
-    assert "Waiting on &lt;supplier&gt; pricing<br>since Friday" in body
+    assert "Waiting on &lt;supplier&gt; pricing" in body
     assert "Sebin" in mailer.reason_subject(answered, "Sebin")
 
 
@@ -271,5 +272,8 @@ def test_the_mail_leads_with_what_was_not_submitted() -> None:
     from app.followups import digest
 
     html = digest.mail_html(_sample_digest(), "https://x/followups")
-    assert "Not submitted today" in html and "6000150622 Omnis Software" in html
-    assert "Not responded by the end of the day" in html and "Rameesa" in html
+    assert "Not submitted" in html and "6000150622 Omnis Software" in html
+    assert "No reason given by the closing time" in html and "Rameesa" in html
+    # The body stays short: reasons and remarks are in the attachments.
+    assert "Enquiry sent to OEMs" not in html
+    assert "View Report" in html and "AI-generated" in html

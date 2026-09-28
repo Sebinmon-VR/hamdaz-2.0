@@ -40,6 +40,10 @@ class Attachment:
     name: str
     content: bytes
     content_type: str = "application/octet-stream"
+    #: Set to show the file inside the message rather than as an attachment:
+    #: the HTML refers to it as ``cid:<content_id>``. How a logo gets into an
+    #: email without linking to an image server that may block it.
+    content_id: str | None = None
 
 
 class MailError(Exception):
@@ -118,14 +122,16 @@ class GraphMailer:
                         len(item.content),
                     )
                     continue
-                kept.append(
-                    {
-                        "@odata.type": "#microsoft.graph.fileAttachment",
-                        "name": item.name,
-                        "contentType": item.content_type,
-                        "contentBytes": base64.b64encode(item.content).decode(),
-                    }
-                )
+                entry = {
+                    "@odata.type": "#microsoft.graph.fileAttachment",
+                    "name": item.name,
+                    "contentType": item.content_type,
+                    "contentBytes": base64.b64encode(item.content).decode(),
+                }
+                if item.content_id:
+                    entry["isInline"] = True
+                    entry["contentId"] = item.content_id
+                kept.append(entry)
             if kept:
                 message["attachments"] = kept
 
