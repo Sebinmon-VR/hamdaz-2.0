@@ -375,13 +375,28 @@ async def sweep(
 
     fetched = await asyncio.gather(*(fetch(u) for u in people))
 
+    # Every question already on these tasks, in one query. Asking once per
+    # task cost a round trip each — six hundred of them to a database a third
+    # of a second away made one check take five minutes, holding the lock the
+    # whole time.
+    ids = {task.id for _, tasks, error in fetched if not error for task in tasks or []}
+    known: dict[str, list[TaskFollowup]] = {}
+    if ids:
+        for existing_row in (
+            await session.scalars(select(TaskFollowup).where(TaskFollowup.task_id.in_(ids)))
+        ).all():
+            known.setdefault(existing_row.task_id, []).append(existing_row)
+
     for user, tasks, error in fetched:
         if error:
             report.errors.append(error)
             continue
         report.tasks_read += len(tasks or [])
         for task in tasks or []:
-            await _close_if_dealt_with(session, task, report)
+            asked_before = known.get(task.id, [])
+            _close_pending(
+                [r for r in asked_before if r.status == FollowupStatus.PENDING], task, report, now
+            )
             decision = decide(
                 task,
                 now=now,
@@ -391,17 +406,13 @@ async def sweep(
             )
             if not decision.ask or decision.due_at is None:
                 continue
-            existing = await session.scalar(
-                select(TaskFollowup.id).where(
-                    TaskFollowup.task_id == task.id, TaskFollowup.due_at == decision.due_at
-                )
-            )
-            if existing is not None:
+            if any(r.due_at == decision.due_at for r in asked_before):
                 continue
-            await _ask(
+            made = await _ask(
                 session, row, user, task, decision.due_at,
                 settings=settings, mailer=mailer, now=now,
             )
+            known.setdefault(task.id, []).append(made)
             report.asked += 1
 
     row.last_run_at = now
@@ -422,10 +433,16 @@ async def _close_if_dealt_with(
             )
         )
     ).all()
+    _close_pending(list(pending), task, report, datetime.now(UTC))
+
+
+def _close_pending(
+    pending: list[TaskFollowup], task: ProposalTask, report: SweepReport, now: datetime
+) -> None:
+    """The rule behind :func:`_close_if_dealt_with`, on rows already loaded."""
     if not pending:
         return
     due = due_of(task)
-    now = datetime.now(UTC)
     for row in pending:
         note = None
         if is_finished(task):
