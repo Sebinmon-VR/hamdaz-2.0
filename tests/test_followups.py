@@ -185,3 +185,91 @@ def test_due_today_lists_todays_tasks_soonest_first_with_the_ask_time() -> None:
     assert [r["task_id"] for r in rows] == ["901", "902", "903"]
     assert rows[0]["ask_at"] == DUE + timedelta(minutes=20)
     assert rows[-1]["finished"] is True
+
+
+
+# ── the end-of-day report ──────────────────────────────────────────────
+
+
+def _digest_settings(**overrides):
+    from app.models.followup import FollowupSettings
+
+    fields = dict(
+        digest_enabled=True, digest_time="18:00", digest_timezone="Asia/Kolkata",
+        digest_recipients=["sebin@hamdaz.com"], digest_include_ceo=False,
+        digest_formats=["pdf", "xlsx"], digest_last_sent_on=None,
+    )
+    fields.update(overrides)
+    return FollowupSettings(**fields)
+
+
+def test_the_report_goes_at_six_in_the_evening_india_time_once_a_day() -> None:
+    from datetime import date
+
+    from app.followups import digest
+
+    row = _digest_settings()
+    # 18:00 IST is 12:30 UTC.
+    assert digest.cutoff_for(row, date(2026, 9, 29)) == datetime(2026, 9, 29, 12, 30, tzinfo=UTC)
+    assert not digest.is_due(row, datetime(2026, 9, 29, 12, 29, tzinfo=UTC))
+    assert digest.is_due(row, datetime(2026, 9, 29, 12, 31, tzinfo=UTC))
+    row.digest_last_sent_on = date(2026, 9, 29)
+    assert not digest.is_due(row, datetime(2026, 9, 29, 15, 0, tzinfo=UTC))
+    row.digest_enabled = False
+    row.digest_last_sent_on = None
+    assert not digest.is_due(row, datetime(2026, 9, 29, 15, 0, tzinfo=UTC))
+
+
+def _sample_digest():
+    from datetime import date
+
+    from app.followups import digest
+
+    built = digest.Digest(
+        day=date(2026, 9, 29),
+        window_start=datetime(2026, 9, 28, 12, 30, tzinfo=UTC),
+        window_end=datetime(2026, 9, 29, 12, 30, tzinfo=UTC),
+        zone="Asia/Kolkata", team="Presale",
+    )
+    built.lines.append(digest.DigestLine(
+        person="Rameesa", email="rameesa@hamdaz.com", task="6000151129", end_user="ADNOC",
+        due="29 Sep 2026, 19:29", submission_status="Not Submitted", asked="29 Sep 2026, 10:02",
+        mailed="Yes", status="Not responded", reason="No reason given by the end of the day.",
+        answered="", managers_told="",
+    ))
+    task = dict(
+        email="fasna@hamdaz.com", end_user="ADNOC", due="29 Sep 2026, 17:51", status="Completed",
+        current_type="RFP", priority="High", quote_no="QT-000123", order_status="",
+        remarks="22/09 - Enquiry sent to OEMs", followup="",
+    )
+    built.submitted.append(digest.TaskLine(person="Fasna Sherin", task="0020007321 Single Stage RFP",
+                                           submission_status="Submitted", **task))
+    built.not_submitted.append(digest.TaskLine(person="Fasna Sherin", task="6000150622 Omnis Software",
+                                               submission_status="Not Submitted", **task))
+    return built
+
+
+def test_the_report_builds_as_a_pdf_and_a_workbook_with_every_list() -> None:
+    import io
+
+    from openpyxl import load_workbook
+
+    from app.followups import digest
+
+    built = _sample_digest()
+    pdf = digest.build_pdf(built)
+    assert pdf.startswith(b"%PDF") and len(pdf) > 2000
+
+    wb = load_workbook(io.BytesIO(digest.build_xlsx(built)))
+    assert wb.sheetnames == ["Not submitted", "Submitted", "Reasons"]
+    values = [c.value for row in wb["Not submitted"].iter_rows() for c in row]
+    assert "6000150622 Omnis Software" in values and "QT-000123" in values
+    assert "Not responded" in [c.value for row in wb["Reasons"].iter_rows() for c in row]
+
+
+def test_the_mail_leads_with_what_was_not_submitted() -> None:
+    from app.followups import digest
+
+    html = digest.mail_html(_sample_digest(), "https://x/followups")
+    assert "Not submitted today" in html and "6000150622 Omnis Software" in html
+    assert "Not responded by the end of the day" in html and "Rameesa" in html

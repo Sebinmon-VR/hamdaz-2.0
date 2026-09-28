@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
-from typing import Any
+from datetime import date, datetime
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -62,6 +62,18 @@ class FollowupSettingsOut(BaseModel):
     ask_from_user_id: uuid.UUID | None
     ask_from_email: str | None = None
     notify_managers_by_email: bool
+    digest_enabled: bool = True
+    #: "HH:MM" on ``digest_timezone``'s clock.
+    digest_time: str = "18:00"
+    digest_timezone: str = "Asia/Kolkata"
+    digest_recipients: list[str] = Field(default_factory=list)
+    digest_include_ceo: bool = False
+    digest_formats: list[str] = Field(default_factory=lambda: ["pdf", "xlsx"])
+    digest_sender_email: str | None = None
+    digest_last_sent_on: date | None = None
+    digest_last_error: str | None = None
+    #: Who it would go to right now, the CEO role holders included.
+    digest_to: list[str] = Field(default_factory=list)
     last_run_at: datetime | None
     last_error: str | None
     updated_at: datetime
@@ -81,6 +93,24 @@ class FollowupSettingsIn(BaseModel):
     watch_from: datetime | None = None
     ask_from_user_id: uuid.UUID | None = None
     notify_managers_by_email: bool | None = None
+    digest_enabled: bool | None = None
+    digest_time: str | None = Field(default=None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    digest_timezone: str | None = Field(default=None, max_length=64)
+    digest_recipients: list[str] | None = Field(default=None, max_length=30)
+    digest_include_ceo: bool | None = None
+    digest_formats: list[Literal["pdf", "xlsx"]] | None = Field(default=None, min_length=1)
+    digest_sender_email: str | None = Field(default=None, max_length=320)
+
+
+class DigestOut(BaseModel):
+    day: str
+    lines: int
+    submitted: int = 0
+    not_submitted: int = 0
+    not_responded: int
+    recipients: list[str]
+    sent: bool
+    error: str | None
 
 
 class SweepOut(BaseModel):

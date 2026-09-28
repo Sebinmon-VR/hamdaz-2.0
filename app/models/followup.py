@@ -30,11 +30,12 @@ about on the first tick.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 
 from sqlalchemy import (
     Boolean,
+    Date,
     DateTime,
     ForeignKey,
     Index,
@@ -64,10 +65,16 @@ class FollowupStatus(StrEnum):
     #: Closed by the system, not the person: the task was finished or its due
     #: date moved before anybody answered. ``resolved_note`` says which.
     RESOLVED = "resolved"
+    #: Still unanswered at the end of the day, and reported to the CEO as such.
+    #: A mark rather than a closure: the person can still answer, and is still
+    #: asked to — see ``app.followups.digest``.
+    NO_RESPONSE = "no_response"
 
 
 #: What the person can still act on. Everything else is history.
-OPEN_FOLLOWUP_STATUSES: frozenset[str] = frozenset({FollowupStatus.PENDING})
+OPEN_FOLLOWUP_STATUSES: frozenset[str] = frozenset(
+    {FollowupStatus.PENDING, FollowupStatus.NO_RESPONSE}
+)
 
 
 class FollowupSettings(Base, Timestamped):
@@ -122,6 +129,37 @@ class FollowupSettings(Base, Timestamped):
     notify_managers_by_email: Mapped[bool] = mapped_column(
         Boolean, default=True, server_default=text("true"), nullable=False
     )
+
+    # ── the end-of-day report ──────────────────────────────────────────
+    #: Send the day's reasons as one report at the closing time.
+    digest_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=text("true"), nullable=False
+    )
+    #: The closing time, "HH:MM" on the clock of ``digest_timezone``.
+    digest_time: Mapped[str] = mapped_column(
+        String(5), default="18:00", server_default=text("'18:00'"), nullable=False
+    )
+    digest_timezone: Mapped[str] = mapped_column(
+        String(64), default="Asia/Kolkata", server_default=text("'Asia/Kolkata'"), nullable=False
+    )
+    #: Who gets it by address. Sebin while it is tried out.
+    digest_recipients: Mapped[list[str]] = mapped_column(
+        ARRAY(String(320)), default=list, server_default=text("'{}'::varchar[]"), nullable=False
+    )
+    #: Also send it to whoever holds the CEO role. Off while it is tried out.
+    digest_include_ceo: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
+    )
+    #: "pdf", "xlsx", or both.
+    digest_formats: Mapped[list[str]] = mapped_column(
+        ARRAY(String(8)), default=lambda: ["pdf", "xlsx"],
+        server_default=text("'{pdf,xlsx}'::varchar[]"), nullable=False,
+    )
+    #: Whose mailbox it is sent from. Null: the first recipient's own.
+    digest_sender_email: Mapped[str | None] = mapped_column(String(320))
+    #: The day the report last went, in ``digest_timezone`` — so it goes once.
+    digest_last_sent_on: Mapped[date | None] = mapped_column(Date)
+    digest_last_error: Mapped[str | None] = mapped_column(Text)
 
     last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     #: What went wrong on the last sweep, if anything. A sweep that fails

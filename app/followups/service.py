@@ -125,6 +125,28 @@ async def update_settings(
     if changes.get("poll_seconds") is not None:
         row.poll_seconds = int(changes["poll_seconds"])
 
+    # The end-of-day report.
+    for key in ("digest_enabled", "digest_include_ceo"):
+        if changes.get(key) is not None:
+            setattr(row, key, bool(changes[key]))
+    if changes.get("digest_time") is not None:
+        row.digest_time = str(changes["digest_time"])
+    if changes.get("digest_timezone") is not None:
+        from zoneinfo import ZoneInfo
+
+        try:
+            ZoneInfo(str(changes["digest_timezone"]))
+        except Exception as exc:  # noqa: BLE001
+            raise FollowupError("That is not a timezone this server knows.") from exc
+        row.digest_timezone = str(changes["digest_timezone"])
+    if "digest_recipients" in changes:
+        row.digest_recipients = _clean_emails(changes["digest_recipients"])
+    if changes.get("digest_formats"):
+        row.digest_formats = sorted({str(f) for f in changes["digest_formats"]})
+    if "digest_sender_email" in changes:
+        sender = (changes["digest_sender_email"] or "").strip().lower()
+        row.digest_sender_email = sender or None
+
     # From the moment it is switched on, never from before. The archive of
     # bids that closed last year is not two hundred emails on the first tick.
     if row.enabled and not was_on:

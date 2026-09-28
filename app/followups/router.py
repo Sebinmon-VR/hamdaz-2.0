@@ -15,14 +15,18 @@ from __future__ import annotations
 import uuid
 from typing import Annotated
 
+from datetime import date
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.deps import CurrentUser
 from app.core.config import Settings, get_settings
 from app.core.db import get_session
-from app.followups import service
+from app.followups import digest, service
 from app.followups.schemas import (
+    DigestOut,
     DueTodayOut,
     FalsePositiveIn,
     FollowupOut,
@@ -72,10 +76,11 @@ def _out(row: TaskFollowup, viewer: User) -> FollowupOut:
     return body
 
 
-def _settings_out(row) -> FollowupSettingsOut:
+async def _settings_out(session: AsyncSession, row) -> FollowupSettingsOut:
     body = FollowupSettingsOut.model_validate(row)
     body.team_name = row.team.name if row.team else None
     body.ask_from_email = row.ask_from.email if row.ask_from else None
+    body.digest_to = await digest.recipients(session, row)
     return body
 
 
@@ -91,7 +96,7 @@ async def read_settings(admin: SuperAdmin, session: Session) -> FollowupSettings
     row = await service.get_settings(session)
     await session.commit()
     await session.refresh(row)
-    return _settings_out(row)
+    return await _settings_out(session, row)
 
 
 @router.patch("/settings", response_model=FollowupSettingsOut, summary="Change it")
@@ -106,7 +111,7 @@ async def update_settings(
         raise _translate(exc) from exc
     await session.commit()
     await session.refresh(row)
-    return _settings_out(row)
+    return await _settings_out(session, row)
 
 
 @router.post("/run", response_model=SweepOut, summary="Sweep now, even if switched off")
@@ -153,6 +158,78 @@ async def try_on_my_task(
     await session.commit()
     await session.refresh(row)
     return _out(row, admin)
+
+
+# ── the end-of-day report ──────────────────────────────────────────────
+
+
+def _link(config: Settings) -> str:
+    return f"{(config.followup_link_url or config.frontend_url).rstrip('/')}/followups"
+
+
+def _day(value: str | None, row) -> date:
+    from datetime import UTC, datetime
+
+    if not value:
+        return digest.local_today(row, datetime.now(UTC))
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="The day must be YYYY-MM-DD.") from exc
+
+
+@router.post("/digest/send", response_model=DigestOut, summary="Send a day's report now")
+async def send_digest_now(
+    admin: SuperAdmin,
+    session: Session,
+    request: Request,
+    config: Config,
+    day: Annotated[str | None, Query(description="YYYY-MM-DD; today if left out")] = None,
+) -> DigestOut:
+    """A preview send, for trying it out: to the same recipients, with the
+    same attachments — but nobody is marked "not responded" and the day's
+    real report still goes at the closing time."""
+    from datetime import UTC, datetime
+
+    row = await service.get_settings(session)
+    result = await digest.send(
+        session, row,
+        mailer=_mailer(request), link=_link(config), now=datetime.now(UTC),
+        sharepoint=request.app.state.sharepoint,
+        day=_day(day, row), mark_no_response=False,
+    )
+    await session.commit()
+    return DigestOut(**result)
+
+
+@router.get("/digest/file", summary="Download a day's report as PDF or Excel")
+async def download_digest(
+    admin: SuperAdmin,
+    session: Session,
+    request: Request,
+    format: Annotated[str, Query(pattern="^(pdf|xlsx)$")] = "pdf",
+    day: Annotated[str | None, Query(description="YYYY-MM-DD; today if left out")] = None,
+) -> Response:
+    """Built on demand and marks nothing — what the CEO would get, right now."""
+    row = await service.get_settings(session)
+    when = _day(day, row)
+    try:
+        tasks = await digest.day_tasks(session, row, request.app.state.sharepoint, when)
+    except Exception:  # noqa: BLE001 - the reasons still build
+        tasks = []
+    built = await digest.gather(session, row, day=when, mark_no_response=False, tasks=tasks)
+    await session.rollback()
+    content, media = (
+        (digest.build_pdf(built), digest.PDF_TYPE)
+        if format == "pdf"
+        else (digest.build_xlsx(built), digest.XLSX_TYPE)
+    )
+    name = f"end-of-day-report-{when:%Y-%m-%d}.{format}"
+    return Response(
+        content=content,
+        media_type=media,
+        headers={"Content-Disposition": f'attachment; filename="{name}"'},
+    )
 
 
 # ── listings ───────────────────────────────────────────────────────────

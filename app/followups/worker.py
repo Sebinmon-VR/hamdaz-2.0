@@ -14,12 +14,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import UTC, datetime
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import Settings
-from app.followups import service
+from app.followups import digest, service
 from app.followups.mailer import FollowupMailer
 from app.proposals.sharepoint import SharePointProposals
 
@@ -91,7 +92,9 @@ class FollowupWorker:
         async with self._factory() as session:
             row = await service.get_settings(session)
             wait = max(30, row.poll_seconds)
-            if not (row.enabled or force):
+            now = datetime.now(UTC)
+            digest_due = digest.is_due(row, now)
+            if not (row.enabled or force or digest_due):
                 await session.commit()
                 return max(wait, 120)
             got = await session.scalar(
@@ -100,6 +103,11 @@ class FollowupWorker:
             if not got:
                 await session.commit()
                 return wait
+            if not (row.enabled or force):
+                # Only the report is due: send it and go back to sleep.
+                await self._send_digest(session, row, now)
+                await session.commit()
+                return max(wait, 120)
             report = await service.sweep(
                 session,
                 settings=self._settings,
@@ -107,6 +115,10 @@ class FollowupWorker:
                 mailer=self._mailer,
                 force=force,
             )
+            # After the sweep, so anything that fell overdue just before the
+            # closing time is asked — and reported — rather than missed.
+            if digest.is_due(row, now):
+                await self._send_digest(session, row, now)
             await session.commit()
             if report.asked or report.resolved:
                 logger.info("follow-ups: %s", report.as_dict())
@@ -114,3 +126,14 @@ class FollowupWorker:
             return wait
 
     last_report: dict | None = None
+
+    async def _send_digest(self, session: AsyncSession, row, now) -> None:
+        result = await digest.send(
+            session,
+            row,
+            mailer=self._mailer,
+            link=f"{(self._settings.followup_link_url or self._settings.frontend_url).rstrip('/')}/followups",
+            now=now,
+            sharepoint=self._sharepoint,
+        )
+        logger.info("end-of-day report: %s", result)
