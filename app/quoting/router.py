@@ -69,7 +69,7 @@ from app.models.quoting import DocumentKind, QuoteRequest, QuoteStatus
 from app.proposals import mirror
 from app.proposals.router import get_sharepoint
 from app.proposals.sharepoint import SharePointError, SharePointProposals
-from app.quoting import bidpack, filing, report_pdf, service
+from app.quoting import bidpack, costing, filing, report_pdf, service
 from app.quoting import calculation as calc
 from app.quoting import report as report_mod
 from app.quoting import workbook as workbook_mod
@@ -215,6 +215,15 @@ async def _out(
         found = sources.get(str(out.id))
         if found is not None:
             out.supplier_unit_price, out.supplier_currency = found
+
+    # The automatic reading of import / export beside what the person said,
+    # so the form can show "we read this as an import, because…" next to the
+    # box they may overrule it in. See ``costing.detect_direction``.
+    chosen = costing.chosen_supplier_quote(request)
+    body.trade_direction_detected, body.trade_direction_reason = costing.detect_direction(
+        request, chosen
+    )
+    body.trade_direction_effective = costing.effective_direction(request, chosen)
 
     pack = bidpack.build(request)
     body.bid = BidPackOut.model_validate(pack, from_attributes=True)

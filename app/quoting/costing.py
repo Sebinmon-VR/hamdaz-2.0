@@ -34,7 +34,7 @@ from typing import Final
 
 from app.core.config import Settings
 from app.models.comparison import SupplierQuote
-from app.models.quoting import CostStage, QuoteCostLine, QuoteRequest
+from app.models.quoting import CostStage, QuoteCostLine, QuoteRequest, TradeDirection
 
 logger = logging.getLogger("hamdaz.quoting")
 
@@ -61,29 +61,95 @@ _PAY_UP_FRONT: Final = (
 
 HOUSE_DEFAULT: Final = "House default — edit or remove"
 
+#: Wording that says the goods are going *out* — to a customer abroad. Read
+#: from where the goods are going and how the deal is described, never from
+#: the customer's name: a Saudi company buying for its Dubai office is a local
+#: delivery, and only the delivery address knows that.
+_GOING_ABROAD: Final = ("export", "re-export", "re export", "for export")
+
 
 def _mentions(text: str | None, hints: tuple[str, ...]) -> bool:
     lowered = (text or "").strip().lower()
     return bool(lowered) and any(hint in lowered for hint in hints)
 
 
-def is_import(request: QuoteRequest, quote: SupplierQuote | None) -> bool:
-    """Whether the goods have to be brought in.
+def chosen_supplier_quote(request: QuoteRequest) -> SupplierQuote | None:
+    """The offer the quote is priced from, out of the comparison on it."""
+    chosen = request.selected_supplier_quote_id
+    if chosen is None or request.comparison is None:
+        return None
+    return next((q for q in request.comparison.quotes if q.id == chosen), None)
 
-    Decided by what the documents say — an Incoterm on the offer that hands
-    the goods over abroad (EXW, FOB, CIF…), or a route or a basis on the
-    quote that names a courier, a freight mode or an overseas purchase — and
-    never by the currency alone. It used to be: a Redington in Dubai quoting
-    in dollars was treated as an import, and 1% insurance and 5% duty were
-    put on a price that carries neither.
+
+def detect_direction(
+    request: QuoteRequest, quote: SupplierQuote | None
+) -> tuple[str | None, str]:
+    """What the documents say about the border, and why — the automatic half.
+
+    An Incoterm on the offer that hands the goods over abroad (EXW, FOB, CIF…),
+    or a route or a basis on the quote that names a courier, a freight mode or
+    an overseas purchase, reads as an import. Wording that says the goods are
+    going out for export reads as an export. Never the currency alone: a
+    Redington in Dubai quotes in dollars too, and treating that as an import
+    put 1% insurance and 5% duty on a price that carries neither.
+
+    Returns ``(None, reason)`` when nothing on the documents says either way.
+    That is an honest answer, not a default — the costing then seeds no duty,
+    and the screen says the direction has not been read rather than guessing
+    "local" and printing it on the approver's report as a fact.
     """
     if quote is not None:
         term = (quote.incoterms or "").strip().split()[:1]
         if term and term[0].upper() in _ABROAD_TERMS:
-            return True
-    return _mentions(request.supplier_route, _FROM_ABROAD) or _mentions(
-        request.supplier_basis, _FROM_ABROAD
-    )
+            return (
+                TradeDirection.IMPORT,
+                f"The supplier's offer is {term[0].upper()}: the goods are handed "
+                "over abroad, so bringing them in is ours to pay for.",
+            )
+    for label, text in (("route", request.supplier_route), ("basis", request.supplier_basis)):
+        if _mentions(text, _FROM_ABROAD):
+            return (
+                TradeDirection.IMPORT,
+                f"The supplier {label} reads as an overseas purchase: “{text.strip()}”.",
+            )
+    for label, text in (
+        ("delivery terms", request.delivery_terms),
+        ("ship-to", request.ship_to),
+        ("route", request.supplier_route),
+        ("basis", request.supplier_basis),
+    ):
+        if _mentions(text, _GOING_ABROAD):
+            return (
+                TradeDirection.EXPORT,
+                f"The {label} says the goods are going out: “{text.strip()}”.",
+            )
+    return None, "Nothing on the documents says the goods cross a border."
+
+
+def effective_direction(request: QuoteRequest, quote: SupplierQuote | None) -> str | None:
+    """The direction the costing uses: a person's word first, then the reading.
+
+    The stored column is what somebody chose on the form. It wins outright,
+    because the automatic reading is a guess from wording and the person
+    typing the quote has the documents in front of them. Null there means
+    nobody has said, and the documents decide.
+    """
+    stated = (request.trade_direction or "").strip().lower()
+    if stated in {d.value for d in TradeDirection}:
+        return stated
+    detected, _ = detect_direction(request, quote)
+    return detected
+
+
+def is_import(request: QuoteRequest, quote: SupplierQuote | None) -> bool:
+    """Whether the goods have to be brought in — what duty and insurance hang on.
+
+    A person's own answer on the quote settles it; otherwise the documents
+    do, by the reading in :func:`detect_direction`. A quote somebody marked
+    "local" seeds no duty however the supplier's offer is worded, and one
+    marked "import" gets it even when the offer says nothing.
+    """
+    return effective_direction(request, quote) == TradeDirection.IMPORT
 
 
 def pays_up_front(request: QuoteRequest, quote: SupplierQuote | None) -> bool:
@@ -105,8 +171,10 @@ def seed_costing(
     fx = request.fx_rate if request.fx_rate and request.fx_rate > 0 else None
     converting = bool(theirs and ours and theirs != ours)
 
-    # What the supplier quoted for shipping, exactly as they quoted it.
-    if quote.freight is not None and quote.freight > 0:
+    # What the supplier quoted for shipping, exactly as they quoted it —
+    # unless somebody has already typed the freight on the freight form, in
+    # which case that is the answer and a seeded row would count it twice.
+    if request.freight_charges is None and quote.freight is not None and quote.freight > 0:
         if converting and fx:
             base = (quote.freight / fx).quantize(_PRICE, rounding=ROUND_HALF_UP)
         elif converting:
@@ -152,6 +220,10 @@ def seed_costing(
         importing
         and settings.costing_default_duty_percent > 0
         and not (request.customs_duty_percent or _ZERO) > 0
+        # A duty figure on the freight form is the agent's own number; a
+        # house rate beside it would be ignored by the build-up anyway, and
+        # would read on the sheet as a second answer.
+        and request.duty_charges is None
     ):
         request.customs_duty_percent = settings.costing_default_duty_percent
         added.append("duty")

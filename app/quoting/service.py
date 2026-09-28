@@ -213,7 +213,9 @@ _ESTIMATE_FIELDS = (
 _BID_FIELDS = (
     "rfp_number", "buying_entity", "line_item_ref", "manufacturer_name",
     "manufacturer_part_number", "manufacturer_class_no", "incoterm_required",
-    "incoterm_place", "ship_to", "requested_delivery_date", "delivery_days",
+    "incoterm_place", "trade_direction", "freight_currency", "ship_to",
+    "requested_delivery_date",
+    "delivery_days",
     "country_of_origin", "mode_of_shipment", "bid_validity_days", "bid_reference",
     "technical_verdict", "commercial_verdict", "supplier_currency",
     # The selling & costing report's own facts. See ``app/quoting/report.py``.
@@ -235,6 +237,9 @@ _DECIMAL_FIELDS = (
 _NULLABLE_DECIMALS = (
     "fx_rate", "target_markup_percent", "submission_unit_price", "submission_total",
     "walk_away_margin_percent", "comfortable_margin_percent", "tax_percentage",
+    # The freight form's charges. Null is "not entered here", not zero: a
+    # blank freight box leaves the supplier's own freight row standing.
+    "freight_charges", "documentation_charges", "duty_charges",
 )
 
 

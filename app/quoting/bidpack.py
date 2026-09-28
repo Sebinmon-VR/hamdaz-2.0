@@ -75,6 +75,44 @@ def _percent(value: Decimal | None) -> Decimal:
     return (value or _ZERO).quantize(_PERCENT, rounding=ROUND_HALF_UP)
 
 
+def is_seeded_freight(row) -> bool:
+    """A freight row the automatic path put in from a quotation.
+
+    Recognised by the label it was given — ``Freight – <supplier>`` from the
+    supplier's offer, ``Freight`` or ``Freight – <carrier>`` from a courier's —
+    because those are the rows a figure typed on the freight form stands in
+    for. A row somebody typed under another name ("Air freight to site") is
+    theirs and is left alone.
+    """
+    label = (getattr(row, "label", "") or "").strip()
+    return label == "Freight" or label.startswith("Freight –")
+
+
+def freight_form_amount(request: QuoteRequest, value: Decimal | None) -> tuple[Decimal | None, str | None]:
+    """One charge from the freight form in the quote's own currency.
+
+    Returns ``(amount, note)``. The charge is in ``freight_currency``, which
+    is either the quote's own — taken as it is — or the supplier's, converted
+    at the bid's rate the way every other supplier figure is (1 unit of ours =
+    ``fx_rate`` of theirs). Any other currency, or the supplier's with no rate
+    yet, cannot be converted honestly: the amount is None and the note says
+    why, rather than a foreign figure being added to ours as if it were ours.
+    """
+    if value is None:
+        return None, None
+    ours = (request.currency or "AED").upper()
+    theirs = (request.freight_currency or "").upper() or ours
+    if theirs == ours:
+        return value, None
+    rate = request.fx_rate if request.fx_rate and request.fx_rate > 0 else None
+    if theirs == (request.supplier_currency or "").upper() and rate:
+        return value / rate, None
+    return None, (
+        f"Stated in {theirs}, and the bid holds no rate from {theirs} to {ours}. "
+        f"Enter it in {ours}, or in the supplier's currency once the rate is set."
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class CostElement:
     """One row of the build-up, whether it was typed or worked out.
@@ -302,6 +340,12 @@ def landed_cost(request: QuoteRequest) -> LandedCost:
     )
 
     stored = sorted(request.cost_lines, key=lambda c: c.position or 0)
+    # The freight form. A figure typed there is a person's answer to "what
+    # does the freight cost", so it stands in for the row the automatic path
+    # seeded from a quotation rather than being added on top of it.
+    manual_freight, freight_note = freight_form_amount(request, request.freight_charges)
+    if request.freight_charges is not None:
+        stored = [row for row in stored if not is_seeded_freight(row)]
     # Partitioned so that every row lands on one side or the other. Testing for
     # destination and treating everything else as origin — rather than testing
     # for each — means a row whose stage is unset cannot fall out of the
@@ -352,25 +396,85 @@ def landed_cost(request: QuoteRequest) -> LandedCost:
             )
         )
 
-    cif = goods + sum(origin_amounts.values(), _ZERO)
+    if request.freight_charges is not None:
+        ref += 1
+        elements.append(
+            CostElement(
+                ref=ref,
+                stage=CostStage.ORIGIN,
+                label="Freight",
+                basis="Entered on the freight form",
+                amount_source=(
+                    request.freight_charges if request.freight_currency
+                    and request.freight_currency.upper() != currency.upper() else None
+                ),
+                source_currency=(
+                    request.freight_currency.upper() if request.freight_currency
+                    and request.freight_currency.upper() != currency.upper() else None
+                ),
+                amount_base=_money(manual_freight),
+                is_principal=False,
+                is_firm=True,
+                computed=False,
+                notes=freight_note,
+            )
+        )
+
+    cif = goods + sum(origin_amounts.values(), _ZERO) + (manual_freight or _ZERO)
 
     # Duty, on the CIF value, because that is what customs charges it on.
-    duty = cif * (request.customs_duty_percent or _ZERO) / Decimal(100)
-    if duty > 0:
+    # A duty figure typed on the freight form replaces the rate: it is what
+    # the clearing agent actually said, and the rate is only ever an estimate.
+    entered_duty, duty_note = freight_form_amount(request, request.duty_charges)
+    if request.duty_charges is not None:
+        duty = entered_duty or _ZERO
+        duty_basis = "Entered on the freight form"
+    else:
+        duty = cif * (request.customs_duty_percent or _ZERO) / Decimal(100)
+        duty_basis = f"{_percent(request.customs_duty_percent)}% of the CIF value"
+    if duty > 0 or duty_note:
         ref += 1
+        entered = request.duty_charges is not None
+        foreign = entered and bool(request.freight_currency) and (
+            request.freight_currency.upper() != currency.upper()
+        )
         elements.append(
             CostElement(
                 ref=ref,
                 stage=CostStage.DESTINATION,
                 label="Import duty",
-                basis=f"{_percent(request.customs_duty_percent)}% of the CIF value",
-                amount_source=None,
-                source_currency=None,
+                basis=duty_basis,
+                amount_source=request.duty_charges if foreign else None,
+                source_currency=request.freight_currency.upper() if foreign else None,
                 amount_base=_money(duty),
                 is_principal=False,
-                is_firm=False,
-                computed=True,
-                notes=None,
+                is_firm=entered,
+                computed=not entered,
+                notes=duty_note,
+            )
+        )
+
+    # Documentation — certificates, legalisation, the agent's paperwork. After
+    # arrival, alongside duty, because that is when it is paid.
+    documentation, doc_note = freight_form_amount(request, request.documentation_charges)
+    if request.documentation_charges is not None:
+        ref += 1
+        foreign = bool(request.freight_currency) and (
+            request.freight_currency.upper() != currency.upper()
+        )
+        elements.append(
+            CostElement(
+                ref=ref,
+                stage=CostStage.DESTINATION,
+                label="Documentation charges",
+                basis="Entered on the freight form",
+                amount_source=request.documentation_charges if foreign else None,
+                source_currency=request.freight_currency.upper() if foreign else None,
+                amount_base=_money(documentation),
+                is_principal=False,
+                is_firm=True,
+                computed=False,
+                notes=doc_note,
             )
         )
 
@@ -443,7 +547,9 @@ def landed_cost(request: QuoteRequest) -> LandedCost:
             )
         )
 
-    destination_total = duty + financing + sum(destination_amounts.values(), _ZERO)
+    destination_total = (
+        duty + financing + (documentation or _ZERO) + sum(destination_amounts.values(), _ZERO)
+    )
     total = cif + destination_total
 
     quantity, note = _bid_quantity(request)

@@ -199,6 +199,15 @@ class QuoteRequestIn(BaseModel):
     #: The Incoterm the RFP demands, and the place it names.
     incoterm_required: str | None = Field(default=None, max_length=40)
     incoterm_place: str | None = Field(default=None, max_length=200)
+    #: Import, export or local — said by a person. Null leaves it to the
+    #: documents, and the response says what they were read as.
+    trade_direction: Literal["import", "export", "local"] | None = None
+    #: The freight form. Charges in ``freight_currency`` (null: the quote's
+    #: own); each null means "not entered", and the automatic figure stands.
+    freight_currency: str | None = Field(default=None, min_length=3, max_length=3)
+    freight_charges: Decimal | None = Field(default=None, ge=0)
+    documentation_charges: Decimal | None = Field(default=None, ge=0)
+    duty_charges: Decimal | None = Field(default=None, ge=0)
     ship_to: str | None = Field(default=None, max_length=200)
     requested_delivery_date: date | None = None
     #: What we will actually commit to, in calendar days from the PO.
@@ -253,7 +262,7 @@ class QuoteRequestIn(BaseModel):
     compliance: list[ComplianceIn] = Field(default_factory=list)
     submission_fields: list[SubmissionFieldIn] = Field(default_factory=list)
 
-    @field_validator("country_of_origin", "currency", "supplier_currency")
+    @field_validator("country_of_origin", "currency", "supplier_currency", "freight_currency")
     @classmethod
     def _upper(cls, value: str | None) -> str | None:
         """Codes are codes. "gb" and "GB" are the same country and a portal that
@@ -529,6 +538,19 @@ class QuoteRequestOut(BaseModel):
     manufacturer_class_no: str | None = None
     incoterm_required: str | None = None
     incoterm_place: str | None = None
+    #: What a person said, if anything. The column as stored.
+    trade_direction: str | None = None
+    #: What the documents say — the chosen offer's Incoterm, the route, the
+    #: basis — and in a sentence, why. Null when they say nothing either way.
+    #: Filled on read, never stored; see ``app.quoting.costing.detect_direction``.
+    trade_direction_detected: str | None = None
+    trade_direction_reason: str | None = None
+    #: The one the costing actually uses: the person's word, else the reading.
+    trade_direction_effective: str | None = None
+    freight_currency: str | None = None
+    freight_charges: Decimal | None = None
+    documentation_charges: Decimal | None = None
+    duty_charges: Decimal | None = None
     ship_to: str | None = None
     requested_delivery_date: datetime | None = None
     delivery_days: int | None = None

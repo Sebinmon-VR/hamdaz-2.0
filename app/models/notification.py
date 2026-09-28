@@ -43,6 +43,11 @@ class NotificationKind(StrEnum):
     NEGOTIATION = "negotiation"
     ORDER = "order"
     REPORT_SUBMITTED = "report_submitted"
+    #: A task of yours passed its due date without being finished, and you
+    #: are being asked why — see ``app.followups``.
+    TASK_OVERDUE = "task_overdue"
+    #: Somebody on your team answered that question. For the managers.
+    TASK_REASON = "task_reason"
     MENTION = "mention"
     GENERAL = "general"
 

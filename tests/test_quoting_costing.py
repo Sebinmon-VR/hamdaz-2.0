@@ -232,3 +232,96 @@ def test_a_courier_on_the_route_makes_it_an_import() -> None:
 
     assert costing.is_import(request, quote) is True
     assert costing.seed_costing(request, quote, house()) == ["insurance", "duty"]
+
+
+# ── the freight form ───────────────────────────────────────────────────
+
+
+def test_a_person_saying_local_stops_duty_even_on_an_exw_offer() -> None:
+    request = request_with(trade_direction="local")
+    costing.seed_costing(request, supplier(incoterms="EXW Shenzhen"), house())
+
+    assert request.customs_duty_percent == Decimal(0)
+    assert [r.label for r in request.cost_lines] == []
+
+
+def test_a_person_saying_import_seeds_duty_on_an_offer_that_says_nothing() -> None:
+    request = request_with(trade_direction="import")
+    costing.seed_costing(request, supplier(), house())
+
+    assert request.customs_duty_percent == Decimal(5)
+
+
+def test_the_documents_are_read_when_nobody_has_said() -> None:
+    request = request_with()
+    detected, reason = costing.detect_direction(request, supplier(incoterms="FOB Hamburg"))
+    assert detected == "import" and "FOB" in reason
+
+    exporting = request_with(delivery_terms="For export to Oman")
+    assert costing.detect_direction(exporting, supplier())[0] == "export"
+
+    assert costing.detect_direction(request_with(), supplier())[0] is None
+
+
+def test_typed_freight_replaces_the_suppliers_freight_row_and_is_not_seeded_twice() -> None:
+    from app.quoting import bidpack
+
+    request = request_with(currency="USD", freight_charges=Decimal("90"))
+    costing.seed_costing(request, supplier(freight=Decimal("60"), incoterms="EXW"), house())
+
+    assert not any(r.label.startswith("Freight") for r in request.cost_lines)
+    landed = bidpack.landed_cost(request)
+    freight = [e for e in landed.elements if e.label == "Freight"]
+    assert [f.amount_base for f in freight] == [Decimal("90.00")]
+    assert freight[0].basis == "Entered on the freight form"
+
+
+def test_typed_freight_wins_over_a_seeded_row_already_on_the_quote() -> None:
+    from app.quoting import bidpack
+
+    request = request_with(currency="USD")
+    costing.seed_costing(request, supplier(freight=Decimal("60")), house())
+    request.freight_charges = Decimal("75")
+
+    landed = bidpack.landed_cost(request)
+    assert [e.amount_base for e in landed.elements if "Freight" in e.label] == [Decimal("75.00")]
+
+
+def test_typed_duty_replaces_the_rate_and_documentation_is_added() -> None:
+    from app.quoting import bidpack
+
+    request = request_with(
+        currency="USD", customs_duty_percent=Decimal(5),
+        duty_charges=Decimal("40"), documentation_charges=Decimal("25"),
+    )
+    landed = bidpack.landed_cost(request)
+
+    assert landed.customs_duty == Decimal("40.00")
+    assert landed.total == Decimal("637.00") + Decimal("40") + Decimal("25")
+    labels = {e.label: e for e in landed.elements}
+    assert labels["Documentation charges"].amount_base == Decimal("25.00")
+
+
+def test_charges_in_the_suppliers_currency_convert_at_the_bids_rate() -> None:
+    from app.quoting import bidpack
+
+    request = request_with(
+        currency="USD", supplier_currency="AED", fx_rate=Decimal("3.6725"),
+        freight_currency="AED", freight_charges=Decimal("367.25"),
+    )
+    freight = next(e for e in bidpack.landed_cost(request).elements if e.label == "Freight")
+
+    assert freight.amount_base == Decimal("100.00")
+    assert (freight.amount_source, freight.source_currency) == (Decimal("367.25"), "AED")
+
+
+def test_a_charge_in_a_currency_with_no_rate_is_not_added_as_if_it_were_ours() -> None:
+    from app.quoting import bidpack
+
+    request = request_with(currency="USD", freight_currency="EUR", documentation_charges=Decimal("50"))
+    landed = bidpack.landed_cost(request)
+    doc = next(e for e in landed.elements if e.label == "Documentation charges")
+
+    assert doc.amount_base == Decimal("0.00")
+    assert "EUR" in (doc.notes or "")
+    assert landed.total == Decimal("637.00")

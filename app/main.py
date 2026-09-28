@@ -33,6 +33,9 @@ from app.directory.graph import GraphDirectory
 from app.directory.router import router as directory_router
 from app.finance.cache import PnlCache
 from app.finance.router import router as finance_router
+from app.followups.mailer import FollowupMailer
+from app.followups.router import router as followups_router
+from app.followups.worker import FollowupWorker
 from app.forms.router import router as templates_router
 from app.hr.public import router as careers_router
 from app.hr.router import router as hr_router
@@ -210,6 +213,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         ),
     )
     app.state.workflow_worker.start()
+    # Asks the holder of a task that went past its due date why, and passes
+    # the answer to their team's managers. Off until a super admin turns it
+    # on, and scoped by its settings to one team — see app/followups.
+    app.state.followup_worker = FollowupWorker(
+        factory=get_session_factory(),
+        settings=settings,
+        sharepoint=app.state.sharepoint,
+        mailer=FollowupMailer(settings, http),
+    )
+    app.state.followup_worker.start()
     logger.info("started environment=%s", settings.environment)
 
     try:
@@ -219,6 +232,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # closed connection pool is a noisy shutdown for no reason.
         await app.state.intake_worker.stop()
         await app.state.workflow_worker.stop()
+        await app.state.followup_worker.stop()
         await http.aclose()
         await dispose_engine()
 
@@ -288,6 +302,7 @@ def create_app() -> FastAPI:
     # which would otherwise try to read "admin" as a report id.
     app.include_router(admin_router, prefix=settings.api_prefix)
     app.include_router(notifications_router, prefix=settings.api_prefix)
+    app.include_router(followups_router, prefix=settings.api_prefix)
     # The webhook first: Graph posts to it unauthenticated, and it must not
     # inherit anything that would refuse Microsoft.
     app.include_router(intake_webhook_router, prefix=settings.api_prefix)

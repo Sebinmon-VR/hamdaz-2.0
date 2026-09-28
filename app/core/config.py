@@ -364,6 +364,12 @@ class Settings(BaseSettings):
     #: Where the browser lands after a successful sign-in, and the address the
     #: link in an approval email points at.
     frontend_url: str = "http://localhost:3000"
+    #: Where the links in the overdue-task follow-up mails point. Its own
+    #: setting, and production by default, because those mails reach real
+    #: people from whichever backend sent them — a laptop included — and a
+    #: localhost link in somebody's inbox opens nothing. ``frontend_url``
+    #: stays local so signing in on a laptop still lands on the laptop.
+    followup_link_url: str = "https://calm-sky-08cea4100.6.azurestaticapps.net"
     #: NoDecode stops pydantic-settings JSON-decoding this before the validator
     #: below runs, which is what lets a plain comma-separated env var work.
     cors_origins: Annotated[list[str], NoDecode] = Field(

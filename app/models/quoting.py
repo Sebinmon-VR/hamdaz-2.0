@@ -204,6 +204,24 @@ class ComplianceArea(StrEnum):
     LOGISTICS = "logistics"
 
 
+class TradeDirection(StrEnum):
+    """Which way the goods cross the border, if they cross one at all.
+
+    Three answers rather than a boolean, because "not an import" is two
+    different things: goods bought and sold in the country, and goods sold to a
+    customer abroad. The costing treats the first two alike — no duty, no
+    insurance seeded — and the third is what the export paperwork, and one day
+    the zero-rating, hang off.
+    """
+
+    #: Bought abroad, brought in. Duty and insurance are real costs.
+    IMPORT = "import"
+    #: Sold to a customer abroad. The goods leave the country.
+    EXPORT = "export"
+    #: Bought and delivered in the country. Nothing crosses a border.
+    LOCAL = "local"
+
+
 class CostStage(StrEnum):
     """Which side of the customs border a cost element sits on.
 
@@ -323,6 +341,36 @@ class QuoteRequest(Base, UUIDPrimaryKey, Timestamped):
     #: bids, and comparing two sentences will not find it.
     incoterm_required: Mapped[str | None] = mapped_column(String(40))
     incoterm_place: Mapped[str | None] = mapped_column(String(200))
+    #: Whether the goods cross a border, and which way — see ``TradeDirection``.
+    #: **Null means nobody has said**, and the documents decide: an Incoterm
+    #: that hands the goods over abroad, or a route that names a courier, reads
+    #: as an import (``app.quoting.costing.detect_direction``). A value here is
+    #: a person's word and wins over whatever the documents suggest, because
+    #: the automatic reading is a guess from wording and a duty line put on a
+    #: local purchase — or left off an import — is the single most expensive
+    #: way for that guess to be wrong.
+    trade_direction: Mapped[str | None] = mapped_column(String(12))
+
+    # ── the freight form ───────────────────────────────────────────────
+    # What bringing the goods in (or sending them out) costs, typed by a
+    # person. The automatic path fills freight from the supplier's own
+    # quotation and duty as a house rate; these are the manual answer for when
+    # that reading is wrong or the documents said nothing. Null on each means
+    # "not entered here", and the automatic figure stands.
+
+    #: The currency the three charges below are stated in. Null means the
+    #: quote's own currency. The quote's currency or the supplier's — the two
+    #: the bid holds a rate between.
+    freight_currency: Mapped[str | None] = mapped_column(String(3))
+    #: The freight, as a figure. Entered, it replaces the freight row seeded
+    #: from the supplier's quotation rather than adding to it.
+    freight_charges: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
+    #: Documentation: certificates of origin, legalisation, the clearing
+    #: agent's paperwork.
+    documentation_charges: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
+    #: Customs duty as a figure. Entered, it replaces the duty worked out as
+    #: ``customs_duty_percent`` of the CIF value.
+    duty_charges: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
     #: Where the goods are actually to be delivered, as the RFP states it. Not
     #: always the Incoterm place, and when the two disagree somebody has to ask.
     ship_to: Mapped[str | None] = mapped_column(String(200))

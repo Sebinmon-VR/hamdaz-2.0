@@ -74,6 +74,12 @@ from app.models.comparison import (
     SupplierQuoteItem,
 )
 from app.models.dashboard import TeamDashboardWidget
+from app.models.followup import (
+    OPEN_FOLLOWUP_STATUSES,
+    FollowupSettings,
+    FollowupStatus,
+    TaskFollowup,
+)
 from app.models.hr import (
     CLOSED_STAGES,
     ApplicationFile,
@@ -196,6 +202,10 @@ __all__ = [
     "EmployeeDocument",
     "EmploymentType",
     "FieldType",
+    "FollowupSettings",
+    "FollowupStatus",
+    "OPEN_FOLLOWUP_STATUSES",
+    "TaskFollowup",
     "FormTemplate",
     "JobApplication",
     "JobOpening",
