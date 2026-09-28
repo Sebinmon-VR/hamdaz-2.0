@@ -632,10 +632,31 @@ async def answer(
     row.answered_at = now
 
     managers = [m for m in await managers_of(session, row.team_id) if m.id != user.id]
-    if managers:
+    # The CEO hears each reason too, as it arrives — the same people the
+    # reports go to: the named addresses, plus the CEO role's holders once the
+    # "Also send to the CEO" switch is on. See ``digest.recipients``.
+    from app.followups import digest
+
+    ceo_emails = [
+        e for e in await digest.recipients(session, followup_settings)
+        if e != (user.email or "").casefold()
+    ]
+    readers = list(managers)
+    if ceo_emails:
+        known = {(m.email or "").casefold() for m in managers}
+        extra = (
+            await session.scalars(
+                select(User).where(
+                    User.email.in_([e for e in ceo_emails if e not in known]),
+                    User.is_active.is_(True),
+                )
+            )
+        ).all()
+        readers += [u for u in extra if u.id != user.id]
+    if readers:
         await notifications.notify(
             session,
-            users=managers,
+            users=readers,
             kind=NotificationKind.TASK_REASON,
             title=f"{user.display_name}: why “{row.task_title[:120]}” is late",
             body=text[:500],
@@ -644,7 +665,7 @@ async def answer(
             source_id=str(row.id),
             payload={"task_id": row.task_id},
         )
-    await _forward(row, user, managers, settings, followup_settings, mailer, now)
+    await _forward(row, user, managers, settings, followup_settings, mailer, now, ceo_emails)
     await session.flush()
     return row
 
@@ -671,9 +692,16 @@ async def _forward(
     followup_settings: FollowupSettings,
     mailer,
     now: datetime,
+    ceo_emails: list[str] | None = None,
 ) -> None:
-    if not managers:
-        row.forward_error = "This team has no manager to send the reason to."
+    """Mail the reason to the team's managers and approvers, and the CEO."""
+    to: list[str] = []
+    for address in [m.email for m in managers if m.email] + list(ceo_emails or []):
+        address = address.strip().lower()
+        if address and address not in to:
+            to.append(address)
+    if not to:
+        row.forward_error = "This team has no manager or approver, and no CEO address is set."
         return
     if not (settings.notify_by_email and followup_settings.notify_managers_by_email):
         row.forward_error = "Email to managers is switched off; they were notified in the app."
@@ -682,7 +710,7 @@ async def _forward(
         await mailer.send_reason(
             row,
             sender=user,
-            recipients=[m.email for m in managers if m.email],
+            recipients=to,
             link=form_link(settings, row.id),
         )
         row.forwarded_at = now
