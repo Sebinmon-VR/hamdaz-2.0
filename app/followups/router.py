@@ -333,14 +333,18 @@ async def due_today(
 
     now = datetime.now(UTC)
     start, end = service.today_bounds(now)
-    asked = {
-        (r.task_id, r.due_at): r
+    # Each task's latest question, whatever due time it was asked against.
+    ids = {task.id for _, tasks in people for task in tasks}
+    asked: dict[str, TaskFollowup] = {}
+    if ids:
         for r in (
             await session.scalars(
-                select(TaskFollowup).where(TaskFollowup.due_at >= start, TaskFollowup.due_at < end)
+                select(TaskFollowup)
+                .where(TaskFollowup.task_id.in_(ids))
+                .order_by(TaskFollowup.created_at)
             )
-        ).all()
-    }
+        ).all():
+            asked[r.task_id] = r
     return DueTodayOut(
         team_name=resolved.name if (resolved and scope == "team") else None,
         scope=scope,

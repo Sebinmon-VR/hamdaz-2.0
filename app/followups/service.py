@@ -425,12 +425,16 @@ async def _close_if_dealt_with(
     if not pending:
         return
     due = due_of(task)
+    now = datetime.now(UTC)
     for row in pending:
         note = None
         if is_finished(task):
             note = "The bid was marked submitted before anybody answered."
-        elif due is not None and due != row.due_at:
-            note = "The task's due date was moved before anybody answered."
+        elif due is not None and due > now and due - row.due_at > timedelta(minutes=1):
+            # Only a deadline pushed *out*, into the future: the work is no
+            # longer late. A date read differently, or moved earlier, leaves a
+            # late task late — and the question stands.
+            note = "The task's due date was moved later before anybody answered."
         if note:
             row.status = FollowupStatus.RESOLVED
             row.resolved_note = note
@@ -710,18 +714,20 @@ def watches(row: FollowupSettings | None, user: User, task: ProposalTask) -> str
 
     The same filters the sweep applies, said in words, so a screen can tell a
     task that is waiting for its question from one that will never get one.
+    The words before the "—" are the badge; the rest is its tooltip.
     """
     if row is None or not row.enabled:
-        return "The follow-up is switched off."
+        return "Follow-up off — the follow-up is switched off."
     only = set(row.only_emails or [])
     if only and (user.email or "").casefold() not in only:
-        return "This person is outside the trial — only the people named in the settings are asked."
+        return "Outside the trial — only the people named in the settings are asked."
     word = (row.only_title_contains or "").strip().casefold()
     if word and word not in (task.title or "").casefold():
         return f"Outside the trial — only tasks with “{row.only_title_contains}” in the title are asked about."
     due = due_of(task)
     if row.watch_from is None or (due is not None and due < row.watch_from):
-        return "Due before the follow-up was switched on."
+        started = row.watch_from.astimezone(GULF).strftime("%d %b %H:%M UAE") if row.watch_from else "—"
+        return f"Due before switch-on — the follow-up only asks about tasks due after {started}."
     return None
 
 
@@ -730,7 +736,7 @@ def due_today_rows(
     *,
     now: datetime,
     grace_minutes: int,
-    asked: dict[tuple[str, datetime], TaskFollowup],
+    asked: dict[str, TaskFollowup],
     settings_row: FollowupSettings | None = None,
 ) -> list[dict[str, Any]]:
     """Every task due today, finished or not, soonest first.
@@ -745,7 +751,9 @@ def due_today_rows(
             due = due_of(task)
             if due is None or not (start <= due < end):
                 continue
-            followup = asked.get((task.id, due))
+            # By the task, not the task and its due time: a question asked
+            # before a deadline was re-read or moved is still this task's.
+            followup = asked.get(task.id)
             finished = is_finished(task)
             # Asked now rather than at the deadline — see ``decide``.
             reason_now = not finished and marked_not_submitted(task.submission_status)

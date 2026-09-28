@@ -184,10 +184,13 @@ def test_the_screen_says_when_a_task_is_outside_the_trial() -> None:
     fasna = User(email="fasna@hamdaz.com", display_name="Fasna", entra_object_id="y")
 
     assert watches(trial, sebin, task()) is None
-    assert "outside the trial" in watches(trial, fasna, task())
+    assert watches(trial, fasna, task()).startswith("Outside the trial")
     assert "in the title" in watches(trial, sebin, task(title="RFQ 6000151129"))
     trial.enabled = False
-    assert watches(trial, sebin, task()) == "The follow-up is switched off."
+    assert watches(trial, sebin, task()).startswith("Follow-up off")
+    trial.enabled = True
+    early = task(bid_closing_date=stored(WATCH - timedelta(hours=2)))
+    assert watches(trial, sebin, early).startswith("Due before switch-on")
 
 
 def test_due_today_lists_todays_tasks_soonest_first_with_the_ask_time() -> None:
@@ -335,3 +338,48 @@ def test_the_weekly_report_has_a_by_person_summary() -> None:
     assert digest.build_pdf(built).startswith(b"%PDF")
     html = digest.mail_html(built, "https://x/followups")
     assert "By person" in html and "Due this week" in html
+
+
+
+def test_a_deadline_read_differently_does_not_close_the_question() -> None:
+    """What closed Rameesa's question: the same deadline, re-read eleven hours
+    earlier, looked like a moved date. Only a deadline pushed out into the
+    future closes a question now."""
+    import asyncio
+
+    from app.followups.service import SweepReport, _close_if_dealt_with
+
+    class Session:
+        def __init__(self, rows):
+            self.rows = rows
+
+        async def scalars(self, _):
+            class Result:
+                def __init__(self, rows):
+                    self._rows = rows
+
+                def all(self):
+                    return self._rows
+
+            return Result(self.rows)
+
+    now = datetime.now(UTC)
+    asked = TaskFollowup(task_id="901", status=FollowupStatus.PENDING, due_at=now - timedelta(hours=1))
+    earlier = task(bid_closing_date=stored(now - timedelta(hours=12)))
+    asyncio.run(_close_if_dealt_with(Session([asked]), earlier, SweepReport()))
+    assert asked.status == FollowupStatus.PENDING
+
+    extended = task(bid_closing_date=stored(now + timedelta(days=3)))
+    asyncio.run(_close_if_dealt_with(Session([asked]), extended, SweepReport()))
+    assert asked.status == FollowupStatus.RESOLVED
+
+
+def test_due_today_finds_a_question_by_its_task_whatever_due_time_it_holds() -> None:
+    from app.followups.service import due_today_rows
+
+    person = User(email="rameesa@hamdaz.com", display_name="Rameesa", entra_object_id="x")
+    asked = TaskFollowup(task_id="901", status=FollowupStatus.PENDING, due_at=DUE + timedelta(hours=11))
+    rows = due_today_rows(
+        [(person, [task()])], now=DUE, grace_minutes=20, asked={"901": asked},
+    )
+    assert rows[0]["followup_status"] == FollowupStatus.PENDING
