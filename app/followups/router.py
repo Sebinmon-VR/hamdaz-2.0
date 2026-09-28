@@ -185,6 +185,7 @@ async def send_digest_now(
     request: Request,
     config: Config,
     day: Annotated[str | None, Query(description="YYYY-MM-DD; today if left out")] = None,
+    period: Annotated[str, Query(pattern="^(day|week)$")] = "day",
 ) -> DigestOut:
     """A preview send, for trying it out: to the same recipients, with the
     same attachments — but nobody is marked "not responded" and the day's
@@ -196,7 +197,7 @@ async def send_digest_now(
         session, row,
         mailer=_mailer(request), link=_link(config), now=datetime.now(UTC),
         sharepoint=request.app.state.sharepoint,
-        day=_day(day, row), mark_no_response=False,
+        day=_day(day, row), weekly=period == "week", preview=True,
     )
     await session.commit()
     return DigestOut(**result)
@@ -209,22 +210,30 @@ async def download_digest(
     request: Request,
     format: Annotated[str, Query(pattern="^(pdf|xlsx)$")] = "pdf",
     day: Annotated[str | None, Query(description="YYYY-MM-DD; today if left out")] = None,
+    period: Annotated[str, Query(pattern="^(day|week)$")] = "day",
 ) -> Response:
     """Built on demand and marks nothing — what the CEO would get, right now."""
     row = await service.get_settings(session)
     when = _day(day, row)
+    days = 7 if period == "week" else 1
     try:
-        tasks = await digest.day_tasks(session, row, request.app.state.sharepoint, when)
+        tasks = await digest.day_tasks(session, row, request.app.state.sharepoint, when, days=days)
     except Exception:  # noqa: BLE001 - the reasons still build
         tasks = []
-    built = await digest.gather(session, row, day=when, mark_no_response=False, tasks=tasks)
+    built = await digest.gather(
+        session, row, day=when, mark_no_response=False, tasks=tasks, days=days
+    )
     await session.rollback()
     content, media = (
         (digest.build_pdf(built), digest.PDF_TYPE)
         if format == "pdf"
         else (digest.build_xlsx(built), digest.XLSX_TYPE)
     )
-    name = f"end-of-day-report-{when:%Y-%m-%d}.{format}"
+    name = (
+        f"weekly-report-{built.first_day:%Y-%m-%d}-to-{when:%Y-%m-%d}.{format}"
+        if built.weekly
+        else f"end-of-day-report-{when:%Y-%m-%d}.{format}"
+    )
     return Response(
         content=content,
         media_type=media,

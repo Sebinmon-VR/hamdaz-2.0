@@ -93,7 +93,7 @@ class FollowupWorker:
             row = await service.get_settings(session)
             wait = max(30, row.poll_seconds)
             now = datetime.now(UTC)
-            digest_due = digest.is_due(row, now)
+            digest_due = digest.is_due(row, now) or digest.is_weekly_due(row, now)
             if not (row.enabled or force or digest_due):
                 await session.commit()
                 return max(wait, 120)
@@ -104,8 +104,8 @@ class FollowupWorker:
                 await session.commit()
                 return wait
             if not (row.enabled or force):
-                # Only the report is due: send it and go back to sleep.
-                await self._send_digest(session, row, now)
+                # Only a report is due: send it and go back to sleep.
+                await self._send_reports(session, row, now)
                 await session.commit()
                 return max(wait, 120)
             report = await service.sweep(
@@ -117,8 +117,7 @@ class FollowupWorker:
             )
             # After the sweep, so anything that fell overdue just before the
             # closing time is asked — and reported — rather than missed.
-            if digest.is_due(row, now):
-                await self._send_digest(session, row, now)
+            await self._send_reports(session, row, now)
             await session.commit()
             if report.asked or report.resolved:
                 logger.info("follow-ups: %s", report.as_dict())
@@ -127,13 +126,21 @@ class FollowupWorker:
 
     last_report: dict | None = None
 
-    async def _send_digest(self, session: AsyncSession, row, now) -> None:
-        result = await digest.send(
-            session,
-            row,
-            mailer=self._mailer,
-            link=f"{(self._settings.followup_link_url or self._settings.frontend_url).rstrip('/')}/followups",
-            now=now,
-            sharepoint=self._sharepoint,
-        )
-        logger.info("end-of-day report: %s", result)
+    async def _send_reports(self, session: AsyncSession, row, now) -> None:
+        """The end-of-day report, then the weekly one when it is the day.
+
+        In that order: the daily send marks the unanswered as not responded,
+        and the week's report should say so too.
+        """
+        link = f"{(self._settings.followup_link_url or self._settings.frontend_url).rstrip('/')}/followups"
+        if digest.is_due(row, now):
+            result = await digest.send(
+                session, row, mailer=self._mailer, link=link, now=now, sharepoint=self._sharepoint,
+            )
+            logger.info("end-of-day report: %s", result)
+        if digest.is_weekly_due(row, now):
+            result = await digest.send(
+                session, row, mailer=self._mailer, link=link, now=now,
+                sharepoint=self._sharepoint, weekly=True,
+            )
+            logger.info("weekly report: %s", result)

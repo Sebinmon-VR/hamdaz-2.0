@@ -79,6 +79,22 @@ def local_today(row: FollowupSettings, now: datetime) -> date:
     return now.astimezone(_zone(row.digest_timezone)).date()
 
 
+WEEKDAYS: Final = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+
+
+def is_weekly_due(row: FollowupSettings, now: datetime) -> bool:
+    """Whether this week's report should go now: the chosen weekday, past the
+    closing time, not yet sent today."""
+    if not row.weekly_enabled:
+        return False
+    today = local_today(row, now)
+    if today.weekday() != (row.weekly_day if row.weekly_day is not None else 4):
+        return False
+    if row.weekly_last_sent_on == today:
+        return False
+    return now >= cutoff_for(row, today)
+
+
 def is_due(row: FollowupSettings, now: datetime) -> bool:
     """Whether today's report should go now: past the closing time, not yet sent."""
     if not row.digest_enabled:
@@ -132,11 +148,14 @@ class TaskLine:
 
 @dataclass(slots=True)
 class Digest:
+    #: The last day the report covers.
     day: date
     window_start: datetime
     window_end: datetime
     zone: str
     team: str | None
+    #: 1 for the end-of-day report, 7 for the weekly one.
+    days: int = 1
     lines: list[DigestLine] = field(default_factory=list)
     #: Every task of the team due on the day, split by Submission Status.
     submitted: list[TaskLine] = field(default_factory=list)
@@ -146,8 +165,52 @@ class Digest:
         return sum(1 for line in self.lines if line.status == STATUS_LABELS.get(status, status))
 
     @property
+    def weekly(self) -> bool:
+        return self.days > 1
+
+    @property
+    def first_day(self) -> date:
+        return self.day - timedelta(days=self.days - 1)
+
+    @property
+    def kind(self) -> str:
+        return "Weekly report" if self.weekly else "End of day report"
+
+    @property
+    def period(self) -> str:
+        """"Monday 28 September 2026", or "22 – 28 Sep 2026" for a week."""
+        if not self.weekly:
+            return f"{self.day:%A %d %B %Y}"
+        first = self.first_day
+        head = f"{first:%d}" if (first.month, first.year) == (self.day.month, self.day.year) else f"{first:%d %b}"
+        return f"{head} – {self.day:%d %b %Y}"
+
+    @property
+    def span(self) -> str:
+        """How the period reads in running text: "today" or "this week"."""
+        return "this week" if self.weekly else "today"
+
+    @property
     def title(self) -> str:
-        return f"End of day report — {self.day:%A %d %B %Y}"
+        return f"{self.kind} — {self.period}"
+
+    def people(self) -> list[tuple[str, int, int, int, int, int]]:
+        """Per person: due, submitted, not submitted, reasons given, not responded."""
+        table: dict[str, list[int]] = {}
+        for line in self.submitted:
+            table.setdefault(line.person, [0, 0, 0, 0, 0])[1] += 1
+        for line in self.not_submitted:
+            table.setdefault(line.person, [0, 0, 0, 0, 0])[2] += 1
+        for line in self.lines:
+            row = table.setdefault(line.person, [0, 0, 0, 0, 0])
+            if line.status == STATUS_LABELS[FollowupStatus.ANSWERED]:
+                row[3] += 1
+            elif line.status == STATUS_LABELS[FollowupStatus.NO_RESPONSE]:
+                row[4] += 1
+        out = [(name, v[1] + v[2], v[1], v[2], v[3], v[4]) for name, v in table.items()]
+        # Most not submitted first, then most not responded.
+        out.sort(key=lambda r: (-r[3], -r[5], r[0].casefold()))
+        return out
 
 
 def _gulf(value: datetime | None) -> str:
@@ -155,7 +218,7 @@ def _gulf(value: datetime | None) -> str:
 
 
 async def day_tasks(
-    session: AsyncSession, row: FollowupSettings, sharepoint, day: date
+    session: AsyncSession, row: FollowupSettings, sharepoint, day: date, *, days: int = 1
 ) -> list[tuple[User, Any]]:
     """Every task of the team due on ``day`` (a UAE calendar day), with its holder.
 
@@ -168,8 +231,9 @@ async def day_tasks(
     from app.followups.service import due_of
     from app.teams import service as teams_service
 
-    start = datetime.combine(day, time(0, 0), tzinfo=_GULF).astimezone(UTC)
-    end = start + timedelta(days=1)
+    first = day - timedelta(days=days - 1)
+    start = datetime.combine(first, time(0, 0), tzinfo=_GULF).astimezone(UTC)
+    end = start + timedelta(days=days)
     out: list[tuple[User, Any]] = []
     for user, _ in await teams_service.list_members(session, row.team_id):
         if not user.is_active:
@@ -192,11 +256,12 @@ async def gather(
     day: date,
     mark_no_response: bool,
     tasks: list[tuple[User, Any]] | None = None,
+    days: int = 1,
 ) -> Digest:
-    """The follow-ups asked in ``day``'s window, and — at the real end of day —
-    the unanswered ones marked not responded."""
+    """The follow-ups asked in the window ending at ``day``'s closing time, and —
+    at the real end of day — the unanswered ones marked not responded."""
     end = cutoff_for(row, day)
-    start = cutoff_for(row, day - timedelta(days=1))
+    start = cutoff_for(row, day - timedelta(days=days))
     rows = (
         await session.scalars(
             select(TaskFollowup)
@@ -221,6 +286,7 @@ async def gather(
         window_end=end,
         zone=row.digest_timezone or "Asia/Kolkata",
         team=row.team.name if row.team else None,
+        days=days,
     )
     for f in rows:
         told = ""
@@ -338,7 +404,7 @@ def build_pdf(digest: Digest) -> bytes:
 
         canvas.setFont("Helvetica-Bold", 14)
         canvas.setFillColor(house.NAVY)
-        canvas.drawRightString(page_w - margin, y - 45, "END OF DAY REPORT")
+        canvas.drawRightString(page_w - margin, y - 45, digest.kind.upper())
         rule_w, rule_h = 181.0, 2.4
         canvas.setFillColor(house.CYAN)
         canvas.rect(page_w - margin - rule_w, y - 53, rule_w * 0.62, rule_h, stroke=0, fill=1)
@@ -351,7 +417,7 @@ def build_pdf(digest: Digest) -> bytes:
         )
         canvas.setFont("Helvetica-Bold", 8.4)
         canvas.setFillColor(house.INK)
-        canvas.drawRightString(page_w - margin, y - 82, f"{digest.day:%A %d %B %Y}")
+        canvas.drawRightString(page_w - margin, y - 82, digest.period)
         canvas.setStrokeColor(house.LINE)
         canvas.setLineWidth(0.8)
         canvas.line(margin, y - 100, page_w - margin, y - 100)
@@ -362,19 +428,20 @@ def build_pdf(digest: Digest) -> bytes:
             canvas.drawImage(footer, margin, 17, width=width, height=fh, mask="auto")
             canvas.setFont("Helvetica", 6.5)
             canvas.setFillColor(house.FAINT)
-            canvas.drawString(margin, 17 + fh + 4, f"End of day report  ·  {digest.team or 'All teams'}  ·  {digest.day:%d %b %Y}")
+            canvas.drawString(margin, 17 + fh + 4, f"{digest.kind}  ·  {digest.team or 'All teams'}  ·  {digest.period}")
             canvas.drawRightString(page_w - margin, 17 + fh + 4, f"Page {doc.page}")
         canvas.restoreState()
 
     cell = ParagraphStyle("cell", fontName="Helvetica", fontSize=7.6, leading=9.6, alignment=TA_LEFT, textColor=house.INK)
     head = ParagraphStyle("head", parent=cell, fontName="Helvetica-Bold", textColor="#ffffff")
     lead = ParagraphStyle("lead", parent=cell, fontSize=9.4, leading=13)
+    section = ParagraphStyle("section", parent=lead, fontName="Helvetica-Bold", fontSize=11, textColor=house.NAVY, spaceBefore=6)
 
     def p(text: str, style=cell) -> Paragraph:
         return Paragraph(escape(text or "").replace("\n", "<br/>"), style)
 
     counts = [
-        ("Due today", len(digest.submitted) + len(digest.not_submitted)),
+        ("Due " + digest.span, len(digest.submitted) + len(digest.not_submitted)),
         ("Submitted", len(digest.submitted)),
         ("Not submitted", len(digest.not_submitted)),
         ("Reasons asked", len(digest.lines)),
@@ -423,8 +490,6 @@ def build_pdf(digest: Digest) -> bytes:
             style.append(("BACKGROUND", (0, r), (-1, r), house.ROW))
     table.setStyle(TableStyle(style))
 
-    section = ParagraphStyle("section", parent=lead, fontName="Helvetica-Bold", fontSize=11, textColor=house.NAVY, spaceBefore=6)
-
     def task_table(lines: list[TaskLine], shade) -> Table:
         heads = ["#", "Person", "Task", "Due (UAE)", "Status", "Submission", "Type", "Priority", "Zoho quote", "Order", "Remarks", "Reason / follow-up"]
         cols = [16, 56, 130, 56, 46, 50, 34, 38, 50, 40, 130, 110]
@@ -456,31 +521,56 @@ def build_pdf(digest: Digest) -> bytes:
         t.setStyle(TableStyle(st))
         return t
 
+    when = (
+        f"from {digest.first_day:%d %B} to {digest.day:%d %B %Y}" if digest.weekly
+        else f"on {digest.day:%d %B %Y}"
+    )
     story: list[Any] = [
         Paragraph(
-            f"{digest.team or 'The team'} tasks due on {digest.day:%d %B %Y} (UAE time), "
+            f"{digest.team or 'The team'} tasks due {when} (UAE time), "
             f"submitted and not, and every reason asked for between "
             f"{_local(digest.window_start, digest.zone)} and {_local(digest.window_end, digest.zone)}. "
-            f"Anybody who had not answered by the closing time is marked <b>Not responded</b>.",
+            f"Anybody who had not answered by the day's closing time is marked <b>Not responded</b>.",
             lead,
         ),
         Spacer(1, 8),
         tiles,
         Spacer(1, 10),
+    ]
+    if digest.weekly:
+        # The week at a glance, one row a person, before the task lists.
+        people = digest.people()
+        rows = [[p(h, head) for h in ("Person", "Due", "Submitted", "Not submitted", "Reasons given", "Not responded")]]
+        rows += [[p(name), p(str(a)), p(str(b)), p(str(c)), p(str(d)), p(str(e))] for name, a, b, c, d, e in people]
+        people_table = Table(rows, colWidths=[width * 0.3] + [width * 0.14] * 5, repeatRows=1)
+        people_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), house.NAVY),
+            ("LINEBELOW", (0, 0), (-1, -1), 0.5, house.LINE),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ]))
+        story += [
+            Paragraph("By person", section),
+            Spacer(1, 4),
+            people_table if people else Paragraph("Nothing was due this week.", lead),
+            Spacer(1, 10),
+        ]
+    story += [
         Paragraph(f"Not submitted ({len(digest.not_submitted)})", section),
         Spacer(1, 4),
         task_table(digest.not_submitted, house.LOSS_RED) if digest.not_submitted
-        else Paragraph("Every task due today was submitted.", lead),
+        else Paragraph(f"Every task due {digest.span} was submitted.", lead),
         Spacer(1, 10),
         Paragraph(f"Submitted ({len(digest.submitted)})", section),
         Spacer(1, 4),
         task_table(digest.submitted, None) if digest.submitted
-        else Paragraph("Nothing due today was submitted.", lead),
+        else Paragraph(f"Nothing due {digest.span} was submitted.", lead),
         Spacer(1, 10),
         Paragraph(f"Reasons asked for ({len(digest.lines)})", section),
         Spacer(1, 4),
     ]
-    story.append(table if digest.lines else Paragraph("Nobody was asked for a reason today.", lead))
+    story.append(table if digest.lines else Paragraph(f"Nobody was asked for a reason {digest.span}.", lead))
 
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
@@ -515,12 +605,12 @@ def build_xlsx(digest: Digest) -> bytes:
 
     ws["A1"] = "HAMDAZTECH TECHNOLOGY SERVICES - L.L.C"
     ws["A1"].font = Font(bold=True, size=11, color=navy)
-    ws["A2"] = "Overdue task reasons — end of day report"
+    ws["A2"] = f"Reasons asked for — {digest.kind.lower()}"
     ws["A2"].font = Font(bold=True, size=14, color=navy)
-    ws["A3"] = f"{digest.day:%A %d %B %Y}  ·  {digest.team or 'All teams'}"
+    ws["A3"] = f"{digest.period}  ·  {digest.team or 'All teams'}"
     ws["A3"].font = Font(size=10, color="64727F")
     summary = (
-        f"Due today {len(digest.submitted) + len(digest.not_submitted)}  ·  "
+        f"Due {digest.span} {len(digest.submitted) + len(digest.not_submitted)}  ·  "
         f"Submitted {len(digest.submitted)}  ·  Not submitted {len(digest.not_submitted)}  ·  "
         f"Reasons asked {len(digest.lines)}  ·  Reason given {digest.count(FollowupStatus.ANSWERED)}  ·  "
         f"Not responded {digest.count(FollowupStatus.NO_RESPONSE)}  ·  "
@@ -572,7 +662,7 @@ def build_xlsx(digest: Digest) -> bytes:
         sheet = wb.create_sheet(title)
         sheet["A1"] = "HAMDAZTECH TECHNOLOGY SERVICES - L.L.C"
         sheet["A1"].font = Font(bold=True, size=11, color=navy)
-        sheet["A2"] = f"{title} — due {digest.day:%A %d %B %Y} (UAE)"
+        sheet["A2"] = f"{title} — due {digest.period} (UAE)"
         sheet["A2"].font = Font(bold=True, size=14, color=navy)
         sheet["A3"] = f"{digest.team or 'All teams'}  ·  {len(lines)} task(s)"
         sheet["A3"].font = Font(size=10, color="64727F")
@@ -600,6 +690,26 @@ def build_xlsx(digest: Digest) -> bytes:
     # The day's picture first; the reasons behind it after.
     wb.move_sheet("Reasons", offset=2)
 
+    if digest.weekly:
+        people = wb.create_sheet("By person", 0)
+        people["A1"] = "HAMDAZTECH TECHNOLOGY SERVICES - L.L.C"
+        people["A1"].font = Font(bold=True, size=11, color=navy)
+        people["A2"] = f"Weekly report — {digest.period}"
+        people["A2"].font = Font(bold=True, size=14, color=navy)
+        people["A3"] = digest.team or "All teams"
+        people["A3"].font = Font(size=10, color="64727F")
+        heads = ["Person", "Due", "Submitted", "Not submitted", "Reasons given", "Not responded"]
+        for col, heading in enumerate(heads, start=1):
+            cell = people.cell(row=5, column=col, value=heading)
+            cell.font = Font(bold=True, color="FFFFFF", size=10)
+            cell.fill = PatternFill("solid", fgColor=navy)
+        for n, values in enumerate(digest.people(), start=1):
+            for col, value in enumerate(values, start=1):
+                cell = people.cell(row=5 + n, column=col, value=value)
+                cell.border = Border(bottom=thin)
+        for col, w in enumerate([28, 10, 12, 14, 14, 14], start=1):
+            people.column_dimensions[people.cell(row=5, column=col).column_letter].width = w
+
     buffer = io.BytesIO()
     wb.save(buffer)
     return buffer.getvalue()
@@ -626,30 +736,43 @@ def mail_html(digest: Digest, link: str) -> str:
 
     body = m.heading(digest.title, eyebrow=f"Proposals · {digest.team or 'All teams'}")
     body += m.counts([
-        ("Due today", len(digest.submitted) + len(digest.not_submitted), False),
+        ("Due " + digest.span, len(digest.submitted) + len(digest.not_submitted), False),
         ("Submitted", len(digest.submitted), False),
         ("Not submitted", len(digest.not_submitted), True),
         ("Not responded", digest.count(FollowupStatus.NO_RESPONSE), True),
     ])
+    if digest.weekly and digest.people():
+        body += (
+            f"<p style='margin:20px 0 8px;font-weight:600'>By person</p>"
+            + m.grid(
+                ["Person", "Due", "Submitted", "Not submitted", "Not responded"],
+                [[name, str(a), str(b), str(c), str(e)] for name, a, b, c, _, e in digest.people()],
+            )
+        )
     if digest.not_submitted:
+        # A week can hold dozens; the mail shows the first and says where the rest are.
+        shown = digest.not_submitted[:25]
         rows = [
-            [str(i), t.person, t.task, t.due.split(", ")[-1], _follow_up_state(t.followup)]
-            for i, t in enumerate(digest.not_submitted, start=1)
+            [str(i), t.person, t.task, t.due if digest.weekly else t.due.split(", ")[-1], _follow_up_state(t.followup)]
+            for i, t in enumerate(shown, start=1)
         ]
         colours = [None, None, None, None, None]
+        more = len(digest.not_submitted) - len(shown)
         body += (
             f"<p style='margin:20px 0 8px;font-weight:600'>Not submitted</p>"
             + m.grid(["#", "Person", "Task", "Due (UAE)", "Follow-up"], rows, colours=colours)
+            + (f"<p style='margin:6px 0 0;font-size:12.5px;color:#5f6b77'>And {more} more in the "
+               f"attached report.</p>" if more > 0 else "")
         )
     else:
-        body += "<p style='margin:20px 0 0'>Every task due today was submitted.</p>"
+        body += f"<p style='margin:20px 0 0'>Every task due {digest.span} was submitted.</p>"
     missing = [line for line in digest.lines if line.status == STATUS_LABELS[FollowupStatus.NO_RESPONSE]]
     if missing:
         body += (
             f"<p style='margin:20px 0 8px;font-weight:600'>No reason given by the closing time</p>"
             + m.grid(
                 ["Person", "Task"],
-                [[line.person, line.task] for line in missing],
+                [[line.person, line.task] for line in missing[:25]],
             )
         )
     body += (
@@ -661,7 +784,11 @@ def mail_html(digest: Digest, link: str) -> str:
 
 
 def attachments(digest: Digest, formats: list[str]) -> list[Attachment]:
-    stem = f"end-of-day-report-{digest.day:%Y-%m-%d}"
+    stem = (
+        f"weekly-report-{digest.first_day:%Y-%m-%d}-to-{digest.day:%Y-%m-%d}"
+        if digest.weekly
+        else f"end-of-day-report-{digest.day:%Y-%m-%d}"
+    )
     out: list[Attachment] = []
     if "pdf" in formats:
         out.append(Attachment(f"{stem}.pdf", build_pdf(digest), PDF_TYPE))
@@ -679,19 +806,30 @@ async def send(
     now: datetime,
     sharepoint=None,
     day: date | None = None,
-    mark_no_response: bool = True,
+    weekly: bool = False,
+    preview: bool = False,
 ) -> dict[str, Any]:
-    """Gather, mark, and mail one day's report. Records the outcome on ``row``."""
+    """Gather and mail one report — the day's, or the week to ``day``.
+
+    The real end-of-day send marks the unanswered as not responded and
+    records the day; the real weekly send records the day; a preview does
+    neither, so trying it out never changes what the real one will say.
+    """
     day = day or local_today(row, now)
+    days = 7 if weekly else 1
+    mark_no_response = not weekly and not preview
     try:
-        tasks = await day_tasks(session, row, sharepoint, day)
+        tasks = await day_tasks(session, row, sharepoint, day, days=days)
     except Exception as exc:  # noqa: BLE001 - the reasons still go, said so
-        logger.warning("end-of-day report: the day's tasks could not be read: %s", exc)
+        logger.warning("report: the tasks could not be read: %s", exc)
         tasks = []
-    digest = await gather(session, row, day=day, mark_no_response=mark_no_response, tasks=tasks)
+    digest = await gather(
+        session, row, day=day, mark_no_response=mark_no_response, tasks=tasks, days=days
+    )
     to = await recipients(session, row)
     result: dict[str, Any] = {
         "day": day.isoformat(),
+        "period": "week" if weekly else "day",
         "lines": len(digest.lines),
         "submitted": len(digest.submitted),
         "not_submitted": len(digest.not_submitted),
@@ -710,7 +848,7 @@ async def send(
             await mailer.send(
                 sender=sender,
                 recipients=to,
-                subject=f"End of Day Report — {digest.day:%d %b %Y} — "
+                subject=f"{digest.kind.title()} — {digest.period} — "
                 f"{len(digest.submitted)} Submitted, {len(digest.not_submitted)} Not Submitted",
                 html=mail_html(digest, link),
                 attachments=attachments(digest, list(row.digest_formats or ["pdf", "xlsx"]))
@@ -720,10 +858,13 @@ async def send(
         except Exception as exc:  # noqa: BLE001 - recorded, and tried again tomorrow
             result["error"] = f"{type(exc).__name__}: {exc}"[:2000]
             logger.warning("end-of-day report for %s not sent: %s", day, exc)
-    if mark_no_response:
-        # The real end of day: recorded even when the mail failed, so the
-        # marking is not repeated — the error says the mail needs resending.
-        row.digest_last_sent_on = day
+    if not preview:
+        # Recorded even when the mail failed, so the send is not repeated on
+        # every tick — the error on the settings says it needs resending.
+        if weekly:
+            row.weekly_last_sent_on = day
+        else:
+            row.digest_last_sent_on = day
     row.digest_last_error = result["error"]
     await session.flush()
     return result

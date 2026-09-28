@@ -125,10 +125,12 @@ async def update_settings(
     if changes.get("poll_seconds") is not None:
         row.poll_seconds = int(changes["poll_seconds"])
 
-    # The end-of-day report.
-    for key in ("digest_enabled", "digest_include_ceo"):
+    # The end-of-day and weekly reports.
+    for key in ("digest_enabled", "digest_include_ceo", "weekly_enabled"):
         if changes.get(key) is not None:
             setattr(row, key, bool(changes[key]))
+    if changes.get("weekly_day") is not None:
+        row.weekly_day = int(changes["weekly_day"])
     if changes.get("digest_time") is not None:
         row.digest_time = str(changes["digest_time"])
     if changes.get("digest_timezone") is not None:

@@ -199,6 +199,7 @@ def _digest_settings(**overrides):
         digest_enabled=True, digest_time="18:00", digest_timezone="Asia/Kolkata",
         digest_recipients=["sebin@hamdaz.com"], digest_include_ceo=False,
         digest_formats=["pdf", "xlsx"], digest_last_sent_on=None,
+        weekly_enabled=True, weekly_day=4, weekly_last_sent_on=None,
     )
     fields.update(overrides)
     return FollowupSettings(**fields)
@@ -277,3 +278,40 @@ def test_the_mail_leads_with_what_was_not_submitted() -> None:
     # The body stays short: reasons and remarks are in the attachments.
     assert "Enquiry sent to OEMs" not in html
     assert "View Report" in html and "AI-generated" in html
+
+
+
+def test_the_weekly_report_goes_on_friday_at_the_closing_time() -> None:
+    from datetime import date
+
+    from app.followups import digest
+
+    row = _digest_settings()
+    friday = datetime(2026, 10, 2, 12, 31, tzinfo=UTC)  # 18:01 IST on a Friday
+    assert digest.is_weekly_due(row, friday)
+    assert not digest.is_weekly_due(row, datetime(2026, 10, 2, 12, 29, tzinfo=UTC))
+    assert not digest.is_weekly_due(row, datetime(2026, 10, 1, 12, 31, tzinfo=UTC))  # Thursday
+    row.weekly_last_sent_on = date(2026, 10, 2)
+    assert not digest.is_weekly_due(row, friday)
+    row.weekly_last_sent_on = None
+    row.weekly_enabled = False
+    assert not digest.is_weekly_due(row, friday)
+
+
+def test_the_weekly_report_has_a_by_person_summary() -> None:
+    import io
+
+    from openpyxl import load_workbook
+
+    from app.followups import digest
+
+    built = _sample_digest()
+    built.days = 7
+    assert built.title == "Weekly report — 23 – 29 Sep 2026"
+    assert built.people()[0][0] == "Fasna Sherin"  # most not submitted first
+
+    wb = load_workbook(io.BytesIO(digest.build_xlsx(built)))
+    assert wb.sheetnames == ["By person", "Not submitted", "Submitted", "Reasons"]
+    assert digest.build_pdf(built).startswith(b"%PDF")
+    html = digest.mail_html(built, "https://x/followups")
+    assert "By person" in html and "Due this week" in html

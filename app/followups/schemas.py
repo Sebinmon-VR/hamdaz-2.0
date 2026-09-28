@@ -72,6 +72,10 @@ class FollowupSettingsOut(BaseModel):
     digest_sender_email: str | None = None
     digest_last_sent_on: date | None = None
     digest_last_error: str | None = None
+    weekly_enabled: bool = True
+    #: 0 Monday … 6 Sunday.
+    weekly_day: int = 4
+    weekly_last_sent_on: date | None = None
     #: Who it would go to right now, the CEO role holders included.
     digest_to: list[str] = Field(default_factory=list)
     last_run_at: datetime | None
@@ -100,10 +104,14 @@ class FollowupSettingsIn(BaseModel):
     digest_include_ceo: bool | None = None
     digest_formats: list[Literal["pdf", "xlsx"]] | None = Field(default=None, min_length=1)
     digest_sender_email: str | None = Field(default=None, max_length=320)
+    weekly_enabled: bool | None = None
+    weekly_day: int | None = Field(default=None, ge=0, le=6)
 
 
 class DigestOut(BaseModel):
     day: str
+    #: "day" or "week".
+    period: str = "day"
     lines: int
     submitted: int = 0
     not_submitted: int = 0

@@ -161,6 +161,18 @@ class FollowupSettings(Base, Timestamped):
     digest_last_sent_on: Mapped[date | None] = mapped_column(Date)
     digest_last_error: Mapped[str | None] = mapped_column(Text)
 
+    # ── the weekly report ──────────────────────────────────────────────
+    #: The same report over the week, sent on one weekday at the closing time,
+    #: to the same people. Nobody is marked by it — the daily one does that.
+    weekly_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=text("true"), nullable=False
+    )
+    #: 0 Monday … 6 Sunday. Friday by default, the end of the UAE week.
+    weekly_day: Mapped[int] = mapped_column(
+        Integer, default=4, server_default=text("4"), nullable=False
+    )
+    weekly_last_sent_on: Mapped[date | None] = mapped_column(Date)
+
     last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     #: What went wrong on the last sweep, if anything. A sweep that fails
     #: leaves everything as it was, and this is the only sign it happened.
