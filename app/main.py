@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 from app.access.router import router as access_router
 from app.admin.router import router as admin_router
 from app.analytics.router import router as analytics_router
+from app.ariba.mailer import AribaMailer
 from app.ariba.router import router as ariba_router
 from app.ariba.worker import AribaWorker
 from app.assignment.router import router as assignment_router
@@ -230,7 +231,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Off unless ARIBA_ENABLED is set. With ARIBA_FIX_BCD it also corrects the
     # BCD of the matching Proposals row — that column only; see app/ariba/bcd.py.
     app.state.ariba_worker = AribaWorker(
-        factory=get_session_factory(), settings=settings, sharepoint=app.state.sharepoint
+        factory=get_session_factory(),
+        settings=settings,
+        sharepoint=app.state.sharepoint,
+        mailer=AribaMailer(settings, http),
     )
     app.state.ariba_worker.start()
     logger.info("started environment=%s", settings.environment)

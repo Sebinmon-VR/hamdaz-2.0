@@ -56,9 +56,15 @@ def test_the_gap_and_the_daily_cap_hold() -> None:
     assert service.refusal(_settings(), yesterday, settled, NOW) is None
 
 
-def test_a_refused_sign_in_pauses_even_a_forced_visit() -> None:
-    paused = AribaState(visits_today=0, paused_until=NOW + timedelta(hours=3))
-    assert "paused" in (service.refusal(_settings(), paused, NOW, NOW, force=True) or "")
+def test_a_failed_sign_in_blocks_every_visit_until_resumed() -> None:
+    blocked = AribaState(
+        visits_today=0, blocked_at=NOW - timedelta(days=3), blocked_reason="wrong password"
+    )
+    # Days later, and even when somebody asks: no sign-in until a person resumes it.
+    reason = service.refusal(_settings(), blocked, NOW - timedelta(hours=1), NOW, force=True)
+    assert reason is not None and "resumes" in reason
+    blocked.blocked_at = None
+    assert service.refusal(_settings(), blocked, NOW - timedelta(hours=1), NOW) is None
 
 
 def test_visits_are_counted_per_day() -> None:
@@ -109,3 +115,26 @@ def test_events_match_by_number_or_by_one_exact_title() -> None:
     assert got["Doc2"] == [rows[1]]
     # Two rows fit the title: not a match, rather than a guess.
     assert got["Doc3"] == []
+
+
+def test_sign_ins_are_capped_per_day_apart_from_visits() -> None:
+    settings = Settings(ariba_max_logins_per_day=5)
+    record = AribaState(visits_today=0, logins_today=0)
+    for _ in range(5):
+        service.count_login(record, NOW)
+    assert service.logins_left(settings, record, NOW) == 0
+    # The next day starts again.
+    assert service.logins_left(settings, record, NOW + timedelta(days=1)) == 5
+
+    # Sign-ins used and no saved session: no visit at all, even when asked.
+    reason = service.refusal(settings, record, NOW - timedelta(hours=1), NOW, force=True)
+    assert reason == "no saved session, and the day's sign-ins are used"
+    # A saved session may still be used: a visit on it costs no sign-in.
+    record.session_state = {"cookies": []}
+    assert service.refusal(settings, record, NOW - timedelta(hours=1), NOW, force=True) is None
+
+
+def test_a_stopped_reader_visits_for_nobody() -> None:
+    stopped = AribaState(visits_today=0, stopped_at=NOW, stopped_by="sebin@hamdaz.com")
+    reason = service.refusal(_settings(), stopped, NOW - timedelta(hours=1), NOW, force=True)
+    assert reason == "stopped by sebin@hamdaz.com"

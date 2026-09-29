@@ -301,6 +301,10 @@ class Settings(BaseSettings):
     ariba_min_gap_seconds: int = 1800
     #: And never more than this many times in a day.
     ariba_max_visits_per_day: int = 12
+    #: Sign-ins a day, apart from visits — most visits reuse the saved session
+    #: and sign in not at all. Once they are used and the session ends, the
+    #: reader waits for the next day.
+    ariba_max_logins_per_day: int = 5
     #: The End Time column is shown in the browser's time zone, so the reader's
     #: browser is put in the one the dates should mean.
     ariba_timezone: str = "Asia/Dubai"

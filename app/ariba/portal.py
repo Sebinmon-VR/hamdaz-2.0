@@ -11,7 +11,8 @@ supplier login. What one visit does, and all it does:
 
 It never clicks into an event, never participates, never downloads. The pace is
 a person's, and nothing here disguises the browser: if Ariba ever asks for more
-than a password — a captcha, a second factor — that is :class:`SignInRefusedError`,
+than a password — a captcha, a second factor — or signing in fails in any other
+way, that is :class:`SignInFailedError`,
 and the worker stops signing in until somebody has looked.
 """
 
@@ -64,8 +65,14 @@ class PortalError(Exception):
     """The visit did not get as far as the Events list."""
 
 
-class SignInRefusedError(PortalError):
-    """Ariba would not take the password, or asked for more than one."""
+class SignInNotAllowedError(PortalError):
+    """The session has ended and the caller allowed no sign-in on this visit —
+    the day's sign-ins are used. Not a failure: nothing was attempted."""
+
+
+class SignInFailedError(PortalError):
+    """Signing in did not work, for any reason — a refused password, a security
+    check, a page that never loaded. Never retried: see the worker."""
 
 
 @dataclass(slots=True)
@@ -121,7 +128,7 @@ async def _sign_in(page, username: str, password: str) -> None:
     try:
         await field.wait_for(timeout=30_000)
     except Exception as exc:
-        raise SignInRefusedError("Ariba did not ask for a password after the username") from exc
+        raise SignInFailedError("Ariba did not ask for a password after the username") from exc
     await _pause()
     await field.press_sequentially(password, delay=70)
     await _pause(0.5, 1.2)
@@ -131,9 +138,24 @@ async def _sign_in(page, username: str, password: str) -> None:
     try:
         await page.wait_for_url(re.compile(r"dashboard|Supplier\.aw|Sourcing"), timeout=60_000)
     except Exception as exc:
-        raise SignInRefusedError(f"sign-in did not reach the portal (at {page.url[:80]})") from exc
+        raise SignInFailedError(f"sign-in did not reach the portal (at {page.url[:80]})") from exc
     if await page.locator("input[type=password]").count():
-        raise SignInRefusedError("Ariba refused the password")
+        said = await _page_error(page)
+        raise SignInFailedError(
+            f"Ariba refused the sign-in: {said}" if said else "Ariba refused the password"
+        )
+
+
+async def _page_error(page) -> str | None:
+    """Whatever the sign-in page says went wrong, for the report."""
+    for selector in ("[role=alert]", ".w-login-page-error", ".error", ".errorMessage"):
+        try:
+            text = (await page.locator(selector).first.inner_text(timeout=1500)).strip()
+        except Exception:  # noqa: BLE001 - no such element is the usual answer
+            continue
+        if text:
+            return " ".join(text.split())[:300]
+    return None
 
 
 async def read_open_events(
@@ -142,8 +164,12 @@ async def read_open_events(
     password: str,
     session_state: dict[str, Any] | None,
     timezone: str,
+    may_sign_in: bool = True,
 ) -> Visit:
     """One visit: the rows under Status: Open, and the session to keep.
+
+    ``may_sign_in`` false: read on the saved session only, and stop with
+    :class:`SignInNotAllowedError` if Ariba has ended it.
 
     Run on a thread with an event loop of its own. On Windows the app's loop is
     the selector kind psycopg needs (see app/__init__.py), which cannot start
@@ -155,7 +181,7 @@ async def read_open_events(
         loop = asyncio.ProactorEventLoop() if sys.platform == "win32" else asyncio.new_event_loop()
         try:
             return loop.run_until_complete(
-                _visit(username, password, session_state, timezone)
+                _visit(username, password, session_state, timezone, may_sign_in)
             )
         finally:
             loop.close()
@@ -164,7 +190,11 @@ async def read_open_events(
 
 
 async def _visit(
-    username: str, password: str, session_state: dict[str, Any] | None, timezone: str
+    username: str,
+    password: str,
+    session_state: dict[str, Any] | None,
+    timezone: str,
+    may_sign_in: bool,
 ) -> Visit:
     try:
         from playwright.async_api import async_playwright
@@ -189,15 +219,24 @@ async def _visit(
             page = await context.new_page()
             await page.goto(SOURCING_URL, wait_until="load", timeout=90_000)
             frame = await _events_frame(page)
+            if frame is None and not may_sign_in:
+                raise SignInNotAllowedError("the saved session has ended")
             if frame is None:
-                await _pause()
-                await _sign_in(page, username, password)
-                signed_in = True
-                await _pause()
-                await page.goto(SOURCING_URL, wait_until="load", timeout=90_000)
-                frame = await _events_frame(page)
+                # Everything from here to the Events list is the sign-in, and
+                # any failure in it — a timeout included — is a failed sign-in.
+                try:
+                    await _pause()
+                    await _sign_in(page, username, password)
+                    signed_in = True
+                    await _pause()
+                    await page.goto(SOURCING_URL, wait_until="load", timeout=90_000)
+                    frame = await _events_frame(page)
+                except SignInFailedError:
+                    raise
+                except Exception as exc:
+                    raise SignInFailedError(f"{type(exc).__name__}: {exc}"[:400]) from exc
                 if frame is None:
-                    raise SignInRefusedError("signed in, but Ariba asked to sign in again")
+                    raise SignInFailedError("signed in, but Ariba asked to sign in again")
 
             header = frame.locator(_OPEN_GROUP).first
             # The header says how many there are — "Status: Open (18)" — and

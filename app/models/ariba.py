@@ -56,11 +56,24 @@ class AribaState(Base, Timestamped):
     #: What the last visit found, or why it failed.
     last_result: Mapped[str | None] = mapped_column(Text)
     last_error: Mapped[str | None] = mapped_column(Text)
-    #: Set when sign-in is refused. Nothing signs in again before it, so a
-    #: wrong password cannot become a locked account.
+    #: No longer set — the timed pause it held became ``blocked_at``, which
+    #: does not expire. Kept so the column's history reads.
     paused_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: Set when a sign-in fails, for any reason. Nothing signs in again until a
+    #: super admin resumes it — a wrong password retried on a timer is how an
+    #: account gets locked, and a security check retried looks like an attack.
+    blocked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    blocked_reason: Mapped[str | None] = mapped_column(Text)
+    #: Set when a super admin stops the reader from the admin page: no visits
+    #: and no BCD corrections until one of them starts it again.
+    stopped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    stopped_by: Mapped[str | None] = mapped_column(String(320))
     visits_on: Mapped[date | None] = mapped_column(Date)
     visits_today: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    #: Sign-ins, counted apart from visits: a visit on the saved session is
+    #: not one. Attempts count, successful or not.
+    logins_on: Mapped[date | None] = mapped_column(Date)
+    logins_today: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     def __repr__(self) -> str:
         # Deliberately no session material.

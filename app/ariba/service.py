@@ -98,12 +98,19 @@ def refusal(
     """Why a visit may not happen yet, or ``None`` when it may.
 
     ``force`` — somebody asking now — skips the settle and the gap, never the
-    pause after a refused sign-in or the daily cap.
+    block after a failed sign-in or the daily cap.
     """
-    if record.paused_until and now < record.paused_until:
-        return f"paused until {record.paused_until:%Y-%m-%d %H:%M} UTC after a refused sign-in"
+    if record.stopped_at is not None:
+        return f"stopped by {record.stopped_by or 'a super admin'}"
+    if record.blocked_at is not None:
+        return (
+            f"sign-in failed {record.blocked_at:%Y-%m-%d %H:%M} UTC; stopped until a super "
+            "admin resumes it"
+        )
     if record.visits_on == now.date() and record.visits_today >= settings.ariba_max_visits_per_day:
         return "the day's visits are used"
+    if record.session_state is None and logins_left(settings, record, now) == 0:
+        return "no saved session, and the day's sign-ins are used"
     if force:
         return None
     if now - newest < timedelta(seconds=settings.ariba_settle_seconds):
@@ -121,6 +128,18 @@ def count_visit(record: AribaState, now: datetime) -> None:
         record.visits_today = 0
     record.visits_today += 1
     record.last_visit_at = now
+
+
+def logins_left(settings: Settings, record: AribaState, now: datetime) -> int:
+    used = record.logins_today if record.logins_on == now.date() else 0
+    return max(0, settings.ariba_max_logins_per_day - used)
+
+
+def count_login(record: AribaState, now: datetime) -> None:
+    if record.logins_on != now.date():
+        record.logins_on = now.date()
+        record.logins_today = 0
+    record.logins_today += 1
 
 
 async def keep(

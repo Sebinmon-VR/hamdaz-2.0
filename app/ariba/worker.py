@@ -16,12 +16,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from datetime import timedelta
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.ariba import bcd, portal, service
+from app.ariba.mailer import AribaMailer
 from app.core.config import Settings
 from app.proposals.sharepoint import SharePointProposals
 
@@ -30,9 +30,6 @@ logger = logging.getLogger("hamdaz.ariba.worker")
 #: Beside the intake's and the follow-ups' locks, and used by nothing else.
 ARIBA_LOCK = 812_404
 
-#: A refused sign-in stops sign-ins for this long. Retrying a wrong password
-#: on a timer is how an account gets locked.
-PAUSE_AFTER_REFUSAL = timedelta(hours=24)
 
 
 class AribaWorker:
@@ -42,10 +39,12 @@ class AribaWorker:
         factory: async_sessionmaker[AsyncSession],
         settings: Settings,
         sharepoint: SharePointProposals,
+        mailer: AribaMailer,
     ) -> None:
         self._factory = factory
         self._settings = settings
         self._sharepoint = sharepoint
+        self._mailer = mailer
         self._task: asyncio.Task | None = None
 
     def start(self) -> None:
@@ -84,7 +83,8 @@ class AribaWorker:
 
     async def tick(self, *, force: bool = False) -> str:
         """Look, and visit if it is earned. ``force`` is somebody asking now,
-        and skips the wait for new tenders — never the pause after a refusal."""
+        and skips the wait for new tenders — never a stop, a failed sign-in's block
+        or the daily caps."""
         settings = self._settings
         if not settings.ariba_configured:
             return "no Ariba login configured"
@@ -95,6 +95,11 @@ class AribaWorker:
             if not got:
                 return "another instance is visiting"
             record = await service.state(session)
+            if record.stopped_at is not None:
+                # Stopped from the admin page: nothing at all, and the
+                # watermark stays put so starting again catches up.
+                await session.commit()
+                return f"stopped by {record.stopped_by or 'a super admin'}"
             now = service.now_utc()
             found = await service.pending(session, settings, record)
             recheck = None
@@ -127,30 +132,91 @@ class AribaWorker:
                     password=settings.ariba_password,
                     session_state=record.session_state,
                     timezone=settings.ariba_timezone,
+                    may_sign_in=service.logins_left(settings, record, now) > 0,
                 )
-            except portal.SignInRefusedError as exc:
+            except portal.SignInNotAllowedError:
+                # A limit, not a failure: no block, no email. The next day's
+                # first visit signs in.
                 record.session_state = None
-                record.paused_until = now + PAUSE_AFTER_REFUSAL
-                record.last_error = f"sign-in refused: {exc}"
+                record.last_result = (
+                    f"session ended; today's {settings.ariba_max_logins_per_day} sign-ins are "
+                    "used, so the next sign-in is tomorrow"
+                )
                 await session.commit()
-                logger.warning("ariba sign-in refused; paused for a day: %s", exc)
+                logger.info("ariba: %s", record.last_result)
+                return record.last_result
+            except portal.SignInFailedError as exc:
+                service.count_login(record, now)
+                # Any failed sign-in stops sign-ins until a super admin resumes
+                # them — never retried on a timer — and every super admin is told.
+                reason = str(exc)[:600]
+                record.session_state = None
+                record.blocked_at = now
+                record.blocked_reason = reason
+                record.last_error = f"sign-in failed: {reason}"
+                await session.commit()
+                logger.warning("ariba sign-in failed; stopped until resumed: %s", reason)
+                unsent = await self._mailer.sign_in_failed(session, reason=reason, at=now)
+                if unsent:
+                    record.last_error = f"{record.last_error} (super admins not emailed: {unsent})"
+                await session.commit()
                 return record.last_error
             except Exception as exc:  # noqa: BLE001 - the last good table stays
+                # The session held, the page did not. Retried at the next
+                # visit; the super admins are told once, when failures begin.
+                first = record.last_error is None
                 record.last_error = f"{type(exc).__name__}: {exc}"[:600]
                 await session.commit()
                 logger.warning("ariba visit failed: %s", record.last_error)
+                if first:
+                    unsent = await self._mailer.visit_failed(
+                        session, reason=record.last_error, at=now
+                    )
+                    if unsent:
+                        record.last_error = f"{record.last_error} (not emailed: {unsent})"
+                        await session.commit()
                 return record.last_error
 
+            if visit.signed_in:
+                service.count_login(record, now)
             summary = await service.keep(session, settings, record, visit, now)
             if found.newest:
                 record.watermark = max(found.newest, record.watermark or found.newest)
             summary = f"{summary}; {await self._check_bcd(session)}"
             record.last_result = summary
             record.last_error = None
-            record.paused_until = None
             await session.commit()
             logger.info("ariba visit: %s%s", summary, " (signed in)" if visit.signed_in else "")
             return summary
+
+    async def set_stopped(self, stopped: bool, *, by: str) -> str:
+        """The admin page's switch. Stopped: no visits, no BCD corrections —
+        taken under the same lock, so a visit in flight finishes first."""
+        async with self._factory() as session:
+            await session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": ARIBA_LOCK})
+            record = await service.state(session)
+            if stopped:
+                record.stopped_at = service.now_utc()
+                record.stopped_by = by
+            else:
+                record.stopped_at = None
+                record.stopped_by = None
+            await session.commit()
+        logger.warning("ariba reader %s by %s", "stopped" if stopped else "started", by)
+        return "stopped: no visits and no BCD corrections" if stopped else "started"
+
+    async def resume(self) -> str:
+        """A super admin has looked: sign-ins may happen again."""
+        async with self._factory() as session:
+            record = await service.state(session)
+            was = record.blocked_reason
+            record.blocked_at = None
+            record.blocked_reason = None
+            record.paused_until = None
+            record.last_error = None
+            await session.commit()
+        logger.info("ariba sign-in resumed (was: %s)", was)
+        return "sign-in resumed; the next visit will sign in" if was else "sign-in was not stopped"
 
     async def _check_bcd(self, session: AsyncSession) -> str:
         """The BCD comparison, reported rather than raised: the events a visit
@@ -170,6 +236,10 @@ class AribaWorker:
             )
             if not got:
                 return "the reader is busy; try again in a minute"
+            record = await service.state(session)
+            if record.stopped_at is not None:
+                await session.commit()
+                return f"stopped by {record.stopped_by or 'a super admin'}; BCD not checked"
             summary = await self._check_bcd(session)
             await session.commit()
             return summary
