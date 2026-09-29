@@ -93,7 +93,11 @@ class FollowupWorker:
             row = await service.get_settings(session)
             wait = max(30, row.poll_seconds)
             now = datetime.now(UTC)
-            digest_due = digest.is_due(row, now) or digest.is_weekly_due(row, now)
+            digest_due = (
+                digest.is_due(row, now)
+                or digest.is_weekly_due(row, now)
+                or service.person_reports_due(row, now)
+            )
             if not (row.enabled or force or digest_due):
                 await session.commit()
                 return max(wait, 120)
@@ -144,3 +148,10 @@ class FollowupWorker:
                 sharepoint=self._sharepoint, weekly=True,
             )
             logger.info("weekly report: %s", result)
+        # After the end-of-day report, which marks the unanswered as not
+        # responded — so each person's report says so too.
+        if service.person_reports_due(row, now):
+            result = await service.send_person_reports(
+                session, row, settings=self._settings, mailer=self._mailer, now=now
+            )
+            logger.info("person reports: %s", result)

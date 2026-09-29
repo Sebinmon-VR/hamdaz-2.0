@@ -105,6 +105,12 @@ def is_due(row: FollowupSettings, now: datetime) -> bool:
     return now >= cutoff_for(row, today)
 
 
+#: Under the carried-over list, wherever it is shown.
+CARRIED_NOTE: Final = (
+    "Due after the previous day's ask time, so asked in this day's batch — listed apart from the day's own."
+)
+
+
 # ── the day's content ──────────────────────────────────────────────────
 
 
@@ -123,6 +129,8 @@ class DigestLine:
     answered: str
     managers_told: str
     task_url: str | None = None
+    #: Asked in a daily batch about a task due the day before: its own list.
+    carried: bool = False
 
 
 @dataclass(slots=True)
@@ -307,6 +315,7 @@ async def gather(
                 answered=_gulf(f.answered_at),
                 managers_told=told,
                 task_url=f.task_url,
+                carried=bool(getattr(f, "carried_over", False)),
             )
         )
 
@@ -465,30 +474,36 @@ def build_pdf(digest: Digest) -> bytes:
     headings = ["#", "Person", "Task", "Due (UAE)", "Submission", "Asked (UAE)", "Mailed", "Status", "Reason / note", "Answered (UAE)", "Managers told"]
     widths = [18, 64, 150, 62, 52, 62, 34, 58, 170, 62, 46]
     scale = width / sum(widths)
-    data: list[list[Any]] = [[p(h, head) for h in headings]]
-    for i, line in enumerate(digest.lines, start=1):
-        task = line.task + (f"\n{line.end_user}" if line.end_user else "")
-        data.append([
-            p(str(i)), p(line.person), p(task), p(line.due), p(line.submission_status),
-            p(line.asked), p(line.mailed), p(line.status), p(line.reason),
-            p(line.answered), p(line.managers_told),
-        ])
-    table = Table(data, colWidths=[w * scale for w in widths], repeatRows=1)
-    style = [
-        ("BACKGROUND", (0, 0), (-1, 0), house.NAVY),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("LINEBELOW", (0, 0), (-1, -1), 0.5, house.LINE),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-        ("LEFTPADDING", (0, 0), (-1, -1), 4),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-    ]
-    for r, line in enumerate(digest.lines, start=1):
-        if line.status == STATUS_LABELS[FollowupStatus.NO_RESPONSE]:
-            style.append(("BACKGROUND", (0, r), (-1, r), house.LOSS_RED))
-        elif r % 2 == 0:
-            style.append(("BACKGROUND", (0, r), (-1, r), house.ROW))
-    table.setStyle(TableStyle(style))
+
+    def reasons_table(lines: list[DigestLine]) -> Table:
+        data: list[list[Any]] = [[p(h, head) for h in headings]]
+        for i, line in enumerate(lines, start=1):
+            task = line.task + (f"\n{line.end_user}" if line.end_user else "")
+            data.append([
+                p(str(i)), p(line.person), p(task), p(line.due), p(line.submission_status),
+                p(line.asked), p(line.mailed), p(line.status), p(line.reason),
+                p(line.answered), p(line.managers_told),
+            ])
+        table = Table(data, colWidths=[w * scale for w in widths], repeatRows=1)
+        style = [
+            ("BACKGROUND", (0, 0), (-1, 0), house.NAVY),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LINEBELOW", (0, 0), (-1, -1), 0.5, house.LINE),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ]
+        for r, line in enumerate(lines, start=1):
+            if line.status == STATUS_LABELS[FollowupStatus.NO_RESPONSE]:
+                style.append(("BACKGROUND", (0, r), (-1, r), house.LOSS_RED))
+            elif r % 2 == 0:
+                style.append(("BACKGROUND", (0, r), (-1, r), house.ROW))
+        table.setStyle(TableStyle(style))
+        return table
+
+    own = [line for line in digest.lines if not line.carried]
+    carried = [line for line in digest.lines if line.carried]
 
     def task_table(lines: list[TaskLine], shade) -> Table:
         heads = ["#", "Person", "Task", "Due (UAE)", "Status", "Submission", "Type", "Priority", "Zoho quote", "Order", "Remarks", "Reason / follow-up"]
@@ -567,10 +582,21 @@ def build_pdf(digest: Digest) -> bytes:
         task_table(digest.submitted, None) if digest.submitted
         else Paragraph(f"Nothing due {digest.span} was submitted.", lead),
         Spacer(1, 10),
-        Paragraph(f"Reasons asked for ({len(digest.lines)})", section),
+        Paragraph(f"Reasons asked for ({len(own)})", section),
         Spacer(1, 4),
     ]
-    story.append(table if digest.lines else Paragraph(f"Nobody was asked for a reason {digest.span}.", lead))
+    story.append(
+        reasons_table(own) if own
+        else Paragraph(f"Nobody was asked for a reason {digest.span}.", lead)
+    )
+    if carried:
+        story += [
+            Spacer(1, 10),
+            Paragraph(f"Carried over from the previous day ({len(carried)})", section),
+            Paragraph(CARRIED_NOTE, lead),
+            Spacer(1, 4),
+            reasons_table(carried),
+        ]
 
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
@@ -623,7 +649,7 @@ def build_xlsx(digest: Digest) -> bytes:
     headings = [
         "#", "Person", "Email", "Task", "End user", "Due (UAE)", "Submission status",
         "Asked (UAE)", "Mailed", "Status", "Reason / note", "Answered (UAE)", "Managers told",
-        "SharePoint link",
+        "SharePoint link", "List",
     ]
     start = 6
     for col, heading in enumerate(headings, start=1):
@@ -632,11 +658,13 @@ def build_xlsx(digest: Digest) -> bytes:
         cell.fill = PatternFill("solid", fgColor=navy)
         cell.alignment = Alignment(vertical="center", wrap_text=True)
     red = PatternFill("solid", fgColor="FDE2E1")
-    for i, line in enumerate(digest.lines, start=1):
+    ordered = [x for x in digest.lines if not x.carried] + [x for x in digest.lines if x.carried]
+    for i, line in enumerate(ordered, start=1):
         values = [
             i, line.person, line.email, line.task, line.end_user, line.due,
             line.submission_status, line.asked, line.mailed, line.status, line.reason,
             line.answered, line.managers_told, line.task_url or "",
+            "Carried over from the previous day" if line.carried else "The day's own",
         ]
         for col, value in enumerate(values, start=1):
             cell = ws.cell(row=start + i, column=col, value=value)
@@ -644,7 +672,7 @@ def build_xlsx(digest: Digest) -> bytes:
             cell.border = Border(bottom=thin)
             if line.status == STATUS_LABELS[FollowupStatus.NO_RESPONSE]:
                 cell.fill = red
-    for col, w in enumerate([5, 18, 24, 44, 24, 17, 16, 17, 8, 15, 60, 17, 10, 40], start=1):
+    for col, w in enumerate([5, 18, 24, 44, 24, 17, 16, 17, 8, 15, 60, 17, 10, 40, 30], start=1):
         ws.column_dimensions[ws.cell(row=start, column=col).column_letter].width = w
     ws.freeze_panes = ws.cell(row=start + 1, column=1)
     ws.auto_filter.ref = f"A{start}:{ws.cell(row=start, column=len(headings)).column_letter}{start + max(1, len(digest.lines))}"
@@ -766,6 +794,13 @@ def mail_html(digest: Digest, link: str) -> str:
         )
     else:
         body += f"<p style='margin:20px 0 0'>Every task due {digest.span} was submitted.</p>"
+    carried_n = sum(1 for line in digest.lines if line.carried)
+    if carried_n:
+        body += (
+            f"<p style='margin:20px 0 0'><b>{carried_n} carried over from the previous day</b> "
+            f"\u2014 {escape(CARRIED_NOTE[0].lower() + CARRIED_NOTE[1:])} They are in their own "
+            f"section of the attached report.</p>"
+        )
     missing = [line for line in digest.lines if line.status == STATUS_LABELS[FollowupStatus.NO_RESPONSE]]
     if missing:
         body += (

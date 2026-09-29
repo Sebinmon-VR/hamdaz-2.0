@@ -114,6 +114,28 @@ class FollowupSettings(Base, Timestamped):
     poll_seconds: Mapped[int] = mapped_column(
         Integer, default=120, server_default=text("120"), nullable=False
     )
+    #: When the question is asked. ``after_due``: ``grace_minutes`` after each
+    #: task's due time, one mail per task. ``daily``: once a day at
+    #: ``ask_time``, one mail per person with everything overdue by then — and
+    #: a task due after that time waits for the next day's batch, listed apart
+    #: as carried over.
+    ask_mode: Mapped[str] = mapped_column(
+        String(16), default="after_due", server_default=text("'after_due'"), nullable=False
+    )
+    #: "HH:MM" on the clock of ``digest_timezone`` — the closing time's clock,
+    #: and before it, so there is time to answer before the report goes.
+    ask_time: Mapped[str] = mapped_column(
+        String(5), default="16:00", server_default=text("'16:00'"), nullable=False
+    )
+    #: The day the daily batch last ran, in ``digest_timezone`` — so it runs once.
+    ask_last_run_on: Mapped[date | None] = mapped_column(Date)
+    #: While set, every follow-up email — the asks and the reasons to managers —
+    #: goes to this one address instead, marked with who it was meant for.
+    #: For trying a change out; null sends to the real people.
+    test_mail_to: Mapped[str | None] = mapped_column(String(320))
+    #: The day the per-person reports to the managers last went, in
+    #: ``digest_timezone`` — daily mode sends them once, at the closing time.
+    summaries_last_sent_on: Mapped[date | None] = mapped_column(Date)
     #: Tasks due before this moment are never asked about. Set when the
     #: feature is switched on, so an archive of old bids does not become two
     #: hundred emails on the first tick.
@@ -215,6 +237,12 @@ class TaskFollowup(Base, UUIDPrimaryKey, Timestamped):
     #: whether a task is done. "Not Submitted" on a bid that went in last week
     #: is a status nobody moved.
     status_at_ask: Mapped[str | None] = mapped_column(String(80))
+    #: Asked in a daily batch about a task due before that day — after the
+    #: previous day's ask time. Listed apart, with a note, in the mail and the
+    #: report.
+    carried_over: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
+    )
     #: The due date and time that passed, as SharePoint stated it.
     due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     #: When SharePoint last saw the row change, at the moment of asking. The

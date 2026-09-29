@@ -302,26 +302,243 @@ def reason_body(row: TaskFollowup, who: str, link: str) -> str:
     return page(body)
 
 
+# ── the daily batch, to the person ─────────────────────────────────────
+
+
+def test_banner(meant_for: list[str], sent_by: str | None = None) -> str:
+    """Said at the top of a mail sent to the testing address instead."""
+    by = f", from {escape(sent_by)}'s mailbox" if sent_by else ""
+    return (
+        f"<div style='margin:0 0 16px;padding:10px 12px;background:#fff4d6;"
+        f"border:1px solid #f0d58a;"
+        f"font-size:12.5px;color:{_INK}'><b>TEST</b> — this email would have gone to "
+        f"{escape(', '.join(meant_for) or 'nobody')}{by}.</div>"
+    )
+
+
+def _task_block(row: TaskFollowup, link: str) -> str:
+    """One task in a person's list: what it is, when it was due, and its buttons."""
+    details = [("Task", row.task_title)]
+    if row.end_user:
+        details.append(("End user", row.end_user))
+    details += [
+        ("Was due", _when(row.due_at)),
+        ("Submission status", row.status_at_ask or "Not set"),
+    ]
+    hint = (
+        f"<p style='margin:8px 0 0;font-size:12.5px;color:{_MUTED}'>No Submission Status is set. "
+        f"If the bid went in, set it to <b>Submitted</b> and press <b>Already Updated</b>; if it "
+        f"was missed, press <b>Submit Reason</b>.</p>"
+        if status_not_set(row)
+        else ""
+    )
+    open_task = (
+        f"&nbsp;&nbsp;<a href='{escape(row.task_url)}' style='color:{_NAVY};font-size:12.5px'>"
+        f"Open in SharePoint</a>"
+        if row.task_url
+        else ""
+    )
+    return (
+        f"<div style='margin:0 0 16px'>{facts(details)}{hint}"
+        f"<p style='margin:10px 0 0'>{button(link, 'Submit Reason')}&nbsp;&nbsp;"
+        f"{button(link + '?false-positive=1', 'Already Updated', primary=False)}"
+        f"{open_task}</p></div>"
+    )
+
+
+def batch_subject(rows: list[TaskFollowup]) -> str:
+    n = len(rows)
+    return f"Reason Required: {n} task{'s' if n != 1 else ''} past due, not submitted"
+
+
+def batch_body(rows: list[TaskFollowup], links: dict, *, ask_time: str) -> str:
+    """Today's tasks first; then the ones carried over from yesterday, apart,
+    with a note saying why they are in today's list."""
+    first = ((rows[0].assignee.display_name if rows[0].assignee else "").split() or ["there"])[0]
+    today = [r for r in rows if not r.carried_over]
+    carried = [r for r in rows if r.carried_over]
+    body = (
+        heading("Reasons required", eyebrow="Proposals")
+        + f"<p style='margin:0 0 14px'>Hi {escape(first)},<br>These tasks are past their due "
+        f"time and not marked <b>Submitted</b> on the Proposals list. Please give the reason "
+        f"for each — a sentence or two is enough. If you have already submitted a bid or "
+        f"updated its status, press <b>Already Updated</b> on it.</p>"
+    )
+    if today:
+        body += (
+            f"<p style='margin:18px 0 8px;font-weight:700;color:{_NAVY}'>"
+            f"Due today ({len(today)})</p>"
+            + "".join(_task_block(r, links[r.id]) for r in today)
+        )
+    if carried:
+        body += (
+            f"<p style='margin:22px 0 4px;font-weight:700;color:{_ALERT}'>"
+            f"Carried over from yesterday ({len(carried)})</p>"
+            f"<p style='margin:0 0 10px;font-size:12.5px;color:{_MUTED}'>These were due after "
+            f"yesterday's ask time ({escape(ask_time)}), so they are asked today, in their own "
+            f"list.</p>"
+            + "".join(_task_block(r, links[r.id]) for r in carried)
+        )
+    return page(body)
+
+
+# ── one person's day, to the managers, at the closing time ───────────
+
+
+def _person_state(row: TaskFollowup) -> tuple[str, str | None]:
+    """How a task reads in the person's report, and its colour."""
+    if row.status == "answered":
+        return "Reason given", None
+    if row.status == "false_positive":
+        return "Already updated", _OK
+    if row.status == "resolved":
+        return "Closed", None
+    return "Not answered", _ALERT
+
+
+def person_report_subject(who: str, day) -> str:
+    return f"Reasons: {who} — {day:%d %b %Y}"
+
+
+def person_report_body(who: str, rows: list[TaskFollowup], day, link: str) -> str:
+    """Everything one person was asked about that day, answered or not."""
+    states = [_person_state(r) for r in rows]
+    missing = sum(1 for label, _ in states if label == "Not answered")
+    answered = sum(1 for label, _ in states if label == "Reason given")
+    updated = sum(1 for label, _ in states if label == "Already updated")
+    table = grid(
+        ["Task", "Due", "Status", "Reason / note"],
+        [
+            [
+                r.task_title + (" (carried over from the previous day)" if r.carried_over else ""),
+                _when(r.due_at),
+                label,
+                (r.reason or r.resolved_note or "").strip()
+                or ("No reason given by the closing time." if label == "Not answered" else ""),
+            ]
+            for r, (label, _) in zip(rows, states, strict=True)
+        ],
+        colours=[None, None, None, None],
+    )
+    # The grid colours by column; a missing reason is said in words as well.
+    body = (
+        heading(f"Reasons from {who}", eyebrow=f"Proposals · {day:%d %b %Y}")
+        + counts(
+            [
+                ("Asked", len(rows), False),
+                ("Reason given", answered, False),
+                ("Already updated", updated, False),
+                ("Not answered", missing, True),
+            ]
+        )
+        + "<div style='height:14px'></div>"
+        + table
+        + f"<p style='margin:20px 0 0'>{button(link, 'View Follow-ups')}</p>"
+    )
+    return page(body)
+
+
 class FollowupMailer(GraphMailer):
-    async def send_ask(
-        self, row: TaskFollowup, *, sender: User, link: str, early: bool = False
+    """Every follow-up mail goes through :meth:`_deliver`, so the testing
+    address (``FollowupSettings.test_mail_to``) catches all of them alike."""
+
+    async def _deliver(
+        self,
+        *,
+        sender: str,
+        recipients: list[str],
+        subject: str,
+        html: str,
+        redirect_to: str | None,
+        sender_name: str | None = None,
     ) -> None:
+        if redirect_to:
+            # Into the page's own cell, above the heading: the first thing read.
+            cell = "line-height:1.5'>"
+            html = html.replace(cell, cell + test_banner(recipients, sender_name), 1)
+            # Sent *as* the testing address too, not as the colleague it names:
+            # a test must not leave mail in somebody else's Sent Items.
+            sender, recipients, subject = redirect_to, [redirect_to], f"[TEST] {subject}"
         await self.send(
-            sender=sender.entra_object_id,
-            recipients=[row.assignee_email],
-            subject=ask_subject(row, early=early),
-            html=ask_body(row, link, early=early),
+            sender=sender,
+            recipients=recipients,
+            subject=subject,
+            html=html,
             attachments=logo_attachment(),
         )
 
+    async def send_ask(
+        self,
+        row: TaskFollowup,
+        *,
+        sender: User,
+        link: str,
+        early: bool = False,
+        redirect_to: str | None = None,
+    ) -> None:
+        await self._deliver(
+            sender=sender.entra_object_id,
+            sender_name=sender.display_name,
+            recipients=[row.assignee_email],
+            subject=ask_subject(row, early=early),
+            html=ask_body(row, link, early=early),
+            redirect_to=redirect_to,
+        )
+
+    async def send_batch(
+        self,
+        rows: list[TaskFollowup],
+        *,
+        sender: User,
+        links: dict,
+        ask_time: str,
+        redirect_to: str | None = None,
+    ) -> None:
+        await self._deliver(
+            sender=sender.entra_object_id,
+            sender_name=sender.display_name,
+            recipients=[rows[0].assignee_email],
+            subject=batch_subject(rows),
+            html=batch_body(rows, links, ask_time=ask_time),
+            redirect_to=redirect_to,
+        )
+
     async def send_reason(
-        self, row: TaskFollowup, *, sender: User, recipients: list[str], link: str
+        self,
+        row: TaskFollowup,
+        *,
+        sender: User,
+        recipients: list[str],
+        link: str,
+        redirect_to: str | None = None,
     ) -> None:
         who = sender.display_name
-        await self.send(
+        await self._deliver(
             sender=sender.entra_object_id,
+            sender_name=sender.display_name,
             recipients=recipients,
             subject=reason_subject(row, who),
             html=reason_body(row, who, link),
-            attachments=logo_attachment(),
+            redirect_to=redirect_to,
+        )
+
+    async def send_person_report(
+        self,
+        rows: list[TaskFollowup],
+        *,
+        person: User,
+        sender_email: str,
+        recipients: list[str],
+        day,
+        link: str,
+        redirect_to: str | None = None,
+    ) -> None:
+        who = person.display_name
+        await self._deliver(
+            sender=sender_email,
+            sender_name=sender_email,
+            recipients=recipients,
+            subject=person_report_subject(who, day),
+            html=person_report_body(who, rows, day, link),
+            redirect_to=redirect_to,
         )

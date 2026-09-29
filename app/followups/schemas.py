@@ -19,6 +19,8 @@ class FollowupOut(BaseModel):
     end_user: str | None
     status_at_ask: str | None
     due_at: datetime
+    #: Asked in a daily batch about a task due the day before.
+    carried_over: bool = False
     task_modified_at: datetime | None
     team_id: uuid.UUID | None
     team_name: str | None = None
@@ -58,6 +60,13 @@ class FollowupSettingsOut(BaseModel):
     only_title_contains: str
     grace_minutes: int
     poll_seconds: int
+    #: "after_due" (a grace after each due time) or "daily" (at ``ask_time``).
+    ask_mode: str = "after_due"
+    #: "HH:MM" on ``digest_timezone``'s clock.
+    ask_time: str = "16:00"
+    ask_last_run_on: date | None = None
+    #: While set, every follow-up email goes here instead.
+    test_mail_to: str | None = None
     watch_from: datetime | None
     ask_from_user_id: uuid.UUID | None
     ask_from_email: str | None = None
@@ -92,6 +101,10 @@ class FollowupSettingsIn(BaseModel):
     only_title_contains: str | None = Field(default=None, max_length=120)
     grace_minutes: int | None = Field(default=None, ge=0, le=7 * 24 * 60)
     poll_seconds: int | None = Field(default=None, ge=30, le=3600)
+    ask_mode: Literal["after_due", "daily"] | None = None
+    ask_time: str | None = Field(default=None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    #: Blank or null to send to the real people.
+    test_mail_to: str | None = Field(default=None, max_length=320)
     #: Move the watch window by hand — usually back, to include a test task
     #: that fell due just before the feature was switched on.
     watch_from: datetime | None = None

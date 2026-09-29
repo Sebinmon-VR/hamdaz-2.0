@@ -23,7 +23,7 @@ import asyncio
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Final
 
@@ -125,6 +125,17 @@ async def update_settings(
         row.grace_minutes = int(changes["grace_minutes"])
     if changes.get("poll_seconds") is not None:
         row.poll_seconds = int(changes["poll_seconds"])
+    if changes.get("ask_mode") is not None:
+        if changes["ask_mode"] not in ASK_MODES:
+            raise FollowupError("The ask mode is either 'after_due' or 'daily'.")
+        row.ask_mode = changes["ask_mode"]
+    if changes.get("ask_time") is not None:
+        row.ask_time = _clock(str(changes["ask_time"]), "The ask time")
+    if "test_mail_to" in changes:
+        redirect = (changes["test_mail_to"] or "").strip().lower()
+        if redirect and "@" not in redirect:
+            raise FollowupError("The testing address must be an email address.")
+        row.test_mail_to = redirect or None
 
     # The end-of-day and weekly reports.
     for key in ("digest_enabled", "digest_include_ceo", "weekly_enabled"):
@@ -133,7 +144,7 @@ async def update_settings(
     if changes.get("weekly_day") is not None:
         row.weekly_day = int(changes["weekly_day"])
     if changes.get("digest_time") is not None:
-        row.digest_time = str(changes["digest_time"])
+        row.digest_time = _clock(str(changes["digest_time"]), "The closing time")
     if changes.get("digest_timezone") is not None:
         from zoneinfo import ZoneInfo
 
@@ -150,6 +161,15 @@ async def update_settings(
         sender = (changes["digest_sender_email"] or "").strip().lower()
         row.digest_sender_email = sender or None
 
+    # Asked once a day, the question has to go before the report that says
+    # who answered: an ask at or after the closing time is a report of people
+    # who were never given the chance.
+    if row.ask_mode == "daily" and row.digest_enabled and row.ask_time >= row.digest_time:
+        raise FollowupError(
+            f"The ask time ({row.ask_time}) must be before the end-of-day report "
+            f"({row.digest_time}), so people can answer before it goes."
+        )
+
     # From the moment it is switched on, never from before. The archive of
     # bids that closed last year is not two hundred emails on the first tick.
     if row.enabled and not was_on:
@@ -160,6 +180,58 @@ async def update_settings(
     row.updated_by_id = actor_id
     await session.flush()
     return row
+
+
+def _clock(value: str, what: str) -> str:
+    """"HH:MM", zero-padded, so two of them compare as times."""
+    try:
+        hour, minute = (int(x) for x in value.strip().split(":")[:2])
+        return time(hour, minute).strftime("%H:%M")
+    except (ValueError, TypeError) as exc:
+        raise FollowupError(f"{what} must be a time like 16:00.") from exc
+
+
+# ── when to ask ────────────────────────────────────────────────────────
+
+#: ``after_due``: a grace after each due time, one mail per task. ``daily``:
+#: once a day at ``ask_time``, one mail per person.
+ASK_MODES: Final = ("after_due", "daily")
+
+
+def _settings_zone(row: FollowupSettings) -> ZoneInfo:
+    try:
+        return ZoneInfo(row.digest_timezone or "Asia/Kolkata")
+    except Exception:  # noqa: BLE001 - a bad name falls back, as the report does
+        return ZoneInfo("Asia/Kolkata")
+
+
+def ask_moment(row: FollowupSettings, day: date) -> datetime:
+    """``day``'s ask time, as a UTC instant."""
+    hour, minute = (int(x) for x in (row.ask_time or "16:00").split(":")[:2])
+    local = datetime.combine(day, time(hour, minute), tzinfo=_settings_zone(row))
+    return local.astimezone(UTC)
+
+
+def local_day(row: FollowupSettings, moment: datetime) -> date:
+    return moment.astimezone(_settings_zone(row)).date()
+
+
+def daily_batch_due(row: FollowupSettings, now: datetime) -> bool:
+    """In daily mode: today's ask time has come, and today's batch has not run.
+
+    Late is still today: a server that was down at the ask time asks when it
+    is back, the same evening, rather than skipping the day.
+    """
+    if row.ask_mode != "daily":
+        return False
+    today = local_day(row, now)
+    return row.ask_last_run_on != today and now >= ask_moment(row, today)
+
+
+def is_carried_over(row: FollowupSettings, due_at: datetime, now: datetime) -> bool:
+    """Due on an earlier day than the batch asking about it — in daily mode,
+    after the previous day's ask time."""
+    return local_day(row, due_at) < local_day(row, now)
 
 
 # ── the rule ───────────────────────────────────────────────────────────
@@ -373,6 +445,11 @@ async def sweep(
             except Exception as exc:  # noqa: BLE001 - one person's failure is theirs
                 return user, None, f"{user.email}: {type(exc).__name__}: {exc}"
 
+    daily = row.ask_mode == "daily"
+    # In daily mode the list is still read every poll — so a task finished
+    # before the batch is closed quietly — but questions go only in the batch.
+    asking = (not daily) or force or daily_batch_due(row, now)
+
     fetched = await asyncio.gather(*(fetch(u) for u in people))
 
     # Every question already on these tasks, in one query. Asking once per
@@ -387,6 +464,7 @@ async def sweep(
         ).all():
             known.setdefault(existing_row.task_id, []).append(existing_row)
 
+    batches: dict[uuid.UUID, tuple[User, list[TaskFollowup]]] = {}
     for user, tasks, error in fetched:
         if error:
             report.errors.append(error)
@@ -397,10 +475,14 @@ async def sweep(
             _close_pending(
                 [r for r in asked_before if r.status == FollowupStatus.PENDING], task, report, now
             )
+            if not asking:
+                continue
             decision = decide(
                 task,
                 now=now,
-                grace_minutes=row.grace_minutes,
+                # The batch asks about everything overdue by its time; the
+                # grace belongs to the other mode.
+                grace_minutes=0 if daily else row.grace_minutes,
                 watch_from=row.watch_from,
                 title_contains=row.only_title_contains,
             )
@@ -408,12 +490,28 @@ async def sweep(
                 continue
             if any(r.due_at == decision.due_at for r in asked_before):
                 continue
-            made = await _ask(
-                session, row, user, task, decision.due_at,
-                settings=settings, mailer=mailer, now=now,
-            )
+            if daily:
+                made = await _record(
+                    session, row, user, task, decision.due_at, now=now,
+                    carried_over=is_carried_over(row, decision.due_at, now),
+                )
+                batches.setdefault(user.id, (user, []))[1].append(made)
+            else:
+                made = await _ask(
+                    session, row, user, task, decision.due_at,
+                    settings=settings, mailer=mailer, now=now,
+                )
             known.setdefault(task.id, []).append(made)
             report.asked += 1
+
+    for user, made in batches.values():
+        await _send_batch(session, row, user, made, settings=settings, mailer=mailer, now=now)
+    if daily and asking and not force and not report.errors:
+        # A failed read of somebody's list leaves the day open, so the next
+        # poll tries them again; everybody already asked is not asked twice.
+        # Not on a forced run: "Run Check" is somebody trying it out, and must
+        # not stand in for the day's batch at the ask time.
+        row.ask_last_run_on = local_day(row, now)
 
     row.last_run_at = now
     row.last_error = "; ".join(report.errors)[:2000] if report.errors else None
@@ -469,17 +567,18 @@ async def _sender_for(session: AsyncSession, row: FollowupSettings, assignee: Us
     return assignee
 
 
-async def _ask(
+async def _record(
     session: AsyncSession,
     row: FollowupSettings,
     user: User,
     task: ProposalTask,
     due_at: datetime,
     *,
-    settings: Settings,
-    mailer,
     now: datetime,
+    carried_over: bool = False,
 ) -> TaskFollowup:
+    """The question as a row, and the in-app notice. No mail: the caller
+    sends it — one per task, or one per person in daily mode."""
     followup = TaskFollowup(
         task_id=task.id,
         task_title=(task.title or "(untitled)")[:2000],
@@ -497,7 +596,6 @@ async def _ask(
     session.add(followup)
     await session.flush()
 
-    link = form_link(settings, followup.id)
     early = due_at > now
     await notifications.notify(
         session,
@@ -522,19 +620,77 @@ async def _ask(
         source_id=str(followup.id),
         payload={"task_id": task.id, "due_at": due_at.isoformat()},
     )
+    return followup
 
+
+async def _ask(
+    session: AsyncSession,
+    row: FollowupSettings,
+    user: User,
+    task: ProposalTask,
+    due_at: datetime,
+    *,
+    settings: Settings,
+    mailer,
+    now: datetime,
+) -> TaskFollowup:
+    """One task, one mail: the ``after_due`` mode, and the test button."""
+    followup = await _record(session, row, user, task, due_at, now=now)
+    link = form_link(settings, followup.id)
+    early = due_at > now
     sender = await _sender_for(session, row, user)
     followup.asked_from_email = sender.email
     if not settings.notify_by_email:
         followup.ask_error = "Email is switched off for this deployment (NOTIFY_BY_EMAIL)."
         return followup
     try:
-        await mailer.send_ask(followup, sender=sender, link=link, early=early)
+        await mailer.send_ask(
+            followup, sender=sender, link=link, early=early, redirect_to=row.test_mail_to
+        )
         followup.asked_at = now
     except Exception as exc:  # noqa: BLE001 - the in-app notice still stands
         followup.ask_error = f"{type(exc).__name__}: {exc}"[:2000]
         logger.warning("follow-up mail for task %s not sent: %s", task.id, exc)
     return followup
+
+
+async def _send_batch(
+    session: AsyncSession,
+    row: FollowupSettings,
+    user: User,
+    made: list[TaskFollowup],
+    *,
+    settings: Settings,
+    mailer,
+    now: datetime,
+) -> None:
+    """Daily mode's one mail to one person: today's tasks, then the ones
+    carried over from yesterday, apart and with a note."""
+    if not made:
+        return
+    sender = await _sender_for(session, row, user)
+    for followup in made:
+        followup.asked_from_email = sender.email
+    if not settings.notify_by_email:
+        for followup in made:
+            followup.ask_error = "Email is switched off for this deployment (NOTIFY_BY_EMAIL)."
+        return
+    try:
+        await mailer.send_batch(
+            made,
+            sender=sender,
+            links={f.id: form_link(settings, f.id) for f in made},
+            ask_time=row.ask_time,
+            redirect_to=row.test_mail_to,
+        )
+    except Exception as exc:  # noqa: BLE001 - the in-app notices still stand
+        error = f"{type(exc).__name__}: {exc}"[:2000]
+        for followup in made:
+            followup.ask_error = error
+        logger.warning("follow-up batch mail to %s not sent: %s", user.email, exc)
+        return
+    for followup in made:
+        followup.asked_at = now
 
 
 async def ask_now(
@@ -665,7 +821,12 @@ async def answer(
             source_id=str(row.id),
             payload={"task_id": row.task_id},
         )
-    await _forward(row, user, managers, settings, followup_settings, mailer, now, ceo_emails)
+    if followup_settings.ask_mode == "daily":
+        # No mail per reason: the managers get each person's whole list in
+        # one report at the closing time. See :func:`send_person_reports`.
+        pass
+    else:
+        await _forward(row, user, managers, settings, followup_settings, mailer, now, ceo_emails)
     await session.flush()
     return row
 
@@ -712,12 +873,100 @@ async def _forward(
             sender=user,
             recipients=to,
             link=form_link(settings, row.id),
+            redirect_to=followup_settings.test_mail_to,
         )
         row.forwarded_at = now
         row.forward_error = None
     except Exception as exc:  # noqa: BLE001 - the reason is filed regardless
         row.forward_error = f"{type(exc).__name__}: {exc}"[:2000]
         logger.warning("reason for follow-up %s not mailed: %s", row.id, exc)
+
+
+def person_reports_due(row: FollowupSettings, now: datetime) -> bool:
+    """Daily mode: past today's closing time, and today's reports not sent."""
+    from app.followups import digest
+
+    if row.ask_mode != "daily":
+        return False
+    today = local_day(row, now)
+    return row.summaries_last_sent_on != today and now >= digest.cutoff_for(row, today)
+
+
+async def send_person_reports(
+    session: AsyncSession,
+    row: FollowupSettings,
+    *,
+    settings: Settings,
+    mailer,
+    now: datetime,
+    day: date | None = None,
+) -> str:
+    """One report per person asked today, to that person's managers.
+
+    Everything from the day's list — the day as the end-of-day report has
+    it, from yesterday's closing time to today's — whether they answered or
+    not: the reasons, the tasks already updated, and the ones left unanswered.
+    Sent as the report is, from its sender, since nobody in particular wrote
+    it. Returns a line for the log.
+    """
+    from app.followups import digest
+
+    day = day or local_day(row, now)
+    start = digest.cutoff_for(row, day - timedelta(days=1))
+    end = digest.cutoff_for(row, day)
+    asked = (
+        await session.scalars(
+            select(TaskFollowup)
+            .where(TaskFollowup.created_at > start, TaskFollowup.created_at <= end)
+            .order_by(TaskFollowup.carried_over, TaskFollowup.due_at)
+        )
+    ).all()
+    by_person: dict[uuid.UUID, list[TaskFollowup]] = {}
+    for f in asked:
+        by_person.setdefault(f.assignee_id, []).append(f)
+
+    ceo = await digest.recipients(session, row)
+    sent = failed = 0
+    for rows in by_person.values():
+        person = rows[0].assignee
+        if person is None:
+            continue
+        mine = (person.email or "").casefold()
+        to: list[str] = []
+        for m in await managers_of(session, rows[0].team_id):
+            address = (m.email or "").strip().lower()
+            if address and address != mine and address not in to:
+                to.append(address)
+        for address in ceo:
+            if address and address != mine and address not in to:
+                to.append(address)
+        if not to or not (settings.notify_by_email and row.notify_managers_by_email):
+            continue
+        sender = (row.digest_sender_email or to[0]).strip()
+        try:
+            await mailer.send_person_report(
+                rows,
+                person=person,
+                sender_email=sender,
+                recipients=to,
+                day=day,
+                link=f"{(settings.followup_link_url or settings.frontend_url).rstrip('/')}"
+                f"{FORM_PATH}",
+                redirect_to=row.test_mail_to,
+            )
+        except Exception as exc:  # noqa: BLE001 - one person's report is not the rest
+            failed += 1
+            for f in rows:
+                f.forward_error = f"{type(exc).__name__}: {exc}"[:2000]
+            logger.warning("report for %s not mailed: %s", person.email, exc)
+            continue
+        sent += 1
+        for f in rows:
+            if f.status == FollowupStatus.ANSWERED:
+                f.forwarded_at = now
+                f.forward_error = None
+    row.summaries_last_sent_on = day
+    return f"{sent} person report(s) sent, {failed} failed, {len(by_person)} people asked"
 
 
 # ── listings ───────────────────────────────────────────────────────────
@@ -781,6 +1030,28 @@ def watches(row: FollowupSettings | None, user: User, task: ProposalTask) -> str
     return None
 
 
+def ask_at_for(
+    row: FollowupSettings | None,
+    due: datetime,
+    now: datetime,
+    grace_minutes: int,
+    reason_now: bool,
+) -> datetime:
+    """When the question about a task due at ``due`` goes out, by the mode.
+
+    Daily: the first batch after the due time — today's ask time, or
+    tomorrow's for a task due after it (carried over). Otherwise the grace
+    after the due time, or now for a task already marked Not Submitted.
+    """
+    if row is not None and row.ask_mode == "daily":
+        day = local_day(row, due)
+        moment = ask_moment(row, day)
+        if due > moment or (row.ask_last_run_on == day and not reason_now):
+            moment = ask_moment(row, day + timedelta(days=1))
+        return moment
+    return now if reason_now else due + timedelta(minutes=max(0, grace_minutes))
+
+
 def due_today_rows(
     people: list[tuple[User, list[ProposalTask]]],
     *,
@@ -820,7 +1091,7 @@ def due_today_rows(
                     "assignee_name": user.display_name,
                     "assignee_email": user.email,
                     "due_at": due,
-                    "ask_at": now if reason_now else due + timedelta(minutes=max(0, grace_minutes)),
+                    "ask_at": ask_at_for(settings_row, due, now, grace_minutes, reason_now),
                     "followup_id": followup.id if followup else None,
                     "followup_status": followup.status if followup else None,
                     # Whether the mail reached them — the in-app notice and
