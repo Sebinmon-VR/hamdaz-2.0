@@ -283,6 +283,42 @@ class Settings(BaseSettings):
     #: live SharePoint list from somebody's laptop is not what anybody meant.
     mirror_sync_enabled: bool = False
 
+    # ── the Ariba tender reader ────────────────────────────────────────
+    #: The supplier login on SAP Business Network. Read only: the reader opens
+    #: the Events list and nothing else. See app/ariba.
+    ariba_username: str = ""
+    ariba_password: str = ""
+    #: Off in development and in tests, like the mirror: a laptop must not
+    #: sign in to a customer's portal on a timer.
+    ariba_enabled: bool = False
+    #: How often to look at the mirror for new tenders. A database query, not
+    #: a visit to Ariba — the portal is only opened when there is something new.
+    ariba_check_seconds: int = 120
+    #: Tenders arrive in bursts. Wait this long after the newest one so three
+    #: or four that land together cost one visit, not four.
+    ariba_settle_seconds: int = 180
+    #: Never visit more often than this, whatever arrives.
+    ariba_min_gap_seconds: int = 1800
+    #: And never more than this many times in a day.
+    ariba_max_visits_per_day: int = 12
+    #: The End Time column is shown in the browser's time zone, so the reader's
+    #: browser is put in the one the dates should mean.
+    ariba_timezone: str = "Asia/Dubai"
+    #: What a tender number looks like, in the Proposals title and the Ariba
+    #: title alike — ADNOC's ten-digit 6000… numbers.
+    ariba_reference_pattern: str = r"\b6\d{9}\b"
+    #: Correct the "BCD UAE Time" column of the matching Proposals row when it
+    #: disagrees with Ariba's End Time. Off: the differences are only recorded,
+    #: as a preview of what would be written.
+    ariba_fix_bcd: bool = False
+    #: How often BCD is compared with the events already held, besides after
+    #: every visit. A SharePoint read, not an Ariba visit.
+    ariba_bcd_check_seconds: int = 1800
+
+    @property
+    def ariba_configured(self) -> bool:
+        return bool(self.ariba_username and self.ariba_password)
+
     # ── publishing the priority score ──────────────────────────────────
     #: The one place this app writes a ranking outside its own database: the
     #: ``useranalytics`` list, one row per person, rewritten whenever the live

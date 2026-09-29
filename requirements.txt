@@ -10,6 +10,7 @@ alembic>=1.14
 psycopg[binary,pool]>=3.2
 pyjwt[crypto]>=2.10
 httpx>=0.28
+playwright>=1.47
 anthropic>=0.69
 openai>=3.8
 python-multipart>=0.0.20

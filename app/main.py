@@ -14,6 +14,8 @@ from fastapi.responses import JSONResponse
 from app.access.router import router as access_router
 from app.admin.router import router as admin_router
 from app.analytics.router import router as analytics_router
+from app.ariba.router import router as ariba_router
+from app.ariba.worker import AribaWorker
 from app.assignment.router import router as assignment_router
 from app.assistant.agent import Assistant
 from app.assistant.cache import ActorCache, ConfigCache, PlacesCache
@@ -223,6 +225,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         mailer=FollowupMailer(settings, http),
     )
     app.state.followup_worker.start()
+    # Reads the open tenders from the Ariba supplier portal — only when a new
+    # tender reaches the Proposals mirror, and within a gap and a daily cap.
+    # Off unless ARIBA_ENABLED is set. With ARIBA_FIX_BCD it also corrects the
+    # BCD of the matching Proposals row — that column only; see app/ariba/bcd.py.
+    app.state.ariba_worker = AribaWorker(
+        factory=get_session_factory(), settings=settings, sharepoint=app.state.sharepoint
+    )
+    app.state.ariba_worker.start()
     logger.info("started environment=%s", settings.environment)
 
     try:
@@ -233,6 +243,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await app.state.intake_worker.stop()
         await app.state.workflow_worker.stop()
         await app.state.followup_worker.stop()
+        await app.state.ariba_worker.stop()
         await http.aclose()
         await dispose_engine()
 
@@ -303,6 +314,7 @@ def create_app() -> FastAPI:
     app.include_router(admin_router, prefix=settings.api_prefix)
     app.include_router(notifications_router, prefix=settings.api_prefix)
     app.include_router(followups_router, prefix=settings.api_prefix)
+    app.include_router(ariba_router, prefix=settings.api_prefix)
     # The webhook first: Graph posts to it unauthenticated, and it must not
     # inherit anything that would refuse Microsoft.
     app.include_router(intake_webhook_router, prefix=settings.api_prefix)

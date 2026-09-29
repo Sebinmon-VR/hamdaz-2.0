@@ -1,5 +1,6 @@
 from app.models.access import Module, ModulePage, TeamModuleAccess, TeamPageAccess
 from app.models.analytics import AnalyticsRun, LiveScore, UserAnalytics
+from app.models.ariba import AribaBcdFix, AribaEvent, AribaState
 from app.models.assignment import AssignmentPolicy
 from app.models.assistant import (
     AssistantAccessRule,
@@ -127,6 +128,9 @@ from app.models.workflow import (
 from app.models.zoho import ZohoToken
 
 __all__ = [
+    "AribaBcdFix",
+    "AribaEvent",
+    "AribaState",
     "Workflow", "WorkflowRun", "WorkflowRunEvent", "WorkflowRunFile", "WorkflowRunMessage",
     "WorkflowSettings", "WorkflowTrigger", "WorkflowRunStatus", "RunEventKind", "FileSource",
     "OPEN_RUN_STATUSES",
