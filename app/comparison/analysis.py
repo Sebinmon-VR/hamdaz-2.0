@@ -78,6 +78,8 @@ class Quote:
     freight: Decimal | None = None
     tax: Decimal | None = None
     quoted_total: Decimal | None = None
+    #: Duty, handling and the like, stated with a figure. See ``charges.py``.
+    charges: Decimal | None = None
     delivery_time: str | None = None
     payment_terms: str | None = None
     validity: str | None = None
@@ -380,8 +382,12 @@ def _supplier_row(
     quote: Quote, groups: list[dict[str, Any]], all_labels: list[str]
 ) -> dict[str, Any]:
     items_total = sum((o.line_total for o in quote.items), Decimal(0))
-    total = items_total - (quote.discount or Decimal(0)) + (quote.freight or Decimal(0)) + (
-        quote.tax or Decimal(0)
+    total = (
+        items_total
+        - (quote.discount or Decimal(0))
+        + (quote.freight or Decimal(0))
+        + (quote.charges or Decimal(0))
+        + (quote.tax or Decimal(0))
     )
 
     quoted_for = {
@@ -406,6 +412,7 @@ def _supplier_row(
         "items_total": _out(items_total),
         "discount": _out(quote.discount),
         "freight": _out(quote.freight),
+        "charges": _out(quote.charges),
         "tax": _out(quote.tax),
         "total": _out(total),
         "quoted_total": _out(quote.quoted_total),

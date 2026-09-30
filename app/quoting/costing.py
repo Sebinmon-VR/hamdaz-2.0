@@ -32,6 +32,8 @@ import logging
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Final
 
+from app.comparison.charges import LABELS
+from app.comparison.schemas import ChargeIn
 from app.core.config import Settings
 from app.models.comparison import SupplierQuote
 from app.models.quoting import CostStage, QuoteCostLine, QuoteRequest, TradeDirection
@@ -171,6 +173,13 @@ def seed_costing(
     fx = request.fx_rate if request.fx_rate and request.fx_rate > 0 else None
     converting = bool(theirs and ours and theirs != ours)
 
+    def to_base(amount: Decimal) -> Decimal:
+        if converting and fx:
+            return (amount / fx).quantize(_PRICE, rounding=ROUND_HALF_UP)
+        if converting:
+            return _ZERO
+        return amount.quantize(_PRICE, rounding=ROUND_HALF_UP)
+
     # What the supplier quoted for shipping, exactly as they quoted it —
     # unless somebody has already typed the freight on the freight form, in
     # which case that is the answer and a seeded row would count it twice.
@@ -200,8 +209,26 @@ def seed_costing(
         )
         added.append("freight")
 
+    # Everything else the supplier said is on top — duty, handling, insurance,
+    # clearance — often only in the notes. What they stated beats the house
+    # default for the same thing, so those are settled first.
+    stated = {c.kind: c for c in charges_of(quote)}
+    duty_settled = False
+    for charge in stated.values():
+        if charge.kind == "duty":
+            duty_settled = _seed_duty(request, charge, quote, rows, to_base, theirs, converting)
+            continue
+        rows.append(_charge_row(charge, quote, len(rows) + 1, to_base, theirs, converting))
+        added.append(charge.kind)
+    if duty_settled:
+        added.append("duty")
+
     importing = is_import(request, quote)
-    if importing and settings.costing_default_insurance_percent > 0:
+    if (
+        importing
+        and settings.costing_default_insurance_percent > 0
+        and "insurance" not in stated
+    ):
         rows.append(
             QuoteCostLine(
                 position=len(rows) + 1,
@@ -216,8 +243,12 @@ def seed_costing(
             )
         )
         added.append("insurance")
+    # A supplier who says duty is extra but gives no rate is saying this is an
+    # import, whatever the Incoterm says: the house rate is the allowance.
+    duty_extra = "duty" in stated and not stated["duty"].included
     if (
-        importing
+        (importing or duty_extra)
+        and not duty_settled
         and settings.costing_default_duty_percent > 0
         and not (request.customs_duty_percent or _ZERO) > 0
         # A duty figure on the freight form is the agent's own number; a
@@ -228,7 +259,11 @@ def seed_costing(
         request.customs_duty_percent = settings.costing_default_duty_percent
         added.append("duty")
 
-    if pays_up_front(request, quote) and settings.costing_default_bank_charge_percent > 0:
+    if (
+        pays_up_front(request, quote)
+        and settings.costing_default_bank_charge_percent > 0
+        and "bank" not in stated
+    ):
         rows.append(
             QuoteCostLine(
                 position=len(rows) + 1,
@@ -249,6 +284,95 @@ def seed_costing(
     if added:
         logger.info("quote %s: costing seeded with %s", request.id, ", ".join(added))
     return added
+
+
+#: Paid to the supplier with the goods, so before the duty base; the rest is
+#: paid here, after arrival.
+_ORIGIN_CHARGES: Final = frozenset({"handling", "packing", "insurance", "documentation"})
+
+
+def charges_of(quote: SupplierQuote) -> list[ChargeIn]:
+    """The charges stored on a supplier quote, read back. Bad rows are skipped."""
+    out: list[ChargeIn] = []
+    for raw in getattr(quote, "charges", None) or []:
+        try:
+            out.append(ChargeIn.model_validate(raw))
+        except ValueError:
+            continue
+    return out
+
+
+def _stated(charge: ChargeIn, supplier: str) -> str:
+    return f"{supplier} wrote: “{charge.label}”" if charge.label else f"Stated by {supplier}."
+
+
+def _charge_row(
+    charge: ChargeIn,
+    quote: SupplierQuote,
+    position: int,
+    to_base,
+    theirs: str,
+    converting: bool,
+) -> QuoteCostLine:
+    """One charge as a row of the build-up, exactly as the supplier stated it."""
+    name = LABELS.get(charge.kind, charge.kind.replace("_", " ").capitalize())
+    stage = CostStage.ORIGIN if charge.kind in _ORIGIN_CHARGES else CostStage.DESTINATION
+    row = QuoteCostLine(
+        position=position,
+        stage=stage,
+        label=f"{name} – {quote.supplier_name}",
+        basis="Supplier quotation",
+        amount_base=_ZERO,
+        is_principal=False,
+        is_firm=False,
+        notes=_stated(charge, quote.supplier_name),
+    )
+    if charge.included:
+        row.label = f"{name} – included in {quote.supplier_name}'s price"
+        row.is_firm = True
+    elif charge.amount:
+        amount = Decimal(charge.amount)
+        row.amount_base = to_base(amount)
+        row.amount_source = amount if converting else None
+        row.source_currency = theirs if converting else None
+        row.is_firm = True
+    elif charge.percent:
+        row.percent = Decimal(charge.percent)
+        # A rate on the CIF value can only be taken after arrival; before it,
+        # the goods are the base (``bidpack.landed_cost``).
+        row.percent_of = charge.percent_of if stage is CostStage.DESTINATION else "goods"
+    else:
+        row.label = f"{name} – {quote.supplier_name} says extra, amount not stated"
+        row.notes = (row.notes or "") + " Enter the figure when it is known."
+    return row
+
+
+def _seed_duty(
+    request: QuoteRequest,
+    charge: ChargeIn,
+    quote: SupplierQuote,
+    rows: list[QuoteCostLine],
+    to_base,
+    theirs: str,
+    converting: bool,
+) -> bool:
+    """Duty the supplier stated. True when that settles it and no house rate applies.
+
+    A rate replaces the house rate. A figure is its own firm row, with the rate
+    at 0 so the duty is not counted twice. Included (DDP, "inclusive of duty")
+    is a 0 row saying so. "Extra" with nothing more is left to the house rate.
+    A duty typed on the freight form is the agent's number and wins over all of it.
+    """
+    if request.duty_charges is not None:
+        return True
+    if charge.percent:
+        request.customs_duty_percent = Decimal(charge.percent)
+        return True
+    if charge.amount or charge.included:
+        request.customs_duty_percent = _ZERO
+        rows.append(_charge_row(charge, quote, len(rows) + 1, to_base, theirs, converting))
+        return True
+    return False
 
 
 def seed_tax(request: QuoteRequest, settings: Settings) -> int:

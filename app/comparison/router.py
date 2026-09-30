@@ -50,6 +50,7 @@ from app.comparison.extraction import ExtractionError, QuoteExtractor
 from app.comparison.schemas import (
     AnalyseIn,
     AnalysisOut,
+    ChargeIn,
     ComparisonIn,
     ComparisonOut,
     ComparisonSummaryOut,
@@ -204,6 +205,8 @@ async def extract(
                 contact=_txt(result.contact, 200),
                 discount=_dec(result.discount),
                 freight=_dec(result.freight),
+                charges=[ChargeIn(**c.model_dump()) for c in result.charges],
+                detail_suggestions=result.details,
                 tax=_dec(result.tax),
                 quoted_total=_dec(result.quoted_total),
                 source=QuoteSource.UPLOAD,

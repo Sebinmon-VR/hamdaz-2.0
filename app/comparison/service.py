@@ -98,6 +98,13 @@ def to_domain(quotes: list[QuoteIn], *, ids: list[str] | None = None) -> list[Qu
                 quoted_total=(
                     incoming.quoted_total * rate if incoming.quoted_total is not None else None
                 ),
+                # What they said is extra and priced. A rate or an "at actuals"
+                # has no figure to compare; the costing prices those.
+                charges=sum(
+                    (c.amount * rate for c in incoming.charges if c.amount and not c.included),
+                    Decimal(0),
+                )
+                or None,
                 delivery_time=incoming.delivery_time,
                 payment_terms=incoming.payment_terms,
                 validity=incoming.validity,
@@ -147,6 +154,8 @@ def _row(incoming: QuoteIn, documents: dict[str, tuple[str, bytes]] | None = Non
         freight=incoming.freight,
         tax=incoming.tax,
         quoted_total=incoming.quoted_total,
+        charges=[c.model_dump(mode="json") for c in incoming.charges] or None,
+        detail_suggestions=incoming.detail_suggestions or None,
         source=incoming.source,
         file_name=incoming.file_name,
         file_type=stored[0] if stored else None,

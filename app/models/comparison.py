@@ -147,6 +147,19 @@ class SupplierQuote(Base, UUIDPrimaryKey, Timestamped):
     discount: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
     freight: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
     tax: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
+    #: Duty, handling, insurance, clearance… as the supplier stated them, in
+    #: their currency: ``[{kind, label, amount, percent, percent_of, included}]``.
+    #: Read from the notes as well as the table; costed when the supplier is
+    #: chosen. See ``app.comparison.charges`` and ``costing.seed_costing``.
+    charges: Mapped[list | None] = mapped_column(JSONB)
+    #: Who the supplier is: address, contacts, registration, bank and terms,
+    #: as confirmed on the quote's summary tab. Kept field by field, so a
+    #: supplier library can be built from these rows. See
+    #: ``app.comparison.supplier_details``.
+    details: Mapped[dict | None] = mapped_column(JSONB)
+    #: What the document said about the supplier, offered for ``details``
+    #: rather than written into it: ``{field: value}``.
+    detail_suggestions: Mapped[dict | None] = mapped_column(JSONB)
 
     source: Mapped[QuoteSource] = mapped_column(
         String(20), default=QuoteSource.MANUAL, nullable=False

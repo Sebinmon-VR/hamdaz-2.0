@@ -45,6 +45,7 @@ KIND_LABELS: dict[str, str] = {
     DocumentKind.TECHNICAL_SPEC: "Technical spec",
     DocumentKind.COMPLIANCE: "Compliance",
     DocumentKind.FREIGHT_QUOTE: "Freight quote",
+    DocumentKind.SUPPLIER_EMAIL: "Supplier email",
     DocumentKind.COSTING_REPORT: "Costing report",
     DocumentKind.OTHER: "Document",
 }
@@ -271,4 +272,5 @@ def summary(document: QuoteDocument) -> dict[str, Any]:
         "supplier_quote_id": document.supplier_quote_id,
         "revision": document.revision,
         "suggestions": document.suggestions,
+        "email": (document.extracted or {}).get("email"),
     }

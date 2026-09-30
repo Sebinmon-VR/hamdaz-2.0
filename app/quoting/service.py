@@ -13,7 +13,9 @@ something that no longer exists, which is the failure this whole module exists t
 prevent.
 
 **Approvers are the team's ``approver`` role holders**, plus managers and the
-CEO. Not the requester: nobody approves their own quote, however senior.
+CEO. Not the requester: nobody approves their own quote, however senior. The
+mail asking for a decision goes to fewer people than may give one: the team's
+approvers and managers and the global managers, not the CEO or a super admin.
 
 **The requester chooses the supplier; the approver can overrule it.** The
 requester attaches what they were sent, picks the offer to quote from, and the
@@ -78,6 +80,10 @@ GLOBAL_APPROVERS = frozenset({"super_admin", "ceo", "manager"})
 #: is given deliberately — ``approver`` is the role that exists to say so — or
 #: it comes with managing the team. A plain ``member`` never had it.
 TEAM_APPROVERS = frozenset({"approver", "team_manager"})
+#: The organisation-wide roles that are *mailed* a team's quotes. Narrower than
+#: ``GLOBAL_APPROVERS`` on purpose: the CEO and a super admin can still decide a
+#: quote they open, but are not asked to by every one that is submitted.
+NOTIFIED_GLOBAL_APPROVERS = frozenset({"manager"})
 
 
 class QuoteError(Exception):
@@ -124,8 +130,13 @@ async def may_approve(
     )
 
 
-async def approvers_for(session: AsyncSession, team_id: uuid.UUID) -> list[User]:
-    """Everyone who could decide this team's quotes — who to notify, later."""
+async def approvers_for(
+    session: AsyncSession,
+    team_id: uuid.UUID,
+    *,
+    global_roles: frozenset[str] = GLOBAL_APPROVERS,
+) -> list[User]:
+    """Everyone who could decide this team's quotes."""
     rows = await session.scalars(
         select(TeamMembership)
         .join(Role, Role.id == TeamMembership.role_id)
@@ -141,11 +152,17 @@ async def approvers_for(session: AsyncSession, team_id: uuid.UUID) -> list[User]
         select(User)
         .join(UserRole, UserRole.user_id == User.id)
         .join(Role, Role.id == UserRole.role_id)
-        .where(Role.key.in_(GLOBAL_APPROVERS))
+        .where(Role.key.in_(global_roles))
     )
     for user in globals_.all():
         people.setdefault(user.id, user)
     return list(people.values())
+
+
+async def approvers_to_notify(session: AsyncSession, team_id: uuid.UUID) -> list[User]:
+    """Who is mailed about this team's quotes: its approvers and managers, and
+    the global managers. Not the CEO — see ``NOTIFIED_GLOBAL_APPROVERS``."""
+    return await approvers_for(session, team_id, global_roles=NOTIFIED_GLOBAL_APPROVERS)
 
 
 def require_owner(
@@ -161,6 +178,21 @@ def require_owner(
         return
     if request.created_by_id != user.id and request.assigned_to_id != user.id:
         raise QuotePermissionError("This quote is not yours to edit.")
+
+
+def may_add_documents(request: QuoteRequest, *, user: User, roles: set[str]) -> bool:
+    """Who may file another supporting document, at any stage.
+
+    Like the currency, this is not frozen by submitting. An RFQ addendum, a
+    datasheet or a certificate filed beside the quote restates no number, so an
+    approver is still deciding the document they were sent. Supplier
+    quotations are the exception and stay behind ``require_editable``, because
+    they reprice the quote. So does removing a file: what the approvers saw
+    stays filed.
+    """
+    if user.id in (request.created_by_id, request.assigned_to_id):
+        return True
+    return SUPER_ADMIN in roles
 
 
 def may_set_currency(request: QuoteRequest, *, user: User, roles: set[str]) -> bool:

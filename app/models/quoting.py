@@ -252,6 +252,9 @@ class DocumentKind(StrEnum):
     TECHNICAL_SPEC = "technical_spec"
     COMPLIANCE = "compliance"
     FREIGHT_QUOTE = "freight_quote"
+    #: The supplier's own email, as a ``.eml``: picked from the requester's
+    #: mailbox or dropped in. Sent on to the approvers. See ``supplier_mail``.
+    SUPPLIER_EMAIL = "supplier_email"
     #: The selling & costing report the system rendered on submit.
     COSTING_REPORT = "costing_report"
     OTHER = "other"

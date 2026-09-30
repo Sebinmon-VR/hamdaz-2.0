@@ -932,3 +932,15 @@ async def test_a_team_lead_is_not_emailed_as_an_approver(db, team, requester) ->
     people = await service.approvers_for(db, team.id)
     assert lead.id not in {p.id for p in people}
 
+
+
+async def test_the_ceo_may_approve_but_is_not_emailed(db, team, requester) -> None:
+    """The approval request goes to approvers and managers only."""
+    ceo = await person(db, "ceo-quotes@hamdaz.com", "ceo")
+    manager = await person(db, "mgr-quotes@hamdaz.com", "manager")
+    await db.commit()
+
+    mailed = {p.id for p in await service.approvers_to_notify(db, team.id)}
+    assert manager.id in mailed
+    assert ceo.id not in mailed
+    assert ceo.id in {p.id for p in await service.approvers_for(db, team.id)}

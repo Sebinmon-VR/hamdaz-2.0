@@ -73,6 +73,8 @@ _COLUMNS: Final[tuple[tuple[str, tuple[str, ...]], ...]] = (
 _NOT_AN_ITEM: Final = re.compile(
     r"^\s*(sub\s*-?\s*total|total|grand\s+total|net\s+total|vat|tax|gst|freight|"
     r"shipping|delivery\s+charge|handling|discount|rounding|amount\s+in\s+words|"
+    r"customs|(?:import\s+)?dut(?:y|ies)|clearance|insurance|bank\s+charges?|"
+    r"documentation\s+charges?|legali[sz]ation|attestation|"
     r"s\.?\s*no\.?|sr\.?\s*no\.?)\b",
     re.I,
 )
@@ -182,6 +184,11 @@ _TOTALS: Final[dict[str, re.Pattern[str]]] = {
 #: A number that is not a percentage. "5%" on a VAT line is the rate, and the
 #: amount is somewhere to its right.
 _AMOUNT: Final = re.compile(r"([0-9][0-9,.\s]*[0-9]|[0-9])(?!\s*%)")
+#: What, right after a number, says it is not money: a rate, or a duration.
+_NOT_AN_AMOUNT: Final = re.compile(
+    r"[\d.,]*\s*%|\s*(?:(?:-|–|to)\s*\d+\s*)?(?:days?|weeks?|months?|hours?|hrs?|working|business)\b",
+    re.I,
+)
 
 #: Below this share of table rows yielding a priced item, the column mapping was
 #: probably wrong. Decline rather than report a partial quote as the whole.
@@ -529,8 +536,11 @@ def _amount_on_label_line(text: str, label: re.Pattern[str]) -> Decimal | None:
         after = line[label.search(line).end() :]
         candidates = [
             value
-            for raw in _AMOUNT.findall(after)
-            if (value := to_number(raw)) is not None
+            for match in _AMOUNT.finditer(after)
+            # "Delivery by courier in 3-5 days" is not a freight of 5, and the
+            # "1" of "10%" is not an amount either.
+            if not _NOT_AN_AMOUNT.match(after, match.end())
+            and (value := to_number(match.group(1))) is not None
         ]
         if candidates:
             return candidates[-1]

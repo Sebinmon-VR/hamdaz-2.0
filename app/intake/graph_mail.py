@@ -75,17 +75,19 @@ class MailReader(GraphMailer):
     def __init__(self, settings: Settings, http: httpx.AsyncClient) -> None:
         super().__init__(settings, http)
 
-    async def _graph(self, url: str, params: dict[str, str] | None = None) -> dict[str, Any]:
+    async def _graph(
+        self, url: str, params: dict[str, str] | None = None, *, immutable: bool = False
+    ) -> dict[str, Any]:
         token = await self._access_token()
+        # Plain-text bodies. And, when asked, ids that survive the message
+        # being moved to another folder — kept on a row and used days later.
+        prefer = 'outlook.body-content-type="text"'
+        if immutable:
+            prefer += ', IdType="ImmutableId"'
         response = await self._http.get(
             url,
             params=params,
-            headers={
-                "Authorization": f"Bearer {token}",
-                # Asks Graph to keep serving the page even if some property is
-                # unavailable, rather than failing the whole call.
-                "Prefer": 'outlook.body-content-type="text"',
-            },
+            headers={"Authorization": f"Bearer {token}", "Prefer": prefer},
         )
         if response.status_code == 403:
             raise MailError(
@@ -189,6 +191,67 @@ class MailReader(GraphMailer):
                 )
             )
         return out
+
+    async def search(
+        self, mailbox: str, query: str | None, *, fields: str, top: int = 25
+    ) -> list[dict[str, Any]]:
+        """Messages in a mailbox, newest first, or those matching ``query``.
+
+        Graph's ``$search`` looks at the sender, subject and body and ranks by
+        date on its own; it cannot be combined with ``$orderby``, so the
+        unsearched listing asks for the order instead.
+        """
+        params = {"$select": fields, "$top": str(max(1, min(top, 50)))}
+        cleaned = (query or "").replace('"', " ").strip()
+        if cleaned:
+            params["$search"] = f'"{cleaned}"'
+        else:
+            params["$orderby"] = "receivedDateTime desc"
+        payload = await self._graph(
+            f"{GRAPH_BASE}/users/{mailbox}/messages", params, immutable=True
+        )
+        return list(payload.get("value", []))
+
+    async def full_message(self, mailbox: str, message_id: str) -> dict[str, Any]:
+        """One message with its text body and recipients, by immutable id."""
+        return await self._graph(
+            f"{GRAPH_BASE}/users/{mailbox}/messages/{message_id}",
+            {
+                "$select": "id,subject,from,toRecipients,ccRecipients,sentDateTime,"
+                "receivedDateTime,body,hasAttachments"
+            },
+            immutable=True,
+        )
+
+    async def attachment_names(self, mailbox: str, message_id: str) -> list[str]:
+        payload = await self._graph(
+            f"{GRAPH_BASE}/users/{mailbox}/messages/{message_id}/attachments",
+            {"$select": "name,isInline"},
+            immutable=True,
+        )
+        return [
+            str(a.get("name") or "attachment")
+            for a in payload.get("value", [])
+            if not a.get("isInline")
+        ]
+
+    async def mime(self, mailbox: str, message_id: str) -> bytes:
+        """The message exactly as sent, attachments included: a ``.eml``."""
+        token = await self._access_token()
+        response = await self._http.get(
+            f"{GRAPH_BASE}/users/{mailbox}/messages/{message_id}/$value",
+            headers={"Authorization": f"Bearer {token}", "Prefer": 'IdType="ImmutableId"'},
+        )
+        if response.status_code == 403:
+            raise MailError(
+                "Graph refused to read the mailbox. The app registration needs "
+                "the Mail.Read application permission, granted by an admin."
+            )
+        if response.status_code == 404:
+            raise MailError("That message is no longer in the mailbox.")
+        if response.status_code >= 400:
+            raise MailError(f"Graph returned {response.status_code} reading the message")
+        return response.content
 
     async def body_of(self, mailbox: str, message_id: str) -> str:
         """The plain-text body, trimmed to what a model needs to read."""

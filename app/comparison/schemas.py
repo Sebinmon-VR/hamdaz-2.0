@@ -37,6 +37,19 @@ class ItemIn(BaseModel):
     lead_time: str | None = Field(default=None, max_length=2000)
 
 
+class ChargeIn(BaseModel):
+    """A charge the supplier puts on top of their lines. See ``app.comparison.charges``."""
+
+    kind: str = Field(max_length=30)
+    label: str = Field(default="", max_length=300)
+    #: In the supplier's currency, as quoted.
+    amount: Decimal | None = None
+    percent: Decimal | None = None
+    percent_of: str = "goods"
+    #: Their price already carries it.
+    included: bool = False
+
+
 class QuoteIn(BaseModel):
     supplier_name: str = Field(min_length=1, max_length=200)
     quote_number: str | None = Field(default=None, max_length=100)
@@ -61,6 +74,9 @@ class QuoteIn(BaseModel):
     freight: Decimal | None = None
     tax: Decimal | None = None
     quoted_total: Decimal | None = None
+    charges: list[ChargeIn] = Field(default_factory=list)
+    #: What the document says about the supplier, offered for their details.
+    detail_suggestions: dict[str, Any] = Field(default_factory=dict)
 
     items: list[ItemIn] = Field(default_factory=list)
 
@@ -141,6 +157,7 @@ class QuoteOut(BaseModel):
     freight: Decimal | None
     tax: Decimal | None
     quoted_total: Decimal | None
+    charges: list[ChargeIn] | None = None
     source: str
     file_name: str | None
     file_type: str | None

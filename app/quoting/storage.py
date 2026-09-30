@@ -357,6 +357,17 @@ class QuoteDrive:
             raise DriveError("the upload session ended without the file being created")
         return item
 
+    async def download(self, item_id: str) -> bytes:
+        """A file this app filed, read back — to attach it to a mail."""
+        response = await self._http.get(
+            f"{GRAPH_BASE}/drives/{self._drive()}/items/{item_id}/content",
+            headers=await self._headers(),
+            follow_redirects=True,
+        )
+        if response.status_code >= 400:
+            raise DriveError(f"download refused ({response.status_code})")
+        return response.content
+
     async def delete_item(self, item_id: str) -> None:
         """Remove a file this app filed. Only ever called for an item this app
         recorded, never for anything a person put in the folder."""

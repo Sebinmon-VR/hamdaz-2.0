@@ -16,13 +16,15 @@ whether it went.
 
 from __future__ import annotations
 
+import html
 import logging
 from decimal import Decimal
 from typing import Any
 
+from app.comparison import supplier_details
 from app.core.mail import Attachment, GraphMailer
 from app.models.quoting import QuoteComment, QuoteRequest, QuoteReview
-from app.quoting import report_pdf, workbook
+from app.quoting import report_pdf, supplier_mail, workbook
 from app.quoting.report import CostingReport
 from app.quoting.report_pdf import PDF_TYPE
 from app.quoting.workbook import XLSX_TYPE
@@ -55,7 +57,75 @@ def _figure(figure, report: CostingReport) -> str:
     return text
 
 
-def _body(request: QuoteRequest, link: str, report: CostingReport | None = None) -> str:
+def _supplier_block(supplier: tuple[str, supplier_details.SupplierDetails] | None) -> str:
+    """Who the supplier is, grouped as on the form, and what nobody filled in.
+
+    Nothing here is mandatory, so a blank is not an error. It is said, so the
+    approver knows what they are deciding without.
+    """
+    if supplier is None:
+        return ""
+    name, details = supplier
+    data = details.model_dump()
+    sections = []
+    for title, fields in supplier_details.GROUPS:
+        rows = []
+        for key, label in fields:
+            value = data.get(key)
+            if not value:
+                continue
+            text = ", ".join(value) if isinstance(value, list) else str(value)
+            rows.append(
+                f"<tr><td style='padding:2px 12px 2px 0;color:#666;vertical-align:top;"
+                f"white-space:nowrap'>{label}</td>"
+                f"<td style='padding:2px 0'>{html.escape(text).replace(chr(10), '<br>')}</td></tr>"
+            )
+        if rows:
+            sections.append(
+                f"<tr><td colspan='2' style='padding:8px 0 2px;font-size:11px;color:#999;"
+                f"text-transform:uppercase;letter-spacing:.04em'>{title}</td></tr>" + "".join(rows)
+            )
+    blank = supplier_details.missing(details)
+    gaps = (
+        f"<p style='margin:8px 0 0;font-size:12px;color:#8a5a00'>Not given: "
+        f"{html.escape(', '.join(blank))}.</p>"
+        if blank
+        else ""
+    )
+    body = (
+        f"<table cellpadding='0' cellspacing='0' style='font-size:13px'>{''.join(sections)}</table>"
+        if sections
+        else "<p style='margin:0;font-size:13px;color:#666'>No details were filled in.</p>"
+    )
+    return (
+        f"<p style='margin:22px 0 4px'><b>Supplier — {html.escape(name)}</b></p>"
+        "<div style='border:1px solid #e3e3e3;border-radius:8px;padding:10px 16px'>"
+        f"{body}{gaps}</div>"
+    )
+
+
+def _emails_block(emails: list[supplier_mail.SupplierEmail]) -> str:
+    """The supplier's own words, under the figures: one card per email."""
+    if not emails:
+        return ""
+    heading = "The supplier's email" if len(emails) == 1 else "The suppliers' emails"
+    attached = (
+        " The original is attached." if len(emails) == 1 else " The originals are attached."
+    ) if any(e.content for e in emails) else ""
+    return (
+        f"<p style='margin:22px 0 4px'><b>{heading}</b></p>"
+        f"<p style='margin:0;color:#666;font-size:12px'>As received.{attached}</p>"
+        + "".join(supplier_mail.card(e.email, link=e.link) for e in emails)
+    )
+
+
+def _body(
+    request: QuoteRequest,
+    link: str,
+    report: CostingReport | None = None,
+    emails: list[supplier_mail.SupplierEmail] | None = None,
+    supplier: tuple[str, supplier_details.SupplierDetails] | None = None,
+) -> str:
     who = request.created_by.display_name if request.created_by else "Somebody"
     rows = [
         ("Customer", request.customer_name),
@@ -108,6 +178,8 @@ def _body(request: QuoteRequest, link: str, report: CostingReport | None = None)
         f"<a href='{link}' style='background:#1a1a1a;color:#fff;padding:10px 18px;"
         f"border-radius:6px;text-decoration:none'>Open the quote</a></p>"
         f"<p style='color:#666;font-size:12px'>{link}</p>"
+        + _supplier_block(supplier)
+        + _emails_block(emails or [])
     )
 
 
@@ -173,6 +245,8 @@ class QuoteMailer(GraphMailer):
         *,
         link: str,
         report: CostingReport | None = None,
+        supplier_emails: list[supplier_mail.SupplierEmail] | None = None,
+        supplier: tuple[str, supplier_details.SupplierDetails] | None = None,
     ) -> dict[str, Any]:
         """Tell the approvers a quote is waiting, with a way straight to it.
 
@@ -226,11 +300,23 @@ class QuoteMailer(GraphMailer):
                     request.id,
                 )
 
+        # The supplier's own emails: formatted in the body, and the originals
+        # attached so an approver can open them in Outlook, attachments and all.
+        for email in supplier_emails or []:
+            if email.content:
+                attachments.append(
+                    Attachment(
+                        name=email.file_name,
+                        content=email.content,
+                        content_type=email.content_type,
+                    )
+                )
+
         return await self.send(
             sender=request.created_by.entra_object_id if request.created_by else "",
             recipients=recipients,
             subject=_subject(request),
-            html=_body(request, link, report),
+            html=_body(request, link, report, supplier_emails, supplier),
             attachments=attachments or None,
         )
 

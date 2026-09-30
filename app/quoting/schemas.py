@@ -479,6 +479,52 @@ class QuoteDocumentOut(BaseModel):
     #: What the reader for this kind proposes for the quote's fields, each
     #: marked applied or not. See ``app/quoting/reading.py``.
     suggestions: dict[str, Any] | None = None
+    #: For a supplier email: who sent it, when, the subject and the text.
+    #: See ``app/quoting/supplier_mail.py``.
+    email: dict[str, Any] | None = None
+
+
+class SupplierDetailsOut(BaseModel):
+    """One offer's supplier: what is confirmed, what the documents offer, and
+    what is still blank. See ``app/comparison/supplier_details.py``."""
+
+    supplier_quote_id: uuid.UUID
+    supplier_name: str
+    #: The offer this quote is priced from.
+    is_selected: bool = False
+    details: dict[str, Any]
+    #: ``{field: {value, source}}``, for blank or different fields only.
+    suggestions: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    #: Labels of the blank fields, in the form's order.
+    missing: list[str] = Field(default_factory=list)
+    may_edit: bool = False
+
+
+class SupplierDetailsFormOut(BaseModel):
+    """The form itself, so the screen and the server agree on the fields."""
+
+    groups: list[dict[str, Any]]
+    supplier_types: list[str]
+    suppliers: list[SupplierDetailsOut]
+
+
+class MailboxMessageOut(BaseModel):
+    """One message in the requester's own mailbox, as the picker lists it."""
+
+    id: str
+    subject: str
+    from_name: str | None = None
+    from_address: str | None = None
+    received: str | None = None
+    preview: str = ""
+    has_attachments: bool = False
+
+
+class SupplierEmailIn(BaseModel):
+    """Which message to attach, by the id the picker listed."""
+
+    message_id: str = Field(min_length=1, max_length=400)
+    notes: str | None = Field(default=None, max_length=2000)
 
 
 class ApplySuggestionsIn(BaseModel):
@@ -645,6 +691,9 @@ class QuoteRequestOut(BaseModel):
     #: that one answers about the whole document and goes false the moment a
     #: quote goes up.
     may_set_currency: bool = False
+    #: Whether the caller may file more supporting documents. Stays true after
+    #: the quote is sent, unlike ``may_edit``. See ``service.may_add_documents``.
+    may_add_documents: bool = False
     #: Set once it is priced from a supplier and has lines. ``submit_reason``
     #: says what is missing while it is not, so a form can say why the button is
     #: off instead of only finding out when it is pressed.

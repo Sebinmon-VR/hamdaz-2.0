@@ -30,7 +30,7 @@ from app.assistant.policy import cost_of
 from app.auth.deps import SESSION_AUDIENCE
 from app.comparison.documents import DocumentError, prepare
 from app.comparison.extraction import ExtractionError
-from app.comparison.schemas import ComparisonIn
+from app.comparison.schemas import ChargeIn, ComparisonIn
 from app.comparison.schemas import ItemIn as SupplierItemIn
 from app.comparison.schemas import QuoteIn as SupplierQuoteIn
 from app.core.security import sign
@@ -574,6 +574,8 @@ async def compare(step: StepContext) -> Any:
                 contact=_txt(result.contact, 200),
                 discount=_dec(result.discount),
                 freight=_dec(result.freight),
+                charges=[ChargeIn(**c.model_dump()) for c in result.charges],
+                detail_suggestions=result.details,
                 tax=_dec(result.tax),
                 quoted_total=_dec(result.quoted_total),
                 source=QuoteSource.UPLOAD,

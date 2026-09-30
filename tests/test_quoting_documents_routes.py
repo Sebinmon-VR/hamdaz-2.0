@@ -353,6 +353,37 @@ async def test_submitting_files_the_report_for_the_pass(quoting, db, requester, 
     assert any(name.endswith("pass 1.pdf") for _, name, _ in drive.filed)
     assert body["filing_error"] is None
 
+
+async def test_more_files_can_be_added_after_it_is_sent(quoting, db, requester, team) -> None:
+    """A datasheet filed beside a sent quote moves no figure; a supplier
+    quotation would reprice it, so that one still waits for a rework."""
+    from tests.test_quoting_routes import _priced
+
+    drive = RecordingDrive([])
+    quoting._transport.app.state.quote_drive = drive
+    quote_id = await _priced(quoting, requester, team)
+    sent = await quoting.post(f"{API}/{quote_id}/submit")
+    assert sent.status_code == 200, sent.text
+    assert sent.json()["may_edit"] is False
+    assert sent.json()["may_add_documents"] is True
+
+    added = await quoting.post(
+        f"{API}/{quote_id}/documents",
+        data={"kind": "technical_spec"},
+        files=[("files", ("datasheet.pdf", io.BytesIO(b"%PDF-1.4"), "application/pdf"))],
+    )
+    assert added.status_code == 200, added.text
+    assert added.json()["status"] == "pending_approval"
+    assert any(d["kind"] == "technical_spec" for d in added.json()["documents"])
+
+    supplier = await quoting.post(
+        f"{API}/{quote_id}/documents",
+        data={"kind": "supplier_quote"},
+        files=[("files", ("offer.csv", io.BytesIO(b"Item,Qty\nA,1\n"), "text/csv"))],
+    )
+    assert supplier.status_code in (403, 409), supplier.text
+
+
 async def test_a_typed_offer_comes_off_the_comparison_by_its_own_id(
     quoting, db, requester, team
 ) -> None:

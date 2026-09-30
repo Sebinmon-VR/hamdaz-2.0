@@ -33,9 +33,12 @@ from __future__ import annotations
 import logging
 from decimal import Decimal, InvalidOperation
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, PrivateAttr, ValidationError
 
+from app.comparison.charges import ExtractedCharge, find_charges
 from app.comparison.documents import Readable, ocr_available
+from app.comparison.supplier_details import OWN_COMPANY
+from app.comparison.supplier_details import suggest as suggest_details
 from app.core.config import Settings
 from app.core.llm import TextModel
 
@@ -84,6 +87,31 @@ class ExtractedQuote(BaseModel):
 
     items: list[ExtractedItem] = Field(description="Every priced line on the quote")
     note: str = Field(description="Anything uncertain or unreadable, naming the line")
+    #: Duty, handling, insurance and the rest, from the notes as much as the
+    #: table. Never asked of a model: read deterministically after either
+    #: reading, so it is kept off the schema a model is held to (every field
+    #: there is required). See ``app.comparison.charges``.
+    _charges: list[ExtractedCharge] = PrivateAttr(default_factory=list)
+
+    @property
+    def charges(self) -> list[ExtractedCharge]:
+        return self._charges
+
+    @charges.setter
+    def charges(self, value: list[ExtractedCharge]) -> None:
+        self._charges = value
+
+    #: Who the supplier is, as the letterhead and footer say. Same treatment
+    #: as the charges. See ``app.comparison.supplier_details``.
+    _details: dict = PrivateAttr(default_factory=dict)
+
+    @property
+    def details(self) -> dict:
+        return self._details
+
+    @details.setter
+    def details(self, value: dict) -> None:
+        self._details = value
 
 
 #: The shape asked of a model, in words, kept beside the models so the two
@@ -165,9 +193,9 @@ class QuoteExtractor:
         if readable.kind != "text":
             return ExtractionError(cannot_read_scan(readable.file_name))
         if (parsed := parse_locally(readable)) is not None:
-            return parsed
+            return with_charges(parsed, readable.text)
         if (modelled := await self._read_with_model(readable)) is not None:
-            return modelled
+            return with_charges(modelled, readable.text)
         return ExtractionError(
             f"No price table could be found in {readable.file_name!r}. It may be a "
             f"covering letter rather than a quotation, or laid out in a way this "
@@ -221,6 +249,32 @@ class QuoteExtractor:
         should leave the other three usable, not lose the whole upload.
         """
         return [await self._read(r) for r in readables]
+
+
+def with_charges(quote: ExtractedQuote, text: str | None) -> ExtractedQuote:
+    """The charges the document states on top of its lines, however it was read.
+
+    A charge sharing a figure with the freight ("Freight & handling USD 300")
+    is the freight, already counted, and is not counted again.
+    """
+    charges = find_charges(text or "", [i.description for i in quote.items])
+    for charge in charges:
+        same = charge.amount is not None and abs(charge.amount - (quote.freight or 0)) < 0.005
+        if quote.freight and same:
+            charge.amount = None
+            charge.included = True
+    quote.charges = charges
+    quote.details = suggest_details(text, exclude=OWN_COMPANY)
+    if quote.contact and "contact_person" not in quote.details and "@" not in quote.contact:
+        quote.details["contact_person"] = quote.contact
+    if said := [c for c in charges if not c.included]:
+        quote.note = (
+            (quote.note or "")
+            + " Charges on top, from the document: "
+            + "; ".join(c.label for c in said)
+            + "."
+        ).strip()
+    return quote
 
 
 def settle_model_reading(quote: ExtractedQuote, text: str | None) -> list[str]:

@@ -56,20 +56,23 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.access import service as access_service
 from app.auth.deps import CurrentUser
 from app.comparison import service as comparison_service
+from app.comparison import supplier_details
 from app.comparison.documents import DocumentError, prepare
 from app.comparison.extraction import ExtractionError, QuoteExtractor
 from app.comparison.router import _dec, _txt
-from app.comparison.schemas import ComparisonIn
+from app.comparison.schemas import ChargeIn, ComparisonIn
 from app.comparison.schemas import ItemIn as SupplierItemIn
 from app.comparison.schemas import QuoteIn as SupplierQuoteIn
 from app.core.config import get_settings
 from app.core.db import get_session
+from app.core.mail import MailError
+from app.intake.graph_mail import MailReader
 from app.models.comparison import QuoteSource
 from app.models.quoting import DocumentKind, QuoteRequest, QuoteStatus
 from app.proposals import mirror
 from app.proposals.router import get_sharepoint
 from app.proposals.sharepoint import SharePointError, SharePointProposals
-from app.quoting import bidpack, costing, filing, report_pdf, service
+from app.quoting import bidpack, costing, filing, report_pdf, service, supplier_mail
 from app.quoting import calculation as calc
 from app.quoting import report as report_mod
 from app.quoting import workbook as workbook_mod
@@ -86,6 +89,7 @@ from app.quoting.schemas import (
     CurrencyIn,
     FxQuoteOut,
     ItemOut,
+    MailboxMessageOut,
     NegotiationIn,
     QuotableTaskOut,
     QuotableTasksOut,
@@ -96,6 +100,9 @@ from app.quoting.schemas import (
     ReviewIn,
     ReviewOut,
     SupplierChoiceIn,
+    SupplierDetailsFormOut,
+    SupplierDetailsOut,
+    SupplierEmailIn,
     TaskQuoteIn,
     TypedSupplierQuotesIn,
 )
@@ -174,6 +181,11 @@ def get_drive(request: Request) -> QuoteDrive:
     return request.app.state.quote_drive
 
 
+def get_mail_reader(request: Request) -> MailReader | None:
+    """Graph, reading the requester's own mailbox for the supplier's email."""
+    return getattr(request.app.state, "mail_reader", None)
+
+
 Extractor = Annotated[QuoteExtractor, Depends(get_extractor)]
 Zoho = Annotated[ZohoBooks, Depends(get_zoho)]
 Rates = Annotated[WinRates, Depends(get_win_rates)]
@@ -181,6 +193,7 @@ SharePoint = Annotated[SharePointProposals, Depends(get_sharepoint)]
 Mailer = Annotated[QuoteMailer, Depends(get_mailer)]
 Drive = Annotated[QuoteDrive, Depends(get_drive)]
 Model = Annotated[Any, Depends(get_text_model)]
+Mailbox = Annotated[MailReader | None, Depends(get_mail_reader)]
 
 
 def _translate(exc: QuoteError) -> HTTPException:
@@ -248,6 +261,7 @@ async def _out(
     # Its own rule: whose quote it is, plus a super admin, and no status in
     # it at all. See ``service.may_set_currency``.
     body.may_set_currency = service.may_set_currency(request, user=user, roles=roles)
+    body.may_add_documents = service.may_add_documents(request, user=user, roles=roles)
     # Asked here rather than re-derived on the screen, like every other
     # permission on this body. A frontend that works out for itself who may
     # delete something is a frontend that will one day disagree with the server.
@@ -797,6 +811,212 @@ async def destroy(
 # ── 2. the supplier quotes behind it ───────────────────────────────────
 
 
+def _supplier_rows(request: QuoteRequest, *, may_edit: bool) -> list[SupplierDetailsOut]:
+    """Each offer's supplier, with what their quotation and emails suggest."""
+    quotes = list(request.comparison.quotes) if request.comparison is not None else []
+    emails = [
+        (document.extracted or {}).get("email")
+        for document in request.documents
+        if str(document.kind) == DocumentKind.SUPPLIER_EMAIL
+    ]
+    emails = [e for e in emails if e]
+    out: list[SupplierDetailsOut] = []
+    for quote in quotes:
+        details = supplier_details.stored(quote.details)
+        document = quote.detail_suggestions or {}
+        known = {**document, **{k: v for k, v in details.model_dump().items() if v}}
+        theirs = [
+            e
+            for e in emails
+            if supplier_details.belongs_to(e, quote.supplier_name, known, len(quotes) == 1)
+        ]
+        out.append(
+            SupplierDetailsOut(
+                supplier_quote_id=quote.id,
+                supplier_name=quote.supplier_name,
+                is_selected=quote.id == request.selected_supplier_quote_id,
+                details=details.model_dump(),
+                suggestions=supplier_details.suggestions_for(
+                    details,
+                    document=document,
+                    document_name=quote.file_name,
+                    terms={
+                        "payment_terms": quote.payment_terms,
+                        "incoterm": quote.incoterms,
+                        "currency": quote.currency,
+                    },
+                    emails=theirs,
+                ),
+                missing=supplier_details.missing(details),
+                may_edit=may_edit,
+            )
+        )
+    # The offer it is priced from first: that is the one being approved.
+    out.sort(key=lambda row: not row.is_selected)
+    return out
+
+
+def _details_form(request: QuoteRequest, *, may_edit: bool) -> SupplierDetailsFormOut:
+    return SupplierDetailsFormOut(
+        groups=[
+            {"title": title, "fields": [{"key": k, "label": label} for k, label in fields]}
+            for title, fields in supplier_details.GROUPS
+        ],
+        supplier_types=list(supplier_details.SUPPLIER_TYPES),
+        suppliers=_supplier_rows(request, may_edit=may_edit),
+    )
+
+
+@router.get(
+    "/{request_id}/supplier-details",
+    response_model=SupplierDetailsFormOut,
+    summary="Who each supplier is: the form, what is known and what is suggested",
+)
+async def supplier_details_of(
+    request_id: uuid.UUID, user: CurrentUser, roles: CurrentRoles, session: Session
+) -> SupplierDetailsFormOut:
+    request = await _load(session, request_id)
+    may_edit = service.may_add_documents(request, user=user, roles=roles)
+    return _details_form(request, may_edit=may_edit)
+
+
+@router.put(
+    "/{request_id}/supplier-quotes/{supplier_quote_id}/details",
+    response_model=SupplierDetailsFormOut,
+    summary="Save who a supplier is",
+)
+async def save_supplier_details(
+    request_id: uuid.UUID,
+    supplier_quote_id: uuid.UUID,
+    payload: supplier_details.SupplierDetails,
+    user: CurrentUser,
+    roles: CurrentRoles,
+    session: Session,
+) -> SupplierDetailsFormOut:
+    """The whole set, replaced. Allowed after the quote is sent: who the
+    supplier is moves no figure, and the approvers are better for knowing."""
+    request = await _load(session, request_id)
+    if not service.may_add_documents(request, user=user, roles=roles):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the person the quote belongs to may fill in the supplier's details.",
+        )
+    quotes = request.comparison.quotes if request.comparison is not None else []
+    row = next((q for q in quotes if q.id == supplier_quote_id), None)
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="No such supplier quote on this quote."
+        )
+    row.details = payload.model_dump(mode="json")
+    await session.flush()
+    logger.info("quote %s: details saved for %s", request.id, row.supplier_name)
+    return _details_form(request, may_edit=True)
+
+
+def _own_mailbox(user) -> str:
+    """The caller's mailbox, and only theirs: the picker reads nobody else's."""
+    mailbox = user.entra_object_id or user.email
+    if not mailbox:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Your account has no mailbox this app can read.",
+        )
+    return mailbox
+
+
+def _may_attach_email(request: QuoteRequest, user, roles, mail: MailReader | None) -> None:
+    if not service.may_add_documents(request, user=user, roles=roles):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the person the quote belongs to may attach emails to it.",
+        )
+    if mail is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Reading mail is not set up on this server.",
+        )
+
+
+@router.get(
+    "/{request_id}/mailbox",
+    response_model=list[MailboxMessageOut],
+    summary="Search your own mailbox for the supplier's email",
+)
+async def search_mailbox(
+    request_id: uuid.UUID,
+    user: CurrentUser,
+    roles: CurrentRoles,
+    session: Session,
+    mail: Mailbox,
+    q: Annotated[str | None, Query(max_length=200)] = None,
+) -> list[MailboxMessageOut]:
+    """The signed-in person's own messages, newest first, or those matching
+    ``q`` (sender, subject or text). Only for someone who may add documents to
+    this quote; never anybody else's mailbox."""
+    request = await _load(session, request_id)
+    _may_attach_email(request, user, roles, mail)
+    try:
+        found = await mail.search(_own_mailbox(user), q, fields=supplier_mail.LIST_FIELDS)
+    except MailError as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+    return [MailboxMessageOut(**supplier_mail.listing(m)) for m in found if m.get("id")]
+
+
+@router.post(
+    "/{request_id}/supplier-emails",
+    response_model=QuoteRequestOut,
+    summary="Attach the supplier's email from your mailbox",
+)
+async def attach_supplier_email(
+    request_id: uuid.UUID,
+    payload: SupplierEmailIn,
+    user: CurrentUser,
+    roles: CurrentRoles,
+    session: Session,
+    mail: Mailbox,
+    drive: Drive,
+) -> QuoteRequestOut:
+    """File the chosen message with the quote, as the original ``.eml``.
+
+    Allowed after the quote is sent, like any supporting document: it moves no
+    figure. It goes to the approvers with the next approval request.
+    """
+    request = await _load(session, request_id)
+    _may_attach_email(request, user, roles, mail)
+    mailbox = _own_mailbox(user)
+    try:
+        raw = await mail.full_message(mailbox, payload.message_id)
+        names = (
+            await mail.attachment_names(mailbox, payload.message_id)
+            if raw.get("hasAttachments")
+            else []
+        )
+        content = await mail.mime(mailbox, payload.message_id)
+    except MailError as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+    email = supplier_mail.from_graph(raw, mailbox=mailbox, attachment_names=names)
+    try:
+        document = await filing.file_upload(
+            session,
+            drive,
+            request,
+            kind=DocumentKind.SUPPLIER_EMAIL,
+            file_name=supplier_mail.file_name_for(email),
+            content=content,
+            content_type=supplier_mail.EML_TYPE,
+            user=user,
+            notes=payload.notes,
+        )
+    except DriveError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"The email could not be filed in the shared library. {exc}",
+        ) from exc
+    document.extracted = {"email": email}
+    await session.flush()
+    return await _out(session, request, user=user, roles=roles)
+
+
 @router.post(
     "/{request_id}/supplier-quotes",
     response_model=QuoteRequestOut,
@@ -890,6 +1110,8 @@ async def attach_suppliers(
                 contact=_txt(result.contact, 200),
                 discount=_dec(result.discount),
                 freight=_dec(result.freight),
+                charges=[ChargeIn(**c.model_dump()) for c in result.charges],
+                detail_suggestions=result.details,
                 tax=_dec(result.tax),
                 quoted_total=_dec(result.quoted_total),
                 source=QuoteSource.UPLOAD,
@@ -1208,12 +1430,12 @@ async def upload_documents(
 
     Supplier quotations are the one kind with more to do — they are read into
     prices and compared — so that kind is handed to the supplier-quote route.
+
+    Every other kind may still be added after the quote is sent for approval
+    ("Add more files"): it is filed and read, but its suggestions wait until
+    the quote is editable again.
     """
     request = await _load(session, request_id)
-    try:
-        service.require_editable(request, user=user)
-    except QuoteError as exc:
-        raise _translate(exc) from exc
     try:
         which = DocumentKind(kind.strip().lower())
     except ValueError as exc:
@@ -1237,6 +1459,13 @@ async def upload_documents(
     if which is DocumentKind.SUPPLIER_QUOTE:
         return await attach_suppliers(
             request_id, user, roles, session, extractor, drive, zoho, files
+        )
+    # Any other document may be filed after the quote is sent: it moves no
+    # figure. See ``service.may_add_documents``.
+    if not service.may_add_documents(request, user=user, roles=roles):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the person the quote belongs to may add files to it.",
         )
 
     from app.quoting import reading
@@ -1265,6 +1494,12 @@ async def upload_documents(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail=f"{name}: could not be filed in the shared library. {exc}",
             ) from exc
+        if which is DocumentKind.SUPPLIER_EMAIL:
+            # Read as an email: who sent it, when, and what it says. A .msg
+            # is filed and attached as it is.
+            email = supplier_mail.from_eml(content)
+            document.extracted = {"email": email} if email else {"read": False}
+            continue
         # What the document says, offered rather than applied.
         await reading.read_into(
             document, request, name, content, upload.content_type, model=text_model
@@ -1413,6 +1648,8 @@ def _quote_in_of(row) -> SupplierQuoteIn:
         notes=row.notes,
         discount=row.discount,
         freight=row.freight,
+        charges=[ChargeIn.model_validate(c) for c in row.charges or []],
+        detail_suggestions=row.detail_suggestions or {},
         tax=row.tax,
         quoted_total=row.quoted_total,
         source=row.source,
@@ -1516,6 +1753,44 @@ def _addresses(*people, without: uuid.UUID | None = None) -> list[str]:
     return list(seen.values())
 
 
+async def _supplier_emails(
+    request: QuoteRequest, drive: QuoteDrive | None, mail: MailReader | None
+) -> list[supplier_mail.SupplierEmail]:
+    """Each supplier email on the quote: what it says, where it is filed, and
+    the original to attach when it can be had.
+
+    The original comes back from the library, or failing that from the
+    mailbox it was picked from. Neither is allowed to stop the approval mail:
+    the card in the body still says what the supplier wrote.
+    """
+    out: list[supplier_mail.SupplierEmail] = []
+    for document in request.documents:
+        if str(document.kind) != DocumentKind.SUPPLIER_EMAIL:
+            continue
+        email = (document.extracted or {}).get("email") or {
+            "subject": document.file_name,
+            "body": "",
+        }
+        content: bytes | None = None
+        try:
+            if drive is not None and getattr(drive, "enabled", False) and document.drive_item_id:
+                content = await drive.download(document.drive_item_id)
+            if content is None and mail is not None and email.get("message_id"):
+                content = await mail.mime(email["mailbox"], email["message_id"])
+        except Exception:  # noqa: BLE001 - the card is still sent
+            logger.warning("supplier email %s could not be read back", document.id)
+        out.append(
+            supplier_mail.SupplierEmail(
+                email=email,
+                link=document.drive_url,
+                content=content,
+                file_name=document.file_name,
+                content_type=document.content_type or supplier_mail.EML_TYPE,
+            )
+        )
+    return out
+
+
 async def _notify_approvers(
     session: AsyncSession,
     mailer: QuoteMailer,
@@ -1523,10 +1798,25 @@ async def _notify_approvers(
     *,
     without: uuid.UUID | None = None,
     report=None,
+    drive: QuoteDrive | None = None,
+    mail: MailReader | None = None,
 ) -> None:
     """Tell the people who can decide it that it is waiting, with the selling
-    & costing report attached so the case is in their hands with the ask."""
-    people = await service.approvers_for(session, request.team_id)
+    & costing report attached so the case is in their hands with the ask, and
+    the supplier's own emails, formatted in the body and attached whole."""
+    people = await service.approvers_to_notify(session, request.team_id)
+    emails = await _supplier_emails(request, drive, mail)
+    chosen = next(
+        (
+            q
+            for q in (request.comparison.quotes if request.comparison is not None else [])
+            if q.id == request.selected_supplier_quote_id
+        ),
+        None,
+    )
+    details = (
+        (chosen.supplier_name, supplier_details.stored(chosen.details)) if chosen else None
+    )
     await _notify(
         session,
         request,
@@ -1535,6 +1825,8 @@ async def _notify_approvers(
             _addresses(*people, without=without),
             link=_quote_link(request),
             report=report,
+            supplier_emails=emails,
+            supplier=details,
         ),
         stamp=True,
     )
@@ -1551,6 +1843,7 @@ async def submit(
     mailer: Mailer,
     zoho: Zoho,
     drive: Drive,
+    mail: Mailbox,
 ) -> QuoteRequestOut:
     """Hand it to the approvers, and tell them so.
 
@@ -1580,7 +1873,9 @@ async def submit(
         )
     except Exception:  # noqa: BLE001 - the approvers are still told
         logger.exception("costing report for quote %s could not be built", request.id)
-    await _notify_approvers(session, mailer, request, without=user.id, report=report)
+    await _notify_approvers(
+        session, mailer, request, without=user.id, report=report, drive=drive, mail=mail
+    )
     return await _out(session, request, user=user, roles=roles)
 
 
@@ -1675,7 +1970,7 @@ async def negotiate(
 
     # The approvers are told, because what they approved is about to change and
     # their approval was of the old numbers.
-    people = await service.approvers_for(session, request.team_id)
+    people = await service.approvers_to_notify(session, request.team_id)
     await _notify(
         session,
         request,
@@ -1742,7 +2037,7 @@ async def add_comment(
 
     owners = (request.created_by_id, request.assigned_to_id)
     if user.id in owners:
-        people = await service.approvers_for(session, request.team_id)
+        people = await service.approvers_to_notify(session, request.team_id)
     else:
         people = [request.created_by, request.assigned_to]
     await _notify(
