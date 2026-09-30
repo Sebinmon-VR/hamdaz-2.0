@@ -66,7 +66,7 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, Timestamped, UUIDPrimaryKey
@@ -1057,3 +1057,47 @@ class QuoteDocument(Base, UUIDPrimaryKey, Timestamped):
 
     def __repr__(self) -> str:
         return f"<QuoteDocument {self.kind} {self.file_name!r}>"
+
+
+class QuoteApprovalSettings(Base, Timestamped):
+    """Who is emailed when a quote is sent for approval. One row, id 1.
+
+    Only the mail. Who may *decide* a quote is ``service.may_approve`` and is
+    not changed here: a CEO switched off this list can still open a quote and
+    approve it, and is simply not asked to by every one that is sent.
+
+    The same list hears about a comment from the requester and a reopened
+    negotiation, since those are the approvers' business too.
+    """
+
+    __tablename__ = "quote_approval_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+
+    #: The team's own ``approver`` role holders.
+    notify_team_approvers: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=text("true"), nullable=False
+    )
+    #: The team's ``team_manager`` role holders.
+    notify_team_managers: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=text("true"), nullable=False
+    )
+    #: Everyone holding the global ``manager`` role.
+    notify_managers: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=text("true"), nullable=False
+    )
+    #: Whoever holds the ``ceo`` role.
+    notify_ceo: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
+    )
+    #: Everyone holding ``super_admin``.
+    notify_super_admins: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
+    )
+    #: Anybody else, by address: a shared approvals mailbox, a finance lead.
+    extra_emails: Mapped[list[str]] = mapped_column(
+        ARRAY(String(320)), default=list, server_default=text("'{}'::varchar[]"), nullable=False
+    )
+    updated_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )

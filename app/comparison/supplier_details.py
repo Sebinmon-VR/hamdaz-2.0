@@ -384,3 +384,44 @@ def suggestions_for(
         for field, value in suggest(email.get("body"), exclude=OWN_COMPANY).items():
             offer(field, value, source)
     return offered
+
+
+# ── on the costing report ──────────────────────────────────────────────
+
+#: What the costing report shows: the basics, how to reach them and where
+#: they are. The rest (registration, bank, terms) is on the summary tab and
+#: in the approval mail; the report is a PDF that travels further than both.
+REPORT_FIELDS: Final = ("address", "country", "contact_person", "phone", "mobile", "emails")
+
+
+def report_lines(details: SupplierDetails) -> tuple[list[tuple[str, str]], list[str]]:
+    """The basics as the report prints them, and which are still blank.
+
+    Address, city and country read as one line, as a letterhead says them.
+    Phone and mobile are one "Contact no." and count as given if either is.
+    """
+    d = details.model_dump()
+    lines: list[tuple[str, str]] = []
+    where = ", ".join(v for v in (d["address"], d["city"], d["country"]) if v)
+    if where:
+        lines.append(("Address", where))
+    who = " — ".join(v for v in (d["contact_person"], d["designation"]) if v)
+    if who:
+        lines.append(("Contact", who))
+    numbers = " / ".join(v for v in (d["phone"], d["mobile"]) if v)
+    if numbers:
+        lines.append(("Contact no.", numbers))
+    if d["emails"]:
+        lines.append(("Email", ", ".join(d["emails"])))
+    blank = [
+        label
+        for label, given in (
+            ("Office address", d["address"]),
+            ("Country", d["country"]),
+            ("Contact person", d["contact_person"]),
+            ("Contact no.", d["phone"] or d["mobile"]),
+            ("Email ids", d["emails"]),
+        )
+        if not given
+    ]
+    return lines, blank

@@ -13,9 +13,9 @@ something that no longer exists, which is the failure this whole module exists t
 prevent.
 
 **Approvers are the team's ``approver`` role holders**, plus managers and the
-CEO. Not the requester: nobody approves their own quote, however senior. The
-mail asking for a decision goes to fewer people than may give one: the team's
-approvers and managers and the global managers, not the CEO or a super admin.
+CEO. Not the requester: nobody approves their own quote, however senior. Who
+is *emailed* the request is a setting (``QuoteApprovalSettings``), by default
+the team's approvers and managers and the global managers.
 
 **The requester chooses the supplier; the approver can overrule it.** The
 requester attaches what they were sent, picks the offer to quote from, and the
@@ -34,6 +34,7 @@ import logging
 import re
 import uuid
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Final
@@ -49,6 +50,7 @@ from app.models.quoting import (
     ComplianceArea,
     ComplianceStatus,
     CostStage,
+    QuoteApprovalSettings,
     QuoteComment,
     QuoteComplianceItem,
     QuoteCostLine,
@@ -80,10 +82,6 @@ GLOBAL_APPROVERS = frozenset({"super_admin", "ceo", "manager"})
 #: is given deliberately — ``approver`` is the role that exists to say so — or
 #: it comes with managing the team. A plain ``member`` never had it.
 TEAM_APPROVERS = frozenset({"approver", "team_manager"})
-#: The organisation-wide roles that are *mailed* a team's quotes. Narrower than
-#: ``GLOBAL_APPROVERS`` on purpose: the CEO and a super admin can still decide a
-#: quote they open, but are not asked to by every one that is submitted.
-NOTIFIED_GLOBAL_APPROVERS = frozenset({"manager"})
 
 
 class QuoteError(Exception):
@@ -159,10 +157,91 @@ async def approvers_for(
     return list(people.values())
 
 
-async def approvers_to_notify(session: AsyncSession, team_id: uuid.UUID) -> list[User]:
-    """Who is mailed about this team's quotes: its approvers and managers, and
-    the global managers. Not the CEO — see ``NOTIFIED_GLOBAL_APPROVERS``."""
-    return await approvers_for(session, team_id, global_roles=NOTIFIED_GLOBAL_APPROVERS)
+async def approval_settings(session: AsyncSession) -> QuoteApprovalSettings:
+    """Who is emailed an approval request. Created with the defaults on first read."""
+    row = await session.get(QuoteApprovalSettings, 1)
+    if row is None:
+        row = QuoteApprovalSettings(id=1)
+        session.add(row)
+        await session.flush()
+        # The timestamps are the database's on insert; read them back now
+        # rather than lazily later, which in async is a MissingGreenlet.
+        await session.refresh(row)
+    return row
+
+
+def clean_emails(values: list[str] | None) -> list[str]:
+    out: list[str] = []
+    for raw in values or []:
+        value = str(raw).strip().lower()
+        if not value:
+            continue
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", value):
+            raise QuoteError(f"{raw!r} is not an email address.")
+        if value not in out:
+            out.append(value)
+    return out
+
+
+@dataclass(frozen=True)
+class Addressee:
+    """An address on the list that is not a person in the system."""
+
+    email: str
+
+    @property
+    def id(self) -> uuid.UUID:
+        return uuid.uuid5(uuid.NAMESPACE_URL, f"mailto:{self.email}")
+
+
+async def approvers_to_notify(
+    session: AsyncSession, team_id: uuid.UUID
+) -> list[User | Addressee]:
+    """Who is mailed about this team's quotes, as the approval settings say.
+
+    By default the team's approvers and managers and the global managers:
+    not the CEO and not the super admins, who can still decide a quote they
+    open. See ``QuoteApprovalSettings``.
+    """
+    rules = await approval_settings(session)
+    team_roles = {
+        key
+        for key, on in (
+            ("approver", rules.notify_team_approvers),
+            ("team_manager", rules.notify_team_managers),
+        )
+        if on
+    }
+    global_roles = {
+        key
+        for key, on in (
+            ("manager", rules.notify_managers),
+            ("ceo", rules.notify_ceo),
+            (SUPER_ADMIN, rules.notify_super_admins),
+        )
+        if on
+    }
+    people: dict[uuid.UUID, User] = {}
+    if team_roles:
+        rows = await session.scalars(
+            select(TeamMembership)
+            .join(Role, Role.id == TeamMembership.role_id)
+            .where(TeamMembership.team_id == team_id, Role.key.in_(team_roles))
+        )
+        for membership in rows.all():
+            people.setdefault(membership.user_id, membership.user)
+    if global_roles:
+        found = await session.scalars(
+            select(User)
+            .join(UserRole, UserRole.user_id == User.id)
+            .join(Role, Role.id == UserRole.role_id)
+            .where(Role.key.in_(global_roles), User.is_active.is_(True))
+        )
+        for user in found.all():
+            people.setdefault(user.id, user)
+    known = {(p.email or "").lower() for p in people.values()}
+    extras = [Addressee(e) for e in rules.extra_emails or [] if e.lower() not in known]
+    return [*people.values(), *extras]
 
 
 def require_owner(

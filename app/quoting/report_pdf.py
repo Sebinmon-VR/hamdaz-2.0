@@ -331,6 +331,9 @@ def _parties(report: CostingReport) -> Table:
     supplier_lines = ["  ·  ".join(supplier_bits)] if supplier_bits else []
     if s.quote_number:
         supplier_lines.append(f"Their ref: {s.quote_number}")
+    supplier_lines += [f"{label}: {value}" for label, value in s.details]
+    if s.missing:
+        supplier_lines.append(f"Not given: {', '.join(s.missing)}")
 
     half = (WIDTH - 6) / 2
     row = [

@@ -51,6 +51,7 @@ from fastapi import (
     UploadFile,
     status,
 )
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.access import service as access_service
@@ -69,6 +70,8 @@ from app.core.mail import MailError
 from app.intake.graph_mail import MailReader
 from app.models.comparison import QuoteSource
 from app.models.quoting import DocumentKind, QuoteRequest, QuoteStatus
+from app.models.team import Team
+from app.models.user import User
 from app.proposals import mirror
 from app.proposals.router import get_sharepoint
 from app.proposals.sharepoint import SharePointError, SharePointProposals
@@ -81,6 +84,9 @@ from app.quoting.mailer import QuoteMailer
 from app.quoting.probability import WinRates
 from app.quoting.schemas import (
     ApplySuggestionsIn,
+    ApprovalRecipientsOut,
+    ApprovalSettingsIn,
+    ApprovalSettingsOut,
     BidPackOut,
     CalcStepOut,
     CommentIn,
@@ -406,6 +412,84 @@ async def _raise_quote(
     request.win_basis = estimate.basis
     await session.flush()
     return await _out(session, request, user=user, roles=roles)
+
+
+# ── who is emailed an approval request — before /{request_id} ─────────
+
+
+def _require_super_admin(roles: set[str]) -> None:
+    if SUPER_ADMIN not in set(roles):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only a super admin can change who is emailed approval requests.",
+        )
+
+
+async def _approval_settings_out(session: AsyncSession, row) -> ApprovalSettingsOut:
+    teams = (await session.scalars(select(Team).order_by(Team.name))).all()
+    preview = []
+    for team in teams:
+        people = await service.approvers_to_notify(session, team.id)
+        preview.append(
+            ApprovalRecipientsOut(
+                team_id=team.id,
+                team_name=team.name,
+                recipients=sorted(
+                    getattr(p, "display_name", None) or p.email for p in people if p.email
+                ),
+            )
+        )
+    updated_by = await session.get(User, row.updated_by_id) if row.updated_by_id else None
+    return ApprovalSettingsOut(
+        notify_team_approvers=row.notify_team_approvers,
+        notify_team_managers=row.notify_team_managers,
+        notify_managers=row.notify_managers,
+        notify_ceo=row.notify_ceo,
+        notify_super_admins=row.notify_super_admins,
+        extra_emails=list(row.extra_emails or []),
+        updated_at=row.updated_at,
+        updated_by_name=updated_by.display_name if updated_by else None,
+        preview=preview,
+    )
+
+
+@router.get(
+    "/approval-settings",
+    response_model=ApprovalSettingsOut,
+    summary="Who is emailed when a quote is sent for approval",
+)
+async def read_approval_settings(
+    _user: CurrentUser, roles: CurrentRoles, session: Session
+) -> ApprovalSettingsOut:
+    _require_super_admin(roles)
+    return await _approval_settings_out(session, await service.approval_settings(session))
+
+
+@router.put(
+    "/approval-settings",
+    response_model=ApprovalSettingsOut,
+    summary="Change who is emailed when a quote is sent for approval",
+)
+async def update_approval_settings(
+    payload: ApprovalSettingsIn, user: CurrentUser, roles: CurrentRoles, session: Session
+) -> ApprovalSettingsOut:
+    """Only the mail. Who may *decide* a quote is not changed here."""
+    _require_super_admin(roles)
+    row = await service.approval_settings(session)
+    try:
+        emails = service.clean_emails(payload.extra_emails)
+    except QuoteError as exc:
+        raise _translate(exc) from exc
+    row.notify_team_approvers = payload.notify_team_approvers
+    row.notify_team_managers = payload.notify_team_managers
+    row.notify_managers = payload.notify_managers
+    row.notify_ceo = payload.notify_ceo
+    row.notify_super_admins = payload.notify_super_admins
+    row.extra_emails = emails
+    row.updated_by_id = user.id
+    await session.flush()
+    logger.info("approval mail settings changed by %s", user.email)
+    return await _approval_settings_out(session, row)
 
 
 @router.get(

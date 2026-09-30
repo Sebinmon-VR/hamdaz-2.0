@@ -452,3 +452,48 @@ def test_a_step_is_healthy_acceptable_below_the_walk_away_or_a_loss() -> None:
 def test_the_signature_lines_stay_blank_until_somebody_has_decided(report) -> None:
     assert report.reviewed_by is None
     assert report.approved_by is None
+
+
+def test_the_supplier_card_carries_the_basic_details(drives) -> None:
+    """Office address, country, contact, number and emails from the summary
+    tab; bank details never; blanks said as not given."""
+    import io
+    import uuid
+
+    import pdfplumber
+
+    from app.models.comparison import QuoteComparison, SupplierQuote
+
+    offer = SupplierQuote(
+        id=uuid.uuid4(),
+        supplier_name="Router Switch Ltd",
+        currency="USD",
+        details={
+            "address": "Unit 5, Tech Park",
+            "country": "Hong Kong",
+            "phone": "+852 3000 1111",
+            "emails": ["sales@router-switch.com"],
+            "iban": "HK00SECRET",
+        },
+    )
+    offer.items = []
+    comparison = QuoteComparison(title="t", currency="USD")
+    comparison.quotes = [offer]
+    drives.comparison = comparison
+    drives.selected_supplier_quote_id = offer.id
+
+    built = report_mod.build(drives, base_rate=RATE, rate_source="test")
+    details = dict(built.supplier.details)
+    assert details["Company"] == "Router Switch Ltd"
+    assert details["Address"] == "Unit 5, Tech Park, Hong Kong"
+    assert details["Contact no."] == "+852 3000 1111"
+    assert details["Email"] == "sales@router-switch.com"
+    assert built.supplier.missing == ("Contact person",)
+
+    pdf = report_pdf.build(drives, base_rate=RATE, prepared_on=date(2026, 9, 24))
+    with pdfplumber.open(io.BytesIO(pdf)) as document:
+        text = "\n".join(page.extract_text() for page in document.pages)
+    assert "Unit 5, Tech Park, Hong Kong" in text
+    assert "sales@router-switch.com" in text
+    assert "Not given: Contact person" in text
+    assert "HK00SECRET" not in text

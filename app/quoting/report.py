@@ -34,6 +34,7 @@ from datetime import date, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Final
 
+from app.comparison import supplier_details
 from app.models.quoting import QuoteRequest
 from app.quoting import bidpack
 from app.quoting.service import supplier_prices
@@ -143,6 +144,11 @@ class SupplierBlock:
     currency: str | None
     quote_number: str | None
     creator: str | None
+    #: Who they are, from the supplier details on the summary tab: label and
+    #: value, bank details left out. See ``supplier_details.report_lines``.
+    details: tuple[tuple[str, str], ...] = ()
+    #: What of that is still blank, said rather than hidden.
+    missing: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -551,8 +557,18 @@ def _supplier(request, supplier_currency: str | None) -> SupplierBlock:
             (q for q in request.comparison.quotes if q.id == request.selected_supplier_quote_id),
             None,
         )
+    name = (request.supplier_name or "").strip() or (chosen.supplier_name if chosen else None)
+    details: list[tuple[str, str]] = []
+    missing: list[str] = []
+    if chosen is not None:
+        details, missing = supplier_details.report_lines(supplier_details.stored(chosen.details))
+        # The name typed on the quote wins the heading; when it is not the
+        # company on the offer (a salesperson's name, say), the company is
+        # still said.
+        if name and chosen.supplier_name and name.lower() != chosen.supplier_name.lower():
+            details.insert(0, ("Company", chosen.supplier_name))
     return SupplierBlock(
-        name=(request.supplier_name or "").strip() or (chosen.supplier_name if chosen else None),
+        name=name,
         basis=(request.supplier_basis or "").strip() or None,
         route=(request.supplier_route or "").strip()
         or (
@@ -563,6 +579,8 @@ def _supplier(request, supplier_currency: str | None) -> SupplierBlock:
         currency=supplier_currency or (chosen.currency if chosen else None),
         quote_number=chosen.quote_number if chosen else None,
         creator=request.created_by.display_name if request.created_by else None,
+        details=tuple(details),
+        missing=tuple(missing),
     )
 
 

@@ -484,6 +484,32 @@ class QuoteDocumentOut(BaseModel):
     email: dict[str, Any] | None = None
 
 
+class ApprovalSettingsIn(BaseModel):
+    """Who is emailed when a quote is sent for approval."""
+
+    notify_team_approvers: bool = True
+    notify_team_managers: bool = True
+    notify_managers: bool = True
+    notify_ceo: bool = False
+    notify_super_admins: bool = False
+    extra_emails: list[str] = Field(default_factory=list, max_length=20)
+
+
+class ApprovalRecipientsOut(BaseModel):
+    """Who a team's approval request would go to, with these settings, now."""
+
+    team_id: uuid.UUID
+    team_name: str
+    recipients: list[str]
+
+
+class ApprovalSettingsOut(ApprovalSettingsIn):
+    updated_at: datetime | None = None
+    updated_by_name: str | None = None
+    #: Per team, because the team's own approvers and managers differ.
+    preview: list[ApprovalRecipientsOut] = Field(default_factory=list)
+
+
 class SupplierDetailsOut(BaseModel):
     """One offer's supplier: what is confirmed, what the documents offer, and
     what is still blank. See ``app/comparison/supplier_details.py``."""
@@ -974,6 +1000,10 @@ class ReportSupplierOut(BaseModel):
     currency: str | None
     quote_number: str | None
     creator: str | None
+    #: ``[label, value]`` pairs from the supplier details, bank left out.
+    details: list[tuple[str, str]] = Field(default_factory=list)
+    #: Labels of what is still blank.
+    missing: list[str] = Field(default_factory=list)
 
 
 class CostingReportOut(BaseModel):
