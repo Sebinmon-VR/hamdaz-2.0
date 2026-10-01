@@ -20,7 +20,9 @@ task's status is the person's to fix, in SharePoint, where the team works.
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta, timezone
@@ -465,6 +467,8 @@ async def sweep(
             known.setdefault(existing_row.task_id, []).append(existing_row)
 
     batches: dict[uuid.UUID, tuple[User, list[TaskFollowup]]] = {}
+    # Each asked task's Remarks and Working notes, as just read, for the mail.
+    notes: dict[str, TaskNotes] = {}
     for user, tasks, error in fetched:
         if error:
             report.errors.append(error)
@@ -496,6 +500,7 @@ async def sweep(
                     carried_over=is_carried_over(row, decision.due_at, now),
                 )
                 batches.setdefault(user.id, (user, []))[1].append(made)
+                notes[task.id] = notes_of(task)
             else:
                 made = await _ask(
                     session, row, user, task, decision.due_at,
@@ -505,7 +510,9 @@ async def sweep(
             report.asked += 1
 
     for user, made in batches.values():
-        await _send_batch(session, row, user, made, settings=settings, mailer=mailer, now=now)
+        await _send_batch(
+            session, row, user, made, settings=settings, mailer=mailer, now=now, notes=notes
+        )
     if daily and asking and not force and not report.errors:
         # A failed read of somebody's list leaves the day open, so the next
         # poll tries them again; everybody already asked is not asked twice.
@@ -645,7 +652,8 @@ async def _ask(
         return followup
     try:
         await mailer.send_ask(
-            followup, sender=sender, link=link, early=early, redirect_to=row.test_mail_to
+            followup, sender=sender, link=link, early=early, redirect_to=row.test_mail_to,
+            notes={task.id: notes_of(task)},
         )
         followup.asked_at = now
     except Exception as exc:  # noqa: BLE001 - the in-app notice still stands
@@ -663,9 +671,11 @@ async def _send_batch(
     settings: Settings,
     mailer,
     now: datetime,
+    notes: dict[str, TaskNotes] | None = None,
 ) -> None:
     """Daily mode's one mail to one person: today's tasks, then the ones
-    carried over from yesterday, apart and with a note."""
+    carried over from yesterday, apart and with a note — each with the
+    Remarks and Working notes it had when read (``notes``, by task id)."""
     if not made:
         return
     sender = await _sender_for(session, row, user)
@@ -682,6 +692,7 @@ async def _send_batch(
             links={f.id: form_link(settings, f.id) for f in made},
             ask_time=row.ask_time,
             redirect_to=row.test_mail_to,
+            notes=notes,
         )
     except Exception as exc:  # noqa: BLE001 - the in-app notices still stand
         error = f"{type(exc).__name__}: {exc}"[:2000]
@@ -776,16 +787,39 @@ async def answer(
     settings: Settings,
     followup_settings: FollowupSettings,
     mailer,
+    use_remarks: bool = False,
+    sharepoint: SharePointProposals | None = None,
 ) -> TaskFollowup:
-    """File the reason and tell the team's managers."""
+    """File the reason and tell the team's managers.
+
+    With ``use_remarks`` the reason is the task's Remarks and Working notes,
+    read from the list now — not what the browser sent — with anything they
+    wrote after them.
+    """
     _require_open_and_theirs(row, user)
-    text = (reason or "").strip()
+    extra = (reason or "").strip()
+    notes = ""
+    if use_remarks:
+        found = await task_notes(session, sharepoint, {row.task_id})
+        notes = found.get(row.task_id, TaskNotes()).text
+        if not notes:
+            raise FollowupError(
+                "This task has no Remarks or Working notes on the Proposals list yet. "
+                "Write the reason in the box instead, or add it to the task first."
+            )
+    text = "\n\n".join(part for part in (notes, extra) if part)
     if len(text) < 3:
         raise FollowupError("Say a little more — the reason is what your manager reads.")
     now = datetime.now(UTC)
     row.reason = text[:5000]
     row.status = FollowupStatus.ANSWERED
     row.answered_at = now
+
+    if row.team_id is None:
+        # Outside any team is a trial — the sweep always files under the
+        # watched team — so nobody but the person hears of the answer.
+        await session.flush()
+        return row
 
     managers = [m for m in await managers_of(session, row.team_id) if m.id != user.id]
     # The CEO hears each reason too, as it arrives — the same people the
@@ -892,6 +926,69 @@ def person_reports_due(row: FollowupSettings, now: datetime) -> bool:
     return row.summaries_last_sent_on != today and now >= digest.cutoff_for(row, today)
 
 
+def _plain_remark(value: str | None) -> str:
+    """A notes column as text: it can come back as rich-text HTML."""
+    text = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</li>", "\n", value or "")
+    text = html.unescape(re.sub(r"<[^>]+>", "", text)).replace("\u200b", "")
+    return re.sub(r"\s*\n\s*", "\n", text).strip()
+
+
+@dataclass(frozen=True)
+class TaskNotes:
+    """What the person wrote on the task itself: its Remarks and Working
+    notes columns on the Proposals list, as text."""
+
+    remarks: str = ""
+    working_notes: str = ""
+
+    @property
+    def text(self) -> str:
+        """The two as one answer — how a reason made with them starts."""
+        parts = [self.remarks] if self.remarks else []
+        if self.working_notes:
+            parts.append(f"Working notes: {self.working_notes}")
+        return "\n\n".join(parts)
+
+
+def notes_of(task: ProposalTask) -> TaskNotes:
+    """The notes of a task already read from the list."""
+    return TaskNotes(_plain_remark(task.remarks), _plain_remark(task.working_notes))
+
+
+async def task_notes(
+    session: AsyncSession, sharepoint: SharePointProposals | None, task_ids: set[str]
+) -> dict[str, TaskNotes]:
+    """Each task's Remarks and Working notes, by task id — read from the list
+    as it is now, since the person may have written them after they were
+    asked. The mirror stands in for a task the list would not give. Read-only."""
+    from app.models.proposal_index import ProposalIndexItem
+
+    out: dict[str, TaskNotes] = {}
+    if sharepoint is not None and task_ids:
+        async def one(task_id: str) -> tuple[str, TaskNotes | None]:
+            try:
+                task = await sharepoint.task(task_id)
+            except Exception as exc:  # noqa: BLE001 - the mirror stands in
+                logger.warning("notes of task %s not read: %s", task_id, exc)
+                return task_id, None
+            return task_id, notes_of(task)
+
+        for task_id, notes in await asyncio.gather(*(one(t) for t in sorted(task_ids))):
+            if notes is not None:
+                out[task_id] = notes
+    missing = task_ids - out.keys()
+    if missing:
+        for item in (
+            await session.scalars(
+                select(ProposalIndexItem).where(ProposalIndexItem.item_id.in_(missing))
+            )
+        ).all():
+            out[item.item_id] = TaskNotes(
+                _plain_remark(item.remarks), _plain_remark(item.working_notes)
+            )
+    return out
+
+
 async def send_person_reports(
     session: AsyncSession,
     row: FollowupSettings,
@@ -900,6 +997,7 @@ async def send_person_reports(
     mailer,
     now: datetime,
     day: date | None = None,
+    sharepoint: SharePointProposals | None = None,
 ) -> str:
     """One report per person asked today, to that person's managers.
 
@@ -918,6 +1016,8 @@ async def send_person_reports(
         await session.scalars(
             select(TaskFollowup)
             .where(TaskFollowup.created_at > start, TaskFollowup.created_at <= end)
+            # A trial (no team) is the tester's alone; see :func:`answer`.
+            .where(TaskFollowup.team_id.is_not(None))
             .order_by(TaskFollowup.carried_over, TaskFollowup.due_at)
         )
     ).all()
@@ -925,6 +1025,7 @@ async def send_person_reports(
     for f in asked:
         by_person.setdefault(f.assignee_id, []).append(f)
 
+    notes = await task_notes(session, sharepoint, {f.task_id for f in asked})
     ceo = await digest.recipients(session, row)
     sent = failed = 0
     for rows in by_person.values():
@@ -953,6 +1054,7 @@ async def send_person_reports(
                 link=f"{(settings.followup_link_url or settings.frontend_url).rstrip('/')}"
                 f"{FORM_PATH}",
                 redirect_to=row.test_mail_to,
+                notes=notes,
             )
         except Exception as exc:  # noqa: BLE001 - one person's report is not the rest
             failed += 1

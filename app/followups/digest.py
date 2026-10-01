@@ -274,6 +274,8 @@ async def gather(
         await session.scalars(
             select(TaskFollowup)
             .where(TaskFollowup.created_at > start, TaskFollowup.created_at <= end)
+            # A trial (no team) is the tester's alone.
+            .where(TaskFollowup.team_id.is_not(None))
             .order_by(TaskFollowup.created_at)
         )
     ).all()
@@ -328,7 +330,7 @@ async def gather(
         asked = (
             await session.scalars(
                 select(TaskFollowup)
-                .where(TaskFollowup.task_id.in_(ids))
+                .where(TaskFollowup.task_id.in_(ids), TaskFollowup.team_id.is_not(None))
                 .order_by(TaskFollowup.created_at)
             )
         ).all()

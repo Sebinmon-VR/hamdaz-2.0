@@ -83,7 +83,7 @@ def facts(pairs: list[tuple[str, str]]) -> str:
         f"<tr><td style='padding:8px 12px;border-bottom:1px solid {_LINE};background:{_HEAD};"
         f"color:{_MUTED};font-size:13px;width:150px;vertical-align:top'>{escape(label)}</td>"
         f"<td style='padding:8px 12px;border-bottom:1px solid {_LINE};color:{_INK};"
-        f"font-size:13px;vertical-align:top'>{escape(value)}</td></tr>"
+        f"font-size:13px;vertical-align:top;white-space:pre-line'>{escape(value)}</td></tr>"
         for label, value in pairs
     )
     return (
@@ -202,11 +202,22 @@ def ask_subject(row: TaskFollowup, *, early: bool = False) -> str:
     return f"Reason Required: {row.task_title[:100]} ({what})"
 
 
-def ask_body(row: TaskFollowup, link: str, *, early: bool = False) -> str:
-    """``early``: asked before the due time, because it was marked Not Submitted."""
+def _notes_facts(row: TaskFollowup, notes: dict | None) -> list[tuple[str, str]]:
+    """The task's Remarks and Working notes as they were when it was asked —
+    so the person sees what they already wrote, and can answer with it."""
+    found = (notes or {}).get(row.task_id)
+    return [
+        ("Remarks", _cap(found.remarks if found else "") or "Not written yet"),
+        ("Working notes", _cap(found.working_notes if found else "") or "Not written yet"),
+    ]
+
+
+def ask_body(row: TaskFollowup, link: str, *, early: bool = False, notes: dict | None = None) -> str:
+    """``early``: asked before the due time, because it was marked Not Submitted.
+    ``notes``: ``service.TaskNotes`` by task id."""
     first = ((row.assignee.display_name if row.assignee else "").split() or ["there"])[0]
     if status_not_set(row) and not early:
-        return _ask_status_not_set(row, link, first)
+        return _ask_status_not_set(row, link, first, notes)
     lead = (
         "This task is marked <b>Not Submitted</b> on the Proposals list."
         if early
@@ -219,11 +230,13 @@ def ask_body(row: TaskFollowup, link: str, *, early: bool = False) -> str:
     details += [
         ("Bid closing" if early else "Was due", _when(row.due_at)),
         ("Submission status", row.status_at_ask or "Not set"),
+        *_notes_facts(row, notes),
     ]
     body = (
         heading("Reason required", eyebrow="Proposals")
         + f"<p style='margin:0 0 14px'>Hi {escape(first)},<br>{lead} Please give the reason — "
-        f"a sentence or two is enough.</p>"
+        f"a sentence or two is enough. If the task's <b>Remarks</b> or <b>Working notes</b> "
+        f"already say why, you can answer with them, and add anything else.</p>"
         + facts(details)
         + f"<p style='margin:20px 0 6px'>{button(link, 'Submit Reason')}&nbsp;&nbsp;"
         f"{button(link + '?false-positive=1', 'Already Updated', primary=False)}</p>"
@@ -240,7 +253,7 @@ def ask_body(row: TaskFollowup, link: str, *, early: bool = False) -> str:
     return page(body)
 
 
-def _ask_status_not_set(row: TaskFollowup, link: str, first: str) -> str:
+def _ask_status_not_set(row: TaskFollowup, link: str, first: str, notes: dict | None = None) -> str:
     """The bid's closing time passed with no Submission Status at all.
 
     Two things are asked, in this order: put the status on the task — which
@@ -250,7 +263,11 @@ def _ask_status_not_set(row: TaskFollowup, link: str, first: str) -> str:
     details = [("Task", row.task_title)]
     if row.end_user:
         details.append(("End user", row.end_user))
-    details += [("Bid closing", _when(row.due_at)), ("Submission status", "Not set")]
+    details += [
+        ("Bid closing", _when(row.due_at)),
+        ("Submission status", "Not set"),
+        *_notes_facts(row, notes),
+    ]
     open_task = (
         f"<a href='{escape(row.task_url)}' style='color:{_NAVY}'>open the task in SharePoint</a>"
         if row.task_url
@@ -269,7 +286,8 @@ def _ask_status_not_set(row: TaskFollowup, link: str, first: str) -> str:
         f"<b>Submitted</b>, then press <b>Already Updated</b>.</td></tr>"
         f"<tr><td style='padding:10px 12px;font-size:13px'>"
         f"<b>2. The bid was missed</b> — set the Submission Status to <b>Not Submitted</b> and "
-        f"press <b>Submit Reason</b> to say why.</td></tr></table>"
+        f"press <b>Submit Reason</b> to say why. You can answer with the task's Remarks or "
+        f"Working notes, and add anything else.</td></tr></table>"
         + f"<p style='margin:20px 0 6px'>{button(link, 'Submit Reason')}&nbsp;&nbsp;"
         f"{button(link + '?false-positive=1', 'Already Updated', primary=False)}</p>"
     )
@@ -316,14 +334,16 @@ def test_banner(meant_for: list[str], sent_by: str | None = None) -> str:
     )
 
 
-def _task_block(row: TaskFollowup, link: str) -> str:
-    """One task in a person's list: what it is, when it was due, and its buttons."""
+def _task_block(row: TaskFollowup, link: str, notes: dict | None = None) -> str:
+    """One task in a person's list: what it is, when it was due, what it says,
+    and its buttons."""
     details = [("Task", row.task_title)]
     if row.end_user:
         details.append(("End user", row.end_user))
     details += [
         ("Was due", _when(row.due_at)),
         ("Submission status", row.status_at_ask or "Not set"),
+        *_notes_facts(row, notes),
     ]
     hint = (
         f"<p style='margin:8px 0 0;font-size:12.5px;color:{_MUTED}'>No Submission Status is set. "
@@ -351,7 +371,9 @@ def batch_subject(rows: list[TaskFollowup]) -> str:
     return f"Reason Required: {n} task{'s' if n != 1 else ''} past due, not submitted"
 
 
-def batch_body(rows: list[TaskFollowup], links: dict, *, ask_time: str) -> str:
+def batch_body(
+    rows: list[TaskFollowup], links: dict, *, ask_time: str, notes: dict | None = None
+) -> str:
     """Today's tasks first; then the ones carried over from yesterday, apart,
     with a note saying why they are in today's list."""
     first = ((rows[0].assignee.display_name if rows[0].assignee else "").split() or ["there"])[0]
@@ -361,14 +383,15 @@ def batch_body(rows: list[TaskFollowup], links: dict, *, ask_time: str) -> str:
         heading("Reasons required", eyebrow="Proposals")
         + f"<p style='margin:0 0 14px'>Hi {escape(first)},<br>These tasks are past their due "
         f"time and not marked <b>Submitted</b> on the Proposals list. Please give the reason "
-        f"for each — a sentence or two is enough. If you have already submitted a bid or "
+        f"for each — a sentence or two is enough. If a task's <b>Remarks</b> or <b>Working "
+        f"notes</b> already say why, you can answer with them, and add anything else. If you have already submitted a bid or "
         f"updated its status, press <b>Already Updated</b> on it.</p>"
     )
     if today:
         body += (
             f"<p style='margin:18px 0 8px;font-weight:700;color:{_NAVY}'>"
             f"Due today ({len(today)})</p>"
-            + "".join(_task_block(r, links[r.id]) for r in today)
+            + "".join(_task_block(r, links[r.id], notes) for r in today)
         )
     if carried:
         body += (
@@ -377,7 +400,7 @@ def batch_body(rows: list[TaskFollowup], links: dict, *, ask_time: str) -> str:
             f"<p style='margin:0 0 10px;font-size:12.5px;color:{_MUTED}'>These were due after "
             f"yesterday's ask time ({escape(ask_time)}), so they are asked today, in their own "
             f"list.</p>"
-            + "".join(_task_block(r, links[r.id]) for r in carried)
+            + "".join(_task_block(r, links[r.id], notes) for r in carried)
         )
     return page(body)
 
@@ -400,27 +423,52 @@ def person_report_subject(who: str, day) -> str:
     return f"Reasons: {who} — {day:%d %b %Y}"
 
 
-def person_report_body(who: str, rows: list[TaskFollowup], day, link: str) -> str:
-    """Everything one person was asked about that day, answered or not."""
+#: A notes column longer than this is cut in the report; the task has it all.
+_NOTES_CAP = 600
+
+
+def _cap(text: str) -> str:
+    return text if len(text) <= _NOTES_CAP else text[:_NOTES_CAP].rstrip() + "…"
+
+
+def _notes_and_note(row: TaskFollowup, notes: dict) -> tuple[str, str, str]:
+    """The task's Remarks and Working notes as they are now, and anything else
+    the person wrote on the form. An answer made with the notes starts with
+    them (``TaskNotes.text``), so they are not said twice. Never a note the
+    system wrote."""
+    found = notes.get(row.task_id)
+    remarks = found.remarks if found else ""
+    working = found.working_notes if found else ""
+    said = found.text if found else ""
+    note = (row.reason or "").strip()
+    if said and note.startswith(said):
+        note = note[len(said):].strip()
+    return _cap(remarks) or "—", _cap(working) or "—", note or "—"
+
+
+def person_report_body(
+    who: str, rows: list[TaskFollowup], day, link: str, notes: dict | None = None
+) -> str:
+    """Everything one person was asked about that day, answered or not, each
+    with the Remarks and Working notes the task has on the Proposals list
+    (``notes``: ``service.TaskNotes`` by task id, read at the closing time)."""
+    notes = notes or {}
     states = [_person_state(r) for r in rows]
     missing = sum(1 for label, _ in states if label == "Not answered")
     answered = sum(1 for label, _ in states if label == "Reason given")
     updated = sum(1 for label, _ in states if label == "Already updated")
     table = grid(
-        ["Task", "Due", "Status", "Reason / note"],
+        ["Task", "Due", "Status", "Remarks", "Working notes", "Other note"],
         [
             [
                 r.task_title + (" (carried over from the previous day)" if r.carried_over else ""),
                 _when(r.due_at),
                 label,
-                (r.reason or r.resolved_note or "").strip()
-                or ("No reason given by the closing time." if label == "Not answered" else ""),
+                *_notes_and_note(r, notes),
             ]
             for r, (label, _) in zip(rows, states, strict=True)
         ],
-        colours=[None, None, None, None],
     )
-    # The grid colours by column; a missing reason is said in words as well.
     body = (
         heading(f"Reasons from {who}", eyebrow=f"Proposals · {day:%d %b %Y}")
         + counts(
@@ -475,13 +523,14 @@ class FollowupMailer(GraphMailer):
         link: str,
         early: bool = False,
         redirect_to: str | None = None,
+        notes: dict | None = None,
     ) -> None:
         await self._deliver(
             sender=sender.entra_object_id,
             sender_name=sender.display_name,
             recipients=[row.assignee_email],
             subject=ask_subject(row, early=early),
-            html=ask_body(row, link, early=early),
+            html=ask_body(row, link, early=early, notes=notes),
             redirect_to=redirect_to,
         )
 
@@ -493,13 +542,14 @@ class FollowupMailer(GraphMailer):
         links: dict,
         ask_time: str,
         redirect_to: str | None = None,
+        notes: dict | None = None,
     ) -> None:
         await self._deliver(
             sender=sender.entra_object_id,
             sender_name=sender.display_name,
             recipients=[rows[0].assignee_email],
             subject=batch_subject(rows),
-            html=batch_body(rows, links, ask_time=ask_time),
+            html=batch_body(rows, links, ask_time=ask_time, notes=notes),
             redirect_to=redirect_to,
         )
 
@@ -532,6 +582,7 @@ class FollowupMailer(GraphMailer):
         day,
         link: str,
         redirect_to: str | None = None,
+        notes: dict | None = None,
     ) -> None:
         who = person.display_name
         await self._deliver(
@@ -539,6 +590,6 @@ class FollowupMailer(GraphMailer):
             sender_name=sender_email,
             recipients=recipients,
             subject=person_report_subject(who, day),
-            html=person_report_body(who, rows, day, link),
+            html=person_report_body(who, rows, day, link, notes),
             redirect_to=redirect_to,
         )

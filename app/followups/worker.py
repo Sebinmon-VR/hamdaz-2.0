@@ -152,6 +152,7 @@ class FollowupWorker:
         # responded — so each person's report says so too.
         if service.person_reports_due(row, now):
             result = await service.send_person_reports(
-                session, row, settings=self._settings, mailer=self._mailer, now=now
+                session, row, settings=self._settings, mailer=self._mailer, now=now,
+                sharepoint=self._sharepoint,
             )
             logger.info("person reports: %s", result)

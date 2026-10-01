@@ -40,10 +40,19 @@ class FollowupOut(BaseModel):
     created_at: datetime
     #: Whether the viewer is the person asked and it still wants an answer.
     may_answer: bool = False
+    #: The task's Remarks and Working notes on the Proposals list, read as
+    #: the form is opened — so the person can answer with them. Only on the
+    #: one-follow-up read.
+    task_remarks: str | None = None
+    task_working_notes: str | None = None
 
 
 class ReasonIn(BaseModel):
-    reason: str = Field(min_length=3, max_length=5000)
+    #: Anything they write. Optional when ``use_remarks`` is set.
+    reason: str = Field(default="", max_length=5000)
+    #: Answer with the task's Remarks and Working notes, read from the list
+    #: as it is sent.
+    use_remarks: bool = False
 
 
 class FalsePositiveIn(BaseModel):

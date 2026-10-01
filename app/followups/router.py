@@ -375,9 +375,17 @@ async def _visible(
 
 @router.get("/{followup_id}", response_model=FollowupOut, summary="One follow-up")
 async def read_followup(
-    followup_id: uuid.UUID, user: CurrentUser, roles: CurrentRoles, session: Session
+    followup_id: uuid.UUID, user: CurrentUser, roles: CurrentRoles, session: Session,
+    request: Request,
 ) -> FollowupOut:
-    return _out(await _visible(followup_id, user, roles, session), user)
+    row = await _visible(followup_id, user, roles, session)
+    body = _out(row, user)
+    # Read live, so the form offers what the notes say now. Read-only.
+    found = await service.task_notes(session, request.app.state.sharepoint, {row.task_id})
+    notes = found.get(row.task_id, service.TaskNotes())
+    body.task_remarks = notes.remarks or None
+    body.task_working_notes = notes.working_notes or None
+    return body
 
 
 @router.post("/{followup_id}/reason", response_model=FollowupOut, summary="Say why")
@@ -396,6 +404,8 @@ async def give_reason(
             session, row,
             user=user,
             reason=body.reason,
+            use_remarks=body.use_remarks,
+            sharepoint=request.app.state.sharepoint,
             settings=config,
             followup_settings=await service.get_settings(session),
             mailer=_mailer(request),
