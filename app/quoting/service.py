@@ -1424,9 +1424,15 @@ def why_not_submit(request: QuoteRequest) -> str | None:
     return None
 
 
-async def submit(session: AsyncSession, request: QuoteRequest, *, user: User) -> QuoteRequest:
+async def submit(
+    session: AsyncSession,
+    request: QuoteRequest,
+    *,
+    user: User,
+    roles: set[str] | frozenset[str] = frozenset(),
+) -> QuoteRequest:
     """Send it to the approvers."""
-    require_editable(request, user=user)
+    require_editable(request, user=user, roles=roles)
     missing = why_not_submit(request)
     if missing is not None:
         raise QuoteError(missing)

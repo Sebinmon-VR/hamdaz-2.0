@@ -553,6 +553,61 @@ class SupplierEmailIn(BaseModel):
     notes: str | None = Field(default=None, max_length=2000)
 
 
+class SupplierQuoteLineOut(BaseModel):
+    """One stored line of a supplier quote. Unconstrained on the way out: a
+    line read badly must still show, so it can be corrected."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    position: int
+    description: str | None = None
+    part_number: str | None = None
+    brand: str | None = None
+    unit: str | None = None
+    quantity: Decimal | None = None
+    unit_price: Decimal | None = None
+    line_total: Decimal | None = None
+    lead_time: str | None = None
+
+
+class SupplierQuoteRowOut(BaseModel):
+    """A supplier quote as stored, every field — what the editor opens on."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    supplier_name: str
+    quote_number: str | None = None
+    quote_date: str | None = None
+    currency: str
+    fx_rate: Decimal
+    validity: str | None = None
+    delivery_time: str | None = None
+    payment_terms: str | None = None
+    warranty: str | None = None
+    incoterms: str | None = None
+    contact: str | None = None
+    notes: str | None = None
+    discount: Decimal | None = None
+    freight: Decimal | None = None
+    tax: Decimal | None = None
+    quoted_total: Decimal | None = None
+    charges: list[dict[str, Any]] | None = None
+    source: str
+    file_name: str | None = None
+    extraction_note: str | None = None
+    items: list[SupplierQuoteLineOut] = Field(default_factory=list)
+
+
+class DocumentEditIn(BaseModel):
+    """A filed document's notes and kind, put right after it was uploaded.
+    A field left out is not changed."""
+
+    notes: str | None = Field(default=None, max_length=4000)
+    kind: str | None = Field(default=None, max_length=40)
+
+
 class ApplySuggestionsIn(BaseModel):
     """Which of a document's suggestions to write onto the quote."""
 
@@ -702,6 +757,9 @@ class QuoteRequestOut(BaseModel):
 
     #: The comparison of the supplier quotes behind this one, when there is one.
     comparison: dict[str, Any] | None = None
+    #: Each supplier quote as stored — every field and line — so it can be
+    #: opened and corrected. ``comparison`` is what was concluded from them.
+    supplier_quotes: list[SupplierQuoteRowOut] = Field(default_factory=list)
     #: The documents people uploaded, and where each was filed. Kept apart from
     #: ``comparison`` because that is a computation and these are files.
     documents: list[QuoteDocumentOut] = Field(default_factory=list)

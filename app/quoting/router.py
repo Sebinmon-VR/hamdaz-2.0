@@ -37,6 +37,7 @@ import logging
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Annotated, Any, Literal
 
 from fastapi import (
@@ -68,7 +69,7 @@ from app.core.config import get_settings
 from app.core.db import get_session
 from app.core.mail import MailError
 from app.intake.graph_mail import MailReader
-from app.models.comparison import QuoteSource
+from app.models.comparison import QuoteSource, SupplierQuoteItem
 from app.models.quoting import DocumentKind, QuoteRequest, QuoteStatus
 from app.models.team import Team
 from app.models.user import User
@@ -93,6 +94,7 @@ from app.quoting.schemas import (
     CommentOut,
     CostingReportOut,
     CurrencyIn,
+    DocumentEditIn,
     FxQuoteOut,
     ItemOut,
     MailboxMessageOut,
@@ -109,6 +111,7 @@ from app.quoting.schemas import (
     SupplierDetailsFormOut,
     SupplierDetailsOut,
     SupplierEmailIn,
+    SupplierQuoteRowOut,
     TaskQuoteIn,
     TypedSupplierQuotesIn,
 )
@@ -214,6 +217,8 @@ async def _out(
     session: AsyncSession, request: QuoteRequest, *, user, roles: set[str]
 ) -> QuoteRequestOut:
     body = QuoteRequestOut.model_validate(request)
+    offers = request.comparison.quotes if request.comparison else []
+    body.supplier_quotes = [SupplierQuoteRowOut.model_validate(q) for q in offers]
     body.team_name = request.team.name if request.team else None
     body.created_by_name = request.created_by.display_name if request.created_by else None
     body.assigned_to_name = request.assigned_to.display_name if request.assigned_to else None
@@ -254,10 +259,13 @@ async def _out(
 
     body.documents = _documents_of(request)
 
-    # Whoever raised it, or a super admin — while it is in a state that can be
+    # Whoever raised it or holds it, or a super admin — the same people
+    # ``service.require_owner`` lets save — while it is in a state that can be
     # edited at all. Submitting still freezes it for everyone.
     body.may_edit = request.is_editable and (
-        request.created_by_id == user.id or SUPER_ADMIN in set(roles)
+        request.created_by_id == user.id
+        or request.assigned_to_id == user.id
+        or SUPER_ADMIN in set(roles)
     )
     body.submit_reason = service.why_not_submit(request)
     body.may_submit = body.may_edit and body.submit_reason is None
@@ -1141,7 +1149,7 @@ async def attach_suppliers(
     """
     request = await _load(session, request_id)
     try:
-        service.require_editable(request, user=user)
+        service.require_editable(request, user=user, roles=roles)
     except QuoteError as exc:
         raise _translate(exc) from exc
 
@@ -1252,7 +1260,7 @@ async def attach_typed_suppliers(
     """
     request = await _load(session, request_id)
     try:
-        service.require_editable(request, user=user)
+        service.require_editable(request, user=user, roles=roles)
     except QuoteError as exc:
         raise _translate(exc) from exc
     quotes = [q.model_copy(update={"source": QuoteSource.MANUAL}) for q in payload.quotes]
@@ -1611,7 +1619,7 @@ async def apply_suggestions(
 
     request = await _load(session, request_id)
     try:
-        service.require_editable(request, user=user)
+        service.require_editable(request, user=user, roles=roles)
     except QuoteError as exc:
         raise _translate(exc) from exc
     document = next((d for d in request.documents if d.id == document_id), None)
@@ -1623,6 +1631,59 @@ async def apply_suggestions(
         raise _translate(exc) from exc
     await session.flush()
     logger.info("quote %s: applied %s from %s", request.id, applied, document.file_name)
+    return await _out(session, request, user=user, roles=roles)
+
+
+@router.patch(
+    "/{request_id}/documents/{document_id}",
+    response_model=QuoteRequestOut,
+    summary="Correct a filed document's notes or kind",
+)
+async def edit_document(
+    request_id: uuid.UUID,
+    document_id: uuid.UUID,
+    payload: DocumentEditIn,
+    user: CurrentUser,
+    roles: CurrentRoles,
+    session: Session,
+) -> QuoteRequestOut:
+    """A note added late, or a file filed under the wrong kind.
+
+    Allowed to whoever may add documents, at any stage — a note or a kind
+    restates no number. Two kinds are the system's and stay as they are: the
+    costing report, and a supplier quotation whose prices are on the
+    comparison (remove the offer to change that). The file itself, and where
+    it was filed, do not move.
+    """
+    request = await _load(session, request_id)
+    if not service.may_add_documents(request, user=user, roles=roles):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="This quote is not yours to edit."
+        )
+    document = next((d for d in request.documents if d.id == document_id), None)
+    if document is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such document")
+    if payload.notes is not None:
+        document.notes = payload.notes.strip() or None
+    if payload.kind is not None and payload.kind != document.kind:
+        try:
+            wanted = DocumentKind(payload.kind)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"{payload.kind!r} is not a document kind.",
+            ) from exc
+        fixed = document.kind == DocumentKind.COSTING_REPORT or (
+            document.kind == DocumentKind.SUPPLIER_QUOTE and document.supplier_quote_id is not None
+        )
+        if fixed or wanted in (DocumentKind.COSTING_REPORT, DocumentKind.SUPPLIER_QUOTE):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="The costing report and priced supplier quotations keep their kind. "
+                "To add a supplier quotation, upload it as one.",
+            )
+        document.kind = wanted
+    await session.flush()
     return await _out(session, request, user=user, roles=roles)
 
 
@@ -1653,7 +1714,7 @@ async def delete_document(
     """
     request = await _load(session, request_id)
     try:
-        service.require_editable(request, user=user)
+        service.require_editable(request, user=user, roles=roles)
     except QuoteError as exc:
         raise _translate(exc) from exc
     document = next((d for d in request.documents if d.id == document_id), None)
@@ -1694,7 +1755,7 @@ async def remove_supplier_quote(
     """
     request = await _load(session, request_id)
     try:
-        service.require_editable(request, user=user)
+        service.require_editable(request, user=user, roles=roles)
     except QuoteError as exc:
         raise _translate(exc) from exc
     if request.comparison is None or not any(
@@ -1711,6 +1772,112 @@ async def remove_supplier_quote(
     if document is not None:
         await filing.remove_document(drive, request, document)
     await session.flush()
+    return await _out(session, request, user=user, roles=roles)
+
+
+@router.put(
+    "/{request_id}/supplier-quotes/{supplier_quote_id}",
+    response_model=QuoteRequestOut,
+    summary="Correct one supplier's offer: its name, terms, charges and lines",
+)
+async def edit_supplier_quote(
+    request_id: uuid.UUID,
+    supplier_quote_id: uuid.UUID,
+    payload: SupplierQuoteIn,
+    user: CurrentUser,
+    roles: CurrentRoles,
+    session: Session,
+    extractor: Extractor,
+    zoho: Zoho,
+) -> QuoteRequestOut:
+    """The offer read or typed wrong — a misspelt supplier, a wrong price, a
+    term the reader missed — put right in place.
+
+    The quote keeps its id, so its document, the choice of it and the lines
+    priced from it all stay attached; the comparison is worked out again over
+    the corrected figures. The quote's own lines are not repriced: choosing
+    the supplier again does that, deliberately, so a correction never moves a
+    price somebody has already set by hand. Only while the quote is editable.
+    """
+    request = await _load(session, request_id)
+    try:
+        service.require_editable(request, user=user, roles=roles)
+    except QuoteError as exc:
+        raise _translate(exc) from exc
+    comparison = request.comparison
+    offers = comparison.quotes if comparison else []
+    row = next((q for q in offers if q.id == supplier_quote_id), None)
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="That supplier quote is not on this request's comparison.",
+        )
+    if not payload.items:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="An offer needs at least one priced line.",
+        )
+    # Where it came from is not the editor's to change.
+    incoming = payload.model_copy(
+        update={
+            "supplier_name": payload.supplier_name.strip(),
+            "currency": payload.currency.upper(),
+            "source": row.source,
+            "file_name": row.file_name,
+            "detail_suggestions": row.detail_suggestions or {},
+        }
+    )
+    ours = (comparison.currency or request.currency or "AED").upper()
+    if incoming.currency == ours:
+        incoming.fx_rate = Decimal(1)
+    elif incoming.fx_rate == 1:
+        # A foreign currency left at 1: read Zoho's rate rather than compare
+        # dollars as dirhams. A rate typed in is kept as typed.
+        failures: list[str] = []
+        await _convert_offers(request, [incoming], zoho, failures)
+        if failures:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"{failures[0]}. Type the exchange rate and save again.",
+            )
+
+    old_name = row.supplier_name
+    for name in (
+        "supplier_name", "quote_number", "quote_date", "currency", "fx_rate", "validity",
+        "delivery_time", "payment_terms", "warranty", "incoterms", "contact", "notes",
+        "discount", "freight", "tax", "quoted_total", "extraction_note",
+    ):
+        setattr(row, name, getattr(incoming, name))
+    row.charges = [c.model_dump(mode="json") for c in incoming.charges] or None
+    row.items.clear()
+    row.items.extend(
+        SupplierQuoteItem(
+            position=position,
+            description=item.description,
+            part_number=item.part_number,
+            brand=item.brand,
+            unit=item.unit,
+            quantity=item.quantity,
+            unit_price=item.unit_price,
+            line_total=item.line_total,
+            lead_time=item.lead_time,
+        )
+        for position, item in enumerate(incoming.items)
+    )
+    # The report names the chosen supplier from the quote's own field when it
+    # was filled from this offer — a corrected spelling follows it there.
+    if request.supplier_name and request.supplier_name.strip() == (old_name or "").strip():
+        request.supplier_name = row.supplier_name
+
+    comparison.analysis = await comparison_service.compare(
+        extractor,
+        [_quote_in_of(q) for q in comparison.quotes],
+        currency=comparison.currency,
+        ids=[str(q.id) for q in comparison.quotes],
+    )
+    comparison.analysed_at = datetime.now(UTC)
+    await session.flush()
+    logger.info("quote %s: supplier quote %s corrected", request.id, row.id)
     return await _out(session, request, user=user, roles=roles)
 
 
@@ -1937,7 +2104,7 @@ async def submit(
     """
     request = await _load(session, request_id)
     try:
-        await service.submit(session, request, user=user)
+        await service.submit(session, request, user=user, roles=roles)
     except QuoteError as exc:
         raise _translate(exc) from exc
 
