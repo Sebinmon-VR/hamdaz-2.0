@@ -484,7 +484,9 @@ def test_the_supplier_card_carries_the_basic_details(drives) -> None:
 
     built = report_mod.build(drives, base_rate=RATE, rate_source="test")
     details = dict(built.supplier.details)
-    assert details["Company"] == "Router Switch Ltd"
+    # The offer names the supplier, over anything typed on the quote: one
+    # record, corrected in one place.
+    assert built.supplier.name == "Router Switch Ltd" and "Company" not in details
     assert details["Address"] == "Unit 5, Tech Park, Hong Kong"
     assert details["Contact no."] == "+852 3000 1111"
     assert details["Email"] == "sales@router-switch.com"

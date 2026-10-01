@@ -549,24 +549,26 @@ def _recommend(steps, floor: Figure, currency: str, comfortable: Decimal) -> str
 
 
 def _supplier(request, supplier_currency: str | None) -> SupplierBlock:
-    """The supplier as the report names them: what was typed, else the offer
-    the quote is priced from."""
+    """The supplier as the report names them: the offer the quote is priced
+    from, as it stands — its name, and its supplier details (type, address,
+    contact, bank) beneath.
+
+    One record, corrected in one place: the offer's name is edited on the
+    offer, and what kind of supplier they are is the details' Supplier type.
+    The quote's own ``supplier_name`` and ``supplier_basis`` are only read
+    for a quote with no offer chosen, or one written before they were
+    dropped from the form."""
     chosen = None
     if request.comparison is not None and request.selected_supplier_quote_id is not None:
         chosen = next(
             (q for q in request.comparison.quotes if q.id == request.selected_supplier_quote_id),
             None,
         )
-    name = (request.supplier_name or "").strip() or (chosen.supplier_name if chosen else None)
+    name = (chosen.supplier_name if chosen else None) or (request.supplier_name or "").strip() or None
     details: list[tuple[str, str]] = []
     missing: list[str] = []
     if chosen is not None:
         details, missing = supplier_details.report_lines(supplier_details.stored(chosen.details))
-        # The name typed on the quote wins the heading; when it is not the
-        # company on the offer (a salesperson's name, say), the company is
-        # still said.
-        if name and chosen.supplier_name and name.lower() != chosen.supplier_name.lower():
-            details.insert(0, ("Company", chosen.supplier_name))
     return SupplierBlock(
         name=name,
         basis=(request.supplier_basis or "").strip() or None,
