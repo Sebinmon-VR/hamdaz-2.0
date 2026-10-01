@@ -89,8 +89,9 @@ class GraphMailer:
         subject: str,
         html: str,
         attachments: list[Attachment] | None = None,
+        cc: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Send as ``sender``, optionally with files.
+        """Send as ``sender``, optionally with files, and with ``cc`` copied.
 
         Attachments go inline in the sendMail body as base64, which Graph caps
         at roughly 4 MB for the whole message. That is ample for what this sends
@@ -112,6 +113,9 @@ class GraphMailer:
                 {"emailAddress": {"address": address}} for address in recipients
             ],
         }
+        copied = [a for a in (cc or []) if a and a.lower() not in {r.lower() for r in recipients}]
+        if copied:
+            message["ccRecipients"] = [{"emailAddress": {"address": address}} for address in copied]
         if attachments:
             kept = []
             for item in attachments:

@@ -274,3 +274,26 @@ def test_the_ask_shows_the_tasks_remarks_and_working_notes() -> None:
     assert "Working notes" in single and "Lots could not be selected" in single
     # A task with no Submission Status gets the other mail, with the notes too.
     assert "Not written yet" in m.ask_body(bare, "https://x/2", notes=notes)
+
+
+def test_the_ceo_is_never_a_manager_to_mail_even_holding_a_team_role() -> None:
+    class Rows:
+        def __init__(self, items):
+            self.items = items
+
+        def all(self):
+            return self.items
+
+    althaf = type("U", (), {"id": uuid.uuid4(), "email": "althaf@hamdaz.com", "is_active": True})()
+    jishad = type("U", (), {"id": uuid.uuid4(), "email": "jishad@hamdaz.com", "is_active": True})()
+
+    class Session:
+        calls = 0
+
+        async def scalars(self, query):
+            Session.calls += 1
+            # First the team's managers and approvers, then the CEO's address.
+            return Rows([althaf, jishad] if Session.calls == 1 else ["jishad@hamdaz.com"])
+
+    found = asyncio.run(service.managers_of(Session(), uuid.uuid4()))
+    assert [u.email for u in found] == ["althaf@hamdaz.com"]

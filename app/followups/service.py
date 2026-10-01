@@ -39,7 +39,7 @@ from app.models.followup import (
     TaskFollowup,
 )
 from app.models.notification import NotificationKind
-from app.models.role import Role
+from app.models.role import Role, UserRole
 from app.models.team import Team, TeamMembership
 from app.models.user import User
 from app.notifications import service as notifications
@@ -387,7 +387,21 @@ async def watched_people(session: AsyncSession, row: FollowupSettings) -> list[U
     ]
 
 
+async def ceo_emails(session: AsyncSession) -> set[str]:
+    """Whoever holds the CEO role. The follow-ups, reminders and BCD checks
+    send them nothing — whatever other role they are later given — unless a
+    report's own "send to the CEO" switch says otherwise."""
+    rows = await session.scalars(
+        select(User.email)
+        .join(UserRole, UserRole.user_id == User.id)
+        .join(Role, Role.id == UserRole.role_id)
+        .where(Role.key == "ceo")
+    )
+    return {(e or "").strip().lower() for e in rows.all() if e}
+
+
 async def managers_of(session: AsyncSession, team_id: uuid.UUID | None) -> list[User]:
+    """The team's managers and approvers — never the CEO."""
     if team_id is None:
         return []
     rows = await session.scalars(
@@ -396,9 +410,10 @@ async def managers_of(session: AsyncSession, team_id: uuid.UUID | None) -> list[
         .join(Role, Role.id == TeamMembership.role_id)
         .where(TeamMembership.team_id == team_id, Role.key.in_(MANAGER_ROLES))
     )
+    ceo = await ceo_emails(session)
     seen: dict[uuid.UUID, User] = {}
     for user in rows.all():
-        if user.is_active:
+        if user.is_active and (user.email or "").strip().lower() not in ceo:
             seen.setdefault(user.id, user)
     return list(seen.values())
 
@@ -453,6 +468,13 @@ async def sweep(
     asking = (not daily) or force or daily_batch_due(row, now)
 
     fetched = await asyncio.gather(*(fetch(u) for u in people))
+    # A task whose BCD is still the assignment-time placeholder waits for the
+    # real date, in every module alike. See ``app.bcd.service``.
+    from app.bcd import service as bcd
+
+    held = await bcd.held_ids(
+        session, [t for _, tasks, error in fetched if not error for t in tasks or []]
+    )
 
     # Every question already on these tasks, in one query. Asking once per
     # task cost a round trip each — six hundred of them to a database a third
@@ -479,7 +501,7 @@ async def sweep(
             _close_pending(
                 [r for r in asked_before if r.status == FollowupStatus.PENDING], task, report, now
             )
-            if not asking:
+            if not asking or task.id in held:
                 continue
             decision = decide(
                 task,

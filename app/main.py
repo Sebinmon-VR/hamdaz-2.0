@@ -39,6 +39,15 @@ from app.finance.router import router as finance_router
 from app.followups.mailer import FollowupMailer
 from app.followups.router import router as followups_router
 from app.followups.worker import FollowupWorker
+from app.reminders.mailer import ReminderMailer
+from app.reminders.router import router as reminders_router
+from app.reminders.worker import ReminderWorker
+from app.bcd.mailer import BcdMailer
+from app.bcd.router import router as bcd_router
+from app.bcd.worker import BcdWorker
+from app.taskcalendar.graph import TaskCalendar
+from app.taskcalendar.router import router as task_calendar_router
+from app.taskcalendar.worker import TaskCalendarWorker
 from app.forms.router import router as templates_router
 from app.hr.public import router as careers_router
 from app.hr.router import router as hr_router
@@ -226,6 +235,35 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         mailer=FollowupMailer(settings, http),
     )
     app.state.followup_worker.start()
+    # Two days before a task is due, asks its holder where it stands, on a
+    # form that can update the task. Off, and with the SharePoint write off,
+    # until a super admin turns them on - see app/reminders.
+    app.state.reminder_worker = ReminderWorker(
+        factory=get_session_factory(),
+        settings=settings,
+        sharepoint=app.state.sharepoint,
+        mailer=ReminderMailer(settings, http),
+    )
+    app.state.reminder_worker.start()
+    # Holds a new task whose BCD is the assignment time, and asks for the real
+    # one: the assignee, then the managers after two working hours. Off until
+    # a super admin turns it on - see app/bcd.
+    app.state.bcd_worker = BcdWorker(
+        factory=get_session_factory(),
+        settings=settings,
+        sharepoint=app.state.sharepoint,
+        mailer=BcdMailer(settings, http),
+    )
+    app.state.bcd_worker.start()
+    # Each open task's BCD as an event in its holder's Outlook calendar. Off
+    # until a super admin turns it on - see app/taskcalendar.
+    app.state.task_calendar = TaskCalendar(settings, http)
+    app.state.task_calendar_worker = TaskCalendarWorker(
+        factory=get_session_factory(),
+        sharepoint=app.state.sharepoint,
+        calendar=app.state.task_calendar,
+    )
+    app.state.task_calendar_worker.start()
     # Reads the open tenders from the Ariba supplier portal — only when a new
     # tender reaches the Proposals mirror, and within a gap and a daily cap.
     # Off unless ARIBA_ENABLED is set. With ARIBA_FIX_BCD it also corrects the
@@ -247,6 +285,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await app.state.intake_worker.stop()
         await app.state.workflow_worker.stop()
         await app.state.followup_worker.stop()
+        await app.state.reminder_worker.stop()
+        await app.state.bcd_worker.stop()
+        await app.state.task_calendar_worker.stop()
         await app.state.ariba_worker.stop()
         await http.aclose()
         await dispose_engine()
@@ -318,6 +359,9 @@ def create_app() -> FastAPI:
     app.include_router(admin_router, prefix=settings.api_prefix)
     app.include_router(notifications_router, prefix=settings.api_prefix)
     app.include_router(followups_router, prefix=settings.api_prefix)
+    app.include_router(reminders_router, prefix=settings.api_prefix)
+    app.include_router(bcd_router, prefix=settings.api_prefix)
+    app.include_router(task_calendar_router, prefix=settings.api_prefix)
     app.include_router(ariba_router, prefix=settings.api_prefix)
     # The webhook first: Graph posts to it unauthenticated, and it must not
     # inherit anything that would refuse Microsoft.

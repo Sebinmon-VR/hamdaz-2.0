@@ -363,8 +363,16 @@ async def gather(
 
 
 async def recipients(session: AsyncSession, row: FollowupSettings) -> list[str]:
-    """The named addresses, plus whoever holds the CEO role when that is on."""
+    """The named addresses, plus whoever holds the CEO role when that is on.
+
+    The switch is the only way the CEO gets these: a CEO's address typed into
+    the named list is dropped while it is off."""
     out: list[str] = [e.strip().lower() for e in (row.digest_recipients or []) if e.strip()]
+    if not row.digest_include_ceo:
+        from app.followups.service import ceo_emails
+
+        ceo = await ceo_emails(session)
+        out = [e for e in out if e not in ceo]
     if row.digest_include_ceo:
         ceos = await session.scalars(
             select(User)

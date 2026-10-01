@@ -48,6 +48,8 @@ class NotificationKind(StrEnum):
     TASK_OVERDUE = "task_overdue"
     #: Somebody on your team answered that question. For the managers.
     TASK_REASON = "task_reason"
+    #: One of your tasks is due in a couple of days: where does it stand?
+    STATUS_REMINDER = "status_reminder"
     MENTION = "mention"
     GENERAL = "general"
 

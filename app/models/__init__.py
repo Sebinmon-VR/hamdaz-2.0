@@ -81,6 +81,9 @@ from app.models.followup import (
     FollowupStatus,
     TaskFollowup,
 )
+from app.models.status_reminder import ReminderStatus, StatusReminder, StatusReminderSettings
+from app.models.bcd_check import BcdCheck, BcdCheckSettings, BcdCheckStatus
+from app.models.task_calendar import TaskCalendarEvent, TaskCalendarSettings
 from app.models.hr import (
     CLOSED_STAGES,
     ApplicationFile,
@@ -211,6 +214,14 @@ __all__ = [
     "FollowupStatus",
     "OPEN_FOLLOWUP_STATUSES",
     "TaskFollowup",
+    "ReminderStatus",
+    "StatusReminder",
+    "StatusReminderSettings",
+    "BcdCheck",
+    "BcdCheckSettings",
+    "BcdCheckStatus",
+    "TaskCalendarEvent",
+    "TaskCalendarSettings",
     "FormTemplate",
     "JobApplication",
     "JobOpening",
