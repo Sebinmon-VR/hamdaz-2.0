@@ -34,6 +34,8 @@ from app.core.llm import TextModel
 from app.dashboards.router import router as dashboards_router
 from app.directory.graph import GraphDirectory
 from app.directory.router import router as directory_router
+from app.enquiries.claude import ClaudeEnquiry
+from app.enquiries.router import router as enquiries_router
 from app.finance.cache import PnlCache
 from app.finance.router import router as finance_router
 from app.followups.mailer import FollowupMailer
@@ -135,6 +137,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Win rates over the estimate history. One sweep serves every draft, and
     # it is a read of Zoho only — nothing is written there.
     app.state.win_rates = WinRates()
+    # Reads tender documents and looks new items up on the web, with Claude.
+    # No key means the enquiry page says so; nothing else depends on it.
+    app.state.enquiry_llm = ClaudeEnquiry(settings)
     # Approvers are told a quote is waiting, from the requester's own mailbox.
     app.state.quote_mailer = QuoteMailer(settings, http)
     # Files the supplier documents people upload into OneDrive. Inert
@@ -351,6 +356,7 @@ def create_app() -> FastAPI:
     app.include_router(assignment_router, prefix=settings.api_prefix)
     app.include_router(analytics_router, prefix=settings.api_prefix)
     app.include_router(quoting_router, prefix=settings.api_prefix)
+    app.include_router(enquiries_router, prefix=settings.api_prefix)
     app.include_router(templates_router, prefix=settings.api_prefix)
     app.include_router(hr_router, prefix=settings.api_prefix)
     app.include_router(finance_router, prefix=settings.api_prefix)

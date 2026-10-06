@@ -203,6 +203,56 @@ class OpenAIChat:
             int(getattr(usage, "output_tokens", 0) or 0),
         )
 
+    async def read_documents(
+        self,
+        *,
+        model: str,
+        instructions: str,
+        content: list[dict[str, Any]],
+        schema: dict[str, Any],
+        reasoning_effort: str = "low",
+        max_output_tokens: int = 16000,
+        user_key: str,
+    ) -> tuple[str, int, int]:
+        """One answer over documents the caller hands over whole.
+
+        ``content`` is a user message's parts as the Responses API takes them:
+        ``input_text`` for what was read locally, ``input_file`` for a PDF the
+        model has to look at (a scan), ``input_image`` for a photograph. The
+        answer is held to ``schema``. A tender's item list is long, hence the
+        larger output budget than ``answer`` allows.
+        """
+        params: dict[str, Any] = {
+            "model": model,
+            "instructions": instructions,
+            "input": [{"role": "user", "content": content}],
+            "store": False,
+            "max_output_tokens": max_output_tokens,
+            "truncation": "auto",
+            "safety_identifier": user_key,
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "answer",
+                    "strict": True,
+                    "schema": schema,
+                }
+            },
+        }
+        spec = MODELS_BY_KEY.get(model)
+        if spec is None or spec.supports_reasoning:
+            params["reasoning"] = {"effort": reasoning_effort}
+        try:
+            response = await self.client().responses.create(**params)
+        except openai.OpenAIError as exc:
+            raise LLMError(explain(exc)) from exc
+        usage = getattr(response, "usage", None)
+        return (
+            (getattr(response, "output_text", "") or "").strip(),
+            int(getattr(usage, "input_tokens", 0) or 0),
+            int(getattr(usage, "output_tokens", 0) or 0),
+        )
+
     async def speak(
         self,
         text: str,
@@ -284,6 +334,14 @@ def explain(exc: Exception) -> str:
     if isinstance(exc, openai.PermissionDeniedError):
         return "The OpenAI key is not allowed to use this model. Ask a super admin."
     if isinstance(exc, openai.RateLimitError):
+        # OpenAI answers an empty balance with the same 429 as a rate limit.
+        # Waiting does not fix that one, so it must not read as "try again".
+        code = getattr(exc, "code", None)
+        if code in ("insufficient_quota", "credit_balance_exhausted") or "credits" in str(exc):
+            return (
+                "The OpenAI account has no credits left. Add credits at "
+                "platform.openai.com, under Settings, Billing."
+            )
         return "OpenAI is rate limiting this key. Try again shortly."
     if isinstance(exc, openai.NotFoundError):
         return "OpenAI does not know the configured model. Ask a super admin to pick another."

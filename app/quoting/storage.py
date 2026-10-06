@@ -357,6 +357,60 @@ class QuoteDrive:
             raise DriveError("the upload session ended without the file being created")
         return item
 
+    async def list_files(
+        self, folder: str, *, depth: int = 3, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        """The files under ``<root>/<folder>``, its subfolders included.
+
+        Read only. Each entry: ``id``, ``name``, ``size``, ``path`` (relative
+        to the task folder), ``web_url``, ``mime`` and ``modified``. A folder
+        that does not exist yet is simply empty. ``depth`` and ``limit`` keep a
+        folder somebody filled with a whole archive from becoming the run.
+        """
+        if not self.enabled:
+            raise DriveError("No drive is configured for quote documents")
+        headers = await self._headers()
+        found: list[dict[str, Any]] = []
+        pending: list[tuple[str, int]] = [("", 0)]
+        while pending and len(found) < limit:
+            relative, level = pending.pop(0)
+            path = f"{self.root}/{folder.strip('/')}" + (f"/{relative}" if relative else "")
+            url: str | None = self._path_url(path, "/children")
+            params: dict[str, str] | None = {
+                "$select": "id,name,size,file,folder,webUrl,lastModifiedDateTime",
+                "$top": "200",
+            }
+            while url:
+                response = await self._http.get(url, headers=headers, params=params)
+                if response.status_code == 404:
+                    break
+                if response.status_code != 200:
+                    raise DriveError(
+                        f"could not list {path} ({response.status_code}): {response.text[:160]}"
+                    )
+                payload = response.json()
+                for item in payload.get("value", []):
+                    name = str(item.get("name") or "")
+                    inner = f"{relative}/{name}" if relative else name
+                    if "folder" in item:
+                        if level + 1 < depth:
+                            pending.append((inner, level + 1))
+                    elif "file" in item:
+                        found.append(
+                            {
+                                "id": item["id"],
+                                "name": name,
+                                "size": int(item.get("size") or 0),
+                                "path": inner,
+                                "web_url": item.get("webUrl"),
+                                "mime": (item.get("file") or {}).get("mimeType"),
+                                "modified": item.get("lastModifiedDateTime"),
+                            }
+                        )
+                # The next page's link carries its own query string.
+                url, params = payload.get("@odata.nextLink"), None
+        return found[:limit]
+
     async def download(self, item_id: str) -> bytes:
         """A file this app filed, read back — to attach it to a mail."""
         response = await self._http.get(

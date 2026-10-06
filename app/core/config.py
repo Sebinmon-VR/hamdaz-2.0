@@ -263,6 +263,23 @@ class Settings(BaseSettings):
     #: buy almost nothing on that. See app/proposals/mirror.py.
     embedding_model: str = "text-embedding-3-small"
 
+    # ── enquiry analysis ───────────────────────────────────────────────
+    #: The Claude model that reads a tender's documents and looks new items up
+    #: on the web, through ANTHROPIC_API_KEY (the user's choice, 2026-10-06,
+    #: after the OpenAI credit ran out). See app/enquiries/claude.py.
+    enquiry_model: str = "claude-opus-5-5"
+    #: How hard it thinks: low, medium, high. Medium is the model's default.
+    enquiry_effort: str = "medium"
+    #: Look new items up on the web during every analysis. The user asked for
+    #: it automatic (2026-10-05); it is the part of a run that costs the most.
+    enquiry_web_search: bool = True
+    #: At most this many new items are looked up per run, in batches.
+    enquiry_web_max_lines: int = 30
+    #: "Recently" means within this many months; older is "in our history".
+    enquiry_recent_months: int = 12
+    #: The task folder's subfolder the analysis reports are filed into.
+    enquiry_report_folder: str = "Enquiry analysis"
+
     @property
     def openai_configured(self) -> bool:
         return bool(self.openai_api_key)

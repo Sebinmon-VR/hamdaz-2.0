@@ -198,6 +198,21 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         ),
     ),
     ModuleSpec(
+        key="enquiry_analysis",
+        name="Enquiry Analysis",
+        description=(
+            "Read a pre-sales task's documents into the items it asks for, and "
+            "check each against our supplier quotes, our quotes and Zoho: seen "
+            "recently, in our history, or new — with suppliers, rates and a web "
+            "lookup for new items. Reports as PDF and Excel, filed in the task "
+            "folder. Shows past buy and sell rates, so granted like quote requests."
+        ),
+        pages=(
+            PageSpec("list", "Enquiry analyses", "/enquiries"),
+            PageSpec("detail", "Enquiry analysis", "/enquiries/[taskId]"),
+        ),
+    ),
+    ModuleSpec(
         key="assignment",
         name="Work Assignment",
         description=(

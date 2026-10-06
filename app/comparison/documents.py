@@ -126,12 +126,17 @@ def prepare(
     declared_type: str | None = None,
     *,
     force_native: bool = False,
+    ocr: bool = True,
 ) -> Readable:
     """Decide what shape this file takes, converting only if it must.
 
     ``force_native`` treats a PDF as a scan even when it has a text layer —
     the escape hatch for a quote whose text layer is garbage (some print
     drivers emit one glyph per word), so it goes through OCR instead.
+
+    ``ocr=False`` carries a scan as its bytes without trying the local engine,
+    for a caller that hands scans to a model able to see them (the enquiry
+    analysis) and would rather not spend half a minute a page first.
     """
     if not content:
         raise DocumentError(f"{file_name!r} is empty")
@@ -149,12 +154,12 @@ def prepare(
             return Readable("text", media_type, file_name, text=text, tables=tables)
         # No text layer. OCR if an engine is installed; otherwise the bytes are
         # carried so the extractor can say what this is and what to do instead.
-        if (read := _ocr(content, media_type)) is not None:
+        if ocr and (read := _ocr(content, media_type)) is not None:
             text, tables = read
             return Readable("text", media_type, file_name, text=text, tables=tables)
         return Readable("document", media_type, file_name, data=content)
     if media_type in IMAGE_TYPES:
-        if (read := _ocr(content, media_type)) is not None:
+        if ocr and (read := _ocr(content, media_type)) is not None:
             text, tables = read
             return Readable("text", media_type, file_name, text=text, tables=tables)
         return Readable("image", media_type, file_name, data=content)

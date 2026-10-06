@@ -23,11 +23,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.comparison import analysis as analysis_mod
 from app.comparison.analysis import Offer, Quote
-from app.comparison.extraction import QuoteExtractor
-from app.comparison.schemas import ComparisonIn, ItemIn, QuoteIn
+from app.comparison.extraction import ExtractedQuote, QuoteExtractor, blank_to_none, to_decimal
+from app.comparison.schemas import ChargeIn, ComparisonIn, ItemIn, QuoteIn
 from app.models.comparison import (
     ComparisonStatus,
     QuoteComparison,
+    QuoteSource,
     SupplierQuote,
     SupplierQuoteItem,
 )
@@ -133,6 +134,74 @@ async def compare(
 
 
 # ── storage ────────────────────────────────────────────────────────────
+
+
+def _amount(value) -> Decimal | None:
+    """A read amount, with 0 meaning "not on the document"."""
+    return to_decimal(blank_to_none(value))
+
+
+def _text(value: str | None, limit: int | None = None) -> str | None:
+    """A read string, with "" meaning "not on the document".
+
+    ``limit`` trims to what the field holds. Only the short ones pass it — a
+    part number, an incoterm — where an over-long value means a sentence was
+    read where a code belongs. Terms and delivery times are never trimmed:
+    cutting a condition off a quote changes what it says.
+    """
+    text = blank_to_none((value or "").strip())
+    if text is not None and limit is not None and len(text) > limit:
+        return text[:limit].rstrip()
+    return text
+
+
+def quote_in_from(result: ExtractedQuote, file_name: str, currency: str = "AED") -> QuoteIn:
+    """A read quotation as the posted shape, for a person to check or to store.
+
+    One conversion for every reader of supplier quotes: the comparison's own
+    upload and the enquiry analysis, which finds quotations among a task's
+    documents.
+    """
+    return QuoteIn(
+        supplier_name=(result.supplier_name or file_name)[:200],
+        quote_number=_text(result.quote_number, 100),
+        quote_date=_text(result.quote_date, 40),
+        # The quote's own currency; fx_rate stays 1 until a person sets it.
+        currency=(result.currency or currency or "AED").upper()[:3],
+        validity=_text(result.validity),
+        delivery_time=_text(result.delivery_time),
+        payment_terms=_text(result.payment_terms),
+        warranty=_text(result.warranty),
+        incoterms=_text(result.incoterms, 60),
+        contact=_text(result.contact, 200),
+        discount=_amount(result.discount),
+        freight=_amount(result.freight),
+        charges=[ChargeIn(**c.model_dump()) for c in result.charges],
+        detail_suggestions=result.details,
+        tax=_amount(result.tax),
+        quoted_total=_amount(result.quoted_total),
+        source=QuoteSource.UPLOAD,
+        file_name=file_name,
+        extraction_note=_text(result.note),
+        items=[
+            ItemIn(
+                description=item.description,
+                part_number=_text(item.part_number, 120),
+                brand=_text(item.brand, 120),
+                unit=_text(item.unit, 40),
+                quantity=_amount(item.quantity) or 0,
+                unit_price=_amount(item.unit_price) or 0,
+                line_total=_amount(item.line_total),
+                lead_time=_text(item.lead_time),
+            )
+            for item in result.items
+        ],
+    )
+
+
+def build_row(incoming: QuoteIn) -> SupplierQuote:
+    """A supplier quote row and its lines, not yet attached to a comparison."""
+    return _row(incoming)
 
 
 def _row(incoming: QuoteIn, documents: dict[str, tuple[str, bytes]] | None = None) -> SupplierQuote:

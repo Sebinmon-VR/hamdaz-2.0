@@ -50,19 +50,16 @@ from app.comparison.extraction import ExtractionError, QuoteExtractor
 from app.comparison.schemas import (
     AnalyseIn,
     AnalysisOut,
-    ChargeIn,
     ComparisonIn,
     ComparisonOut,
     ComparisonSummaryOut,
     ExtractionFailure,
     ExtractionOut,
-    ItemIn,
     QuoteIn,
 )
 from app.comparison.service import ComparisonError, ComparisonNotFoundError
 from app.core.config import Settings, get_settings
 from app.core.db import get_session
-from app.models.comparison import QuoteSource
 from app.roles.deps import CurrentRoles
 
 logger = logging.getLogger("hamdaz.comparison")
@@ -186,47 +183,7 @@ async def extract(
         if isinstance(result, ExtractionError):
             failed.append(ExtractionFailure(file_name=readable.file_name, error=str(result)))
             continue
-        quotes.append(
-            QuoteIn(
-                supplier_name=(result.supplier_name or readable.file_name)[:200],
-                # blank_to_none: the extraction schema uses "" and 0 to keep
-                # its decoding grammar simple, but a stored empty string reads
-                # as "the supplier said nothing" rather than "we did not find it".
-                quote_number=_txt(result.quote_number, 100),
-                quote_date=_txt(result.quote_date, 40),
-                # The quote's own currency; fx_rate stays 1 until a person sets
-                # it. No rate is fetched — see QuoteIn.fx_rate.
-                currency=(result.currency or currency or "AED").upper()[:3],
-                validity=_txt(result.validity),
-                delivery_time=_txt(result.delivery_time),
-                payment_terms=_txt(result.payment_terms),
-                warranty=_txt(result.warranty),
-                incoterms=_txt(result.incoterms, 60),
-                contact=_txt(result.contact, 200),
-                discount=_dec(result.discount),
-                freight=_dec(result.freight),
-                charges=[ChargeIn(**c.model_dump()) for c in result.charges],
-                detail_suggestions=result.details,
-                tax=_dec(result.tax),
-                quoted_total=_dec(result.quoted_total),
-                source=QuoteSource.UPLOAD,
-                file_name=readable.file_name,
-                extraction_note=_txt(result.note),
-                items=[
-                    ItemIn(
-                        description=item.description,
-                        part_number=_txt(item.part_number, 120),
-                        brand=_txt(item.brand, 120),
-                        unit=_txt(item.unit, 40),
-                        quantity=_dec(item.quantity) or 0,
-                        unit_price=_dec(item.unit_price) or 0,
-                        line_total=_dec(item.line_total),
-                        lead_time=_txt(item.lead_time),
-                    )
-                    for item in result.items
-                ],
-            )
-        )
+        quotes.append(service.quote_in_from(result, readable.file_name, currency))
 
     return ExtractionOut(
         # No model reads these any more; the field is kept for the callers
