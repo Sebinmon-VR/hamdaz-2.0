@@ -633,7 +633,7 @@ class Run:
                         )
                 except ZohoError as exc:
                     zoho_ok = False
-                    await self.warn(f"Zoho's purchase orders, bills and quotes could not be read: {exc}")
+                    await self.warn(f"Zoho's quotes could not be read: {exc}")
 
             lines.append(
                 EnquiryLine(

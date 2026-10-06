@@ -176,13 +176,13 @@ def test_suppliers_one_per_name_latest_first() -> None:
     history = [
         {"source": "supplier_quote", "supplier": "Acme LLC", "rate": "100", "currency": "AED", "date": "2025-01-01"},
         {"source": "supplier_quote", "supplier": "acme llc", "rate": "110", "currency": "AED", "date": "2026-01-01"},
-        {"source": "zoho_po", "counterparty": "Beta Trading", "currency": "USD", "date": "2024-06-01"},
+        # Zoho is not a supplier source: a quote's counterparty is our customer.
         {"source": "zoho_estimate", "counterparty": "A Customer", "date": "2026-02-01"},
     ]
     current = [(0.9, _known(supplier="This Enquiry Supplier", when=date(2026, 10, 1), current=True))]
     out = matching.suppliers_from(history, current)
     names = [s["name"] for s in out]
-    assert names == ["This Enquiry Supplier", "acme llc", "Beta Trading"]
+    assert names == ["This Enquiry Supplier", "acme llc"]
     assert out[1]["last_rate"] == "110"
     assert all(s["partner"] is None for s in out)
 

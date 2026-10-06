@@ -6,7 +6,12 @@ this company has already handled:
 * **supplier quote lines** — what suppliers offered us, at what price;
 * **quote request lines** — what we quoted customers, at what price and cost;
 * **Zoho Books** — the items catalogue (its sale and purchase rates), and the
-  purchase orders, bills and quotes that name a matching item.
+  quotes we sent that carry a matching item.
+
+Zoho is not asked who supplies anything. Its items name no vendor, and the
+user ruled out its purchase orders and bills as a supplier source (2026-10-07):
+suppliers come from our supplier quotes, the web, and — when it exists — the
+supplier library.
 
 Matching is by part number first (the same code, once punctuation and case are
 gone) and then by the words of the description, weighted towards how much of
@@ -313,16 +318,15 @@ def _dec(value: Any) -> Decimal | None:
     return number if number.is_finite() and number != 0 else None
 
 
-#: Which Zoho documents name an item, and how each is described.
+#: Which Zoho documents to look an item up in, and how each is described:
+#: our quotes to customers only — see the module note on suppliers.
 _ZOHO_DOCS: Final = (
-    ("purchaseorders", "zoho_po", "purchaseorder_number", "vendor_name"),
-    ("bills", "zoho_bill", "bill_number", "vendor_name"),
     ("estimates", "zoho_estimate", "estimate_number", "customer_name"),
 )
 
 
 async def zoho_documents(zoho: Any, item_id: str) -> list[dict[str, Any]]:
-    """The latest purchase orders, bills and quotes that carry a Zoho item."""
+    """The latest quotes we sent in Zoho that carry a Zoho item."""
     from app.zoho.catalogue import BY_KEY
 
     out: list[dict[str, Any]] = []
@@ -414,6 +418,4 @@ def suppliers_from(history: list[dict[str, Any]], current: list[tuple[float, Kno
             add(h.get("supplier"), "supplier_quote", h.get("rate"), h.get("currency"), h.get("date"))
         elif h["source"] == "quote_request":
             add(h.get("supplier"), "quote_request", h.get("cost_rate"), h.get("currency"), h.get("date"))
-        elif h["source"] in ("zoho_po", "zoho_bill"):
-            add(h.get("counterparty"), h["source"], None, h.get("currency"), h.get("date"))
     return sorted(found.values(), key=lambda e: e.get("last_date") or "", reverse=True)
