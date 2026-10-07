@@ -20,6 +20,7 @@ from app.ariba.worker import AribaWorker
 from app.assignment.router import router as assignment_router
 from app.assistant.agent import Assistant
 from app.assistant.cache import ActorCache, ConfigCache, PlacesCache
+from app.assistant.claude_chat import ClaudeChat, ModelRouter
 from app.assistant.executor import ToolExecutor
 from app.assistant.llm import OpenAIChat
 from app.assistant.router import admin_router as assistant_admin_router
@@ -48,6 +49,11 @@ from app.bcd.mailer import BcdMailer
 from app.bcd.router import router as bcd_router
 from app.bcd.worker import BcdWorker
 from app.taskcalendar.graph import TaskCalendar
+from app.msteams.bridge import AppCaller
+from app.msteams.graph import EmployeeGraph
+from app.msteams.router import admin_router as employee_accounts_router
+from app.msteams.router import callback_router as teams_callback_router
+from app.msteams.worker import TeamsWorker
 from app.taskcalendar.router import router as task_calendar_router
 from app.taskcalendar.worker import TaskCalendarWorker
 from app.forms.router import router as templates_router
@@ -169,7 +175,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     #: report briefer makes a single call with it. Shared so an OpenAI key, a
     #: base URL or a timeout is configured once and means the same thing to
     #: both, rather than two clients that drift apart on the third setting.
-    openai = OpenAIChat(settings)
+    #: Claude for a ``claude-*`` model key, OpenAI otherwise — chosen per call
+    #: by the model the super admin picked. See app/assistant/claude_chat.py.
+    openai = ModelRouter(OpenAIChat(settings), ClaudeChat(settings))
     # Held on the state as well: the workflow steps that ask the model reach
     # it here, so a flow and a chat use the same client and the same key.
     app.state.openai = openai
@@ -269,6 +277,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         calendar=app.state.task_calendar,
     )
     app.state.task_calendar_worker.start()
+    # AI employees in Teams: each connected employee's chats, read and answered
+    # as its own account through Graph. Off unless AI_TEAMS_ENABLED is set —
+    # see app/msteams.
+    app.state.employee_graph = EmployeeGraph(settings, http)
+    app.state.teams_worker = TeamsWorker(
+        factory=get_session_factory(),
+        settings=settings,
+        graph=app.state.employee_graph,
+        caller=AppCaller(app, settings),
+    )
+    app.state.teams_worker.start()
     # Reads the open tenders from the Ariba supplier portal — only when a new
     # tender reaches the Proposals mirror, and within a gap and a daily cap.
     # Off unless ARIBA_ENABLED is set. With ARIBA_FIX_BCD it also corrects the
@@ -293,6 +312,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await app.state.reminder_worker.stop()
         await app.state.bcd_worker.stop()
         await app.state.task_calendar_worker.stop()
+        await app.state.teams_worker.stop()
         await app.state.ariba_worker.stop()
         await http.aclose()
         await dispose_engine()
@@ -377,6 +397,8 @@ def create_app() -> FastAPI:
     app.include_router(reports_router, prefix=settings.api_prefix)
     app.include_router(assistant_router, prefix=settings.api_prefix)
     app.include_router(assistant_admin_router, prefix=settings.api_prefix)
+    app.include_router(employee_accounts_router, prefix=settings.api_prefix)
+    app.include_router(teams_callback_router, prefix=settings.api_prefix)
     app.include_router(workflows_admin_router, prefix=settings.api_prefix)
     app.include_router(workflows_router, prefix=settings.api_prefix)
 

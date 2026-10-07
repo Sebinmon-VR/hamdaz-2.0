@@ -68,6 +68,114 @@ class PlaceOut(BaseModel):
 
 class ConversationIn(BaseModel):
     title: str | None = Field(default=None, max_length=200)
+    #: Start the chat with an AI employee rather than the assistant itself.
+    employee_id: uuid.UUID | None = None
+
+
+# ── AI employees ───────────────────────────────────────────────────────
+
+
+class EmployeeCardOut(BaseModel):
+    """An AI employee as the people who may talk to it see it."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    name: str
+    title: str
+    description: str
+    greeting: str | None
+    color: str
+
+
+class EmployeeIn(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    title: str = Field(min_length=1, max_length=120)
+    description: str = Field(default="", max_length=4000)
+    instructions: str = Field(default="", max_length=12000)
+    greeting: str | None = Field(default=None, max_length=1000)
+    color: str = Field(default="#0e5e80", pattern=r"^#[0-9a-fA-F]{6}$")
+    model_key: str | None = Field(default=None, max_length=64)
+    reasoning_effort: str | None = Field(default=None, pattern="^(low|medium|high)$")
+    allowed_modules: list[str] = Field(default_factory=list, max_length=60)
+    write_mode: str = Field(default="read_only", pattern="^(read_only|confirm|policy)$")
+    audience_roles: list[str] = Field(default_factory=list, max_length=20)
+    monthly_budget_usd: Decimal | None = Field(default=None, ge=0, le=100000)
+    #: Its own Microsoft 365 account, for Teams (and later Outlook).
+    ms_account_email: str | None = Field(default=None, max_length=320)
+    #: Answer Teams chats as that account, once it is connected.
+    teams_enabled: bool = False
+    enabled: bool = True
+    sort_order: int = 0
+
+
+class EmployeeOut(EmployeeIn):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    created_at: datetime
+    updated_at: datetime
+    #: What its conversations have cost since the first of the month.
+    month_spend_usd: Decimal = Decimal(0)
+    #: Its Microsoft 365 account: not_connected, connected or needs_reconnect.
+    account_status: str = "not_connected"
+    account_email: str | None = None
+    account_error: str | None = None
+    account_last_poll_at: datetime | None = None
+    #: What it did with the latest Teams messages, newest first.
+    account_activity: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class EmployeeChatOut(BaseModel):
+    """One conversation with an AI employee, for its history page."""
+
+    id: uuid.UUID
+    title: str | None
+    #: teams or app — where the person was talking from.
+    channel: str
+    created_at: datetime
+    last_message_at: datetime | None
+    messages: int
+
+
+class EmployeePersonOut(BaseModel):
+    """Somebody who has talked to an AI employee, and their conversations."""
+
+    user_id: uuid.UUID
+    name: str
+    email: str
+    conversations: list[EmployeeChatOut]
+    messages: int
+    last_message_at: datetime | None
+
+
+class EmployeeHistoryOut(BaseModel):
+    employee_id: uuid.UUID
+    name: str
+    people: list[EmployeePersonOut]
+
+
+class EmployeeMessageOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    seq: int
+    role: str
+    content: str
+    created_at: datetime
+
+
+class EmployeeOptionOut(BaseModel):
+    key: str
+    name: str
+
+
+class EmployeeOptionsOut(BaseModel):
+    """What the employee form offers to choose from."""
+
+    modules: list[EmployeeOptionOut]
+    models: list[EmployeeOptionOut]
+    roles: list[EmployeeOptionOut]
+    assistant_model: str
 
 
 class ConversationOut(BaseModel):

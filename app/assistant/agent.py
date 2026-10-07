@@ -155,6 +155,13 @@ class Assistant:
         self._factory = factory
         #: Background turns, held so they are not garbage collected mid-flight.
         self._tasks: set[asyncio.Task[None]] = set()
+        #: The runs this process is driving right now. A run marked running in
+        #: the database but absent here was cut off — the server restarted under
+        #: it — and would otherwise block its conversation for good.
+        self._live: set[uuid.UUID] = set()
+
+    def is_live(self, run_id: uuid.UUID) -> bool:
+        return run_id in self._live
 
     # ── entry points ───────────────────────────────────────────────────
 
@@ -223,6 +230,7 @@ class Assistant:
         client_results: list[dict[str, Any]] | None = None,
     ) -> None:
         emit = queue.put_nowait
+        self._live.add(run_id)
         try:
             await self._loop(run_id, ctx, emit, resume=resume, client_results=client_results)
         except Exception as exc:  # noqa: BLE001 - the run must be closed whatever happened
@@ -242,6 +250,7 @@ class Assistant:
             emit(_sse("error", {"run_id": str(run_id), "message": message}))
             emit(_sse("done", {"run_id": str(run_id), "status": RunStatus.FAILED}))
         finally:
+            self._live.discard(run_id)
             emit(_END)
 
     async def _loop(

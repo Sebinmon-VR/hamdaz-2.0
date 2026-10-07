@@ -862,7 +862,8 @@ async def admission_for(
 #: reports page opens a chat on one report. Validated here rather than on the
 #: model so an unknown kind is refused where somebody can be told about it,
 #: and so adding "project" later is one entry rather than a migration.
-SUBJECT_KINDS: Final[frozenset[str]] = frozenset({"report"})
+#: "employee": a chat with an AI employee — see app/assistant/employees.py.
+SUBJECT_KINDS: Final[frozenset[str]] = frozenset({"report", "employee"})
 
 
 async def create_conversation(

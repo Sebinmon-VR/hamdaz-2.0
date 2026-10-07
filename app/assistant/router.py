@@ -66,6 +66,7 @@ from app.assistant.records import (
     match,
     rows_of,
 )
+from app.assistant import employees
 from app.assistant.policy import may_delete, resolve_tools
 from app.assistant.schemas import (
     PlaceOut,
@@ -79,6 +80,15 @@ from app.assistant.schemas import (
     ConversationDetailOut,
     ConversationIn,
     ConversationOut,
+    EmployeeCardOut,
+    EmployeeChatOut,
+    EmployeeHistoryOut,
+    EmployeeIn,
+    EmployeeMessageOut,
+    EmployeePersonOut,
+    EmployeeOptionOut,
+    EmployeeOptionsOut,
+    EmployeeOut,
     MessageOut,
     ModelIn,
     ModelOut,
@@ -116,6 +126,7 @@ from app.assistant.service import (
 from app.auth.deps import CurrentUser
 from app.core.config import Settings, get_settings
 from app.core.db import get_session
+from app.models.ai_employee import AIEmployee
 from app.models.assistant import AssistantRun, EventKind, RunStatus
 from app.models.team import Team, slugify
 from app.models.user import User
@@ -166,6 +177,9 @@ def get_assistant(request: Request) -> Assistant:
 
 
 Agent = Annotated[Assistant, Depends(get_assistant)]
+
+#: A run this old that nothing in this process is driving was cut off by a restart.
+ORPHAN_AFTER_SECONDS = 90
 
 
 def get_places_cache(request: Request) -> PlacesCache:
@@ -450,8 +464,45 @@ async def create_conversation(
     admission = await service.admission_for(session, snapshot, actor)
     if not admission.admitted:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=admission.reason)
+    if body.employee_id is not None:
+        try:
+            employee = await employees.check(
+                session, await session.get(AIEmployee, body.employee_id), actor
+            )
+        except employees.EmployeeError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        conversation = await service.create_conversation(
+            session,
+            user=user,
+            title=body.title or f"Chat with {employee.name}",
+            subject_kind=employees.SUBJECT_KIND,
+            subject_id=employee.id,
+            subject_label=f"{employee.name} · {employee.title}",
+        )
+        return ConversationOut.model_validate(conversation)
     conversation = await service.create_conversation(session, user=user, title=body.title)
     return ConversationOut.model_validate(conversation)
+
+
+@router.get(
+    "/employees",
+    response_model=list[EmployeeCardOut],
+    summary="The AI employees I may talk to",
+)
+async def my_employees(
+    user: CurrentUser,
+    session: Session,
+    actor_cache: ActorCached,
+) -> list[EmployeeCardOut]:
+    actor = await cached_actor(session, actor_cache, user)
+    rows = (
+        await session.scalars(
+            select(AIEmployee)
+            .where(AIEmployee.enabled.is_(True))
+            .order_by(AIEmployee.sort_order, AIEmployee.name)
+        )
+    ).all()
+    return [EmployeeCardOut.model_validate(e) for e in rows if employees.may_talk(e, actor)]
 
 
 @router.get("/conversations", response_model=list[ConversationOut], summary="My chats")
@@ -555,6 +606,15 @@ async def _prepare(
     admission = await service.admission_for(session, snapshot, actor)
     if not admission.admitted:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=admission.reason)
+    employee: AIEmployee | None = None
+    if conversation is not None and conversation.subject_kind == employees.SUBJECT_KIND:
+        try:
+            employee = await employees.check(
+                session, await session.get(AIEmployee, conversation.subject_id), actor
+            )
+        except employees.EmployeeError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        snapshot = await employees.apply(session, snapshot, employee)
     if snapshot.model is None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -563,24 +623,30 @@ async def _prepare(
                 "not in its model list. A super admin needs to pick another."
             ),
         )
-    if not settings.openai_configured:
+    model_key = snapshot.settings.model_key
+    if not request.app.state.openai.configured_for(model_key):
+        provider = "ANTHROPIC_API_KEY" if model_key.startswith("claude-") else "OPENAI_API_KEY"
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
-                "The assistant has no OpenAI API key configured. Ask a super admin "
-                "to set OPENAI_API_KEY."
+                f"The assistant is set to {model_key}, and no {provider} is configured. "
+                "Ask a super admin to set it, or to pick another model."
             ),
         )
     tools = resolve_tools(
         snapshot.settings, snapshot.module_policies, snapshot.tool_policies, actor
     )
+    subject = _subject_note(conversation)
+    if employee is not None:
+        tools = employees.narrow_tools(tools, employee)
+        subject = employees.persona(employee)
     context = TurnContext(
         user=user,
         actor=actor,
         session_cookie=_session_cookie(request, settings),
         snapshot=snapshot,
         tools=tools,
-        subject=_subject_note(conversation),
+        subject=subject,
         where=await _where(request, session, user, page, screen),
     )
     return snapshot, context
@@ -773,6 +839,19 @@ async def send_message(
         raise _translate(exc) from exc
 
     open_run = await service.open_run_for(session, conversation.id)
+    if (
+        open_run is not None
+        and open_run.status == RunStatus.RUNNING
+        and not agent.is_live(open_run.id)
+        and open_run.started_at < datetime.now(UTC) - timedelta(seconds=ORPHAN_AFTER_SECONDS)
+    ):
+        # Marked running, but nothing in this process is running it: the server
+        # restarted mid-turn. Close it so the conversation can carry on.
+        open_run.status = RunStatus.FAILED
+        open_run.error = "Interrupted: the server restarted while this was being answered."
+        open_run.finished_at = datetime.now(UTC)
+        await session.commit()
+        open_run = None
     if open_run is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -1360,6 +1439,189 @@ async def update_settings(
         raise _translate(exc) from exc
     _forget(request)
     return _settings_out(row, settings)
+
+
+# ── AI employees ───────────────────────────────────────────────────────
+
+
+async def _employee_out(session: AsyncSession, row: AIEmployee) -> EmployeeOut:
+    from app.models.teams_chat import AIEmployeeAccount
+
+    out = EmployeeOut.model_validate(row)
+    out.month_spend_usd = await employees.month_spend(session, row.id)
+    account = await session.get(AIEmployeeAccount, row.id)
+    if account is not None:
+        out.account_status = account.status
+        out.account_email = account.email
+        out.account_error = account.error
+        out.account_last_poll_at = account.last_poll_at
+        out.account_activity = list(reversed(account.activity or []))[:30]
+    return out
+
+
+@admin_router.get("/employees", response_model=list[EmployeeOut], summary="AI employees")
+async def list_employees(admin: SuperAdmin, session: Session) -> list[EmployeeOut]:
+    rows = (await session.scalars(select(AIEmployee).order_by(AIEmployee.sort_order, AIEmployee.name))).all()
+    return [await _employee_out(session, row) for row in rows]
+
+
+@admin_router.get(
+    "/employees/options", response_model=EmployeeOptionsOut, summary="What an AI employee can be given"
+)
+async def employee_options(admin: SuperAdmin, session: Session) -> EmployeeOptionsOut:
+    from app.assistant.catalogue import GROUPS
+    from app.roles.catalogue import SYSTEM_ROLES, RoleScope
+
+    current = await service.get_settings(session)
+    return EmployeeOptionsOut(
+        modules=[EmployeeOptionOut(key=g.key, name=g.name) for g in GROUPS if g.key not in employees.ALWAYS_MODULES],
+        models=[
+            EmployeeOptionOut(key=m.key, name=m.name)
+            for m in await service.list_models(session)
+            if m.enabled
+        ],
+        roles=[EmployeeOptionOut(key=r.key, name=r.name) for r in SYSTEM_ROLES if r.scope == RoleScope.GLOBAL],
+        assistant_model=current.model_key,
+    )
+
+
+def _apply_employee(row: AIEmployee, body: EmployeeIn, admin: User) -> None:
+    for field, value in body.model_dump().items():
+        if isinstance(value, str) and field in ("model_key", "greeting", "reasoning_effort", "ms_account_email"):
+            value = value.strip() or None
+        setattr(row, field, value)
+    row.updated_by_id = admin.id
+
+
+@admin_router.post(
+    "/employees", response_model=EmployeeOut, status_code=status.HTTP_201_CREATED, summary="Create an AI employee"
+)
+async def create_employee(body: EmployeeIn, admin: SuperAdmin, session: Session) -> EmployeeOut:
+    row = AIEmployee(created_by_id=admin.id)
+    _apply_employee(row, body, admin)
+    session.add(row)
+    await session.flush()
+    await session.refresh(row)
+    await session.commit()
+    return await _employee_out(session, row)
+
+
+@admin_router.put("/employees/{employee_id}", response_model=EmployeeOut, summary="Change an AI employee")
+async def update_employee(
+    employee_id: uuid.UUID, body: EmployeeIn, admin: SuperAdmin, session: Session
+) -> EmployeeOut:
+    row = await session.get(AIEmployee, employee_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such AI employee.")
+    _apply_employee(row, body, admin)
+    await session.flush()
+    await session.refresh(row)
+    await session.commit()
+    return await _employee_out(session, row)
+
+
+@admin_router.get(
+    "/employees/{employee_id}/history",
+    response_model=EmployeeHistoryOut,
+    summary="Everyone who has talked to an AI employee",
+)
+async def employee_history(employee_id: uuid.UUID, admin: SuperAdmin, session: Session) -> EmployeeHistoryOut:
+    """Its conversations, grouped by the person, most recently active first.
+
+    Super admin only, like the assistant's own run log: these are other
+    people's chats, kept for oversight of what the employee says.
+    """
+    from sqlalchemy import func
+
+    from app.models.assistant import AssistantConversation, AssistantMessage
+    from app.models.teams_chat import TeamsChat
+
+    employee = await session.get(AIEmployee, employee_id)
+    if employee is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such AI employee.")
+    counts = (
+        select(AssistantMessage.conversation_id, func.count().label("n"))
+        .group_by(AssistantMessage.conversation_id)
+        .subquery()
+    )
+    rows = (
+        await session.execute(
+            select(AssistantConversation, User, func.coalesce(counts.c.n, 0))
+            .join(User, User.id == AssistantConversation.user_id)
+            .outerjoin(counts, counts.c.conversation_id == AssistantConversation.id)
+            .where(
+                AssistantConversation.subject_kind == employees.SUBJECT_KIND,
+                AssistantConversation.subject_id == employee.id,
+            )
+        )
+    ).all()
+    teams_ids = set(
+        (
+            await session.scalars(
+                select(TeamsChat.assistant_conversation_id).where(
+                    TeamsChat.employee_id == employee.id, TeamsChat.assistant_conversation_id.is_not(None)
+                )
+            )
+        ).all()
+    )
+    people: dict[uuid.UUID, EmployeePersonOut] = {}
+    for conversation, user, n in rows:
+        person = people.get(user.id)
+        if person is None:
+            person = people[user.id] = EmployeePersonOut(
+                user_id=user.id, name=user.display_name, email=user.email,
+                conversations=[], messages=0, last_message_at=None,
+            )
+        last = conversation.last_message_at or conversation.created_at
+        person.conversations.append(
+            EmployeeChatOut(
+                id=conversation.id,
+                title=conversation.title,
+                channel="teams" if conversation.id in teams_ids else "app",
+                created_at=conversation.created_at,
+                last_message_at=conversation.last_message_at,
+                messages=int(n),
+            )
+        )
+        person.messages += int(n)
+        if person.last_message_at is None or last > person.last_message_at:
+            person.last_message_at = last
+    for person in people.values():
+        person.conversations.sort(key=lambda c: c.last_message_at or c.created_at, reverse=True)
+    ordered = sorted(people.values(), key=lambda p: p.last_message_at or datetime.min.replace(tzinfo=UTC), reverse=True)
+    return EmployeeHistoryOut(employee_id=employee.id, name=employee.name, people=ordered)
+
+
+@admin_router.get(
+    "/employees/{employee_id}/history/{conversation_id}",
+    response_model=list[EmployeeMessageOut],
+    summary="One conversation with an AI employee",
+)
+async def employee_conversation(
+    employee_id: uuid.UUID, conversation_id: uuid.UUID, admin: SuperAdmin, session: Session
+) -> list[EmployeeMessageOut]:
+    from app.models.assistant import AssistantConversation
+
+    conversation = await session.get(AssistantConversation, conversation_id)
+    if (
+        conversation is None
+        or conversation.subject_kind != employees.SUBJECT_KIND
+        or conversation.subject_id != employee_id
+    ):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such conversation with this employee.")
+    return [EmployeeMessageOut.model_validate(m) for m in await service.list_messages(session, conversation_id)]
+
+
+@admin_router.delete(
+    "/employees/{employee_id}", status_code=status.HTTP_204_NO_CONTENT, summary="Remove an AI employee"
+)
+async def delete_employee(employee_id: uuid.UUID, admin: SuperAdmin, session: Session) -> None:
+    """Its past conversations stay, as the assistant's, for the record."""
+    row = await session.get(AIEmployee, employee_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such AI employee.")
+    await session.delete(row)
+    await session.commit()
 
 
 @admin_router.get("/models", response_model=list[ModelOut], summary="Models to choose from")

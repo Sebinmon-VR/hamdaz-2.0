@@ -85,6 +85,8 @@ from app.models.status_reminder import ReminderStatus, StatusReminder, StatusRem
 from app.models.bcd_check import BcdCheck, BcdCheckSettings, BcdCheckStatus
 from app.models.task_calendar import TaskCalendarEvent, TaskCalendarSettings
 from app.models.enquiry import EnquiryAnalysis, EnquiryDocument, EnquiryLine
+from app.models.ai_employee import AIEmployee
+from app.models.teams_chat import AIEmployeeAccount, TeamsChat
 from app.models.hr import (
     CLOSED_STAGES,
     ApplicationFile,
@@ -225,6 +227,9 @@ __all__ = [
     "EnquiryAnalysis",
     "EnquiryDocument",
     "EnquiryLine",
+    "AIEmployee",
+    "TeamsChat",
+    "AIEmployeeAccount",
     "TaskCalendarSettings",
     "FormTemplate",
     "JobApplication",

@@ -39,7 +39,7 @@ def init_engine(settings: Settings | None = None) -> AsyncEngine:
         # old enough that Azure's gateway might cut it at any moment — which is
         # the case pre_ping cannot catch, because the cut lands between the
         # check and the query.
-        pool_pre_ping=True,
+        pool_pre_ping=settings.db_pool_pre_ping,
         pool_recycle=settings.db_pool_recycle_seconds,
         pool_size=5,
         max_overflow=10,

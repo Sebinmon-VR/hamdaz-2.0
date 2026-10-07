@@ -97,6 +97,32 @@ def _m(
 
 
 MODELS: Final[tuple[ModelSpec, ...]] = (
+    # ── Anthropic Claude, through ANTHROPIC_API_KEY ────────────────────
+    # Answered by app/assistant/claude_chat.py, which speaks the loop's
+    # OpenAI-shaped events. Deferred tools stay deferred behind Claude's own
+    # tool search. Cached price is Claude's cache read.
+    _m(
+        "claude-opus-5-5",
+        "Claude Opus 5.5",
+        "Anthropic's current Opus: the most careful with tools and long "
+        "documents. Reads scans and PDFs directly.",
+        "4.00", "0.20", "20.00",
+    ),
+    _m(
+        "claude-sonnet-5-5",
+        "Claude Sonnet 5.5",
+        "Anthropic's current Sonnet: half the price of Opus and quicker to "
+        "start answering, which matters when the answer is spoken.",
+        "2.00", "0.20", "10.00",
+    ),
+    _m(
+        "claude-haiku-4-5",
+        "Claude Haiku 4.5",
+        "Anthropic's small, fast model. Cheapest Claude; weaker at choosing "
+        "among many tools.",
+        "1.00", "0.10", "5.00",
+    ),
+    # ── OpenAI ─────────────────────────────────────────────────────────
     _m(
         "gpt-5.6-sol",
         "GPT-5.6 Sol",

@@ -42,6 +42,12 @@ class Settings(BaseSettings):
     #: did nothing wrong. Azure's gateway cuts idle connections at around five
     #: minutes, so this stays comfortably under it.
     db_pool_recycle_seconds: int = 240
+    #: Test each pooled connection before handing it out. Safe, but one extra
+    #: round trip per session — about a quarter of a second from a machine far
+    #: from the database, several times per assistant turn. Off trades that for
+    #: the rare request that meets a connection the network cut while idle
+    #: (``db_pool_recycle_seconds`` retires most of those first).
+    db_pool_pre_ping: bool = True
 
     # ── Entra ID (Microsoft) ───────────────────────────────────────────
     azure_tenant_id: str = ""
@@ -270,6 +276,34 @@ class Settings(BaseSettings):
     enquiry_model: str = "claude-opus-5-5"
     #: How hard it thinks: low, medium, high. Medium is the model's default.
     enquiry_effort: str = "medium"
+
+    # ── AI employees in Teams and Outlook (their own Microsoft 365 accounts) ─
+    #: The loop that reads each connected AI employee's Teams chats and answers
+    #: as them, through Graph. Off until a super admin has connected an
+    #: account and wants it answering. See app/msteams.
+    ai_teams_enabled: bool = False
+    #: How often each connected AI employee's chats are checked.
+    ai_teams_poll_seconds: int = 3
+    #: **Test lock.** Comma-separated app emails. When set, an AI employee
+    #: READS AND ANSWERS ONLY its one-to-one chat with each of these people —
+    #: no other chat is listed, previewed or opened, and nothing is sent
+    #: anywhere else. For trials on a real person's account (2026-10-06: Sebin's
+    #: account playing Luna, Krishnendu the only sender). Blank answers everyone.
+    ai_teams_test_senders: str = ""
+
+    @property
+    def ai_teams_test_list(self) -> frozenset[str]:
+        return frozenset(e.strip().lower() for e in self.ai_teams_test_senders.split(",") if e.strip())
+
+    @property
+    def ai_connect_redirect_uri(self) -> str:
+        """Where Microsoft returns after an AI employee's account is connected.
+
+        Beside the login callback, so it lives on the same host: register it
+        on the app registration as a Web redirect URI too.
+        """
+        base = self.azure_redirect_uri.rsplit("/auth/callback", 1)[0]
+        return f"{base}/ai-employees/oauth/callback"
     #: Look new items up on the web during every analysis. The user asked for
     #: it automatic (2026-10-05); it is the part of a run that costs the most.
     enquiry_web_search: bool = True
