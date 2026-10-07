@@ -107,6 +107,7 @@ from app.models.labels import Label, LabelAssignment, LabelKind, LabelSource
 from app.models.leave import LeaveRequest, LeaveSettings, LeaveStatus, LeaveType
 from app.models.quoting import (
     CommentTarget,
+    QuoteAICall,
     QuoteApprovalSettings,
     QuoteComment,
     QuoteRequest,
@@ -246,6 +247,7 @@ __all__ = [
     "ModulePage",
     "OpeningStatus",
     "PerformanceReview",
+    "QuoteAICall",
     "QuoteApprovalSettings",
     "QuoteComment",
     "QuoteComparison",

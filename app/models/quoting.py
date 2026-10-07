@@ -1113,3 +1113,48 @@ class QuoteApprovalSettings(Base, Timestamped):
     updated_by_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )
+
+
+class QuoteAICall(Base, UUIDPrimaryKey, Timestamped):
+    """One call to a text model made while reading this quote's documents.
+
+    Kept per call, not per document, because that is how it is billed: a free
+    tier that answers badly and Claude asked after it are two calls, and the
+    first was paid for in tokens even though its answer was thrown away.
+    Shown on the quote, so the person looking at it knows which model read
+    which file and what that cost.
+    """
+
+    __tablename__ = "quote_ai_calls"
+    __table_args__ = (Index("ix_quote_ai_calls_request", "request_id", "created_at"),)
+
+    request_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("quote_requests.id", ondelete="CASCADE"), nullable=False
+    )
+    #: Who uploaded the document that caused the call.
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    #: supplier_quote or document — which reader asked.
+    purpose: Mapped[str] = mapped_column(String(40), nullable=False)
+    #: What was being read: "Supplier quote · Hamdaz-Wolfvision Quote.pdf".
+    label: Mapped[str | None] = mapped_column(Text)
+    #: anthropic, groq, cerebras, openrouter, ollama.
+    provider: Mapped[str] = mapped_column(String(40), nullable=False)
+    model: Mapped[str] = mapped_column(String(120), nullable=False)
+    input_tokens: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+    output_tokens: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+    #: USD, at the provider's list price when the call was made; 0 on a free tier.
+    cost_usd: Mapped[Decimal] = mapped_column(
+        Numeric(12, 6), default=Decimal(0), server_default=text("0"), nullable=False
+    )
+    #: False when the answer was unusable and the next provider was asked.
+    used: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=text("true"), nullable=False
+    )
+
+    user: Mapped[User | None] = relationship(lazy="joined")

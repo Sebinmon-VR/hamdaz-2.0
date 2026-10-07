@@ -36,7 +36,7 @@ import asyncio
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Annotated, Any, Literal
 
@@ -65,12 +65,13 @@ from app.comparison.router import _dec, _txt
 from app.comparison.schemas import ChargeIn, ComparisonIn
 from app.comparison.schemas import ItemIn as SupplierItemIn
 from app.comparison.schemas import QuoteIn as SupplierQuoteIn
+from app.core import llm
 from app.core.config import get_settings
 from app.core.db import get_session
 from app.core.mail import MailError
 from app.intake.graph_mail import MailReader
 from app.models.comparison import QuoteSource, SupplierQuoteItem
-from app.models.quoting import DocumentKind, QuoteRequest, QuoteStatus
+from app.models.quoting import DocumentKind, QuoteAICall, QuoteRequest, QuoteStatus
 from app.models.team import Team
 from app.models.user import User
 from app.proposals import mirror
@@ -84,6 +85,9 @@ from app.quoting.fx import FxUnavailableError, zoho_rate
 from app.quoting.mailer import QuoteMailer
 from app.quoting.probability import WinRates
 from app.quoting.schemas import (
+    AICallOut,
+    AIModelTotalOut,
+    AIUsageOut,
     ApplySuggestionsIn,
     ApprovalRecipientsOut,
     ApprovalSettingsIn,
@@ -527,6 +531,82 @@ async def fx_rate(
             detail="Could not read Zoho Books' currency table.",
         ) from exc
     return FxQuoteOut.model_validate(found)
+
+
+#: The most calls the admin list carries. The totals count every call.
+AI_USAGE_LIMIT = 500
+
+
+@router.get(
+    "/admin/ai-usage",
+    response_model=AIUsageOut,
+    summary="Which models read quote documents, and what that cost (super admin)",
+)
+async def ai_usage(
+    _: CurrentUser,
+    roles: CurrentRoles,
+    session: Session,
+    days: Annotated[
+        int, Query(ge=0, le=3650, description="The last N days; 0 for all time")
+    ] = 30,
+) -> AIUsageOut:
+    """Every call to a text model made while reading supplier quotes and
+    documents on quote requests, newest first, with the quote it was for.
+
+    Super admin only: what the company spends on models is not a question for
+    whoever happens to be raising a quote. Free tiers cost nothing; Claude is
+    priced at its list price when the call was made. A document the built-in
+    readers settled on their own made no call and is not listed.
+    """
+    if SUPER_ADMIN not in set(roles):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Super admin only.")
+    since = (datetime.now(UTC) - timedelta(days=days - 1)).date() if days else None
+    query = (
+        select(QuoteAICall, QuoteRequest.title, QuoteRequest.reference)
+        .join(QuoteRequest, QuoteRequest.id == QuoteAICall.request_id)
+        .order_by(QuoteAICall.created_at.desc())
+    )
+    if since is not None:
+        query = query.where(
+            QuoteAICall.created_at >= datetime.combine(since, datetime.min.time(), tzinfo=UTC)
+        )
+    rows = (await session.execute(query)).all()
+
+    calls = []
+    for call, title, reference in rows[:AI_USAGE_LIMIT]:
+        out = AICallOut.model_validate(call)
+        out.quote_title = title
+        out.quote_reference = reference
+        out.user_name = call.user.display_name if call.user else None
+        calls.append(out)
+
+    by_model: dict[tuple[str, str], AIModelTotalOut] = {}
+    for call, _title, _reference in rows:
+        key = (call.provider, call.model)
+        total = by_model.setdefault(
+            key,
+            AIModelTotalOut(
+                provider=call.provider, model=call.model, calls=0,
+                input_tokens=0, output_tokens=0, cost_usd=Decimal(0),
+            ),
+        )
+        total.calls += 1
+        total.input_tokens += call.input_tokens
+        total.output_tokens += call.output_tokens
+        total.cost_usd += call.cost_usd
+
+    every = [call for call, _t, _r in rows]
+    return AIUsageOut(
+        since=since,
+        truncated=len(rows) > AI_USAGE_LIMIT,
+        calls=calls,
+        by_model=sorted(by_model.values(), key=lambda m: (-m.cost_usd, -m.calls)),
+        total_cost_usd=sum((c.cost_usd for c in every), Decimal(0)),
+        input_tokens=sum(c.input_tokens for c in every),
+        output_tokens=sum(c.output_tokens for c in every),
+        paid_calls=sum(1 for c in every if c.provider == "anthropic"),
+        free_calls=sum(1 for c in every if c.provider != "anthropic"),
+    )
 
 
 @router.get(
@@ -1185,8 +1265,12 @@ async def attach_suppliers(
         except DocumentError as exc:
             failures.append(f"{name}: {exc}")
 
+    with llm.capture() as calls:
+        results = await extractor.read_all(readables)
+    _keep_ai_calls(session, request, user, "supplier_quote", calls)
+
     quotes: list[SupplierQuoteIn] = []
-    for readable, result in zip(readables, await extractor.read_all(readables), strict=True):
+    for readable, result in zip(readables, results, strict=True):
         if isinstance(result, ExtractionError):
             failures.append(f"{readable.file_name}: {result}")
             continue
@@ -1595,9 +1679,11 @@ async def upload_documents(
             document.extracted = {"email": email} if email else {"read": False}
             continue
         # What the document says, offered rather than applied.
-        await reading.read_into(
-            document, request, name, content, upload.content_type, model=text_model
-        )
+        with llm.capture() as calls:
+            await reading.read_into(
+                document, request, name, content, upload.content_type, model=text_model
+            )
+        _keep_ai_calls(session, request, user, "document", calls)
     await session.flush()
     return await _out(session, request, user=user, roles=roles)
 
@@ -2404,6 +2490,34 @@ async def queue(
         session, team_id=team_id, assignee=user.id if mine_only else None
     )
     return [_summary(r, roles) for r in rows]
+
+
+def _keep_ai_calls(
+    session: AsyncSession,
+    request: QuoteRequest,
+    user: User,
+    purpose: str,
+    calls: list[llm.ModelCall],
+) -> None:
+    """File each model call against the quote it was made for."""
+    for call in calls:
+        session.add(
+            QuoteAICall(
+                request_id=request.id,
+                user_id=user.id,
+                # The object, not only the id: the row is read back for the
+                # response, and an unloaded relationship is a lazy load.
+                user=user,
+                purpose=purpose,
+                label=(call.label or "")[:500] or None,
+                provider=call.provider,
+                model=call.model,
+                input_tokens=call.input_tokens,
+                output_tokens=call.output_tokens,
+                cost_usd=call.cost_usd.quantize(Decimal("0.000001")),
+                used=call.used,
+            )
+        )
 
 
 @router.get("/{request_id}", response_model=QuoteRequestOut, summary="One quote in full")

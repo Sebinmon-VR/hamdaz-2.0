@@ -351,6 +351,7 @@ async def _second_pass(
         ),
         text=readable.text or "",
         shape=shape,
+        label=f"{kind.value.replace('_', ' ').capitalize()} · {readable.file_name}",
     )
     if answer is None:
         return found

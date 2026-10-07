@@ -672,7 +672,7 @@ async def test_the_model_pass_settles_what_it_read() -> None:
     class StubModel:
         configured = True
 
-        async def extract(self, *, instructions, text, shape, max_tokens=4000):
+        async def extract(self, *, instructions, text, shape, max_tokens=4000, label=None):
             assert shape is JSON_SHAPE and "1 when the quote prints none" in instructions
             return (
                 {

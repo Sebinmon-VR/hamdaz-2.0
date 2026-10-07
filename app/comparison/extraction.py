@@ -221,6 +221,7 @@ class QuoteExtractor:
             text=readable.text,
             shape=JSON_SHAPE,
             max_tokens=6000,
+            label=f"Supplier quote · {readable.file_name}",
         )
         if answer is None:
             return None

@@ -33,8 +33,11 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
+from decimal import Decimal
 from typing import Any, Final
 
 import httpx
@@ -83,6 +86,80 @@ class Answer:
     def paid(self) -> bool:
         """Answered by Claude, which is billed; the free tiers are not."""
         return self.who.startswith("anthropic:")
+
+
+# ── what each call cost ──────────────────────────────────────────────────
+
+#: Claude's list prices, USD per million tokens (input, output). The free
+#: tiers — Groq, Cerebras, OpenRouter's free models, a machine of ours running
+#: Ollama — cost nothing and are not listed. A Claude model missing here is
+#: priced at Opus's rate rather than as free, so an unknown model is never
+#: reported as costing nothing.
+CLAUDE_PRICES: Final[dict[str, tuple[Decimal, Decimal]]] = {
+    "claude-haiku-4-5": (Decimal("1"), Decimal("5")),
+    "claude-sonnet-5": (Decimal("2"), Decimal("10")),
+    "claude-sonnet-5-5": (Decimal("2"), Decimal("10")),
+    "claude-opus-5": (Decimal("5"), Decimal("25")),
+    "claude-opus-5-5": (Decimal("4"), Decimal("20")),
+}
+_UNKNOWN_CLAUDE: Final = (Decimal("5"), Decimal("25"))
+
+
+def cost_of(provider: str, model: str, input_tokens: int, output_tokens: int) -> Decimal:
+    """What one call cost in USD: Claude at its list price, the free tiers nothing."""
+    if provider != "anthropic":
+        return Decimal(0)
+    price_in, price_out = CLAUDE_PRICES.get(model, _UNKNOWN_CLAUDE)
+    return (Decimal(input_tokens) * price_in + Decimal(output_tokens) * price_out) / Decimal(
+        1_000_000
+    )
+
+
+@dataclass(slots=True)
+class ModelCall:
+    """One answer a provider gave — billed whether or not it was usable."""
+
+    provider: str
+    model: str
+    #: What was being read, for the person looking at the bill.
+    label: str | None
+    input_tokens: int
+    output_tokens: int
+    cost_usd: Decimal
+    #: False when the answer was unparseable or failed the caller's check, and
+    #: the next provider was asked: paid for, and thrown away.
+    used: bool = False
+
+
+_CALLS: ContextVar[list[ModelCall] | None] = ContextVar("llm_calls", default=None)
+
+
+@contextmanager
+def capture() -> Iterator[list[ModelCall]]:
+    """Collect every model call made inside the block, so the caller can file
+    them against what they were for — a quote, say. Calls made outside any
+    block are not collected; nothing is lost by them, they are just not kept.
+    """
+    calls: list[ModelCall] = []
+    token = _CALLS.set(calls)
+    try:
+        yield calls
+    finally:
+        _CALLS.reset(token)
+
+
+def _record(provider: Provider, label: str | None, used_in: int, used_out: int) -> ModelCall:
+    call = ModelCall(
+        provider=provider.name,
+        model=provider.model,
+        label=label,
+        input_tokens=used_in,
+        output_tokens=used_out,
+        cost_usd=cost_of(provider.name, provider.model, used_in, used_out),
+    )
+    if (calls := _CALLS.get()) is not None:
+        calls.append(call)
+    return call
 
 
 def providers_from(settings: Settings) -> list[Provider]:
@@ -145,6 +222,7 @@ class TextModel:
         text: str,
         shape: dict[str, Any],
         max_tokens: int = 4000,
+        label: str | None = None,
     ) -> tuple[dict[str, Any], str] | None:
         """A JSON object in ``shape``, read from ``text``, and who answered.
 
@@ -153,7 +231,7 @@ class TextModel:
         deterministic reading standing alone.
         """
         system, body = self._prompt(instructions, text, shape)
-        answer = await self.ask(system=system, user=body, max_tokens=max_tokens)
+        answer = await self.ask(system=system, user=body, max_tokens=max_tokens, label=label)
         return (answer.payload, answer.who) if answer else None
 
     async def ask(
@@ -165,6 +243,7 @@ class TextModel:
         claude_model: str | None = None,
         free_only: bool = False,
         check: Callable[[dict[str, Any]], bool] | None = None,
+        label: str | None = None,
     ) -> Answer | None:
         """One JSON object, from the providers in order.
 
@@ -177,7 +256,8 @@ class TextModel:
         ``claude_model`` overrides the model Claude is asked with, for a job
         that needs the main model rather than the extraction one.
         ``free_only`` leaves Claude out, for a caller with a Claude path of
-        its own to fall back to.
+        its own to fall back to. ``label`` says what is being read, on the
+        record of the call kept by ``capture``.
         """
         for provider in self._providers:
             if provider.name == "anthropic":
@@ -190,6 +270,7 @@ class TextModel:
             except ModelError as exc:
                 logger.info("model %s declined: %s", provider.name, exc)
                 continue
+            call = _record(provider, label, used_in, used_out)
             parsed = parse_json_object(raw)
             if parsed is None:
                 logger.info("model %s answered nothing parseable", provider.name)
@@ -197,6 +278,7 @@ class TextModel:
             if check is not None and not check(parsed):
                 logger.info("model %s answered outside the shape asked for", provider.name)
                 continue
+            call.used = True
             return Answer(parsed, f"{provider.name}:{provider.model}", used_in, used_out)
         return None
 

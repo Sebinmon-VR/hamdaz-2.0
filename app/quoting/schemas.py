@@ -1157,3 +1157,59 @@ class CommentIn(BaseModel):
     target_type: CommentTarget = CommentTarget.QUOTE
     #: A field name, a line id, or a supplier quote id.
     target_ref: str | None = Field(default=None, max_length=120)
+
+
+class AICallOut(BaseModel):
+    """One model call made while reading a quote's documents."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    created_at: datetime
+    #: The quote it was for, to link to.
+    request_id: uuid.UUID
+    quote_title: str | None = None
+    quote_reference: str | None = None
+    #: supplier_quote or document.
+    purpose: str
+    #: What was read: "Supplier quote · Hamdaz-Wolfvision Quote.pdf".
+    label: str | None
+    provider: str
+    model: str
+    input_tokens: int
+    output_tokens: int
+    cost_usd: Decimal
+    #: False when the answer was unusable and the next provider was asked.
+    used: bool
+    #: Who uploaded the document.
+    user_name: str | None = None
+
+
+class AIModelTotalOut(BaseModel):
+    """One model's share of the period."""
+
+    provider: str
+    model: str
+    calls: int
+    input_tokens: int
+    output_tokens: int
+    cost_usd: Decimal
+
+
+class AIUsageOut(BaseModel):
+    """Model calls made reading quote documents, newest first, and what they
+    came to. For super admins: Admin → AI usage."""
+
+    #: The first day counted; null for all time.
+    since: date | None = None
+    #: True when there were more calls than the list carries; the totals still
+    #: count every one.
+    truncated: bool = False
+    calls: list[AICallOut]
+    by_model: list[AIModelTotalOut]
+    total_cost_usd: Decimal
+    input_tokens: int
+    output_tokens: int
+    #: Calls Claude answered, which are billed, and calls the free tiers did.
+    paid_calls: int
+    free_calls: int
