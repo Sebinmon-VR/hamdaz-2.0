@@ -30,6 +30,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
+from app.core.llm import TextModel
 from app.intake.classifier import Classification
 from app.models.proposal_index import ProposalIndexItem
 from app.proposals.mirror import Candidate, Embedder, references_in, search
@@ -117,19 +118,12 @@ SCHEMA: dict[str, Any] = {
 class Matcher:
     """Narrows the list, then asks a model to pick from what is left."""
 
-    def __init__(self, settings: Settings, embedder: Embedder) -> None:
+    def __init__(
+        self, settings: Settings, embedder: Embedder, model: TextModel | None = None
+    ) -> None:
         self._settings = settings
         self._embedder = embedder
-        self._client: Any = None
-
-    def _anthropic(self) -> Any:
-        if self._client is None:
-            import anthropic
-
-            self._client = anthropic.AsyncAnthropic(
-                api_key=self._settings.anthropic_api_key
-            )
-        return self._client
+        self._model = model
 
     async def find(
         self,
@@ -177,7 +171,7 @@ class Matcher:
                 considered=considered,
             )
 
-        if not self._settings.claude_configured:
+        if self._model is None or not self._model.configured:
             # Fall back to the arithmetic. Weaker, and honest about it: the
             # score already blends the reference, the wording and the meaning.
             best = shortlist[0]
@@ -222,33 +216,34 @@ class Matcher:
             ensure_ascii=False,
         )
         rows = json.dumps(considered, ensure_ascii=False)
-        try:
-            response = await self._anthropic().messages.create(
-                model=self._settings.extract_model,
-                max_tokens=600,
-                system=_INSTRUCTIONS,
-                tools=[
-                    {
-                        "name": "decide",
-                        "description": "Say which row the email is about, or none.",
-                        "input_schema": SCHEMA,
-                    }
-                ],
-                tool_choice={"type": "tool", "name": "decide"},
-                messages=[
-                    {"role": "user", "content": f"EMAIL:\n{mail}\n\nSHORTLIST:\n{rows}"}
-                ],
-            )
-        except Exception as exc:  # noqa: BLE001 - a failed match is "no match"
-            logger.warning("match adjudication failed: %s", exc)
-            return {"item_id": "", "confidence": 0.0, "reason": f"Could not check: {exc}"}
+        ids = {str(row["id"]) for row in considered}
 
-        for block in getattr(response, "content", []) or []:
-            if getattr(block, "type", None) == "tool_use":
-                value = getattr(block, "input", None)
-                if isinstance(value, dict):
-                    return value
-        return {"item_id": "", "confidence": 0.0, "reason": "No answer from the model."}
+        def usable(payload: dict[str, Any]) -> bool:
+            # A row that is not on the shortlist is a made-up answer, not a match.
+            return str(payload.get("item_id") or "") in ids | {""}
+
+        system = (
+            f"{_INSTRUCTIONS}\n"
+            "Reply with one JSON object and nothing else — no prose, no code fence — "
+            'with exactly these keys: {"item_id": the id of the matching row, or "" '
+            'for no match; "confidence": 0 to 1; "reason": one sentence}.'
+        )
+        answer = await self._model.ask(
+            system=system,
+            user=f"EMAIL:\n{mail}\n\nSHORTLIST:\n{rows}",
+            max_tokens=600,
+            # Claude, when it comes to Claude, on the main model rather than
+            # the extraction one: which row an email is about is judgement,
+            # and a wrong answer files it on the wrong bid.
+            claude_model=self._settings.anthropic_model,
+            check=usable,
+        )
+        if answer is None:
+            logger.warning("match adjudication: no model answered")
+            return {"item_id": "", "confidence": 0.0, "reason": "No model answered."}
+        decision = dict(answer.payload)
+        decision["reason"] = f"{str(decision.get('reason') or '').strip()} ({answer.who})".strip()
+        return decision
 
 
 def _as_float(value: Any) -> float:

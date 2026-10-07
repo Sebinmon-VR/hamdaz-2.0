@@ -12,20 +12,23 @@ alone". That matters more here than in most places: acting on a bad guess
 creates a real row in the live Proposals list, assigned to a real person, from
 an email that was actually a thank-you note.
 
-Anthropic rather than OpenAI, following the quote extraction already in this
-codebase: the same job — read a document, return a fixed shape — and no reason
-for two providers to own one kind of work. The embeddings in the matcher are
-OpenAI's because Anthropic does not offer any.
+**No model first, then the free one, then Claude.** Mail that is plainly not
+work — an out-of-office, a bounce, a read receipt, a meeting reply — is settled
+by its subject and sender alone, and no model is asked. The rest goes through
+``app.core.llm.TextModel``: the free tiers in ``LLM_PROVIDERS`` first, and
+Claude only when they refuse or run out for the day. The embeddings in the
+matcher are OpenAI's because Anthropic does not offer any.
 """
 
 from __future__ import annotations
 
-import json
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
 from app.core.config import Settings
+from app.core.llm import TextModel, trim
 from app.models.intake import MailCategory
 
 logger = logging.getLogger("hamdaz.intake.classify")
@@ -159,70 +162,122 @@ class Classification:
         return "\n".join(p.strip() for p in parts if p and p.strip())
 
 
-class Classifier:
-    """Reads one message. Holds no state beyond the client."""
+#: Mail no person wrote, recognisable without reading it: the subject a mail
+#: server or a calendar puts on it, or the sender that is a mail server.
+_AUTOMATIC_SUBJECT = re.compile(
+    r"^\s*(automatic reply|auto[- ]?reply|autoreply|out of (the )?office|"
+    r"undeliverable|undelivered mail|delivery status notification|"
+    r"mail delivery (failed|failure|subsystem)|delivery has failed|returned mail|"
+    r"read:|not read:|accepted:|declined:|tentative:|"
+    r"recall:|message recall)",
+    re.IGNORECASE,
+)
+_AUTOMATIC_SENDER = re.compile(r"^(mailer-daemon|postmaster|no-?reply|microsoftexchange)", re.I)
+_OUT_OF_OFFICE = re.compile(
+    r"\b(i am|i'm) (currently )?(out of (the )?office|on (annual )?leave|away)\b", re.I
+)
 
-    def __init__(self, settings: Settings) -> None:
+
+def without_a_model(
+    *, subject: str | None, body: str | None, sender: str | None
+) -> Classification | None:
+    """The mail that needs no model to know it is not work, or ``None``.
+
+    Only ever answers ``general``: a rule may say what is plainly *not* work,
+    never what is, because a tender wrongly settled here would raise nothing
+    and nobody would know. Anything that might be work goes to a model.
+    """
+    subject_text = (subject or "").strip()
+    local = (sender or "").split("@", 1)[0].strip().lower()
+    why = None
+    if _AUTOMATIC_SUBJECT.match(subject_text):
+        why = "its subject is one a mail server or calendar writes"
+    elif _AUTOMATIC_SENDER.match(local):
+        why = "it was sent by a mail server, not a person"
+    elif _OUT_OF_OFFICE.search((body or "")[:600]) and len(body or "") < 1500:
+        why = "it is an out-of-office reply"
+    if why is None:
+        return None
+    return Classification(
+        category=MailCategory.GENERAL,
+        confidence=0.95,
+        title=subject_text[:200],
+        summary="An automatic message; nothing to act on.",
+        reasoning=f"Settled without a model: {why}.",
+    )
+
+
+def _shape() -> str:
+    """The answer's keys, each with what goes in it — the schema in words."""
+    lines = []
+    for key in SCHEMA["required"]:
+        spec = SCHEMA["properties"][key]
+        if "enum" in spec:
+            what = "one of " + " | ".join(spec["enum"]) + ". " + spec.get("description", "")
+        elif spec.get("type") == "array":
+            what = "list of strings. " + spec.get("description", "")
+        else:
+            what = f"{spec.get('type')}. " + spec.get("description", "")
+        lines.append(f'  "{key}": {what}')
+    return "{\n" + "\n".join(lines) + "\n}"
+
+
+def _usable(payload: dict[str, Any]) -> bool:
+    """An answer worth acting on: a real category and a confidence."""
+    return str(payload.get("category") or "") in {c.value for c in MailCategory} and (
+        payload.get("confidence") is not None
+    )
+
+
+class Classifier:
+    """Reads one message. Holds no state beyond the model."""
+
+    def __init__(self, settings: Settings, model: TextModel | None = None) -> None:
         self._settings = settings
-        self._client: Any = None
+        self._model = model
 
     @property
     def available(self) -> bool:
-        return bool(self._settings.anthropic_api_key)
-
-    def _anthropic(self) -> Any:
-        if self._client is None:
-            import anthropic
-
-            self._client = anthropic.AsyncAnthropic(
-                api_key=self._settings.anthropic_api_key
-            )
-        return self._client
+        return self._model is not None and self._model.configured
 
     async def classify(
         self, *, subject: str | None, body: str | None, sender: str | None
     ) -> Classification:
         """What this message is, and what it says.
 
-        A model that is not configured, or that fails, returns ``unknown`` with
-        no confidence rather than raising. The pipeline then leaves the message
-        alone and records why — which is the same outcome as a message it could
-        not understand, and is the safe one.
+        Automatic mail is settled here with no model at all. Otherwise the free
+        model is asked, and Claude after it; when none of them answers, this
+        raises, and the pipeline leaves the message alone and records why —
+        the same outcome as a message it could not understand, and the safe one.
         """
+        settled = without_a_model(subject=subject, body=body, sender=sender)
+        if settled is not None:
+            return settled
         if not self.available:
             raise ClassifierError(
-                "No Anthropic API key is configured, so mail cannot be read."
+                "No model is configured (LLM_PROVIDERS), so mail cannot be read."
             )
 
         content = (
             f"From: {sender or 'unknown'}\n"
             f"Subject: {subject or '(no subject)'}\n\n"
-            f"{(body or '').strip() or '(no body)'}"
+            # The free tiers take a few thousand tokens a minute. The newest
+            # part of a thread is at the top, and that is what is judged.
+            f"{trim((body or '').strip(), self._settings.llm_max_input_chars) or '(no body)'}"
         )
-        try:
-            response = await self._anthropic().messages.create(
-                model=self._settings.extract_model,
-                max_tokens=1500,
-                system=_INSTRUCTIONS,
-                tools=[
-                    {
-                        "name": "record",
-                        "description": "Record what this message is and what it says.",
-                        "input_schema": SCHEMA,
-                    }
-                ],
-                # Forced, so the answer is always the shape above and never a
-                # paragraph of prose the caller has to parse.
-                tool_choice={"type": "tool", "name": "record"},
-                messages=[{"role": "user", "content": content}],
+        system = (
+            f"{_INSTRUCTIONS}\n"
+            "Reply with one JSON object and nothing else — no prose, no code fence — "
+            f"with exactly these keys:\n{_shape()}"
+        )
+        answer = await self._model.ask(
+            system=system, user=content, max_tokens=1500, check=_usable
+        )
+        if answer is None:
+            raise ClassifierError(
+                "No model answered: every provider in LLM_PROVIDERS refused or failed."
             )
-        except Exception as exc:  # noqa: BLE001 - surfaced to the intake row
-            raise ClassifierError(f"{type(exc).__name__}: {exc}") from exc
-
-        payload = _tool_input(response)
-        if payload is None:
-            raise ClassifierError("The model did not answer in the expected shape.")
-
+        payload = answer.payload
         return Classification(
             category=str(payload.get("category") or MailCategory.UNKNOWN),
             confidence=_as_float(payload.get("confidence")),
@@ -234,23 +289,11 @@ class Classifier:
             ],
             deadline=str(payload.get("deadline") or "").strip(),
             summary=str(payload.get("summary") or "").strip(),
-            reasoning=str(payload.get("reasoning") or "").strip(),
-            cost_usd=_cost_of(response, self._settings),
+            reasoning=(
+                f"{str(payload.get('reasoning') or '').strip()} ({answer.who})".strip()
+            ),
+            cost_usd=_cost_of(answer.input_tokens, answer.output_tokens) if answer.paid else 0.0,
         )
-
-
-def _tool_input(response: Any) -> dict[str, Any] | None:
-    for block in getattr(response, "content", []) or []:
-        if getattr(block, "type", None) == "tool_use":
-            value = getattr(block, "input", None)
-            if isinstance(value, dict):
-                return value
-            if isinstance(value, str):
-                try:
-                    return json.loads(value)
-                except json.JSONDecodeError:
-                    return None
-    return None
 
 
 def _as_float(value: Any) -> float:
@@ -263,16 +306,11 @@ def _as_float(value: Any) -> float:
 #: Rough, and rough on purpose. What matters is that the intake bill is
 #: attributable to the feature rather than appearing as a lump on somebody's
 #: account; the exact figure is on the invoice.
-_INPUT_PER_MTOK = 5.0
-_OUTPUT_PER_MTOK = 25.0
+_INPUT_PER_MTOK = 1.0
+_OUTPUT_PER_MTOK = 5.0
 
 
-def _cost_of(response: Any, settings: Settings) -> float:
-    usage = getattr(response, "usage", None)
-    if usage is None:
-        return 0.0
-    read = int(getattr(usage, "input_tokens", 0) or 0)
-    written = int(getattr(usage, "output_tokens", 0) or 0)
+def _cost_of(read: int, written: int) -> float:
     return round(
         (read * _INPUT_PER_MTOK + written * _OUTPUT_PER_MTOK) / 1_000_000, 6
     )

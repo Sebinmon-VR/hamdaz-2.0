@@ -117,6 +117,7 @@ async def _services(request: Request, session: AsyncSession) -> Services:
         extractor=getattr(state, "quote_extractor", None),
         llm=getattr(state, "openai", None),
         executor=getattr(state, "assistant_executor", None),
+        text_model=getattr(state, "text_model", None),
         model_key=model_key,
     )
 

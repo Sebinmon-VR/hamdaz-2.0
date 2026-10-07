@@ -11,11 +11,19 @@ Same client, same key and same conversion as the comparison module — a
 document is prepared by ``app.comparison.documents.prepare`` and reaches the
 model as a document block, an image block, or text — so a file the comparison
 screen can read, this can read.
+
+**The free model first, where it can.** Documents that are text — a PDF with a
+text layer, a spreadsheet, a mail — and short enough for the free tiers' limit
+are asked of the free model in ``LLM_PROVIDERS`` first. Scans and photographs
+need a model that can see, and a long tender would have its middle cut out to
+fit, which is where the items are; both go to Claude, as does anything the
+free model refuses or answers badly.
 """
 
 from __future__ import annotations
 
 import base64
+import json
 import logging
 from typing import Any
 
@@ -23,6 +31,7 @@ import anthropic
 
 from app.comparison.documents import Readable
 from app.core.config import Settings
+from app.core.llm import TextModel
 
 logger = logging.getLogger("hamdaz.workflows.reader")
 
@@ -79,13 +88,45 @@ def _cost(response: Any, settings: Settings) -> float:
 class DocumentReader:
     """One call per run: every document in, one structured answer out."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, model: TextModel | None = None) -> None:
         self._settings = settings
         self._client: anthropic.AsyncAnthropic | None = None
+        self._model = model
 
     @property
     def configured(self) -> bool:
-        return self._settings.claude_configured
+        return self._settings.claude_configured or bool(self._model and self._model.configured)
+
+    async def _read_free(
+        self, readables: list[Readable], schema: dict[str, Any], system: str, ask: str
+    ) -> dict[str, Any] | None:
+        """The free model's reading, when the documents suit it; else ``None``.
+
+        Whole documents or nothing: a tender trimmed to fit loses its middle,
+        and the middle is the item list.
+        """
+        if self._model is None or not self._model.configured:
+            return None
+        if not readables or any(r.kind != "text" for r in readables):
+            return None
+        text = "\n\n".join(f"=== {r.file_name} ===\n{r.text or ''}" for r in readables)
+        if len(text) > self._settings.llm_max_input_chars:
+            return None
+        required = list(schema.get("required") or [])
+        answer = await self._model.ask(
+            system=(
+                f"{system}\nReply with one JSON object and nothing else — no prose, no "
+                f"code fence — matching this JSON schema:\n{json.dumps(schema, ensure_ascii=False)}"
+            ),
+            user=f"{text}\n\n{ask}",
+            max_tokens=6000,
+            free_only=True,
+            check=lambda payload: all(key in payload for key in required),
+        )
+        if answer is None:
+            return None
+        logger.info("requirements read by %s", answer.who)
+        return answer.payload
 
     def _anthropic(self) -> anthropic.AsyncAnthropic:
         if not self.configured:
@@ -138,6 +179,9 @@ class DocumentReader:
             "that quotes customers for equipment and materials. "
             + (instructions or "")
         ).strip()
+        free = await self._read_free(readables, schema, system, ask)
+        if free is not None:
+            return free, 0.0
         try:
             response = await self._anthropic().messages.create(
                 model=self._settings.extract_model,

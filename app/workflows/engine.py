@@ -59,6 +59,8 @@ class Services:
     extractor: Any = None
     llm: Any = None
     executor: Any = None
+    #: The free-first text model (``app.core.llm.TextModel``).
+    text_model: Any = None
     #: The assistant's model key, for agent steps. Read from its settings so
     #: the two use the same model and the same prices.
     model_key: str = ""

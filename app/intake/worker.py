@@ -34,6 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.analytics import live as live_scores
 from app.analytics import publisher as publishing
 from app.core.config import Settings
+from app.core.llm import TextModel
 from app.intake import service as intake_service
 from app.intake.classifier import Classifier
 from app.intake.graph_mail import MailReader
@@ -98,8 +99,10 @@ class Worker:
         self._mail = mail
         self._http = http
         self._embedder = Embedder(settings)
-        self._classifier = Classifier(settings)
-        self._matcher = Matcher(settings, self._embedder)
+        # Free model first, Claude when the free tiers refuse: LLM_PROVIDERS.
+        text_model = TextModel(settings, http)
+        self._classifier = Classifier(settings, text_model)
+        self._matcher = Matcher(settings, self._embedder, text_model)
         self._mirror = MirrorSync()
         self._publisher = publishing.Publisher(settings, sharepoint)
         self._tasks: set[asyncio.Task] = set()

@@ -247,7 +247,7 @@ async def extract(step: StepContext) -> Any:
     typed_lines = [json.dumps(i, ensure_ascii=False) for i in typed_items]
 
     schema = SCHEMAS.get(str(step.config.get("schema") or "requirements"), SCHEMAS["requirements"])
-    reader = DocumentReader(step.services.settings)
+    reader = DocumentReader(step.services.settings, model=step.services.text_model)
 
     if not readables:
         if not typed_items:

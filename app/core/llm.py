@@ -33,7 +33,8 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from typing import Any, Final
 
 import httpx
@@ -66,6 +67,22 @@ class Provider:
     base_url: str
     api_key: str
     model: str
+
+
+@dataclass(frozen=True, slots=True)
+class Answer:
+    """A JSON object from the first provider that gave a usable one."""
+
+    payload: dict[str, Any]
+    #: "groq:openai/gpt-oss-120b" — who answered, for the audit trail.
+    who: str
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+    @property
+    def paid(self) -> bool:
+        """Answered by Claude, which is billed; the free tiers are not."""
+        return self.who.startswith("anthropic:")
 
 
 def providers_from(settings: Settings) -> list[Provider]:
@@ -135,12 +152,41 @@ class TextModel:
         parseable came back. The caller treats all three the same way: as the
         deterministic reading standing alone.
         """
-        if not self._providers:
-            return None
-        prompt = self._prompt(instructions, text, shape)
+        system, body = self._prompt(instructions, text, shape)
+        answer = await self.ask(system=system, user=body, max_tokens=max_tokens)
+        return (answer.payload, answer.who) if answer else None
+
+    async def ask(
+        self,
+        *,
+        system: str,
+        user: str,
+        max_tokens: int = 4000,
+        claude_model: str | None = None,
+        free_only: bool = False,
+        check: Callable[[dict[str, Any]], bool] | None = None,
+    ) -> Answer | None:
+        """One JSON object, from the providers in order.
+
+        The free tiers come first in ``LLM_PROVIDERS``; Claude is asked only
+        when every one before it refused — a rate limit, a spent daily
+        allowance, an outage — or answered something unusable. ``check`` is
+        the caller's test of an answer; one that fails it is treated as no
+        answer, and the next provider is asked.
+
+        ``claude_model`` overrides the model Claude is asked with, for a job
+        that needs the main model rather than the extraction one.
+        ``free_only`` leaves Claude out, for a caller with a Claude path of
+        its own to fall back to.
+        """
         for provider in self._providers:
+            if provider.name == "anthropic":
+                if free_only:
+                    continue
+                if claude_model:
+                    provider = replace(provider, model=claude_model)
             try:
-                raw = await self._ask(provider, prompt, max_tokens)
+                raw, used_in, used_out = await self._ask(provider, (system, user), max_tokens)
             except ModelError as exc:
                 logger.info("model %s declined: %s", provider.name, exc)
                 continue
@@ -148,7 +194,10 @@ class TextModel:
             if parsed is None:
                 logger.info("model %s answered nothing parseable", provider.name)
                 continue
-            return parsed, f"{provider.name}:{provider.model}"
+            if check is not None and not check(parsed):
+                logger.info("model %s answered outside the shape asked for", provider.name)
+                continue
+            return Answer(parsed, f"{provider.name}:{provider.model}", used_in, used_out)
         return None
 
     def _prompt(self, instructions: str, text: str, shape: dict[str, Any]) -> tuple[str, str]:
@@ -164,18 +213,25 @@ class TextModel:
         )
         return system, body
 
-    async def _ask(self, provider: Provider, prompt: tuple[str, str], max_tokens: int) -> str:
+    async def _ask(
+        self, provider: Provider, prompt: tuple[str, str], max_tokens: int
+    ) -> tuple[str, int, int]:
+        """The reply's text, and the tokens it took in and gave out."""
         system, body = prompt
         timeout = httpx.Timeout(self._settings.llm_timeout_seconds, connect=10.0)
         try:
             if provider.name == "anthropic":
+                headers = {
+                    "x-api-key": provider.api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                }
+                # An identity-linked key names its workspace on every request.
+                if self._settings.anthropic_workspace_id:
+                    headers["anthropic-workspace-id"] = self._settings.anthropic_workspace_id
                 response = await self._http.post(
                     provider.base_url,
-                    headers={
-                        "x-api-key": provider.api_key,
-                        "anthropic-version": "2023-06-01",
-                        "content-type": "application/json",
-                    },
+                    headers=headers,
                     json={
                         "model": provider.model,
                         "max_tokens": max_tokens,
@@ -216,15 +272,25 @@ class TextModel:
                 f"{provider.name} refused ({response.status_code}): {response.text[:160]}"
             )
         payload = response.json()
+        usage = payload.get("usage") or {}
         if provider.name == "anthropic":
-            return "".join(
+            text = "".join(
                 block.get("text", "")
                 for block in payload.get("content", [])
                 if block.get("type") == "text"
             )
+            return (
+                text,
+                int(usage.get("input_tokens") or 0),
+                int(usage.get("output_tokens") or 0),
+            )
         choices = payload.get("choices") or []
         message = (choices[0].get("message") if choices else None) or {}
-        return str(message.get("content") or "")
+        return (
+            str(message.get("content") or ""),
+            int(usage.get("prompt_tokens") or 0),
+            int(usage.get("completion_tokens") or 0),
+        )
 
 
 def trim(text: str, budget: int) -> str:

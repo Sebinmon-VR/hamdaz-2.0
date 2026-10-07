@@ -229,7 +229,7 @@ class FakeReader:
     }
     calls: list[dict[str, Any]] = []
 
-    def __init__(self, settings: Any) -> None:
+    def __init__(self, settings: Any, model: Any = None) -> None:
         self.settings = settings
 
     async def read(self, readables, *, schema, instructions="", typed_items=None):

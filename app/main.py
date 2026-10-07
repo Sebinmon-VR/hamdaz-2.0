@@ -235,6 +235,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             extractor=app.state.quote_extractor,
             llm=openai,
             executor=app.state.assistant_executor,
+            text_model=app.state.text_model,
         ),
     )
     app.state.workflow_worker.start()
