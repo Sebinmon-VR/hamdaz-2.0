@@ -152,9 +152,12 @@ def _body(
     else:
         rows.append(("Total", _money(request.total, request.currency)))
     rows.append(("Lines", str(len(request.items))))
-    supplier = _supplier_name(request)
-    if supplier and not (report and report.supplier.name):
-        rows.append(("Priced from", supplier))
+    # Its own name, not ``supplier``: that is the (name, details) pair for the
+    # block at the foot, and overwriting it with a bare name made every quote
+    # with a chosen supplier fail to notify ("too many values to unpack").
+    priced_from = _supplier_name(request)
+    if priced_from and not (report and report.supplier.name):
+        rows.append(("Priced from", priced_from))
     if request.win_probability is not None:
         # The probability travels with the count it came from, here as
         # everywhere else. On its own it invites more confidence than it earned.
