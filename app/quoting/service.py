@@ -400,6 +400,21 @@ def set_items(request: QuoteRequest, items: list[dict[str, Any]]) -> None:
     ]
 
 
+def drop_stale_sources(request: QuoteRequest, items: list[dict[str, Any]]) -> None:
+    """Forget a line's supplier when that supplier's offer is no longer on the quote.
+
+    The page holds the lines it loaded, and saves them back whole. If an offer
+    was removed or replaced in the meantime, its id comes back with them and the
+    insert fails on the foreign key. The line itself is still wanted — it is the
+    quote's own once priced — so only the link goes, as removing the offer does.
+    """
+    known = {q.id for q in request.comparison.quotes} if request.comparison else set()
+    for item in items:
+        source = item.get("source_supplier_quote_id")
+        if source is not None and uuid.UUID(str(source)) not in known:
+            item["source_supplier_quote_id"] = None
+
+
 def set_cost_lines(request: QuoteRequest, rows: list[dict[str, Any]]) -> None:
     """Replace the landed-cost build-up, for the same reason the items are.
 
@@ -433,6 +448,9 @@ def set_cost_lines(request: QuoteRequest, rows: list[dict[str, Any]]) -> None:
             # ``bidpack.landed_cost`` — so nothing stored can go stale.
             percent=_decimal_or_none(row.get("percent")),
             percent_of=(row.get("percent_of") or None) if row.get("percent") is not None else None,
+            line_position=row.get("line_position"),
+            # Per unit means nothing without a line to count the units of.
+            per_unit=bool(row.get("per_unit")) and row.get("line_position") is not None,
         )
         for position, row in enumerate(rows)
     ]
@@ -851,9 +869,10 @@ def reprice_at_margin(request: QuoteRequest, margin_percent: Decimal) -> int:
     walk-away line and the ladder are built on — so it has to be over
     everything it takes to deliver, not over the supplier's price alone, or
     the freight and the duty eat into it and a quote priced "at 25%" keeps
-    20. Each line's landed cost is its cost × (landed total ÷ goods): the
-    freight, insurance, duty and bank charges shared out in proportion to what
-    each line cost, the way the report shares them. Then
+    20. Each line's landed cost is its own: its cost, the charges set against
+    that line (per unit where marked), and its share of the bid's freight,
+    insurance, duty and bank charges in proportion to what it cost — see
+    ``bidpack.LineLanded``. Then
 
         selling price = landed cost ÷ (1 − margin)
 
@@ -873,15 +892,16 @@ def reprice_at_margin(request: QuoteRequest, margin_percent: Decimal) -> int:
     request.target_markup_percent = margin_percent
     if bidpack.goods_cost(request) <= 0:
         return 0
-    uplift = bidpack.landed_cost(request).uplift
+    # Each line on its own landed cost: a charge that belongs to one line, or
+    # is per unit of it, prices that line and no other.
+    landed = bidpack.landed_cost(request)
     step = sell_step(request.currency)
     priced = 0
-    for item in request.items:
+    for index, item in enumerate(sorted(request.items, key=lambda i: i.position or 0)):
         if item.cost_rate is None or item.cost_rate <= 0:
             continue
-        item.rate = sell_at(item.cost_rate * uplift, margin_percent).quantize(
-            step, rounding=ROUND_HALF_UP
-        )
+        each = landed.lines[index].each or item.cost_rate * landed.uplift
+        item.rate = sell_at(each, margin_percent).quantize(step, rounding=ROUND_HALF_UP)
         priced += 1
     return priced
 

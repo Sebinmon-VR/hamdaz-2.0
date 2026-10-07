@@ -683,7 +683,9 @@ async def update(
     try:
         service.require_editable(request, user=user, roles=roles)
         service.apply_fields(request, payload.model_dump())
-        service.set_items(request, [i.model_dump() for i in payload.items])
+        items = [i.model_dump() for i in payload.items]
+        service.drop_stale_sources(request, items)
+        service.set_items(request, items)
         service.set_cost_lines(request, [c.model_dump() for c in payload.cost_lines])
         service.set_compliance(request, [c.model_dump() for c in payload.compliance])
         service.set_submission_fields(

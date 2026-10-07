@@ -880,6 +880,18 @@ class QuoteCostLine(Base, UUIDPrimaryKey, Timestamped):
     )
     notes: Mapped[str | None] = mapped_column(Text)
 
+    #: The priced line this cost belongs to, by its position; null when it is
+    #: the whole bid's and is shared across the lines by value. A position and
+    #: not an id because the lines are replaced wholesale on every save, and
+    #: the two lists are saved together. Two lines from two suppliers carry two
+    #: suppliers' charges, and spreading both over both prices each line wrong.
+    line_position: Mapped[int | None] = mapped_column(Integer)
+    #: The amounts are per unit of that line, and are multiplied by its
+    #: quantity. Ignored on a row that belongs to the whole bid.
+    per_unit: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
+    )
+
     request: Mapped[QuoteRequest] = relationship(back_populates="cost_lines")
 
     def __repr__(self) -> str:

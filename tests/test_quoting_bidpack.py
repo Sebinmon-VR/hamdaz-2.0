@@ -703,3 +703,84 @@ def test_a_status_read_back_as_a_plain_string_still_serialises():
     assert body.red_flags[0].severity == Severity.CRITICAL
     assert body.model_dump(mode="json")["red_flags"][0]["severity"] == "critical"
 
+
+
+# ── a cost that belongs to one line ────────────────────────────────────
+
+
+def _two_suppliers() -> QuoteRequest:
+    """RFQ 6000151129 — a ViewSonic panel and a WolfVision Cynap, two of each,
+    from two suppliers, each with its own charges stated per unit. The figures
+    are the hand-built costing report's."""
+    request = request_with(target_markup_percent=Decimal(20))
+    request.items = [
+        QuoteRequestItem(position=0, name="ViewSonic IFP6534", quantity=Decimal(2),
+                         rate=Decimal(0), discount=Decimal(0), cost_rate=Decimal("5325.13")),
+        QuoteRequestItem(position=1, name="WolfVision Cynap Core Pro", quantity=Decimal(2),
+                         rate=Decimal(0), discount=Decimal(0), cost_rate=Decimal("9800")),
+    ]
+    rows = [
+        (0, "Wall bracket", "165.26"), (0, "Wi-Fi module", "165.26"),
+        (0, "Clearance, COO & transport", "100"), (0, "Cables & accessories", "600"),
+        (0, "Installation", "500"), (0, "5-year warranty uplift", "1250"),
+        (1, "Clearance, COO & transport", "100"), (1, "Cables & accessories", "209"),
+        (1, "Installation", "400"),
+    ]
+    request.cost_lines = [
+        QuoteCostLine(position=i, stage=CostStage.ORIGIN, label=label,
+                      amount_base=Decimal(amount), line_position=line, per_unit=True)
+        for i, (line, label, amount) in enumerate(rows)
+    ]
+    return request
+
+
+def test_a_cost_per_unit_of_one_line_is_that_lines_alone_times_its_quantity() -> None:
+    landed = bidpack.landed_cost(_two_suppliers())
+
+    viewsonic, wolfvision = landed.lines
+    assert viewsonic.each == Decimal("8105.65")
+    assert wolfvision.each == Decimal("10509")
+    assert (viewsonic.total, wolfvision.total) == (Decimal("16211.30"), Decimal("21018.00"))
+    assert landed.total == Decimal("37229.30")
+    # Shown on the build-up as the line's total, and as per unit of it.
+    installation = next(e for e in landed.elements if e.label == "Installation")
+    assert (installation.amount_base, installation.per_unit) == (Decimal("1000.00"), True)
+    assert all(part.own for part in wolfvision.parts)
+
+
+def test_the_margin_prices_each_line_on_its_own_landed_cost() -> None:
+    request = _two_suppliers()
+    service.reprice_at_margin(request, Decimal(20))
+    viewsonic, wolfvision = sorted(request.items, key=lambda i: i.position)
+    # landed ÷ (1 − 20%), to the whole dirham.
+    assert viewsonic.rate == Decimal("10132")
+    assert wolfvision.rate == Decimal("13136")
+
+
+def test_the_bids_own_costs_are_still_shared_by_value_beside_a_lines_own() -> None:
+    request = _two_suppliers()
+    request.cost_lines.append(
+        QuoteCostLine(position=99, stage=CostStage.ORIGIN, label="Freight",
+                      amount_base=Decimal("1000"))
+    )
+    landed = bidpack.landed_cost(request)
+    goods = Decimal("5325.13") * 2 + Decimal("9800") * 2
+    shared = (1000 * Decimal("10650.26") / goods).quantize(Decimal("0.01"))
+    assert landed.lines[0].total == Decimal("16211.30") + shared
+    assert sum(line.total for line in landed.lines) == landed.total
+
+
+def test_a_row_whose_line_is_gone_falls_back_to_the_whole_bid() -> None:
+    request = _two_suppliers()
+    request.items = request.items[:1]
+    landed = bidpack.landed_cost(request)
+    # The WolfVision rows now name no line: shared, and not per unit.
+    assert landed.total == Decimal("10650.26") + 2 * Decimal("2780.52") + Decimal("709")
+    assert landed.lines[0].total == landed.total
+
+
+def test_the_line_and_per_unit_survive_the_api_shape() -> None:
+    pack = bidpack.build(_two_suppliers())
+    out = BidPackOut.model_validate(pack, from_attributes=True)
+    assert out.landed.lines[1].each == Decimal("10509")
+    assert any(e.line_position == 1 and e.per_unit for e in out.landed.elements)

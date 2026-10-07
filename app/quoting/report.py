@@ -251,7 +251,7 @@ def build(
         comfortable = walk_away
 
     lines, total_qty, total_supplier, supplier_currency = _lines(
-        request, landed_total, fig, rate
+        request, pack.landed, fig, rate
     )
     cost_rows = _cost_rows(pack, fig)
     ladder = _walk_away_ladder(landed_total, sale, walk_away, fig)
@@ -344,8 +344,14 @@ def _price_at_margin(landed: Decimal, margin_percent: Decimal) -> Decimal:
     return landed / keep
 
 
-def _lines(request, landed_total, fig, rate):
-    """The per-line table, with the landed cost allocated by cost share."""
+def _lines(request, landed, fig, rate):
+    """The per-line table, each line at its own landed cost.
+
+    A line carries its own charges and its share of the bid's — see
+    ``bidpack.LineLanded``. Shared by cost alone, two lines from two suppliers
+    would each wear half of the other's freight.
+    """
+    landed_total = landed.total
     sources = supplier_prices(request)
     items = sorted(request.items, key=lambda i: i.position or 0)
     # Keyed by the object rather than the row id: a line that has not been
@@ -358,23 +364,44 @@ def _lines(request, landed_total, fig, rate):
     goods = sum(costs.values(), _ZERO)
     landed_base = _money(landed_total * rate) if rate else None
 
-    # Allocated in proportion to cost, in each currency separately, so the base
-    # column adds up to the base total rather than to a converted residue.
+    # Each line's own landed total, converted line by line.
+    per_line = {id(i): line for i, line in zip(items, landed.lines, strict=False)}
     allocated: dict[int, tuple[Decimal, Decimal | None]] = {}
     if goods > 0:
-        for item_id, cost in costs.items():
-            share = cost / goods
+        for item_id in costs:
+            line = per_line[item_id]
+            # The base column split in the same proportion, from the base
+            # total, so it adds up to that rather than to a converted residue.
+            # The share from the unrounded figures — cost × the line's own
+            # factor — or a rounded line total would move the base by a cent.
+            share = (
+                costs[item_id] * line.uplift / landed_total
+                if line.uplift is not None and landed_total > 0
+                else _ZERO
+            )
             allocated[item_id] = (
-                _money(landed_total * share),
+                line.total,
                 _money(landed_base * share) if landed_base is not None else None,
             )
         # Rounding leaves a cent over or under; the largest line absorbs it so
-        # the column adds up to the total printed under it.
+        # the column adds up to the total printed under it. Measured against
+        # every line, so a charge on a line with no cost stays its own.
         if allocated:
             biggest = max(allocated, key=lambda k: costs[k])
-            over = _money(landed_total) - sum((a for a, _ in allocated.values()), _ZERO)
+            others = [
+                per_line[id(i)].total
+                for i in items
+                if id(i) not in allocated and id(i) in per_line
+            ]
+            over = (
+                _money(landed_total)
+                - sum((a for a, _ in allocated.values()), _ZERO)
+                - sum(others, _ZERO)
+            )
             over_base = (
-                landed_base - sum((b or _ZERO for _, b in allocated.values()), _ZERO)
+                landed_base
+                - sum((b or _ZERO for _, b in allocated.values()), _ZERO)
+                - sum((_money(landed_base * o / landed_total) for o in others), _ZERO)
                 if landed_base is not None
                 else None
             )

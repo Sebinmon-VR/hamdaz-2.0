@@ -85,6 +85,12 @@ class CostLineIn(BaseModel):
     #: What the rate is charged on: the goods, or the CIF value (goods plus
     #: everything before arrival). Destination rows only may use ``cif``.
     percent_of: PercentBasis | None = None
+    #: The priced line this cost belongs to, by its place in ``items`` from
+    #: 0; null for the whole bid, shared across the lines by value.
+    line_position: int | None = Field(default=None, ge=0)
+    #: The amounts are per unit of that line, multiplied by its quantity.
+    #: Only meaningful with ``line_position`` set.
+    per_unit: bool = False
 
 
 class CostLineOut(CostLineIn):
@@ -356,6 +362,36 @@ class CostElementOut(BaseModel):
     #: Set on a row stated as a rate; the amount is then worked out.
     percent: Decimal | None = None
     percent_of: str | None = None
+    #: The line a stored row is charged to; null when the whole bid shares it.
+    line_position: int | None = None
+    #: Stated per unit: the amounts above are then the line's total, over
+    #: ``quantity`` units.
+    per_unit: bool = False
+    quantity: Decimal | None = None
+
+
+class LinePartOut(BaseModel):
+    """One element's share of one line, per unit."""
+
+    label: str
+    basis: str | None
+    each: Decimal
+    #: Charged to this line alone, rather than shared out across the bid.
+    own: bool
+
+
+class LineLandedOut(BaseModel):
+    """What one priced line costs landed. Lines are priced on ``each``."""
+
+    #: The line's place in ``items``, from 0.
+    position: int
+    quantity: Decimal
+    goods: Decimal
+    total: Decimal
+    each: Decimal | None
+    #: This line's landed ÷ its goods; null on a line with no cost.
+    uplift: Decimal | None
+    parts: list[LinePartOut]
 
 
 class LandedCostOut(BaseModel):
@@ -374,10 +410,13 @@ class LandedCostOut(BaseModel):
     #: The share the supplier or forwarder has committed to. The rest is our
     #: estimate, and every point of it that comes in high costs us margin.
     firm_percent: Decimal
-    #: Landed cost ÷ goods cost, to eight places. A line's landed cost is its
-    #: cost × this, and its selling price is that ÷ (1 − margin).
+    #: Landed cost ÷ goods cost, to eight places, for the bid as a whole. Not
+    #: what a line is priced on once a cost belongs to one line — see ``lines``.
     uplift: Decimal
     principal_value: Decimal
+    #: Each line's landed cost, in line order. A line's selling price is its
+    #: ``each`` ÷ (1 − margin).
+    lines: list[LineLandedOut] = Field(default_factory=list)
 
 
 class MarkupScenarioOut(BaseModel):

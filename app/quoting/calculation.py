@@ -71,6 +71,8 @@ def steps(request: QuoteRequest, pack: BidPack) -> list[Step]:  # noqa: C901
 
     # ── the lines ───────────────────────────────────────────────────
     sources = supplier_prices(request)
+    ordered = sorted(request.items, key=lambda i: i.position or 0)
+    lines = {id(i): line for i, line in zip(ordered, pack.landed.lines, strict=False)}
     for item in request.items:
         qty = item.quantity or Decimal(0)
         rate = item.rate or Decimal(0)
@@ -105,16 +107,23 @@ def steps(request: QuoteRequest, pack: BidPack) -> list[Step]:  # noqa: C901
             parts.append(f"cost {_price(item.cost_rate)}")
             if converting:
                 parts.append(f"({foreign} ÷ {fx})")
-            # The line's share of the landing costs: freight, insurance, duty
-            # and bank charges, in proportion to what it cost. The price is
-            # built on this, so the margin typed is the gross margin.
+            # The line's landing costs: its own charges, and its share of the
+            # bid's in proportion to what it cost. The price is built on this,
+            # so the margin typed is the gross margin.
             landed_each = item.cost_rate
-            uplift = pack.landed.uplift
-            if uplift != 1:
-                landed_each = item.cost_rate * uplift
-                parts.append(
-                    f"× {_n(uplift, 4)} (landed cost ÷ goods) = {_n(landed_each)} landed"
-                )
+            line = lines.get(id(item))
+            if line is not None and line.each is not None and line.each != item.cost_rate:
+                landed_each = line.each
+                if any(part.own for part in line.parts) or line.uplift is None:
+                    parts.append(
+                        f"+ {_n(line.each - item.cost_rate)} charges each "
+                        f"= {_n(landed_each)} landed"
+                    )
+                else:
+                    # Only the bid's own costs, shared by value: one factor.
+                    parts.append(
+                        f"× {_n(line.uplift, 4)} (landed cost ÷ goods) = {_n(landed_each)} landed"
+                    )
             # The margin the bid is built at, where one is set; the selling rate
             # is rounded to the cent afterwards, so the implied figure would read
             # 19.99% for a 20% margin.

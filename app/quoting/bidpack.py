@@ -47,6 +47,10 @@ from app.models.quoting import (
 _MONEY = Decimal("0.01")
 _PERCENT = Decimal("0.01")
 _ZERO = Decimal(0)
+#: A line's landed cost per unit, before it is priced: finer than money, so
+#: the price is rounded once, at the end.
+_EACH = Decimal("0.000001")
+_UPLIFT = Decimal("0.00000001")
 
 #: Days in the year used for financing. 365 rather than 360: the exposure is
 #: counted in calendar days because that is how long the money is actually gone.
@@ -140,6 +144,46 @@ class CostElement:
     #: The amount is then worked out here rather than read off the row.
     percent: Decimal | None = None
     percent_of: str | None = None
+    #: The line a stored row is charged to, by position; null when it is the
+    #: whole bid's and is shared across the lines by value.
+    line_position: int | None = None
+    #: Stated per unit of that line. ``amount_base`` and ``amount_source`` are
+    #: then the line's total — the figure × ``quantity``.
+    per_unit: bool = False
+    quantity: Decimal | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LinePart:
+    """One cost element's share of one line, per unit of it."""
+
+    label: str
+    basis: str | None
+    each: Decimal
+    #: Charged to this line alone, rather than shared out across the bid.
+    own: bool
+
+
+@dataclass(frozen=True, slots=True)
+class LineLanded:
+    """What one priced line costs landed: its goods, its own charges, and its
+    share of the bid's.
+
+    Worked out here rather than as cost × one bid-wide factor, because that
+    factor is only right when every charge belongs to every line. Two lines
+    from two suppliers each carry their own supplier's charges, and a charge
+    stated per unit grows with the line's quantity, not with its value.
+    """
+
+    position: int
+    quantity: Decimal
+    goods: Decimal
+    total: Decimal
+    #: Landed cost per unit; null on a line with no quantity.
+    each: Decimal | None
+    #: This line's landed ÷ goods; null on a line with no cost.
+    uplift: Decimal | None
+    parts: list[LinePart]
 
 
 def _rated(row, base: Decimal) -> Decimal | None:
@@ -186,6 +230,10 @@ class LandedCost:
     #: The supplier's own quoted goods value — what the buyer sees if the RFP
     #: makes the principal's quotation a mandatory attachment.
     principal_value: Decimal
+    #: Each line's landed cost, in line order. These, not ``uplift``, are what
+    #: lines are priced on: they add up to ``total`` whenever there are goods
+    #: to share the bid's own charges over.
+    lines: list[LineLanded] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -316,7 +364,35 @@ def landed_cost(request: QuoteRequest) -> LandedCost:
     fx = request.fx_rate if request.fx_rate and request.fx_rate > 0 else None
     goods = goods_cost(request)
 
+    # The lines, in order. A stored row names its line by this index.
+    items = sorted(request.items, key=lambda i: i.position or 0)
+    quantities = [i.quantity or _ZERO for i in items]
+    line_goods = [(i.cost_rate or _ZERO) * (i.quantity or _ZERO) for i in items]
+
+    def line_of(row) -> int | None:
+        """The line a row is charged to. A row naming a line that has since
+        been deleted falls back to the whole bid rather than vanishing."""
+        p = getattr(row, "line_position", None)
+        return p if p is not None and 0 <= p < len(items) else None
+
+    def times(row) -> Decimal:
+        p = line_of(row)
+        per_unit = p is not None and bool(getattr(row, "per_unit", False))
+        return quantities[p] if per_unit else Decimal(1)
+
+    def spread(amount: Decimal, line: int | None, weights: list[Decimal]) -> list[Decimal]:
+        """One element's money, line by line: all on ``line`` when it is that
+        line's own, otherwise shared in proportion to ``weights``."""
+        if line is not None:
+            return [amount if i == line else _ZERO for i in range(len(items))]
+        over = sum(weights, _ZERO)
+        if over <= 0:
+            return [_ZERO] * len(items)
+        return [amount * w / over for w in weights]
+
     elements: list[CostElement] = []
+    #: Each element's money on each line, beside it; None on the goods row.
+    shares: list[list[Decimal] | None] = []
     ref = 0
 
     # The goods, from the priced lines. First because it is the thing being
@@ -338,6 +414,7 @@ def landed_cost(request: QuoteRequest) -> LandedCost:
             notes=None,
         )
     )
+    shares.append(None)
 
     stored = sorted(request.cost_lines, key=lambda c: c.position or 0)
     # The freight form. A figure typed there is a person's answer to "what
@@ -359,12 +436,14 @@ def landed_cost(request: QuoteRequest) -> LandedCost:
     # A row stated as a rate is worked out on the goods: everything before
     # arrival is charged on what was bought, and the CIF value is not known
     # until these rows are summed.
-    origin_amounts = {
-        id(row): (
-            rated if (rated := _rated(row, goods)) is not None else (row.amount_base or _ZERO)
+    # A row of one line's own is rated on that line's goods alone.
+    origin_amounts = {}
+    for row in origin:
+        p = line_of(row)
+        rated_amount = _rated(row, line_goods[p] if p is not None else goods)
+        origin_amounts[id(row)] = (
+            rated_amount if rated_amount is not None else (row.amount_base or _ZERO) * times(row)
         )
-        for row in origin
-    }
 
     for row in origin:
         ref += 1
@@ -378,7 +457,9 @@ def landed_cost(request: QuoteRequest) -> LandedCost:
                 stage=CostStage.ORIGIN,
                 label=row.label,
                 basis=_rate_basis(row, "supplier price") if rated else row.basis,
-                amount_source=None if rated else row.amount_source,
+                amount_source=(
+                    None if rated or row.amount_source is None else row.amount_source * times(row)
+                ),
                 source_currency=None if rated else row.source_currency,
                 amount_base=_money(origin_amounts[id(row)]),
                 # Coerced rather than passed through. A column default is
@@ -393,8 +474,10 @@ def landed_cost(request: QuoteRequest) -> LandedCost:
                 id=str(row.id),
                 percent=row.percent if rated else None,
                 percent_of="goods" if rated else None,
+                **_line_fields(row, line_of(row), quantities),
             )
         )
+        shares.append(spread(origin_amounts[id(row)], line_of(row), line_goods))
 
     if request.freight_charges is not None:
         ref += 1
@@ -419,8 +502,17 @@ def landed_cost(request: QuoteRequest) -> LandedCost:
                 notes=freight_note,
             )
         )
+        shares.append(spread(manual_freight or _ZERO, None, line_goods))
 
     cif = goods + sum(origin_amounts.values(), _ZERO) + (manual_freight or _ZERO)
+    # Each line's value on arrival: its goods, its own charges and its share
+    # of the bid's. What the bid pays after arrival is shared by this, since
+    # duty and the cost of the money are both charged on it. With no row of a
+    # line's own it is in proportion to the goods, as it always was.
+    line_cif = list(line_goods)
+    for vector in shares:
+        if vector is not None:
+            line_cif = [a + b for a, b in zip(line_cif, vector, strict=True)]
 
     # Duty, on the CIF value, because that is what customs charges it on.
     # A duty figure typed on the freight form replaces the rate: it is what
@@ -453,6 +545,7 @@ def landed_cost(request: QuoteRequest) -> LandedCost:
                 notes=duty_note,
             )
         )
+        shares.append(spread(duty, None, line_cif))
 
     # Documentation — certificates, legalisation, the agent's paperwork. After
     # arrival, alongside duty, because that is when it is paid.
@@ -477,6 +570,7 @@ def landed_cost(request: QuoteRequest) -> LandedCost:
                 notes=doc_note,
             )
         )
+        shares.append(spread(documentation or _ZERO, None, line_cif))
 
     # The cost of the money, while it is out of the door. The base is the CIF
     # value: on the terms that make this bite at all — a supplier wanting paying
@@ -509,15 +603,20 @@ def landed_cost(request: QuoteRequest) -> LandedCost:
                 notes=None,
             )
         )
+        shares.append(spread(financing, None, line_cif))
 
     # After arrival a rate may be over the goods or over the CIF value; the
     # bank's cut is on what was paid, a clearance agent's on what arrived.
     destination_amounts = {}
     for row in destination:
         on_cif = (getattr(row, "percent_of", None) or "goods") == "cif"
-        rated_amount = _rated(row, cif if on_cif else goods)
+        p = line_of(row)
+        if p is not None:
+            rated_amount = _rated(row, line_cif[p] if on_cif else line_goods[p])
+        else:
+            rated_amount = _rated(row, cif if on_cif else goods)
         destination_amounts[id(row)] = (
-            rated_amount if rated_amount is not None else (row.amount_base or _ZERO)
+            rated_amount if rated_amount is not None else (row.amount_base or _ZERO) * times(row)
         )
 
     for row in destination:
@@ -534,7 +633,9 @@ def landed_cost(request: QuoteRequest) -> LandedCost:
                     if rated
                     else row.basis
                 ),
-                amount_source=None if rated else row.amount_source,
+                amount_source=(
+                    None if rated or row.amount_source is None else row.amount_source * times(row)
+                ),
                 source_currency=None if rated else row.source_currency,
                 amount_base=_money(destination_amounts[id(row)]),
                 is_principal=bool(row.is_principal),
@@ -544,8 +645,13 @@ def landed_cost(request: QuoteRequest) -> LandedCost:
                 id=str(row.id),
                 percent=row.percent if rated else None,
                 percent_of=("cif" if on_cif else "goods") if rated else None,
+                **_line_fields(row, line_of(row), quantities),
             )
         )
+        # A rate on the goods follows the goods; a figure, or a rate on the
+        # arrival value, follows the arrival value — as duty does.
+        weights = line_goods if rated and not on_cif else line_cif
+        shares.append(spread(destination_amounts[id(row)], line_of(row), weights))
 
     destination_total = (
         duty + financing + (documentation or _ZERO) + sum(destination_amounts.values(), _ZERO)
@@ -561,6 +667,7 @@ def landed_cost(request: QuoteRequest) -> LandedCost:
 
     firm = sum((e.amount_base for e in elements if e.is_firm), _ZERO)
     principal = sum((e.amount_base for e in elements if e.is_principal), _ZERO)
+    lines = _per_line(elements, shares, quantities, line_goods)
 
     return LandedCost(
         currency=currency,
@@ -580,7 +687,60 @@ def landed_cost(request: QuoteRequest) -> LandedCost:
             else Decimal(1)
         ),
         principal_value=_money(principal),
+        lines=lines,
     )
+
+
+def _line_fields(row, line: int | None, quantities: list[Decimal]) -> dict:
+    """Which line a stored row is charged to, and over how many units."""
+    per_unit = line is not None and bool(getattr(row, "per_unit", False))
+    return {
+        "line_position": line,
+        "per_unit": per_unit,
+        "quantity": quantities[line] if per_unit and line is not None else None,
+    }
+
+
+def _per_line(
+    elements: list[CostElement],
+    shares: list[list[Decimal] | None],
+    quantities: list[Decimal],
+    line_goods: list[Decimal],
+) -> list[LineLanded]:
+    """Each line's landed cost, element by element."""
+    out: list[LineLanded] = []
+    for index, qty in enumerate(quantities):
+        parts: list[LinePart] = []
+        total = line_goods[index]
+        for element, vector in zip(elements, shares, strict=True):
+            if vector is None or vector[index] == 0:
+                continue
+            total += vector[index]
+            if qty > 0:
+                parts.append(
+                    LinePart(
+                        label=element.label,
+                        basis=element.basis,
+                        each=_money(vector[index] / qty),
+                        own=element.line_position == index,
+                    )
+                )
+        out.append(
+            LineLanded(
+                position=index,
+                quantity=qty,
+                goods=_money(line_goods[index]),
+                total=_money(total),
+                each=(total / qty).quantize(_EACH, rounding=ROUND_HALF_UP) if qty > 0 else None,
+                uplift=(
+                    (total / line_goods[index]).quantize(_UPLIFT, rounding=ROUND_HALF_UP)
+                    if line_goods[index] > 0
+                    else None
+                ),
+                parts=parts,
+            )
+        )
+    return out
 
 
 # ── what to charge for it ──────────────────────────────────────────────
