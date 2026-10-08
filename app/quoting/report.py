@@ -47,9 +47,13 @@ BASE_CURRENCY: Final = "AED"
 DEFAULT_WALK_AWAY: Final = Decimal(25)
 DEFAULT_COMFORTABLE: Final = Decimal(40)
 
-#: The discounts a customer actually asks for. The ladder is read top to
-#: bottom until the status turns.
-DISCOUNT_LADDER: Final = (Decimal(10), Decimal(20), Decimal(30), Decimal(40), Decimal(50))
+#: The discounts a customer actually asks for, read top to bottom until the
+#: status turns. Which ladder depends on the quoted margin: on a thin quote a
+#: 10% step is already past break-even and says nothing, so it steps by 1%.
+FINE_LADDER: Final = tuple(Decimal(n) for n in range(1, 11))
+WIDE_LADDER: Final = (Decimal(3), Decimal(6), Decimal(9), Decimal(12), Decimal(15))
+#: Below this gross margin the fine ladder is used.
+FINE_LADDER_BELOW: Final = Decimal(30)
 
 _MONEY: Final = Decimal("0.01")
 _PCT: Final = Decimal("0.01")
@@ -530,9 +534,18 @@ def _status(margin_pct: Decimal | None, walk_away: Decimal, comfortable: Decimal
 def _negotiation(
     sale, total_incl_tax, landed, walk_away, comfortable, fig
 ) -> list[NegotiationStep]:
-    """The quoted price, then each discount on the ladder and what it leaves."""
+    """The quoted price, then each discount on the ladder and what it leaves.
+
+    1% steps when the quoted margin is under :data:`FINE_LADDER_BELOW`, 3%
+    steps otherwise. The ladder stops at the first step that makes a loss:
+    every step past it is a bigger loss and tells the approver nothing more.
+    """
+    quoted = ((sale - landed) / sale * Decimal(100)) if sale > 0 else None
+    ladder = FINE_LADDER if quoted is not None and quoted < FINE_LADDER_BELOW else WIDE_LADDER
     steps: list[NegotiationStep] = []
-    for discount in (_ZERO, *DISCOUNT_LADDER):
+    for discount in (_ZERO, *ladder):
+        if steps and steps[-1].status == LOSS:
+            break
         keep = Decimal(1) - discount / Decimal(100)
         sale_d = _money(sale * keep)
         total_d = _money(total_incl_tax * keep)
@@ -569,10 +582,12 @@ def _recommend(steps, floor: Figure, currency: str, comfortable: Decimal) -> str
         opening = (
             "Counter at " + ", then ".join(offers[:-1]) + f"; {offers[-1]} as the final offer"
         )
-    return (
-        f"{opening}. Anything past that needs management approval. "
-        f"Do not go below {floor_text} ex-VAT."
+    # A ladder that ends while still comfortable has not found the edge, so
+    # it cannot say that the next step needs anybody's approval.
+    past = (
+        "" if easy[-1] is steps[-1] else "Anything past that needs management approval. "
     )
+    return f"{opening}. {past}Do not go below {floor_text} ex-VAT."
 
 
 def _supplier(request, supplier_currency: str | None) -> SupplierBlock:
