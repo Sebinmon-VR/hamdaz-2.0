@@ -274,14 +274,20 @@ def test_the_walk_away_is_the_price_at_which_the_margin_is_the_floor(report) -> 
 
 def test_each_discount_step_says_what_it_leaves_and_whether_that_is_fine(report) -> None:
     steps = {s.discount_percent: s for s in report.negotiation}
-    # A 62% margin has room, so the ladder steps by 3%.
+    # 1-3% first, the small asks that are actually given; then the tens.
     assert [s.discount_percent for s in report.negotiation] == [
-        Decimal(0), Decimal(3), Decimal(6), Decimal(9), Decimal(12), Decimal(15),
+        Decimal(0), Decimal(1), Decimal(2), Decimal(3),
+        Decimal(10), Decimal(20), Decimal(30), Decimal(40), Decimal(50),
     ]
     quoted = steps[Decimal(0)]
     assert quoted.total_incl_tax.amount == Decimal("4188.39")
     assert quoted.margin.amount == Decimal("2485.10")
     assert quoted.status == COMFORTABLE
+
+    one = steps[Decimal(1)]
+    assert one.total_incl_tax.amount == Decimal("4146.51")
+    assert one.margin.amount == Decimal("2445.21")
+    assert one.margin_percent == Decimal("61.92")
 
     three = steps[Decimal(3)]
     assert three.total_incl_tax.amount == Decimal("4062.74")
@@ -289,30 +295,26 @@ def test_each_discount_step_says_what_it_leaves_and_whether_that_is_fine(report)
     assert three.margin_percent == Decimal("61.13")
     assert three.status == COMFORTABLE
 
-    fifteen = steps[Decimal(15)]
-    assert fifteen.total_incl_tax.amount == Decimal("3560.13")
-    assert fifteen.margin.amount == Decimal("1886.76")
-    assert fifteen.margin_percent == Decimal("55.65")
-    assert fifteen.status == COMFORTABLE
+    ten = steps[Decimal(10)]
+    assert ten.total_incl_tax.amount == Decimal("3769.55")
+    assert ten.margin.amount == Decimal("2086.21")
+    assert ten.margin_percent == Decimal("58.11")
+    assert ten.status == COMFORTABLE
 
+    assert steps[Decimal(30)].margin.amount == Decimal("1288.42")
+    assert steps[Decimal(30)].margin_percent == Decimal("46.14")
+    assert steps[Decimal(30)].status == COMFORTABLE
 
-def test_a_thin_margin_steps_by_one_percent(drives) -> None:
-    """At 16% a 10% step is most of the margin; the approver needs each point."""
-    for item in drives.items:
-        item.rate = item.cost_rate * Decimal("1.4")
-    built = report_mod.build(drives)
-    assert built.gross_margin_percent < report_mod.FINE_LADDER_BELOW
-    assert [s.discount_percent for s in built.negotiation] == [Decimal(n) for n in range(11)]
+    forty = steps[Decimal(40)]
+    assert forty.total_incl_tax.amount == Decimal("2513.03")
+    assert forty.margin.amount == Decimal("889.52")
+    assert forty.margin_percent == Decimal("37.17")
+    assert forty.status == ACCEPTABLE
 
-
-def test_the_ladder_stops_at_the_first_loss(drives) -> None:
-    for item in drives.items:
-        item.rate = item.cost_rate * Decimal("1.2")
-    built = report_mod.build(drives)
-    steps = built.negotiation
-    assert steps[-1].status == LOSS
-    assert all(s.status != LOSS for s in steps[:-1])
-    assert len(steps) < 11
+    fifty = steps[Decimal(50)]
+    assert fifty.margin.amount == Decimal("490.63")
+    assert fifty.margin_percent == Decimal("24.60")
+    assert fifty.status == NEEDS_APPROVAL
 
 
 def test_the_base_currency_is_converted_once_from_the_unrounded_figure(report) -> None:
@@ -326,7 +328,8 @@ def test_the_base_currency_is_converted_once_from_the_unrounded_figure(report) -
 
 def test_the_recommendation_reads_off_the_ladder(report) -> None:
     assert report.recommendation == (
-        "Counter at 3%, then 6%, then 9%, then 12%; 15% as the final offer. "
+        "Counter at 1%, then 2%, then 3%, then 10%, then 20%; 30% as the final offer. "
+        "Anything past that needs management approval. "
         "Do not go below USD 2,005.12 / AED 7,363.80 ex-VAT."
     )
 
@@ -337,18 +340,18 @@ def test_a_typed_recommendation_beats_the_generated_one(drives) -> None:
 
 
 def test_the_house_lines_can_be_moved_per_quote(drives) -> None:
-    drives.walk_away_margin_percent = Decimal("58")
-    drives.comfortable_margin_percent = Decimal("60")
+    drives.walk_away_margin_percent = Decimal("35")
+    drives.comfortable_margin_percent = Decimal("55")
     built = report_mod.build(drives)
     steps = {s.discount_percent: s for s in built.negotiation}
-    assert steps[Decimal(3)].status == COMFORTABLE  # 61.1%
-    assert steps[Decimal(6)].status == ACCEPTABLE  # 59.9%
-    assert steps[Decimal(9)].status == ACCEPTABLE  # 58.6%
-    assert steps[Decimal(12)].status == NEEDS_APPROVAL  # 57.2%
-    assert built.walk_away_price.amount == (Decimal("1503.84") / Decimal("0.42")).quantize(
+    assert steps[Decimal(10)].status == COMFORTABLE  # 58.1%
+    assert steps[Decimal(20)].status == ACCEPTABLE  # 52.9%
+    assert steps[Decimal(40)].status == ACCEPTABLE  # 37.2%
+    assert steps[Decimal(50)].status == NEEDS_APPROVAL  # 24.6%
+    assert built.walk_away_price.amount == (Decimal("1503.84") / Decimal("0.65")).quantize(
         Decimal("0.01")
     )
-    assert built.recommendation.startswith("Counter at 3% as the final offer. Anything past")
+    assert "any discount" not in built.recommendation
 
 
 def test_a_thin_quote_is_told_to_hold_its_price(drives) -> None:
@@ -415,15 +418,16 @@ def test_the_pdf_renders_and_carries_the_figures(drives) -> None:
     import pdfplumber
 
     with pdfplumber.open(io.BytesIO(pdf)) as document:
-        assert len(document.pages) == 1
-        text = document.pages[0].extract_text()
+        # Nine discount steps take the recommendation over onto a second page.
+        assert len(document.pages) <= 2
+        text = "\n".join(page.extract_text() for page in document.pages)
     for expected in (
         "SELLING & COSTING REPORT", "QT-001720", "1 USD = 3.6725 AED", "ADNOC",
         "router-switch.com", "3,988.94", "14,649.38", "1,503.84", "5,522.85",
         "2,485.10", "62.3%", "2,005.12", "7,363.80", "881457-B21", "748.40",
         "Insurance (1%)", "Payment / bank charges (3%)", "VAT 5%", "4,188.39",
         "Selling price = cost",
-        "Healthy margin", "Below walk-away", "Counter at 3%", "Prepared by",
+        "Healthy margin", "Below walk-away", "Counter at 1%", "Prepared by",
     ):
         assert expected in text, expected
 

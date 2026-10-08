@@ -48,12 +48,12 @@ DEFAULT_WALK_AWAY: Final = Decimal(25)
 DEFAULT_COMFORTABLE: Final = Decimal(40)
 
 #: The discounts a customer actually asks for, read top to bottom until the
-#: status turns. Which ladder depends on the quoted margin: on a thin quote a
-#: 10% step is already past break-even and says nothing, so it steps by 1%.
-FINE_LADDER: Final = tuple(Decimal(n) for n in range(1, 11))
-WIDE_LADDER: Final = (Decimal(3), Decimal(6), Decimal(9), Decimal(12), Decimal(15))
-#: Below this gross margin the fine ladder is used.
-FINE_LADDER_BELOW: Final = Decimal(30)
+#: status turns. 1–3% first: on a thin quote a 10% step is already most of
+#: the margin, and the small asks are the ones that are actually given.
+DISCOUNT_LADDER: Final = (
+    Decimal(1), Decimal(2), Decimal(3),
+    Decimal(10), Decimal(20), Decimal(30), Decimal(40), Decimal(50),
+)
 
 _MONEY: Final = Decimal("0.01")
 _PCT: Final = Decimal("0.01")
@@ -534,18 +534,9 @@ def _status(margin_pct: Decimal | None, walk_away: Decimal, comfortable: Decimal
 def _negotiation(
     sale, total_incl_tax, landed, walk_away, comfortable, fig
 ) -> list[NegotiationStep]:
-    """The quoted price, then each discount on the ladder and what it leaves.
-
-    1% steps when the quoted margin is under :data:`FINE_LADDER_BELOW`, 3%
-    steps otherwise. The ladder stops at the first step that makes a loss:
-    every step past it is a bigger loss and tells the approver nothing more.
-    """
-    quoted = ((sale - landed) / sale * Decimal(100)) if sale > 0 else None
-    ladder = FINE_LADDER if quoted is not None and quoted < FINE_LADDER_BELOW else WIDE_LADDER
+    """The quoted price, then each discount on the ladder and what it leaves."""
     steps: list[NegotiationStep] = []
-    for discount in (_ZERO, *ladder):
-        if steps and steps[-1].status == LOSS:
-            break
+    for discount in (_ZERO, *DISCOUNT_LADDER):
         keep = Decimal(1) - discount / Decimal(100)
         sale_d = _money(sale * keep)
         total_d = _money(total_incl_tax * keep)
