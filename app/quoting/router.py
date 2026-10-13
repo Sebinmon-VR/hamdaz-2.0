@@ -789,6 +789,7 @@ async def set_currency(
     roles: CurrentRoles,
     session: Session,
     zoho: Zoho,
+    extractor: Extractor,
 ) -> QuoteRequestOut:
     """Switch the currency, converting every figure at Zoho's rate.
 
@@ -830,6 +831,7 @@ async def set_currency(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Could not read Zoho Books' currency table to convert the quote.",
         ) from exc
+    await _comparison_follows(request, zoho, extractor)
     return await _out(session, request, user=user, roles=roles)
 
 
@@ -1452,6 +1454,78 @@ async def _convert_offers(
             quote.fx_rate = rates[theirs]
 
 
+async def _rebase_comparison(request: QuoteRequest, zoho: ZohoBooks, failures: list[str]) -> bool:
+    """Put the comparison back in the quote's own currency, if it has drifted.
+
+    A comparison takes the quote's currency when it is made, and every offer's
+    rate is "1 THEIRS in that currency". A quote switched afterwards — to the
+    supplier's currency and back, say — left the comparison behind: a GBP
+    offer on an AED quote sat at a rate of 1, because against a GBP comparison
+    it needs none, and a rate typed in the edit dialog was overwritten with 1
+    for the same reason. So the rates are restated against the quote's
+    currency: Zoho's, for one left at 1 or quoted in the old currency; a rate
+    somebody typed is carried through Zoho's old-to-new rate rather than lost.
+
+    Returns whether anything moved, so the caller knows to work the analysis
+    out again. A rate Zoho cannot give is left at 1 and said in ``failures``.
+    """
+    comparison = request.comparison
+    ours = (request.currency or "AED").upper()
+    if comparison is None or (comparison.currency or "").upper() == ours:
+        return False
+    was = (comparison.currency or ours).upper()
+    step: Decimal | None = None
+    for row in comparison.quotes:
+        theirs = (row.currency or was).upper()
+        try:
+            if theirs == ours:
+                row.fx_rate = Decimal(1)
+            elif theirs != was and row.fx_rate and row.fx_rate != 1:
+                if step is None:
+                    step = (await zoho_rate(zoho, quote_currency=was, supplier_currency=ours)).rate
+                row.fx_rate = (row.fx_rate * step).quantize(Decimal("0.00000001"))
+            else:
+                row.fx_rate = (
+                    await zoho_rate(zoho, quote_currency=theirs, supplier_currency=ours)
+                ).rate
+        except (FxUnavailableError, ZohoError) as exc:
+            row.fx_rate = Decimal(1)
+            failures.append(f"{row.supplier_name}: quoted in {theirs}, not converted — {exc}")
+    comparison.currency = ours
+    logger.info("quote %s: comparison restated from %s to %s", request.id, was, ours)
+    return True
+
+
+async def _comparison_follows(
+    request: QuoteRequest, zoho: ZohoBooks, extractor: QuoteExtractor
+) -> None:
+    """After the quote's currency has moved, move the comparison with it. The
+    currency change itself is done by now and stands: an offer Zoho has no
+    rate for is left at 1, which the edit dialog reads as "not set yet"."""
+    failures: list[str] = []
+    try:
+        if await _rebase_comparison(request, zoho, failures):
+            await _reanalyse(request, extractor)
+    except Exception as exc:  # noqa: BLE001 - the currency switch already happened
+        logger.warning("quote %s: comparison could not follow the currency: %s", request.id, exc)
+    for note in failures:
+        logger.info("quote %s: %s", request.id, note)
+
+
+async def _reanalyse(request: QuoteRequest, extractor: QuoteExtractor) -> None:
+    """Work the comparison out again over the offers it holds now."""
+    comparison = request.comparison
+    if comparison is None or not comparison.quotes:
+        return
+    comparison.analysis = await comparison_service.compare(
+        extractor,
+        [_quote_in_of(q) for q in comparison.quotes],
+        currency=comparison.currency,
+        ids=[str(q.id) for q in comparison.quotes],
+    )
+    comparison.analysed_at = datetime.now(UTC)
+
+
 async def _attach(
     session: AsyncSession,
     request: QuoteRequest,
@@ -1536,6 +1610,7 @@ async def select_supplier(
     roles: CurrentRoles,
     session: Session,
     zoho: Zoho,
+    extractor: Extractor,
 ) -> QuoteRequestOut:
     """Take one supplier's offer as this quote's own lines.
 
@@ -1572,6 +1647,8 @@ async def select_supplier(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Could not read Zoho Books' currency table to convert the offer.",
         ) from exc
+    # Choosing a supplier in another currency moves the quote into it.
+    await _comparison_follows(request, zoho, extractor)
     return await _out(session, request, user=user, roles=roles)
 
 
@@ -1915,6 +1992,12 @@ async def edit_supplier_quote(
             "detail_suggestions": row.detail_suggestions or {},
         }
     )
+    # The dialog asks for "1 GBP in <the quote's currency>", so that is what
+    # the comparison must be in before the typed rate can mean anything.
+    drift: list[str] = []
+    await _rebase_comparison(request, zoho, drift)
+    for note in drift:
+        logger.info("quote %s: %s", request.id, note)
     ours = (comparison.currency or request.currency or "AED").upper()
     if incoming.currency == ours:
         incoming.fx_rate = Decimal(1)
@@ -1957,13 +2040,7 @@ async def edit_supplier_quote(
     if request.supplier_name and request.supplier_name.strip() == (old_name or "").strip():
         request.supplier_name = row.supplier_name
 
-    comparison.analysis = await comparison_service.compare(
-        extractor,
-        [_quote_in_of(q) for q in comparison.quotes],
-        currency=comparison.currency,
-        ids=[str(q.id) for q in comparison.quotes],
-    )
-    comparison.analysed_at = datetime.now(UTC)
+    await _reanalyse(request, extractor)
     await session.flush()
     logger.info("quote %s: supplier quote %s corrected", request.id, row.id)
     return await _out(session, request, user=user, roles=roles)
@@ -2029,13 +2106,7 @@ async def _detach_supplier_quote(
         if item.source_supplier_quote_id == row.id:
             item.source_supplier_quote_id = None
     if comparison.quotes:
-        comparison.analysis = await comparison_service.compare(
-            extractor,
-            [_quote_in_of(q) for q in comparison.quotes],
-            currency=comparison.currency,
-            ids=[str(q.id) for q in comparison.quotes],
-        )
-        comparison.analysed_at = datetime.now(UTC)
+        await _reanalyse(request, extractor)
     else:
         request.comparison = None
         request.comparison_id = None
