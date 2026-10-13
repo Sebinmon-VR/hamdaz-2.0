@@ -50,6 +50,18 @@ def test_a_new_rate_on_the_chosen_offer_recosts_its_lines() -> None:
     assert request.items[0].rate < Decimal("2357.48")
 
 
+def test_the_rate_the_lines_were_costed_at_is_read_off_them() -> None:
+    # 4.85 was saved on the offer before the fix was live, so the offer says
+    # 4.85 while the lines are still at 4.93. Saving 4.85 again must move them.
+    request, offer = priced_from_sterling()
+    offer.fx_rate = Decimal("4.85")
+
+    assert service.restate_at_offer_rate(request, offer, was=Decimal("4.85"), now=Decimal("4.85"))
+
+    assert request.items[0].cost_rate == Decimal("1796.63")  # 370.44 x 4.85
+    assert request.cost_lines[0].amount_base == Decimal("9.70")  # 9.86 x 4.85 / 4.93
+
+
 def test_nothing_moves_without_a_new_rate_or_for_another_offer() -> None:
     request, offer = priced_from_sterling()
     assert not service.restate_at_offer_rate(

@@ -883,11 +883,8 @@ def restate_at_offer_rate(
         request.selected_supplier_quote_id != quote.id
         or not theirs
         or theirs == ours
-        or not was
         or not now
-        or was <= 0
         or now <= 0
-        or was == now
     ):
         return False
     supplier_items = sorted(quote.items, key=lambda i: i.position or 0)
@@ -896,6 +893,24 @@ def restate_at_offer_rate(
         key=lambda i: i.position or 0,
     )
     aligned = len(supplier_items) == len(lines)
+    # The rate the lines were *actually* costed at, read off the lines: the
+    # offer's stored rate is not it when the rate was typed before the deploy
+    # that made it count, or the quote was switched at Zoho's since.
+    first = next(
+        (
+            (line, item)
+            for line, item in zip(lines, supplier_items, strict=False)
+            if aligned and line.cost_rate and item.unit_price
+        ),
+        None,
+    )
+    if first is not None:
+        line, item = first
+        if (item.unit_price * now).quantize(_PRICE, rounding=ROUND_HALF_UP) == line.cost_rate:
+            return False
+        was = line.cost_rate / item.unit_price
+    elif not was or was <= 0 or was == now:
+        return False
     for index, item in enumerate(lines):
         if item.cost_rate is None:
             continue
