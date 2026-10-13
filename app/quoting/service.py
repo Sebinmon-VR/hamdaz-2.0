@@ -861,6 +861,67 @@ async def _adopt_currency(
     await convert_currency(session, request, to_currency=theirs, rates=rates)
 
 
+def restate_at_offer_rate(
+    request: QuoteRequest, quote: SupplierQuote, *, was: Decimal | None, now: Decimal | None
+) -> bool:
+    """The chosen supplier's rate changed: cost their lines at the new one.
+
+    A quote in dirhams priced from a sterling offer has its costs converted
+    once, at whatever rate was set then — Zoho's, usually. A rate typed on the
+    offer afterwards ("1 GBP = 4.86 AED, the rate we will actually pay at")
+    used to change the comparison and nothing else, so the quote went on
+    costing the goods at the old one. Now the lines priced from this offer
+    are costed at the new rate, the charges seeded from it follow, and the
+    selling prices are rebuilt at the quote's margin.
+
+    Only the rate moves anything. A correction to their prices leaves our
+    lines alone, as before — choosing the supplier again does that.
+    """
+    ours = (request.currency or "").upper()
+    theirs = (quote.currency or "").upper()
+    if (
+        request.selected_supplier_quote_id != quote.id
+        or not theirs
+        or theirs == ours
+        or not was
+        or not now
+        or was <= 0
+        or now <= 0
+        or was == now
+    ):
+        return False
+    supplier_items = sorted(quote.items, key=lambda i: i.position or 0)
+    lines = sorted(
+        (i for i in request.items if i.source_supplier_quote_id == quote.id),
+        key=lambda i: i.position or 0,
+    )
+    aligned = len(supplier_items) == len(lines)
+    for index, item in enumerate(lines):
+        if item.cost_rate is None:
+            continue
+        unit = supplier_items[index].unit_price if aligned else None
+        # Their own price times the rate where the lines still pair up; the
+        # old cost rescaled where they do not.
+        cost = unit * now if unit is not None else item.cost_rate * now / was
+        item.cost_rate = cost.quantize(_PRICE, rounding=ROUND_HALF_UP)
+    suffix = f"– {quote.supplier_name}"
+    for row in request.cost_lines:
+        if row.basis != "Supplier quotation" or not (row.label or "").endswith(suffix):
+            continue
+        if row.amount_source is not None and (row.source_currency or "").upper() == theirs:
+            row.amount_base = (row.amount_source * now).quantize(_PRICE, rounding=ROUND_HALF_UP)
+        elif row.amount_base:
+            row.amount_base = (row.amount_base * now / was).quantize(
+                _PRICE, rounding=ROUND_HALF_UP
+            )
+    reprice_at_margin(request, request.target_markup_percent or Decimal(0))
+    logger.info(
+        "quote %s: %s restated from %s to %s %s per %s",
+        request.id, quote.supplier_name, was, now, ours, theirs,
+    )
+    return True
+
+
 def reprice_at_margin(request: QuoteRequest, margin_percent: Decimal) -> int:
     """Price every costed line so the quote keeps ``margin_percent`` of its
     selling price *after the landed cost*.

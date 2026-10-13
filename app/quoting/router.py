@@ -1962,7 +1962,10 @@ async def edit_supplier_quote(
     priced from it all stay attached; the comparison is worked out again over
     the corrected figures. The quote's own lines are not repriced: choosing
     the supplier again does that, deliberately, so a correction never moves a
-    price somebody has already set by hand. Only while the quote is editable.
+    price somebody has already set by hand. The exception is the exchange
+    rate on the chosen offer: a new one re-costs the lines priced from it,
+    at the quote's margin (``service.restate_at_offer_rate``). Only while the
+    quote is editable.
     """
     request = await _load(session, request_id)
     try:
@@ -2013,6 +2016,8 @@ async def edit_supplier_quote(
             )
 
     old_name = row.supplier_name
+    # The rate the quote's lines were costed at, against the one now typed.
+    was_rate = row.fx_rate if (row.currency or "").upper() == incoming.currency else None
     for name in (
         "supplier_name", "quote_number", "quote_date", "currency", "fx_rate", "validity",
         "delivery_time", "payment_terms", "warranty", "incoterms", "contact", "notes",
@@ -2039,6 +2044,9 @@ async def edit_supplier_quote(
     # was filled from this offer — a corrected spelling follows it there.
     if request.supplier_name and request.supplier_name.strip() == (old_name or "").strip():
         request.supplier_name = row.supplier_name
+    # A new rate on the chosen offer is a new cost for the lines priced from
+    # it — the one thing here that moves the quote's own figures.
+    service.restate_at_offer_rate(request, row, was=was_rate, now=row.fx_rate)
 
     await _reanalyse(request, extractor)
     await session.flush()
