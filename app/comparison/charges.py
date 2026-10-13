@@ -102,9 +102,13 @@ _EXTRA: Final = re.compile(
 #: 1 once the regex backtracks, so the check is made on what follows the match.
 _NUMBER: Final = re.compile(r"(?<![\d.,])\d{1,3}(?:,\d{3})+(?:\.\d+)?|(?<![\d.,])\d+(?:\.\d+)?")
 _PERCENT_AFTER: Final = re.compile(r"\s*%")
+#: Counts as well as durations: "the total 2 Off blankets" is two blankets in
+#: a British supplier's words, and was read as a packing charge of 2. Sizes
+#: too: a packing specification gives its carton in centimetres.
 _NOT_MONEY_AFTER: Final = re.compile(
     r"\s*(?:(?:-|–|to)\s*\d+\s*)?(?:days?|weeks?|wks?|months?|hours?|hrs?|years?|yrs?"
-    r"|working|business|kgs?|pcs|nos|units?|x\b)",
+    r"|working|business|kgs?|cms?\b|mm\b|pcs|pieces?|nos|units?|off\b|sets?\b|lots?\b|pairs?\b"
+    r"|boxes|cartons?|ctns?\b|pallets?|packages?|pkgs?\b|rolls?\b|x\b)",
     re.I,
 )
 #: A code or a reference, not money: "HS code 8471.30", "clause 12".

@@ -68,6 +68,18 @@ def test_a_code_or_a_duration_is_not_money() -> None:
     assert charges("Customs Duty | | | 1,250.00")["duty"].amount == 1250
 
 
+def test_a_count_is_not_money() -> None:
+    # IC International's quote: "2 Off" is two blankets, not a packing charge.
+    text = (
+        "May we advise that the approximate packing specification (for the total "
+        "2 Off blankets sent together as one"
+    )
+    assert "packing" not in charges(text)
+    assert "packing" not in charges("Packing specification: 60 x 40 x 30 cm, 12 kg")
+    assert "packing" not in charges("Packing: 3 cartons, 2 pallets")
+    assert charges("Packing charges GBP 25 extra")["packing"].amount == 25
+
+
 def test_a_figure_shared_with_the_freight_is_the_freight() -> None:
     found = charges("Freight & handling USD 300")
     assert "handling" not in found
