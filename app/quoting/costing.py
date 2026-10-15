@@ -286,6 +286,35 @@ def seed_costing(
     return added
 
 
+def add_freight(request: QuoteRequest, quote: SupplierQuote, *, divisor: Decimal) -> bool:
+    """The freight a second supplier stated, as its own row, when the quote
+    is priced from several. ``divisor`` is their currency per one of ours.
+    Never twice, and never over a freight typed on the freight form."""
+    if request.freight_charges is not None or not quote.freight or quote.freight <= 0:
+        return False
+    label = f"Freight – {quote.supplier_name}"
+    if any(row.label == label for row in request.cost_lines):
+        return False
+    ours = (request.currency or "").upper()
+    theirs = (quote.currency or "").upper() or ours
+    converting = theirs != ours
+    request.cost_lines.append(
+        QuoteCostLine(
+            position=len(request.cost_lines) + 1,
+            stage=CostStage.ORIGIN,
+            label=label,
+            basis="Supplier quotation",
+            amount_source=quote.freight if converting else None,
+            source_currency=theirs if converting else None,
+            amount_base=(quote.freight / divisor).quantize(_PRICE, rounding=ROUND_HALF_UP),
+            is_principal=False,
+            is_firm=True,
+            notes="As stated on the supplier's quotation.",
+        )
+    )
+    return True
+
+
 #: Paid to the supplier with the goods, so before the duty base; the rest is
 #: paid here, after arrival.
 _ORIGIN_CHARGES: Final = frozenset({"handling", "packing", "insurance", "documentation"})

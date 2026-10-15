@@ -29,7 +29,7 @@ cost behind them carry nothing and say so.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Final
@@ -37,7 +37,7 @@ from typing import Final
 from app.comparison import supplier_details
 from app.models.quoting import QuoteRequest
 from app.quoting import bidpack
-from app.quoting.service import supplier_prices
+from app.quoting.service import cost_checks, supplier_prices
 
 #: The currency the business reads money in. Zoho's base, and the second
 #: column of every figure on the report.
@@ -99,6 +99,8 @@ class ReportLine:
     margin: Figure | None
     #: Of the selling price.
     margin_percent: Decimal | None
+    #: Who the line is bought from, on a quote priced from several suppliers.
+    supplier: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +155,9 @@ class SupplierBlock:
     details: tuple[tuple[str, str], ...] = ()
     #: What of that is still blank, said rather than hidden.
     missing: tuple[str, ...] = ()
+    #: The report's line numbers priced from this supplier, on a quote priced
+    #: from several. Empty when one supplier carries every line.
+    lines: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,6 +207,9 @@ class CostingReport:
     recommendation: str
     notes: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    #: Every supplier the lines are priced from, the one carrying most of the
+    #: cost first. One entry — ``supplier`` — when a single supplier quoted it.
+    suppliers: list[SupplierBlock] = field(default_factory=list)
 
 
 # ── building it ────────────────────────────────────────────────────────
@@ -263,8 +271,9 @@ def build(
     walk_away_price = _price_at_margin(landed_total, walk_away)
 
     supplier = _supplier(request, supplier_currency)
+    suppliers = _suppliers(request, supplier, supplier_currency)
     recommendation = (request.recommendation or "").strip() or _recommend(
-        steps, fig(walk_away_price), currency, comfortable
+        steps, fig(walk_away_price), currency, comfortable, walk_away
     )
     notes, warnings = _notes(request, pack, cost_rows, lines, supplier, rate, currency)
 
@@ -310,6 +319,7 @@ def build(
         recommendation=recommendation,
         notes=notes,
         warnings=warnings,
+        suppliers=suppliers,
     )
 
 
@@ -428,6 +438,12 @@ def _lines(request, landed, fig, rate):
         next(iter(currencies)) if from_document else (request.currency or BASE_CURRENCY).upper()
     ) if costs else None
 
+    # On a quote priced from several suppliers, each line says whose it is.
+    offers = (
+        {q.id: q.supplier_name for q in request.comparison.quotes} if request.comparison else {}
+    )
+    named = len({i.source_supplier_quote_id for i in items} & set(offers)) > 1
+
     lines: list[ReportLine] = []
     total_supplier = _ZERO if costs else None
     total_qty = _ZERO
@@ -471,6 +487,7 @@ def _lines(request, landed, fig, rate):
                 selling=selling,
                 margin=margin_fig,
                 margin_percent=margin_pct,
+                supplier=offers.get(item.source_supplier_quote_id) if named else None,
             )
         )
     return lines, total_qty, total_supplier, supplier_currency
@@ -555,15 +572,29 @@ def _negotiation(
     return steps
 
 
-def _recommend(steps, floor: Figure, currency: str, comfortable: Decimal) -> str:
+def _recommend(
+    steps, floor: Figure, currency: str, comfortable: Decimal, walk_away: Decimal
+) -> str:
     """What to say if the customer asks for a discount, from the ladder."""
     easy = [s for s in steps if s.discount_percent > 0 and s.status == COMFORTABLE]
     floor_text = f"{currency} {floor.amount:,.2f}"
     if floor.base is not None:
         floor_text += f" / {BASE_CURRENCY} {floor.base:,.2f}"
-    if not easy:
+    quoted = steps[0]
+    if quoted.status == LOSS:
+        return "The quoted price does not cover the landed cost. Do not submit it as it stands."
+    if quoted.status == NEEDS_APPROVAL:
+        # Already under the floor: "do not go below" a price above the quote
+        # is no advice at all.
         return (
-            f"Hold the quoted price — any discount takes the margin below "
+            f"The quoted margin of {_trim(quoted.margin_percent)}% is already below the "
+            f"{_trim(walk_away)}% walk-away ({floor_text} ex-VAT), so the quote itself "
+            f"needs management approval. Give no discount."
+        )
+    if not easy:
+        below = "below" if quoted.status == COMFORTABLE else "further below"
+        return (
+            f"Hold the quoted price — any discount takes the margin {below} "
             f"{_trim(comfortable)}%. Do not go below {floor_text} ex-VAT."
         )
     offers = [f"{_trim(s.discount_percent)}%" for s in easy]
@@ -581,7 +612,34 @@ def _recommend(steps, floor: Figure, currency: str, comfortable: Decimal) -> str
     return f"{opening}. {past}Do not go below {floor_text} ex-VAT."
 
 
-def _supplier(request, supplier_currency: str | None) -> SupplierBlock:
+def _suppliers(request, main: SupplierBlock, supplier_currency: str | None) -> list[SupplierBlock]:
+    """Every supplier the lines are priced from, each with its own details and
+    the line numbers it carries — the chosen one first. A quote priced from one
+    supplier, or from none, has just ``main``."""
+    if request.comparison is None:
+        return [main]
+    offers = {q.id: q for q in request.comparison.quotes}
+    carried: dict = {}
+    for number, item in enumerate(sorted(request.items, key=lambda i: i.position or 0), 1):
+        if item.source_supplier_quote_id in offers:
+            carried.setdefault(item.source_supplier_quote_id, []).append(number)
+    if len(carried) < 2:
+        return [main]
+    chosen = request.selected_supplier_quote_id
+    order = sorted(carried, key=lambda k: (k != chosen, carried[k][0]))
+    return [
+        replace(
+            _supplier(request, None, offer=offers[key]),
+            # The quote's own basis and route describe the main supplier.
+            basis=main.basis if key == chosen else None,
+            route=main.route if key == chosen else None,
+            lines=tuple(carried[key]),
+        )
+        for key in order
+    ]
+
+
+def _supplier(request, supplier_currency: str | None, *, offer=None) -> SupplierBlock:
     """The supplier as the report names them: the offer the quote is priced
     from, as it stands — its name, and its supplier details (type, address,
     contact, bank) beneath.
@@ -591,8 +649,12 @@ def _supplier(request, supplier_currency: str | None) -> SupplierBlock:
     The quote's own ``supplier_name`` and ``supplier_basis`` are only read
     for a quote with no offer chosen, or one written before they were
     dropped from the form."""
-    chosen = None
-    if request.comparison is not None and request.selected_supplier_quote_id is not None:
+    chosen = offer
+    if (
+        chosen is None
+        and request.comparison is not None
+        and request.selected_supplier_quote_id is not None
+    ):
         chosen = next(
             (q for q in request.comparison.quotes if q.id == request.selected_supplier_quote_id),
             None,
@@ -658,6 +720,24 @@ def _notes(request, pack, cost_rows, lines, supplier, rate, currency):
     if pack.landed.total <= 0:
         warnings.append(
             "No cost is recorded behind this quote; the margin shown is the whole price."
+        )
+    checks = cost_checks(request)
+    for check in (c for c in checks if c.offers):
+        quoted = "; ".join(
+            f"{who} quoted {cur} {unit:,.2f} = {currency} {converted:,.2f}"
+            for who, unit, cur, converted in check.offers
+        )
+        warnings.append(
+            f"Line {check.position} ({check.name}): cost {currency} {check.cost:,.2f}, "
+            f"but {quoted}. Check the cost before approving."
+        )
+    unsourced = [c.position for c in checks if not c.offers]
+    if unsourced and lines:
+        which = ", ".join(str(p) for p in unsourced)
+        warnings.append(
+            f"No attached supplier quote has the part on line{'s' if len(unsourced) > 1 else ''} "
+            f"{which}: {'their costs were' if len(unsourced) > 1 else 'its cost was'} "
+            f"typed in. Attach the supplier's quote or confirm the cost."
         )
     for raw in (request.report_notes or "").splitlines():
         line = raw.strip()

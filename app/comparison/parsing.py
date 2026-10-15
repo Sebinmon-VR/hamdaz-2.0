@@ -36,6 +36,7 @@ from typing import Final
 
 from app.comparison.documents import Readable
 from app.comparison.extraction import ExtractedItem, ExtractedQuote
+from app.comparison.supplier_details import is_own_company
 
 logger = logging.getLogger("hamdaz.comparison")
 
@@ -559,8 +560,16 @@ def _first(text: str, patterns: tuple[re.Pattern[str], ...]) -> str | None:
 def _supplier_name(text: str) -> str | None:
     if labelled := _first(text, _SUPPLIER):
         # "From Yalla LLC <info@yallallc.com>": the name, not the address.
-        return labelled.split("<")[0].strip(" :-") or labelled
-    head = [line.strip() for line in text.splitlines()[:14] if line.strip()]
+        name = labelled.split("<")[0].strip(" :-") or labelled
+        if not is_own_company(name):
+            return name
+    # Our own name is never the supplier's: a quote addressed to us names us,
+    # and the supplier's letterhead is the other company on the page.
+    head = [
+        line.strip()
+        for line in text.splitlines()[:14]
+        if line.strip() and not is_own_company(line)
+    ]
     # The letterhead: the first line that reads like a company.
     for line in head:
         if 3 < len(line) < 80 and _COMPANY_SUFFIX.search(line):

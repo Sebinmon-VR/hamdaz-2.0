@@ -77,6 +77,25 @@ LABELS: Final[dict[str, str]] = {key: label for _, fields in GROUPS for key, lab
 #: address, email or TRN is never the supplier's.
 OWN_COMPANY: Final = ("hamdaz",)
 
+#: Our own quotation, as Zoho prints it: the heading or the estimate number.
+_OUR_QUOTATION: Final = re.compile(r"\bcommercial\s+proposal\b|#\s*QT-\d+", re.I)
+
+
+def is_own_company(name: str | None) -> bool:
+    """Whether a name is ours. A quotation addressed to us names us too, so
+    our name is never the supplier's."""
+    folded = (name or "").casefold()
+    return any(word in folded for word in OWN_COMPANY)
+
+
+def is_our_quotation(text: str | None) -> bool:
+    """Whether a document is our own quotation to the customer rather than an
+    offer to us: printed under our letterhead as a commercial proposal. A
+    supplier's quote addressed to us carries our name lower down, but not
+    our heading."""
+    head = "\n".join((text or "").splitlines()[:40])
+    return is_own_company(head) and bool(_OUR_QUOTATION.search(head))
+
 #: What a supplier is to us. Free text is allowed beside these.
 SUPPLIER_TYPES: Final = ("OEM / manufacturer", "Distributor", "Reseller", "Service provider")
 

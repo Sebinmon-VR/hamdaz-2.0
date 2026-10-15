@@ -278,15 +278,50 @@ def _status_pill(status: str) -> Pill:
 # ── the blocks ─────────────────────────────────────────────────────────
 
 
-def _party_box(heading: str, name: str, lines: list[str], width: float) -> Table:
+def _supplier_text(s, *, creator: bool) -> tuple[str, list[str]]:
+    """One supplier as the party box prints it: the name, then the facts."""
+    name = s.name or "Supplier not stated"
+    if s.basis:
+        name += f"  ({s.basis})"
+    if s.lines:
+        name += f"  ·  line{'s' if len(s.lines) > 1 else ''} {', '.join(map(str, s.lines))}"
+    bits = []
+    if s.route:
+        bits.append(f"Route: {s.route}")
+    if creator and s.creator:
+        bits.append(f"Creator: {s.creator}")
+    lines = ["  ·  ".join(bits)] if bits else []
+    if s.quote_number:
+        lines.append(f"Their ref: {s.quote_number}")
+    lines += [f"{label}: {value}" for label, value in s.details]
+    if s.missing:
+        lines.append(f"Not given: {', '.join(s.missing)}")
+    return name, lines
+
+
+def _party_box(
+    heading: str,
+    name: str,
+    lines: list[str],
+    width: float,
+    *,
+    more: list[tuple[str, list[str]]] | None = None,
+) -> Table:
     head = _style("party_head", fontName="Helvetica-Bold", fontSize=7.4, leading=9, textColor=CYAN)
     strong = _style("party_name", fontName="Helvetica-Bold", fontSize=8.4, leading=11)
+    next_name = _style(
+        "party_next", fontName="Helvetica-Bold", fontSize=8.4, leading=11, spaceBefore=5
+    )
     body = _style("party_body", fontSize=8.4, leading=11, textColor=MUTED)
     content = [
         Paragraph(_esc(heading).upper(), head),
         Paragraph(_esc(name), strong),
         *[Paragraph(_esc(line), body) for line in lines if line],
     ]
+    # Further parties in the same box — a quote priced from several suppliers.
+    for other_name, other_lines in more or []:
+        content.append(Paragraph(_esc(other_name), next_name))
+        content.extend(Paragraph(_esc(line), body) for line in other_lines if line)
     table = Table([[content]], colWidths=[width])
     table.setStyle(
         TableStyle(
@@ -320,26 +355,17 @@ def _parties(report: CostingReport) -> Table:
     if c.portal:
         customer_lines.append(f"Portal: {c.portal}")
 
-    supplier_name = s.name or "Supplier not stated"
-    if s.basis:
-        supplier_name += f"  ({s.basis})"
-    supplier_bits = []
-    if s.route:
-        supplier_bits.append(f"Route: {s.route}")
-    if s.creator:
-        supplier_bits.append(f"Creator: {s.creator}")
-    supplier_lines = ["  ·  ".join(supplier_bits)] if supplier_bits else []
-    if s.quote_number:
-        supplier_lines.append(f"Their ref: {s.quote_number}")
-    supplier_lines += [f"{label}: {value}" for label, value in s.details]
-    if s.missing:
-        supplier_lines.append(f"Not given: {', '.join(s.missing)}")
-
     half = (WIDTH - 6) / 2
+    several = report.suppliers if len(report.suppliers) > 1 else [s]
     row = [
         _party_box("Customer", customer_name, customer_lines, half),
         "",
-        _party_box("Supplier", supplier_name, supplier_lines, half),
+        _party_box(
+            "Suppliers" if len(several) > 1 else "Supplier",
+            *_supplier_text(several[0], creator=True),
+            half,
+            more=[_supplier_text(b, creator=False) for b in several[1:]],
+        ),
     ]
     table = Table([row], colWidths=[half, 6, half])
     table.setStyle(
@@ -512,6 +538,9 @@ def _lines_table(report: CostingReport) -> Table:
         if line.part_number:
             desc += f"<b>{_esc(line.part_number)}</b>  "
         desc += f"<font color='#{MUTED.hexval()[2:]}'>{_esc(line.description)}</font>"
+        if line.supplier:
+            tint = CYAN.hexval()[2:]
+            desc += f"<br/><font size='7' color='#{tint}'>from {_esc(line.supplier)}</font>"
         qty = report_mod._trim(line.quantity)
         landed = line.landed
         margin = line.margin

@@ -802,6 +802,9 @@ class QuoteRequestOut(BaseModel):
     #: The documents people uploaded, and where each was filed. Kept apart from
     #: ``comparison`` because that is a computation and these are files.
     documents: list[QuoteDocumentOut] = Field(default_factory=list)
+    #: On an upload's answer only: the files that were not added, and why —
+    #: ``{"file_name", "error"}``. Empty on every other read.
+    failed: list[dict[str, str]] = Field(default_factory=list)
     #: Every sum on the quote, written out in the order it runs. See
     #: ``app.quoting.calculation``.
     calculation: list[CalcStepOut] = Field(default_factory=list)
@@ -840,7 +843,35 @@ class QuoteRequestOut(BaseModel):
         """
         if value is None or isinstance(value, dict):
             return value
-        return getattr(value, "analysis", None)
+        analysis = getattr(value, "analysis", None)
+        if not analysis:
+            return analysis
+        # Each offer carries the id a line is picked by. An analysis stored
+        # before it did is given it here, found by the row it describes.
+        rows = {
+            str(q.id): sorted(q.items, key=lambda i: i.position or 0)
+            for q in getattr(value, "quotes", None) or []
+        }
+        groups = []
+        for group in analysis.get("groups") or []:
+            offers = []
+            for offer in group.get("offers") or []:
+                if "item_id" not in offer:
+                    mine = rows.get(str(offer.get("quote_id")), [])
+                    index = next(
+                        (
+                            n
+                            for n, row in enumerate(mine)
+                            if row.description == offer.get("description")
+                            and (row.part_number or None) == (offer.get("part_number") or None)
+                        ),
+                        None,
+                    )
+                    if index is not None:
+                        offer = {**offer, "item_id": f"{offer.get('quote_id')}-i{index}"}
+                offers.append(offer)
+            groups.append({**group, "offers": offers})
+        return {**analysis, "groups": groups}
 
 
 class QuoteSummaryOut(BaseModel):
@@ -994,6 +1025,16 @@ class SupplierChoiceIn(BaseModel):
     markup_percent: Decimal = Field(default=Decimal(0), ge=0, lt=100)
 
 
+class LineChoiceIn(BaseModel):
+    """Which supplier's row each line is priced from, line by line."""
+
+    #: The comparison's item ids (``"<supplier quote id>-i<n>"``), one per line,
+    #: in the order the lines should be.
+    picks: list[str] = Field(min_length=1, max_length=500)
+    #: The margin, as on :class:`SupplierChoiceIn`.
+    markup_percent: Decimal = Field(default=Decimal(0), ge=0, lt=100)
+
+
 class ReviewIn(BaseModel):
     action: ReviewAction
     #: Required for a rejection or a rework — a refusal that does not say why is
@@ -1044,6 +1085,8 @@ class ReportLineOut(BaseModel):
     margin: FigureOut | None
     #: Of the selling price.
     margin_percent: Decimal | None
+    #: Who the line is bought from, when the quote is priced from several.
+    supplier: str | None = None
 
 
 class ReportCostRowOut(BaseModel):
@@ -1101,6 +1144,8 @@ class ReportSupplierOut(BaseModel):
     details: list[tuple[str, str]] = Field(default_factory=list)
     #: Labels of what is still blank.
     missing: list[str] = Field(default_factory=list)
+    #: The report's line numbers priced from this supplier, when several are.
+    lines: list[int] = Field(default_factory=list)
 
 
 class CostingReportOut(BaseModel):
@@ -1123,6 +1168,9 @@ class CostingReportOut(BaseModel):
 
     customer: ReportCustomerOut
     supplier: ReportSupplierOut
+    #: Every supplier the lines are priced from, ``supplier`` first. One entry
+    #: when a single supplier quoted it.
+    suppliers: list[ReportSupplierOut] = Field(default_factory=list)
 
     quoted_price: FigureOut
     landed_total: FigureOut

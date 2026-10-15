@@ -422,6 +422,18 @@ class QuoteDrive:
             raise DriveError(f"download refused ({response.status_code})")
         return response.content
 
+    async def thumbnail(self, item_id: str, size: str = "medium") -> tuple[bytes, str] | None:
+        """SharePoint's own picture of a file's first page — PDFs, images and
+        Office files alike — or None when it has none to give."""
+        response = await self._http.get(
+            f"{GRAPH_BASE}/drives/{self._drive()}/items/{item_id}/thumbnails/0/{size}/content",
+            headers=await self._headers(),
+            follow_redirects=True,
+        )
+        if response.status_code >= 400 or not response.content:
+            return None
+        return response.content, response.headers.get("content-type", "image/jpeg")
+
     async def delete_item(self, item_id: str) -> None:
         """Remove a file this app filed. Only ever called for an item this app
         recorded, never for anything a person put in the folder."""

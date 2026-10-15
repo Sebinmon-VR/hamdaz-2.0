@@ -315,6 +315,8 @@ def analyse(
                 "offers": [
                     {
                         "quote_id": q.quote_id,
+                        # What a line priced from this row is picked by.
+                        "item_id": o.item_id,
                         "supplier_name": q.supplier_name,
                         "description": o.description,
                         "part_number": o.part_number,

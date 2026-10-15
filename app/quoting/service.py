@@ -575,13 +575,111 @@ def supplier_prices(request: QuoteRequest) -> dict[str, tuple[Decimal, str]]:
             by_source.setdefault(str(item.source_supplier_quote_id), []).append(item)
     for source_id, ours in by_source.items():
         quote = quotes.get(source_id)
-        if quote is None or len(quote.items) != len(ours) or not quote.currency:
+        if quote is None or not quote.currency:
             continue
         theirs = sorted(quote.items, key=lambda i: i.position or 0)
-        for mine, row in zip(ours, theirs, strict=True):
+        if len(theirs) == len(ours):
+            pairs = list(zip(ours, theirs, strict=True))
+        else:
+            # Priced line by line from several suppliers: only some of this
+            # one's rows are on the quote, so each is found by what it is.
+            pairs = [(mine, row) for mine in ours if (row := _row_for(mine, theirs)) is not None]
+        for mine, row in pairs:
             if row.unit_price is not None:
                 out[str(mine.id)] = (row.unit_price, quote.currency.upper())
     return out
+
+
+def _row_for(item: QuoteRequestItem, rows: list[SupplierQuoteItem]) -> SupplierQuoteItem | None:
+    """The supplier's row a line was priced from: by part number, else by its
+    description, as the line was named from it."""
+    code = _part_key(item.item_code)
+    if code:
+        for row in rows:
+            if _part_key(row.part_number) == code:
+                return row
+    name = (item.name or "").strip()
+    return next((r for r in rows if (r.description or "").strip()[:_NAME_LIMIT] == name), None)
+
+#: How far a line's cost may sit from the supplier's price, converted, before
+#: it is called out: wide enough for a rate rounded to four places, narrow
+#: enough for a price converted by hand at 3.625 instead of 3.6725.
+_COST_TOLERANCE: Final = Decimal("0.005")
+
+
+@dataclass(frozen=True)
+class CostCheck:
+    """A costed line that no attached offer bears out.
+
+    ``offers`` is every offer that quoted the part, as (supplier, their unit
+    price, their currency, that price in the quote's currency); empty when no
+    supplier quote attached to the quote has the part at all."""
+
+    position: int
+    name: str
+    cost: Decimal
+    offers: tuple[tuple[str, Decimal, str, Decimal], ...]
+
+
+def _part_key(text: str | None) -> str:
+    return re.sub(r"[^a-z0-9]", "", (text or "").casefold())
+
+
+def _in_our_currency(request: QuoteRequest, quote: SupplierQuote, unit: Decimal) -> Decimal | None:
+    """A supplier's unit price in the quote's currency, at the rate the quote
+    is priced at — or the comparison's, when the quote has none."""
+    theirs = (quote.currency or "").upper()
+    ours = (request.currency or "").upper()
+    if not theirs or theirs == ours:
+        return unit
+    if request.fx_rate and request.fx_rate > 0:
+        return (unit / request.fx_rate).quantize(_PRICE, rounding=ROUND_HALF_UP)
+    if quote.fx_rate and quote.fx_rate != 1:
+        return (unit * quote.fx_rate).quantize(_PRICE, rounding=ROUND_HALF_UP)
+    return None
+
+
+def cost_checks(request: QuoteRequest) -> list[CostCheck]:
+    """The costed lines whose cost is not what any attached supplier quoted.
+
+    A line priced from an offer is checked against its own row; any other is
+    looked up by part number — on the line's code or in its name — among every
+    offer on the quote. A cost one offer bears out passes. One that matches
+    none, or a part no attached offer quotes at all, is returned: a cost typed
+    by hand, converted in somebody's head, is what an approver cannot see.
+    """
+    quotes = list(request.comparison.quotes) if request.comparison is not None else []
+    linked = supplier_prices(request)
+    by_id = {str(q.id): q for q in quotes}
+    out: list[CostCheck] = []
+    for position, item in enumerate(sorted(request.items, key=lambda i: i.position or 0), 1):
+        cost = item.cost_rate
+        if cost is None or cost <= 0:
+            continue
+        candidates: list[tuple[SupplierQuote, Decimal]] = []
+        source = by_id.get(str(item.source_supplier_quote_id or ""))
+        if source is not None and str(item.id) in linked:
+            candidates.append((source, linked[str(item.id)][0]))
+        else:
+            ours = _part_key(f"{item.item_code or ''} {item.name or ''}")
+            for quote in quotes:
+                for row in quote.items:
+                    part = _part_key(row.part_number)
+                    if len(part) >= 5 and part in ours and row.unit_price:
+                        candidates.append((quote, row.unit_price))
+        offers = []
+        for quote, unit in candidates:
+            converted = _in_our_currency(request, quote, unit)
+            if converted is None:
+                continue
+            if abs(converted - cost) <= max(_PRICE, converted * _COST_TOLERANCE):
+                break
+            offers.append((quote.supplier_name, unit, (quote.currency or "").upper(), converted))
+        else:
+            if offers or not candidates:
+                out.append(CostCheck(position, item.name, cost, tuple(offers)))
+    return out
+
 
 #: The quote's own ``name`` is a single line; a supplier's description can be a
 #: paragraph. The rest goes to ``description`` rather than being cut off.
@@ -681,6 +779,108 @@ async def select_supplier(
         request.id,
         quote.supplier_name,
         len(quote.items),
+        margin_percent,
+    )
+    return request
+
+
+async def select_lines(
+    session: AsyncSession,
+    request: QuoteRequest,
+    *,
+    user: User,
+    picks: list[str],
+    margin_percent: Decimal = Decimal(0),
+    rates: Callable[[str, str], Awaitable[FxQuote]] | None = None,
+    roles: set[str] | None = None,
+) -> QuoteRequest:
+    """Price the quote line by line, each line from the supplier somebody chose
+    for it.
+
+    ``picks`` are the comparison's own item ids — ``"<supplier quote id>-i<n>"``,
+    the n-th row of that offer — one per line, in the order the lines should
+    be. One supplier rarely quotes everything: Sunaid had the plug and nobody
+    else did, the other two parts came from rsuae.com, and with one supplier
+    per quote the other lines were typed in by hand.
+
+    One currency among the picks puts the quote in it, as choosing a single
+    supplier does. Mixed currencies leave the quote in its own and each offer
+    is converted at Zoho's rate. The terms, the checklist and the costing are
+    seeded from the supplier carrying most of the cost; freight any other
+    chosen supplier stated is added as its own row.
+    """
+    require_editable(request, user=user, roles=roles)
+    if request.comparison is None:
+        raise QuoteError("No supplier quotes are attached to this request yet.")
+    if not picks:
+        raise QuoteError("Choose a supplier for at least one line.")
+    offers = {str(q.id): q for q in request.comparison.quotes}
+    chosen: list[tuple[SupplierQuote, SupplierQuoteItem]] = []
+    for pick in picks:
+        quote_id, _, index = pick.rpartition("-i")
+        quote = offers.get(quote_id)
+        rows = sorted(quote.items, key=lambda i: i.position or 0) if quote else []
+        if quote is None or not index.isdigit() or int(index) >= len(rows):
+            raise QuoteNotFoundError("A chosen line is not on any supplier quote attached here.")
+        chosen.append((quote, rows[int(index)]))
+
+    currencies = {(q.currency or "").upper() for q, _ in chosen} - {""}
+    ours = (request.currency or "").upper()
+    if len(currencies) == 1 and (theirs := next(iter(currencies))) != ours:
+        await _adopt_currency(session, request, theirs, rates=rates, who=chosen[0][0].supplier_name)
+        ours = theirs
+
+    # Units of each offer's currency per one of ours, to divide their prices by.
+    divisors: dict[str, Decimal] = {}
+    for quote, _ in chosen:
+        theirs = (quote.currency or ours).upper()
+        if theirs in divisors:
+            continue
+        if theirs == ours:
+            divisors[theirs] = Decimal(1)
+        elif rates is not None:
+            # Zoho's, read now — never one typed on the quote or the offer.
+            try:
+                divisors[theirs] = (await rates(ours, theirs)).rate
+            except FxUnavailableError as exc:
+                raise QuoteError(f"No rate from {theirs} to {ours}: {exc}") from exc
+        else:
+            raise QuoteError(f"{quote.supplier_name} quoted in {theirs} and no rate is available.")
+
+    lines = [
+        _line_from(item, quote, margin_percent, fx=divisors[(quote.currency or ours).upper()])
+        for quote, item in chosen
+    ]
+    set_items(request, _carry_over(request, lines))
+
+    weight: dict[str, Decimal] = {}
+    for line in lines:
+        key = str(line["source_supplier_quote_id"])
+        weight[key] = weight.get(key, Decimal(0)) + line["cost_rate"] * (line["quantity"] or 0)
+    main = offers[max(weight, key=lambda k: weight[k])]
+    request.selected_supplier_quote_id = main.id
+    main_currency = (main.currency or ours).upper()
+    if main_currency != ours:
+        # The bid's rate is the main supplier's, at Zoho's figure: the freight
+        # and charges seeded from them are converted at it.
+        request.supplier_currency = main_currency
+        request.fx_rate = divisors[main_currency]
+    absorb_supplier(request, main)
+    seed_submission_checklist(request)
+    house = get_settings()
+    costing.seed_tax(request, house)
+    costing.seed_costing(request, main, house)
+    for key in weight:
+        quote = offers[key]
+        if quote is not main:
+            costing.add_freight(request, quote, divisor=divisors[(quote.currency or ours).upper()])
+    reprice_at_margin(request, margin_percent)
+    await session.flush()
+    logger.info(
+        "quote %s priced line by line from %s (%d lines, margin %s%%)",
+        request.id,
+        ", ".join(offers[k].supplier_name for k in weight),
+        len(lines),
         margin_percent,
     )
     return request
@@ -1109,11 +1309,15 @@ def absorb_supplier(request: QuoteRequest, quote: SupplierQuote) -> None:
     """
     # The money. Carried because every figure in the build-up depends on it,
     # and a bid costed at the wrong rate is wrong in one direction only.
-    if quote.currency and quote.currency != request.currency:
-        if not request.supplier_currency:
-            request.supplier_currency = quote.currency
-        if request.fx_rate is None and quote.fx_rate and quote.fx_rate > 0:
-            request.fx_rate = quote.fx_rate
+    # The rate is not copied from the offer: the offer's is "1 of theirs in
+    # ours" and the quote's is the other way up, and either way it is Zoho's
+    # to give — the caller reads it there.
+    if (
+        quote.currency
+        and quote.currency != request.currency
+        and not request.supplier_currency
+    ):
+        request.supplier_currency = quote.currency
 
     # The manufacturer, when the supplier's lines agree on one. A specified-
     # brand line is won or lost on these matching the RFP character for

@@ -101,6 +101,7 @@ from app.quoting.schemas import (
     DocumentEditIn,
     FxQuoteOut,
     ItemOut,
+    LineChoiceIn,
     MailboxMessageOut,
     NegotiationIn,
     QuotableTaskOut,
@@ -748,6 +749,7 @@ async def update(
     user: CurrentUser,
     roles: CurrentRoles,
     session: Session,
+    zoho: Zoho,
 ) -> QuoteRequestOut:
     """Only while it is yours — in draft, or after a rework.
 
@@ -762,7 +764,9 @@ async def update(
     request = await _load(session, request_id)
     try:
         service.require_editable(request, user=user, roles=roles)
+        before = (request.currency, request.supplier_currency, request.fx_rate)
         service.apply_fields(request, payload.model_dump())
+        await _bid_rate_from_zoho(request, zoho, before)
         items = [i.model_dump() for i in payload.items]
         service.drop_stale_sources(request, items)
         service.set_items(request, items)
@@ -775,6 +779,37 @@ async def update(
     except QuoteError as exc:
         raise _translate(exc) from exc
     return await _out(session, request, user=user, roles=roles)
+
+
+async def _bid_rate_from_zoho(
+    request: QuoteRequest, zoho: ZohoBooks, before: tuple[Any, Any, Any]
+) -> None:
+    """The bid's rate is Zoho's, and there is one only when the supplier's
+    currency is not the quote's. A rate sent with the form is not taken: when
+    it differs from the one stored, or the currencies moved, Zoho is read
+    again and its figure stands."""
+    ours = (request.currency or "").upper()
+    theirs = (request.supplier_currency or "").upper()
+    if not theirs or theirs == ours:
+        request.fx_rate = None
+        return
+    was_ours, was_theirs, was_rate = before
+    unchanged = (
+        (was_ours or "").upper() == ours
+        and (was_theirs or "").upper() == theirs
+        and was_rate is not None
+        and request.fx_rate == was_rate
+    )
+    if unchanged:
+        return
+    try:
+        request.fx_rate = (
+            await zoho_rate(zoho, quote_currency=ours, supplier_currency=theirs)
+        ).rate
+    except (FxUnavailableError, ZohoError) as exc:
+        raise QuoteError(
+            f"Zoho Books has no rate from {ours} to {theirs}: {exc}. Add it in Zoho and save again."
+        ) from exc
 
 
 @router.patch(
@@ -1276,6 +1311,12 @@ async def attach_suppliers(
         if isinstance(result, ExtractionError):
             failures.append(f"{readable.file_name}: {result}")
             continue
+        if supplier_details.is_our_quotation(readable.text):
+            failures.append(
+                f"{readable.file_name}: this is our own quotation, not a supplier's "
+                f"offer, so it is not priced from. Attach it as another document."
+            )
+            continue
         quotes.append(
             SupplierQuoteIn(
                 supplier_name=(result.supplier_name or readable.file_name)[:200],
@@ -1370,6 +1411,8 @@ async def _follow_offer_currency(
     quotes: list[SupplierQuoteIn],
     zoho: ZohoBooks,
     failures: list[str],
+    *,
+    held: list | None = None,
 ) -> None:
     """The quote takes the supplier's currency, rather than converting theirs.
 
@@ -1380,10 +1423,12 @@ async def _follow_offer_currency(
     priced on it yet is simply relabelled; one that already carries figures
     is converted, every one of them, at Zoho's rate, the way the currency
     cell on the summary sheet does it. Offers in mixed currencies leave the
-    quote as it is and are converted for the comparison instead.
+    quote as it is and are converted for the comparison instead — counting
+    the offers already ``held``, so a second supplier in another currency
+    does not pull the quote away from the first.
     """
     ours = (request.currency or "AED").upper()
-    currencies = {(q.currency or ours).upper() for q in quotes}
+    currencies = {(q.currency or ours).upper() for q in [*quotes, *(held or [])]}
     if len(currencies) != 1:
         return
     theirs = currencies.pop()
@@ -1539,35 +1584,79 @@ async def _attach(
     user,
     roles: set[str],
 ) -> QuoteRequestOut:
-    """Compare the supplier quotes, attach the comparison, file the originals."""
-    await _follow_offer_currency(session, request, quotes, zoho, failures)
-    await _convert_offers(request, quotes, zoho, failures)
-    try:
-        comparison = await comparison_service.save(
-            session,
-            extractor,
-            ComparisonIn(
-                title=f"Supplier quotes for {request.title}",
-                reference=request.reference_number,
-                currency=request.currency,
-                quotes=quotes,
-            ),
-            author=user,
-        )
-    except Exception as exc:  # noqa: BLE001 - surfaced, never swallowed
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail=f"Could not compare: {exc}"
-        ) from exc
+    """Add the supplier quotes to the quote's comparison and file the originals.
 
-    # The object, not the id: assigning it leaves the relationship loaded, so
-    # the response can be built without going back to the database for it.
-    request.comparison = comparison
+    Added, not swapped in: the offers come in over days, one supplier at a
+    time, and each upload used to make a new comparison holding only itself —
+    the earlier offers dropped off the quote, the supplier already chosen sat
+    in a comparison the quote no longer had, and the lines nobody could price
+    from the new one were typed in by hand.
+    """
+    held = list(request.comparison.quotes) if request.comparison is not None else []
+    kept: list[SupplierQuoteIn] = []
+    for quote in quotes:
+        if supplier_details.is_own_company(quote.supplier_name):
+            failures.append(
+                f"{quote.file_name or quote.supplier_name}: read as our own company, "
+                f"not a supplier. If it is a supplier's quote, type it in under their name."
+            )
+        elif quote.file_name and any(row.file_name == quote.file_name for row in held):
+            failures.append(
+                f"{quote.file_name}: already attached. Remove it first to read it again."
+            )
+        else:
+            kept.append(quote)
+    if not kept:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No supplier quote was added. " + "; ".join(failures),
+        )
+    quotes = kept
+
+    await _follow_offer_currency(session, request, quotes, zoho, failures, held=held)
+    if held:
+        # The quote may have just changed currency; the offers already on it
+        # follow before the new ones are set beside them.
+        await _comparison_follows(request, zoho, extractor)
+    await _convert_offers(request, quotes, zoho, failures)
+    if held:
+        comparison = request.comparison
+        added = [comparison_service.build_row(q) for q in quotes]
+        comparison.quotes.extend(added)
+        await session.flush()
+        try:
+            await _reanalyse(request, extractor)
+        except Exception as exc:  # noqa: BLE001 - surfaced, never swallowed
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=f"Could not compare: {exc}"
+            ) from exc
+    else:
+        try:
+            comparison = await comparison_service.save(
+                session,
+                extractor,
+                ComparisonIn(
+                    title=f"Supplier quotes for {request.title}",
+                    reference=request.reference_number,
+                    currency=request.currency,
+                    quotes=quotes,
+                ),
+                author=user,
+            )
+        except Exception as exc:  # noqa: BLE001 - surfaced, never swallowed
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=f"Could not compare: {exc}"
+            ) from exc
+        added = list(comparison.quotes)
+        # The object, not the id: assigning it leaves the relationship loaded,
+        # so the response can be built without going back to the database.
+        request.comparison = comparison
     request.multiple_supplier_quotes = True
 
     # File the originals into the task's folder. The library is the store, so
     # a document that cannot be filed is not attached: the whole upload is
     # refused with the reason, and nothing half-done is left behind.
-    for saved in comparison.quotes:
+    for saved in added:
         original = originals.get(saved.file_name or "")
         if original is None:
             continue
@@ -1595,7 +1684,14 @@ async def _attach(
         note = "Could not read: " + "; ".join(failures)
         request.notes = f"{request.notes}\n{note}" if request.notes else note
     await session.flush()
-    return await _out(session, request, user=user, roles=roles)
+    out = await _out(session, request, user=user, roles=roles)
+    # Said back file by file, so the upload panel can put each reason
+    # beside the file it belongs to.
+    out.failed = [
+        {"file_name": name, "error": reason}
+        for name, _, reason in (f.partition(": ") for f in failures)
+    ]
+    return out
 
 
 @router.post(
@@ -1648,6 +1744,47 @@ async def select_supplier(
             detail="Could not read Zoho Books' currency table to convert the offer.",
         ) from exc
     # Choosing a supplier in another currency moves the quote into it.
+    await _comparison_follows(request, zoho, extractor)
+    return await _out(session, request, user=user, roles=roles)
+
+
+@router.post(
+    "/{request_id}/select-lines",
+    response_model=QuoteRequestOut,
+    summary="Price the quote line by line, each line from the supplier chosen for it",
+)
+async def select_lines(
+    request_id: uuid.UUID,
+    payload: LineChoiceIn,
+    user: CurrentUser,
+    roles: CurrentRoles,
+    session: Session,
+    zoho: Zoho,
+    extractor: Extractor,
+) -> QuoteRequestOut:
+    """Several suppliers on one quote: each line from the offer picked for it
+    on the comparison's line-by-line table. Replaces the lines, as choosing
+    one supplier does; they are ordinary lines afterwards."""
+    request = await _load(session, request_id)
+    try:
+        await service.select_lines(
+            session,
+            request,
+            user=user,
+            picks=payload.picks,
+            margin_percent=payload.markup_percent,
+            rates=lambda ours, theirs: zoho_rate(
+                zoho, quote_currency=ours, supplier_currency=theirs
+            ),
+            roles=roles,
+        )
+    except QuoteError as exc:
+        raise _translate(exc) from exc
+    except ZohoError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Could not read Zoho Books' currency table to convert the offers.",
+        ) from exc
     await _comparison_follows(request, zoho, extractor)
     return await _out(session, request, user=user, roles=roles)
 
@@ -2002,17 +2139,17 @@ async def edit_supplier_quote(
     for note in drift:
         logger.info("quote %s: %s", request.id, note)
     ours = (comparison.currency or request.currency or "AED").upper()
-    if incoming.currency == ours:
-        incoming.fx_rate = Decimal(1)
-    elif incoming.fx_rate == 1:
-        # A foreign currency left at 1: read Zoho's rate rather than compare
-        # dollars as dirhams. A rate typed in is kept as typed.
+    # Zoho's rate, always, and only when there is something to convert: the
+    # estimate is converted at Zoho's figure, so costing at any other is how
+    # the quote and the estimate came to disagree. A rate sent in is ignored.
+    incoming.fx_rate = Decimal(1)
+    if incoming.currency != ours:
         failures: list[str] = []
         await _convert_offers(request, [incoming], zoho, failures)
         if failures:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"{failures[0]}. Type the exchange rate and save again.",
+                detail=f"{failures[0]}. Add the currency's rate in Zoho Books and save again.",
             )
 
     old_name = row.supplier_name
@@ -2606,6 +2743,38 @@ async def detail(
     """Everything an approver needs: the quote, its lines and margins, the
     supplier comparison, every comment and the whole review history."""
     return await _out(session, await _load(session, request_id), user=user, roles=roles)
+
+
+@router.get(
+    "/{request_id}/documents/{document_id}/thumbnail",
+    summary="A picture of a filed document's first page",
+    responses={200: {"content": {"image/jpeg": {}}}, 404: {}},
+)
+async def document_thumbnail(
+    request_id: uuid.UUID,
+    document_id: uuid.UUID,
+    _: CurrentUser,
+    session: Session,
+    drive: Drive,
+) -> Response:
+    """For the cards on the supplier quotes tab: which document is which, at
+    a glance. SharePoint draws it; a document it cannot draw is a 404, and
+    the card shows an icon instead."""
+    request = await _load(session, request_id)
+    document = next((d for d in request.documents if d.id == document_id), None)
+    if document is None or not document.drive_item_id or not drive.enabled:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No picture")
+    try:
+        found = await drive.thumbnail(document.drive_item_id)
+    except DriveError:
+        found = None
+    if found is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No picture")
+    content, media_type = found
+    # The file under a document never changes; its picture can be kept.
+    return Response(
+        content, media_type=media_type, headers={"Cache-Control": "private, max-age=86400"}
+    )
 
 
 @router.get(

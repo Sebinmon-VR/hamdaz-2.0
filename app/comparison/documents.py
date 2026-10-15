@@ -31,6 +31,7 @@ import io
 import logging
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Final
 
 #: A supplier quote bigger than this is a mistake rather than a quote, and
@@ -517,9 +518,29 @@ def _grid(rows: list[list[str]]) -> str:
     return "\n".join(lines)[:_MAX_TEXT_CHARS]
 
 
+#: The first bytes of an old Excel 97-2003 workbook (an OLE2 compound file).
+_OLE2: Final = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+
 def _from_spreadsheet(
     content: bytes, file_name: str
 ) -> tuple[str, list[list[list[str]]]]:
+    """A workbook's sheets as text and tables, whatever ``.xls`` really is.
+
+    A file called ``.xls`` is one of four things: an old Excel 97-2003 workbook
+    (SAP and Ariba still export these), a modern workbook misnamed, or an HTML
+    page or a tab-separated text file that a portal saved with an Excel name so
+    that Excel opens it. The bytes decide, not the extension.
+    """
+    head = content[:512].lstrip(b"\xef\xbb\xbf \t\r\n").lower()
+    if content.startswith(_OLE2):
+        return _sheets_to_text(_xls_sheets(content, file_name), file_name)
+    if head.startswith((b"<", b"\xff\xfe<", b"\xfe\xff\x00<")):
+        return _sheets_to_text(_html_sheets(content, file_name), file_name)
+    if not content.startswith(b"PK"):
+        # Not a zip, so not an .xlsx: a delimited text export with an Excel name.
+        return _from_csv(content, file_name)
+
     try:
         from openpyxl import load_workbook
     except ImportError as exc:  # pragma: no cover - dependency is declared
@@ -534,28 +555,133 @@ def _from_spreadsheet(
     except Exception as exc:  # noqa: BLE001 - openpyxl raises many shapes
         raise DocumentError(f"{file_name!r} is not a readable spreadsheet: {exc}") from exc
 
-    parts: list[str] = []
-    tables: list[list[list[str]]] = []
     try:
-        for sheet in workbook.worksheets:
-            rows = [
-                ["" if cell is None else str(cell) for cell in row]
-                for row in sheet.iter_rows(values_only=True)
-            ]
-            populated = [r for r in rows if any(c and c.strip() for c in r)]
-            if grid := _grid(rows):
-                # A sheet already *is* a table, so it is offered to the parser
-                # as one rather than only as flattened text.
-                if len(populated) >= 2:
-                    tables.append(populated)
-                # Quotes often put the commercial terms on a second sheet.
-                parts.append(f"--- sheet: {sheet.title} ---\n{grid}")
+        sheets = [
+            (
+                sheet.title,
+                [
+                    ["" if cell is None else str(cell) for cell in row]
+                    for row in sheet.iter_rows(values_only=True)
+                ],
+            )
+            for sheet in workbook.worksheets
+        ]
     finally:
         workbook.close()
+    return _sheets_to_text(sheets, file_name)
+
+
+def _sheets_to_text(
+    sheets: list[tuple[str, list[list[str]]]], file_name: str
+) -> tuple[str, list[list[list[str]]]]:
+    parts: list[str] = []
+    tables: list[list[list[str]]] = []
+    for title, rows in sheets:
+        populated = [r for r in rows if any(c and c.strip() for c in r)]
+        if grid := _grid(rows):
+            # A sheet already *is* a table, so it is offered to the parser
+            # as one rather than only as flattened text.
+            if len(populated) >= 2:
+                tables.append(populated)
+            # Quotes often put the commercial terms on a second sheet.
+            parts.append(f"--- sheet: {title} ---\n{grid}")
 
     if not parts:
         raise DocumentError(f"{file_name!r} has no readable cells")
     return "\n\n".join(parts)[:_MAX_TEXT_CHARS], tables
+
+
+def _xls_cell(cell: object, datemode: int) -> str:
+    import xlrd
+
+    if cell.ctype in (xlrd.XL_CELL_EMPTY, xlrd.XL_CELL_BLANK):  # type: ignore[attr-defined]
+        return ""
+    value = cell.value  # type: ignore[attr-defined]
+    if cell.ctype == xlrd.XL_CELL_NUMBER:  # type: ignore[attr-defined]
+        # 10.0 is printed "10": a quantity read as "10.0" is still 10, but a
+        # part number stored as a number is not "4711.0".
+        return str(int(value)) if float(value).is_integer() else str(value)
+    if cell.ctype == xlrd.XL_CELL_DATE:  # type: ignore[attr-defined]
+        try:
+            moment = xlrd.xldate.xldate_as_datetime(value, datemode)
+        except Exception:  # noqa: BLE001 - a malformed date is shown raw
+            return str(value)
+        return moment.date().isoformat() if moment.time() == datetime.min.time() else str(moment)
+    if cell.ctype == xlrd.XL_CELL_BOOLEAN:  # type: ignore[attr-defined]
+        return "TRUE" if value else "FALSE"
+    if cell.ctype == xlrd.XL_CELL_ERROR:  # type: ignore[attr-defined]
+        return ""
+    return str(value)
+
+
+def _xls_sheets(content: bytes, file_name: str) -> list[tuple[str, list[list[str]]]]:
+    """An Excel 97-2003 workbook, read with ``xlrd`` — no Excel, no model."""
+    try:
+        import xlrd
+    except ImportError as exc:  # pragma: no cover - dependency is declared
+        raise DocumentError(
+            f"{file_name!r} is an old Excel 97-2003 file and the reader for those (xlrd) "
+            "is not installed. Save it as .xlsx and upload it again."
+        ) from exc
+    try:
+        book = xlrd.open_workbook(file_contents=content, on_demand=True)
+    except Exception as exc:  # noqa: BLE001 - xlrd raises many shapes
+        raise DocumentError(f"{file_name!r} is not a readable Excel 97-2003 file: {exc}") from exc
+    try:
+        sheets = []
+        for index in range(book.nsheets):
+            sheet = book.sheet_by_index(index)
+            rows = [
+                [_xls_cell(sheet.cell(r, c), book.datemode) for c in range(sheet.ncols)]
+                for r in range(sheet.nrows)
+            ]
+            sheets.append((sheet.name, rows))
+            book.unload_sheet(index)
+        return sheets
+    finally:
+        book.release_resources()
+
+
+def _html_sheets(content: bytes, file_name: str) -> list[tuple[str, list[list[str]]]]:
+    """The tables of an HTML page saved with an Excel name, as sheets."""
+    from html.parser import HTMLParser
+
+    class Tables(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__(convert_charrefs=True)
+            self.tables: list[list[list[str]]] = []
+            self.row: list[str] | None = None
+            self.cell: list[str] | None = None
+
+        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            if tag == "table":
+                self.tables.append([])
+            elif tag == "tr" and self.tables:
+                self.row = []
+            elif tag in ("td", "th") and self.row is not None:
+                self.cell = []
+            elif tag == "br" and self.cell is not None:
+                self.cell.append(" ")
+
+        def handle_endtag(self, tag: str) -> None:
+            if tag in ("td", "th") and self.row is not None and self.cell is not None:
+                self.row.append(re.sub(r"\s+", " ", "".join(self.cell)).strip())
+                self.cell = None
+            elif tag == "tr" and self.row is not None and self.tables:
+                self.tables[-1].append(self.row)
+                self.row = None
+
+        def handle_data(self, data: str) -> None:
+            if self.cell is not None:
+                self.cell.append(data)
+
+    parser = Tables()
+    parser.feed(_decode(content, file_name))
+    parser.close()
+    sheets = [(f"table {n}", rows) for n, rows in enumerate(parser.tables, start=1) if rows]
+    if not sheets:
+        raise DocumentError(f"{file_name!r} is a web page with no tables in it")
+    return sheets
 
 
 def _from_csv(content: bytes, file_name: str) -> tuple[str, list[list[list[str]]]]:
