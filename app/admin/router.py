@@ -29,7 +29,6 @@ from app.admin.schemas import (
 )
 from app.auth.deps import CurrentUser
 from app.core.db import get_session
-from app.models.intake import IntakeMessage, IntakeSettings, IntakeStatus
 from app.models.notification import Notification
 from app.models.proposal_index import MirrorState, ProposalIndexItem
 from app.models.report import (
@@ -66,37 +65,6 @@ async def _count(session: AsyncSession, statement) -> int:
     return int(await session.scalar(statement) or 0)
 
 
-async def _intake_status(session: AsyncSession) -> dict[str, Any]:
-    settings = await session.get(IntakeSettings, 1)
-    counts = {
-        row.status: int(row.n)
-        for row in (
-            await session.execute(
-                select(IntakeMessage.status, func.count().label("n")).group_by(
-                    IntakeMessage.status
-                )
-            )
-        ).all()
-    }
-    return {
-        "enabled": bool(settings and settings.enabled),
-        "mailbox": settings.mailbox if settings else "",
-        "senders": len(settings.allowed_senders or []) if settings else 0,
-        # Surfaced first and named plainly. It is the one setting here that
-        # changes something outside this system.
-        "writes_to_sharepoint": bool(settings and settings.create_in_sharepoint),
-        "teams_webhook_set": bool(settings and settings.teams_webhook_url),
-        "subscription_expires_at": (
-            settings.subscription_expires_at if settings else None
-        ),
-        "last_poll_at": settings.last_poll_at if settings else None,
-        "last_error": settings.last_error if settings else None,
-        "messages": {s.value: counts.get(s.value, 0) for s in IntakeStatus},
-        # The number that would worry somebody, hoisted out of the breakdown.
-        "needs_attention": counts.get(IntakeStatus.FAILED.value, 0),
-    }
-
-
 async def _mirror_status(session: AsyncSession) -> dict[str, Any]:
     state = await session.get(MirrorState, 1)
     rows = await _count(
@@ -105,29 +73,15 @@ async def _mirror_status(session: AsyncSession) -> dict[str, Any]:
         .select_from(ProposalIndexItem)
         .where(ProposalIndexItem.deleted.is_(False)),
     )
-    embedded = await _count(
-        session,
-        select(func.count())
-        .select_from(ProposalIndexItem)
-        .where(
-            ProposalIndexItem.deleted.is_(False),
-            ProposalIndexItem.embedding.is_not(None),
-        ),
-    )
     stale = None
     if state and state.last_sync_at:
         stale = int((datetime.now(UTC) - state.last_sync_at).total_seconds())
     return {
         "rows": rows,
-        "embedded": embedded,
-        # Below one, matching is running without its middle stage — usually a
-        # missing OpenAI key rather than anything broken.
-        "embedding_coverage": round(embedded / rows, 3) if rows else 0.0,
         "last_sync_at": state.last_sync_at if state else None,
         "seconds_since_sync": stale,
         "last_duration_ms": state.duration_ms if state else 0,
         "rows_changed_last": state.rows_changed if state else 0,
-        "rows_embedded_last": state.rows_embedded if state else 0,
         "last_error": state.last_error if state else None,
         "needs_attention": 1 if (state and state.last_error) or rows == 0 else 0,
     }
@@ -232,7 +186,6 @@ async def console(
     caller re-deciding what counts as a problem.
     """
     figures: dict[str, dict[str, Any]] = {
-        "intake": await _intake_status(session),
         "mirror": await _mirror_status(session),
         "standing": await _standing_status(session),
         "reports": await _reports_status(session),

@@ -27,8 +27,11 @@ from typing import Any, Final
 
 import anthropic
 
-from app.assistant.llm import LLMError
 from app.core.config import Settings
+
+class LLMError(Exception):
+    """Claude could not be used. The message is safe to show a person."""
+
 
 logger = logging.getLogger("hamdaz.enquiries")
 
@@ -40,6 +43,7 @@ PRICES: Final[dict[str, tuple[Decimal, Decimal]]] = {
     "claude-opus-5": (Decimal("5"), Decimal("25")),
     "claude-sonnet-5-5": (Decimal("2"), Decimal("10")),
     "claude-sonnet-5": (Decimal("2"), Decimal("10")),
+    "claude-haiku-5-5": (Decimal("0.10"), Decimal("0.50")),
     "claude-haiku-4-5": (Decimal("1"), Decimal("5")),
 }
 

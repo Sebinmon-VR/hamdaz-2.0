@@ -1,24 +1,23 @@
-"""The loops that make this live: keep the mirror current, keep watching mail.
+"""The loop that keeps the local copy of the Proposals list current.
 
-Two jobs on two timers, both in-process:
+Pull the Proposals list into the local copy and recompute who is next. This is
+what makes the priority score current instead of computed when somebody asks,
+and it is the only thing that touches SharePoint on a clock — reading it, and
+publishing the ranking where that is switched on.
 
-* **mirror** — pull the Proposals list into the local copy and recompute who is
-  next. This is what makes the priority score current instead of computed when
-  somebody asks, and it is the only thing that touches SharePoint on a clock.
-* **mail** — ask Graph what has arrived and take each new message through the
-  pipeline.
+The mail half of this worker — watching a mailbox and sorting what arrived
+with a model — was removed on 2026-10-14; the reader of the mailbox itself is
+kept in ``graph_mail`` for the quote pages.
 
-**Only one instance runs each loop.** On App Service there is usually more than
-one, and two copies of the mail loop would read the same inbox and race each
-other into the same work. A Postgres advisory lock settles it: whoever takes it
-runs, everybody else sleeps and tries again later, and the lock is released by
-the commit or rollback that ends the work, so a crashed instance releases it
-without anybody intervening.
+**Only one instance runs the loop.** On App Service there is usually more than
+one, and a Postgres advisory lock settles it: whoever takes it runs, everybody
+else sleeps and tries again later, and the lock is released by the commit or
+rollback that ends the work, so a crashed instance releases it without anybody
+intervening.
 
-Both loops are deliberately hard to notice. They log at debug when nothing
-happened, they never raise into the event loop, and an error leaves the last
-good state in place — a stale mirror beats a broken one, and a mailbox that
-cannot be read is a message on the settings screen rather than a dead app.
+The loop is deliberately hard to notice. It logs at debug when nothing
+happened, never raises into the event loop, and an error leaves the last good
+state in place — a stale mirror beats a broken one.
 """
 
 from __future__ import annotations
@@ -34,38 +33,30 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.analytics import live as live_scores
 from app.analytics import publisher as publishing
 from app.core.config import Settings
-from app.core.llm import TextModel
-from app.intake import service as intake_service
-from app.intake.classifier import Classifier
-from app.intake.graph_mail import MailReader
-from app.intake.matcher import Matcher
 from app.models.assignment import AssignmentPolicy
-from app.models.intake import IntakeSettings
 from app.models.team import Team
 from app.proposals import mirror as mirror_service
-from app.proposals.mirror import Embedder, MirrorSync
+from app.proposals.mirror import MirrorSync
 from app.proposals.sharepoint import SharePointError, SharePointProposals
 
 logger = logging.getLogger("hamdaz.intake.worker")
 
-#: Arbitrary, and constant. Two numbers nobody else in this database uses, so
-#: the two loops do not block each other and neither blocks anything else.
+#: Arbitrary, and constant. A number nobody else in this database uses.
 MIRROR_LOCK = 812_401
-MAIL_LOCK = 812_402
 
 #: A list subscription this close to expiry is renewed at the next sync.
 RENEW_WITHIN = timedelta(days=2)
 
 #: How long a failed loop waits before trying again. Longer than the normal
-#: interval on purpose: whatever broke — SharePoint, Graph, a model — is not
-#: usually fixed within the second, and hammering it makes the logs useless.
+#: interval on purpose: whatever broke is not usually fixed within the second,
+#: and hammering it makes the logs useless.
 BACKOFF_SECONDS = 300
 
 
 async def _take_lock(session: AsyncSession, key: int) -> bool:
     """Try to become the instance that runs this loop.
 
-    Transaction-scoped on purpose. Each loop does its work inside the one
+    Transaction-scoped on purpose. The loop does its work inside the one
     transaction it opens here and ends with a commit, so the lock lasts exactly
     as long as the work and goes away with it — on commit, on rollback, or when
     a crashed instance's connection is dropped.
@@ -74,15 +65,14 @@ async def _take_lock(session: AsyncSession, key: int) -> bool:
     comes from a pool, so after the commit the session hands it back and the
     unlock runs on whichever connection it is given next. The lock stayed on
     the first one, every later attempt saw "another instance holds it", and the
-    mirror quietly stopped refreshing. An error was worse still, because the
-    unlock then ran inside the aborted transaction and buried the real failure.
+    mirror quietly stopped refreshing.
     """
     got = await session.scalar(text("SELECT pg_try_advisory_xact_lock(:k)"), {"k": key})
     return bool(got)
 
 
 class Worker:
-    """Owns the loops. Started and stopped with the application."""
+    """Owns the loop. Started and stopped with the application."""
 
     def __init__(
         self,
@@ -90,19 +80,10 @@ class Worker:
         factory: async_sessionmaker[AsyncSession],
         settings: Settings,
         sharepoint: SharePointProposals,
-        mail: MailReader,
-        http,
     ) -> None:
         self._factory = factory
         self._settings = settings
         self._sharepoint = sharepoint
-        self._mail = mail
-        self._http = http
-        self._embedder = Embedder(settings)
-        # Free model first, Claude when the free tiers refuse: LLM_PROVIDERS.
-        text_model = TextModel(settings, http)
-        self._classifier = Classifier(settings, text_model)
-        self._matcher = Matcher(settings, self._embedder, text_model)
         self._mirror = MirrorSync()
         self._publisher = publishing.Publisher(settings, sharepoint)
         self._tasks: set[asyncio.Task] = set()
@@ -121,11 +102,10 @@ class Worker:
     def start(self) -> None:
         if self._tasks:
             return
-        for coro in (self._mirror_loop(), self._mail_loop()):
-            task = asyncio.create_task(coro)
-            self._tasks.add(task)
-            task.add_done_callback(self._tasks.discard)
-        logger.info("intake worker started")
+        task = asyncio.create_task(self._mirror_loop())
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        logger.info("mirror worker started")
 
     async def stop(self) -> None:
         self._stopping.set()
@@ -183,7 +163,7 @@ class Worker:
         while not self._stopping.is_set():
             wait = max(3, self._settings.mirror_watch_seconds)
             try:
-                if not await self._mirror_wanted():
+                if not self._mirror_wanted():
                     wait = 60
                 else:
                     full_due = (
@@ -215,22 +195,16 @@ class Worker:
         logger.info("proposals list moved at %s; syncing", stamp)
         return True
 
-    async def _mirror_wanted(self) -> bool:
-        """Whether the mirror should be kept current at all.
+    def _mirror_wanted(self) -> bool:
+        """Whether the mirror should be kept current: ``MIRROR_SYNC_ENABLED``.
 
-        Either because somebody set the environment flag — which is how the
-        live ranking is kept fresh without any mail involved — or because the
-        intake is on, which cannot work without it: matching an email means
-        searching the mirror.
+        Before 2026-10-14 a switched-on mail intake also kept it running, since
+        matching an email meant searching the mirror. The intake's sorting is
+        gone, so the environment flag alone decides.
         """
-        if self._settings.mirror_sync_enabled:
-            return True
-        async with self._factory() as session:
-            intake = await intake_service.get_settings(session)
-            await session.commit()
-            return bool(intake.enabled)
+        return bool(self._settings.mirror_sync_enabled)
 
-    async def sync_once(self, *, embed: bool = True, force: bool = False) -> None:
+    async def sync_once(self, *, force: bool = False) -> None:
         """One mirror refresh, then rewrite who is next.
 
         The recompute follows the sync in the same session on purpose: the
@@ -240,15 +214,13 @@ class Worker:
         ``force`` is for the admin route, which is somebody asking explicitly
         and should not be refused because a background flag is off.
         """
-        if not force and not await self._mirror_wanted():
+        if not force and not self._mirror_wanted():
             return
         async with self._factory() as session:
             if not await _take_lock(session, MIRROR_LOCK):
                 logger.debug("another instance holds the mirror lock")
                 return
-            report = await self._mirror.run(
-                session, self._sharepoint, self._embedder, embed=embed
-            )
+            report = await self._mirror.run(session, self._sharepoint)
             if report.error:
                 logger.warning("mirror sync: %s", report.error)
                 await session.commit()
@@ -262,8 +234,8 @@ class Worker:
             await self._renew_subscription(session)
             await session.commit()
             logger.debug(
-                "mirror: read=%d changed=%d embedded=%d in %dms",
-                report.read, report.changed, report.embedded, report.duration_ms,
+                "mirror: read=%d changed=%d in %dms",
+                report.read, report.changed, report.duration_ms,
             )
 
     async def _renew_subscription(self, session: AsyncSession) -> None:
@@ -289,7 +261,7 @@ class Worker:
 
         Per team as well as overall because they answer different questions —
         the least loaded person in presales is not the least loaded person in
-        the company, and the intake assigns from a team's ranking.
+        the company.
 
         Only teams with an enabled assignment policy of their own: that is the
         rule for distributing work at all, and a ranking for a team that does
@@ -307,123 +279,7 @@ class Worker:
         for team in teams:
             await live_scores.recompute(session, team=team, reason=reason, counted=counted)
 
-    # ── the mail ───────────────────────────────────────────────────────
-
-    async def _mail_loop(self) -> None:
-        if not await self._sleep(20):
-            return
-        while not self._stopping.is_set():
-            interval = 60
-            try:
-                interval = await self.poll_once()
-            except Exception:  # noqa: BLE001 - a loop must not die
-                logger.exception("mail poll failed")
-                interval = BACKOFF_SECONDS
-            if not await self._sleep(interval):
-                return
-
-    async def poll_once(self) -> int:
-        """Ask what has arrived, record it, and work through it.
-
-        Returns how long to wait before asking again, which is the configured
-        interval unless the intake is switched off — in which case it is a lazy
-        check for somebody having turned it on.
-        """
-        async with self._factory() as session:
-            intake = await intake_service.get_settings(session)
-            if not intake.enabled or not intake.mailbox:
-                await session.commit()
-                return 120
-            interval = max(15, intake.poll_seconds)
-
-            if not await _take_lock(session, MAIL_LOCK):
-                logger.debug("another instance holds the mail lock")
-                await session.commit()
-                return interval
-            await self._drain(session, intake)
-            await session.commit()
-            return interval
-
-    async def _drain(self, session: AsyncSession, intake: IntakeSettings) -> None:
-        try:
-            messages, cursor = await self._mail.delta(
-                intake.mailbox,
-                delta_link=intake.delta_link,
-                since=intake.watch_from,
-            )
-        except Exception as exc:  # noqa: BLE001 - shown on the settings screen
-            intake.last_error = f"{type(exc).__name__}: {exc}"
-            intake.last_poll_at = datetime.now(UTC)
-            await session.flush()
-            return
-
-        fresh = 0
-        for raw in messages:
-            if raw.get("isDraft"):
-                continue
-            row = await intake_service.record(session, raw, not_before=intake.watch_from)
-            if row is None:
-                continue
-            fresh += 1
-            # The delta projection has no body. Fetching it only for messages
-            # that are new, and only after the sender filter would keep them,
-            # is what stops a busy inbox costing a request per message.
-            if row.body is None or len(row.body) < 40:
-                try:
-                    row.body = await self._mail.body_of(
-                        intake.mailbox, row.graph_message_id
-                    )
-                except Exception:  # noqa: BLE001 - classify on the preview
-                    logger.debug("could not fetch body for %s", row.graph_message_id)
-        await session.flush()
-
-        if cursor:
-            intake.delta_link = cursor
-        intake.last_poll_at = datetime.now(UTC)
-        intake.last_error = None
-        await session.flush()
-
-        for row in await intake_service.pending(session, limit=20):
-            await intake_service.process(
-                session, row,
-                settings=self._settings,
-                intake=intake,
-                classifier=self._classifier,
-                matcher=self._matcher,
-                sharepoint=self._sharepoint,
-                http=self._http,
-            )
-            await session.flush()
-        if fresh:
-            logger.info("intake: %d new message(s)", fresh)
-
     # ── used by the routes ─────────────────────────────────────────────
-
-    async def process_message_id(self, message_id: str) -> None:
-        """Handle one message Graph told us about, now rather than at the poll."""
-        async with self._factory() as session:
-            intake = await intake_service.get_settings(session)
-            if not intake.enabled or not intake.mailbox:
-                return
-            try:
-                raw = await self._mail.message(intake.mailbox, message_id)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("could not read message %s: %s", message_id, exc)
-                return
-            row = await intake_service.record(session, raw, not_before=intake.watch_from)
-            if row is None:
-                await session.commit()
-                return
-            await intake_service.process(
-                session, row,
-                settings=self._settings,
-                intake=intake,
-                classifier=self._classifier,
-                matcher=self._matcher,
-                sharepoint=self._sharepoint,
-                http=self._http,
-            )
-            await session.commit()
 
     @property
     def last_sync(self):
@@ -432,15 +288,3 @@ class Worker:
     @property
     def publisher(self) -> publishing.Publisher:
         return self._publisher
-
-    @property
-    def embedder(self) -> Embedder:
-        return self._embedder
-
-    @property
-    def matcher(self) -> Matcher:
-        return self._matcher
-
-    @property
-    def classifier(self) -> Classifier:
-        return self._classifier

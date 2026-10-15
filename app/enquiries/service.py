@@ -36,7 +36,6 @@ from typing import Any
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.assistant.llm import LLMError
 from app.comparison import service as comparison_service
 from app.comparison.documents import DocumentError, Readable, prepare
 from app.comparison.extraction import ExtractionError
@@ -224,7 +223,7 @@ async def run(deps: Deps, analysis_id: uuid.UUID, user_id: uuid.UUID) -> None:
             await current.go()
     except Exception as exc:  # noqa: BLE001 — a run must end in a state, whatever happened
         logger.exception("enquiry analysis %s failed", analysis_id)
-        message = str(exc) if isinstance(exc, (EnquiryError, LLMError)) else (
+        message = str(exc) if isinstance(exc, (EnquiryError, claude.LLMError)) else (
             f"The analysis stopped on an error: {type(exc).__name__}: {exc}"
         )
         # The log so far, and why it stopped: the session that held it may
@@ -693,7 +692,7 @@ class Run:
                         schema=research.SCHEMA,
                         user_key=str(self.user.id),
                     )
-                except LLMError as exc:
+                except claude.LLMError as exc:
                     failures.append(str(exc))
                     await self.say(f"Web lookup {number}/{len(batches)} failed: {exc}", "error")
                     return

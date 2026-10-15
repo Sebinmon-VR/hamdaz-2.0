@@ -1,9 +1,13 @@
-"""The intake's HTTP surface: settings, the log, and Graph's webhook.
+"""The mirror's HTTP surface: is the copy current, refresh it, who is next, and
+Graph's webhook for changes to the Proposals list.
 
-Almost all of it is super admin only, and for the same reason the delivery log
-is: this is a record of who was told what about whose work, plus the addresses
-being watched. The one exception is the webhook, which cannot be authenticated
-by a session because the caller is Microsoft — it is authenticated by echoing a
+The paths stay under ``/intake`` because Graph's list subscription was made
+with ``/intake/notifications`` as its address; moving it would silently stop
+the notifications. The mail half — the watched mailbox, its settings and its
+log — was removed on 2026-10-14.
+
+Super admin only, except the webhook, which cannot be authenticated by a
+session because the caller is Microsoft — it is authenticated by echoing a
 validation token and by checking the secret we gave Graph when we subscribed.
 """
 
@@ -11,7 +15,6 @@ from __future__ import annotations
 
 import contextlib
 import secrets
-import uuid
 from datetime import datetime
 from typing import Annotated, Any
 
@@ -23,17 +26,7 @@ from app.analytics import live as live_scores
 from app.auth.deps import CurrentUser
 from app.core.config import Settings, get_settings
 from app.core.db import get_session
-from app.intake import service
-from app.intake.schemas import (
-    IntakeMessageOut,
-    IntakePage,
-    IntakeSettingsIn,
-    IntakeSettingsOut,
-    MirrorStatusOut,
-    StandingOut,
-)
-from app.intake.service import IntakeError
-from app.models.intake import IntakeMessage, IntakeStatus
+from app.intake.schemas import MirrorStatusOut, StandingOut
 from app.models.proposal_index import MirrorState, ProposalIndexItem
 from app.models.team import Team
 from app.models.user import User
@@ -43,27 +36,20 @@ from app.roles.deps import CurrentRoles
 from app.teams import service as teams_service
 from app.teams.service import TeamError
 
-router = APIRouter(prefix="/intake", tags=["mail intake"])
-#: Not under ``/intake`` and not authenticated by session: the caller is
-#: Microsoft, not a person. Kept separate so nothing here inherits a dependency
-#: that would refuse them.
-webhook_router = APIRouter(prefix="/intake", tags=["mail intake"])
+router = APIRouter(prefix="/intake", tags=["proposals mirror"])
+#: Not authenticated by session: the caller is Microsoft, not a person. Kept
+#: separate so nothing here inherits a dependency that would refuse them.
+webhook_router = APIRouter(prefix="/intake", tags=["proposals mirror"])
 
 Session = Annotated[AsyncSession, Depends(get_session)]
 Config = Annotated[Settings, Depends(get_settings)]
 
 
 async def require_super_admin(user: CurrentUser, roles: CurrentRoles) -> User:
-    """Only a super admin configures the intake or reads its log.
-
-    The log holds who was told what about whose work, and the settings decide
-    whose mailbox is read — neither is anybody else's business, including a
-    CEO's.
-    """
     if SUPER_ADMIN not in roles:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only a super admin can see or change the mail intake.",
+            detail="Only a super admin can see or change the Proposals mirror.",
         )
     return user
 
@@ -76,167 +62,12 @@ def _worker(request: Request):
     if worker is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="The intake worker is not running in this process.",
+            detail="The mirror worker is not running in this process.",
         )
     return worker
 
 
-def _translate(exc: IntakeError) -> HTTPException:
-    return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
-
-
-# ── settings ───────────────────────────────────────────────────────────
-
-
-@router.get("/settings", response_model=IntakeSettingsOut, summary="What is watched")
-async def read_settings(admin: SuperAdmin, session: Session) -> IntakeSettingsOut:
-    return IntakeSettingsOut.model_validate(await service.get_settings(session))
-
-
-@router.patch("/settings", response_model=IntakeSettingsOut, summary="Change it")
-async def update_settings(
-    body: IntakeSettingsIn, admin: SuperAdmin, session: Session
-) -> IntakeSettingsOut:
-    """Only the fields sent change.
-
-    Note ``create_in_sharepoint``. It ships off, and turning it on is the
-    moment this system starts writing rows into the live Proposals list the
-    team works in. Everything else can be undone; that cannot.
-    """
-    try:
-        row = await service.update_settings(
-            session, actor_id=admin.id, changes=body.model_dump(exclude_unset=True)
-        )
-    except IntakeError as exc:
-        raise _translate(exc) from exc
-    await session.commit()
-    return IntakeSettingsOut.model_validate(row)
-
-
-# ── the log ────────────────────────────────────────────────────────────
-
-
-def _message_out(row: IntakeMessage) -> IntakeMessageOut:
-    return IntakeMessageOut(
-        id=row.id,
-        received_at=row.received_at,
-        sender_email=row.sender_email,
-        sender_name=row.sender_name,
-        subject=row.subject,
-        status=row.status,
-        category=row.category,
-        is_reopened=row.is_reopened,
-        confidence=float(row.confidence) if row.confidence is not None else None,
-        reasoning=row.reasoning,
-        extracted=row.extracted or {},
-        matched_item_id=row.matched_item_id,
-        match_confidence=(
-            float(row.match_confidence) if row.match_confidence is not None else None
-        ),
-        match_reason=row.match_reason,
-        candidates=row.candidates or [],
-        action=row.action,
-        assigned_user_id=row.assigned_user_id,
-        assigned_name=row.assigned_user.display_name if row.assigned_user else None,
-        assigned_reason=row.assigned_reason,
-        created_item_id=row.created_item_id,
-        would_create=row.would_create,
-        would_update=row.would_update,
-        notified_teams=row.notified_teams,
-        notified_user_ids=list(row.notified_user_ids or []),
-        error=row.error,
-        processed_at=row.processed_at,
-        cost_usd=float(row.cost_usd) if row.cost_usd is not None else None,
-        web_link=row.web_link,
-    )
-
-
-@router.get("/messages", response_model=IntakePage, summary="Every mail it has seen")
-async def list_messages(
-    admin: SuperAdmin,
-    session: Session,
-    status_filter: Annotated[str | None, Query(alias="status")] = None,
-    category: Annotated[str | None, Query()] = None,
-    limit: Annotated[int, Query(ge=1, le=200)] = 50,
-    offset: Annotated[int, Query(ge=0)] = 0,
-) -> IntakePage:
-    """Including the ones it ignored, which are the useful ones.
-
-    "Why did nothing happen when I sent that" is the question this exists to
-    answer, and only the ignored rows answer it.
-    """
-    rows, total = await service.listing(
-        session, status=status_filter, category=category, limit=limit, offset=offset
-    )
-    counts = {
-        row.status: int(row.n)
-        for row in (
-            await session.execute(
-                select(IntakeMessage.status, func.count().label("n")).group_by(
-                    IntakeMessage.status
-                )
-            )
-        ).all()
-    }
-    return IntakePage(
-        messages=[_message_out(r) for r in rows],
-        total=total,
-        counts={s.value: counts.get(s.value, 0) for s in IntakeStatus},
-    )
-
-
-@router.get(
-    "/messages/{message_id}", response_model=IntakeMessageOut, summary="One in full"
-)
-async def read_message(
-    message_id: uuid.UUID, admin: SuperAdmin, session: Session
-) -> IntakeMessageOut:
-    row = await session.get(IntakeMessage, message_id)
-    if row is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such message")
-    return _message_out(row)
-
-
-@router.post(
-    "/messages/{message_id}/retry",
-    response_model=IntakeMessageOut,
-    summary="Put one back through",
-)
-async def retry_message(
-    message_id: uuid.UUID,
-    request: Request,
-    admin: SuperAdmin,
-    session: Session,
-    config: Config,
-) -> IntakeMessageOut:
-    """Run the pipeline over a message again, from where it is now.
-
-    For after a setting changed — a sender added, a threshold lowered, or
-    writing switched on. The classification is redone rather than reused,
-    because the thing being retried is usually the decision.
-    """
-    row = await session.get(IntakeMessage, message_id)
-    if row is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such message")
-    worker = _worker(request)
-    intake = await service.get_settings(session)
-    row.status = IntakeStatus.RECEIVED
-    row.error = None
-    await session.flush()
-    await service.process(
-        session, row,
-        settings=config,
-        intake=intake,
-        classifier=worker.classifier,
-        matcher=worker.matcher,
-        sharepoint=request.app.state.sharepoint,
-        http=request.app.state.http,
-    )
-    await session.commit()
-    return _message_out(row)
-
-
-# ── the mirror and the ranking ─────────────────────────────────────────
+# ── the mirror ─────────────────────────────────────────────────────────
 
 
 @router.get("/mirror", response_model=MirrorStatusOut, summary="Is the local copy current")
@@ -252,24 +83,11 @@ async def mirror_status(
         )
         or 0
     )
-    embedded = int(
-        await session.scalar(
-            select(func.count())
-            .select_from(ProposalIndexItem)
-            .where(
-                ProposalIndexItem.deleted.is_(False),
-                ProposalIndexItem.embedding.is_not(None),
-            )
-        )
-        or 0
-    )
     return MirrorStatusOut(
         rows=rows,
-        embedded=embedded,
         last_sync_at=state.last_sync_at if state else None,
         rows_read=state.rows_read if state else 0,
         rows_changed=state.rows_changed if state else 0,
-        rows_embedded=state.rows_embedded if state else 0,
         duration_ms=state.duration_ms if state else 0,
         last_error=state.last_error if state else None,
         subscription_id=state.subscription_id if state else None,
@@ -280,19 +98,14 @@ async def mirror_status(
 
 
 @router.post("/mirror/sync", response_model=MirrorStatusOut, summary="Refresh it now")
-async def sync_mirror(
-    request: Request,
-    admin: SuperAdmin,
-    session: Session,
-    embed: Annotated[bool, Query(description="Also embed changed rows.")] = True,
-) -> MirrorStatusOut:
+async def sync_mirror(request: Request, admin: SuperAdmin, session: Session) -> MirrorStatusOut:
     """Pull the list and rewrite the ranking, without waiting for the timer.
 
     Reads SharePoint; writes nothing to it.
     """
     # Forced: somebody asked explicitly, so a background flag being off
     # is not a reason to refuse them.
-    await _worker(request).sync_once(embed=embed, force=True)
+    await _worker(request).sync_once(force=True)
     return await mirror_status(admin, session, get_settings())
 
 
@@ -360,11 +173,7 @@ async def standing(
     session: Session,
     team: Annotated[str | None, Query(description="Team handle or id.")] = None,
 ) -> list[StandingOut]:
-    """The current ranking. Rank 1 is next.
-
-    A stored table rather than a computation, which is what lets the intake
-    decide who an incoming tender goes to while the email is still being read.
-    """
+    """The current ranking. Rank 1 is next. A stored table, not a computation."""
     found: Team | None = None
     if team:
         try:
@@ -401,24 +210,25 @@ async def standing(
 @webhook_router.post(
     "/notifications",
     include_in_schema=False,
-    summary="Where Graph posts when mail arrives",
+    summary="Where Graph posts when the Proposals list changes",
 )
 async def graph_notification(
     request: Request,
     session: Session,
     validationToken: Annotated[str | None, Query()] = None,
 ) -> Response:
-    """Graph's change notifications. Not a route a person calls.
+    """Graph's change notifications for the Proposals list. Not a route a person calls.
 
-    Two things happen here and both are required by Graph. On subscribing it
-    posts a ``validationToken`` and expects it echoed back as plain text within
-    seconds — so that branch must come first and must not touch the database.
-    Afterwards it posts batches of notifications, each carrying the
-    ``clientState`` we set at subscribe time, which is checked before anything
-    is acted on: an endpoint that trusts whatever posts to it is an open door.
+    On subscribing Graph posts a ``validationToken`` and expects it echoed back
+    as plain text within seconds — so that branch must come first and must not
+    touch the database. Afterwards it posts batches of notifications, each
+    carrying the ``clientState`` we set at subscribe time, which is checked
+    before anything is acted on: an endpoint that trusts whatever posts to it is
+    an open door. A notification says only "the list changed", never which row,
+    so the answer is to wake the mirror loop, which re-reads the whole list.
 
     Always 202. Graph retries anything else, and a retry storm caused by our
-    own bug helps nobody — what went wrong belongs on the intake row.
+    own bug helps nobody.
     """
     if validationToken:
         return Response(content=validationToken, media_type="text/plain")
@@ -433,83 +243,9 @@ async def graph_notification(
     if worker is None:
         return Response(status_code=status.HTTP_202_ACCEPTED)
 
-    intake = await service.get_settings(session)
     mirror = await mirror_service.state(session)
-    expected = intake.subscription_secret
     list_secret = mirror.subscription_secret
-
     for item in payload.get("value", []) or []:
-        state_token = item.get("clientState")
-        # Two subscriptions post here and each carries its own secret. A list
-        # notification says only "the list changed", never which row, so the
-        # answer is to wake the mirror loop, which re-reads the whole list.
-        if list_secret and state_token == list_secret:
+        if list_secret and item.get("clientState") == list_secret:
             worker.kick()
-            continue
-        if not intake.enabled or (expected and state_token != expected):
-            continue
-        resource = str(item.get("resourceData", {}).get("id") or "")
-        if resource:
-            # Handled inline rather than in a background task: Graph allows
-            # thirty seconds, one message is well inside that, and a task
-            # spawned here would outlive the request with nothing watching it.
-            await worker.process_message_id(resource)
     return Response(status_code=status.HTTP_202_ACCEPTED)
-
-
-@router.post("/subscription", summary="Ask Graph to notify us")
-async def create_subscription(
-    request: Request, admin: SuperAdmin, session: Session, config: Config
-) -> dict[str, Any]:
-    """Subscribe to the watched mailbox, so mail is handled in seconds.
-
-    Graph validates the endpoint before creating anything: it posts to the URL
-    and expects the token echoed. So this fails outright if the app is not
-    reachable from the internet, which is the honest outcome — a subscription
-    that silently never fires would be worse.
-
-    Polling continues either way. It is the safety net, and Microsoft's own
-    advice is not to rely on notifications alone.
-    """
-    intake = await service.get_settings(session)
-    if not intake.mailbox:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Set the mailbox first.",
-        )
-    base = (config.public_base_url or str(request.base_url)).rstrip("/")
-    if not base.startswith("https://"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                "Graph will only post to an https address it can reach. Set "
-                "PUBLIC_BASE_URL to this app's public URL."
-            ),
-        )
-    secret = secrets.token_urlsafe(24)
-    try:
-        created = await request.app.state.mail_reader.subscribe(
-            intake.mailbox,
-            notification_url=f"{base}{config.api_prefix}/intake/notifications",
-            secret=secret,
-        )
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)
-        ) from exc
-
-    intake.subscription_id = created.get("id")
-    intake.subscription_secret = secret
-    expires = created.get("expirationDateTime")
-    if expires:
-        try:
-            intake.subscription_expires_at = datetime.fromisoformat(
-                str(expires).replace("Z", "+00:00")
-            )
-        except ValueError:
-            intake.subscription_expires_at = None
-    await session.commit()
-    return {
-        "subscription_id": intake.subscription_id,
-        "expires_at": intake.subscription_expires_at,
-    }

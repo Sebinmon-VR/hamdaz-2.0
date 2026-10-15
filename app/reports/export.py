@@ -127,8 +127,6 @@ def blocks(report: Report) -> list[Block]:
 
     if report.brief:
         out.append(Block("heading", text="In short"))
-        if report.brief_headline:
-            out.append(Block("prose", text=report.brief_headline))
         out.append(Block("prose", text=report.brief))
 
     out.append(Block("heading", text="Overview"))

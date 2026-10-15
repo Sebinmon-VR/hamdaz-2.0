@@ -215,19 +215,25 @@ async def send_to_teams(
     body: str | None = None,
     facts: dict[str, Any] | None = None,
     link: str | None = None,
+    recipient: str | None = None,
 ) -> bool:
     """Post one card to a Teams channel. True if it went.
 
     Never raises. A notification is already recorded in the app before this is
     called, so a webhook that is wrong, expired or unreachable costs a copy and
     not the fact — and failing the thing that caused it would be absurd.
+
+    ``recipient`` rides along beside the card for a Teams Workflow that posts
+    to a person's chat ("Post card in a chat … Recipient: triggerBody()?
+    ['recipient']"); a webhook that does not use it ignores it.
     """
     if not webhook_url:
         return False
+    message = _card(title=title, body=body, facts=facts or {}, link=link)
+    if recipient:
+        message["recipient"] = recipient
     try:
-        response = await http.post(
-            webhook_url, json=_card(title=title, body=body, facts=facts or {}, link=link)
-        )
+        response = await http.post(webhook_url, json=message)
     except Exception as exc:  # noqa: BLE001 - a copy, never the record
         logger.warning("Teams webhook failed: %s", exc)
         return False

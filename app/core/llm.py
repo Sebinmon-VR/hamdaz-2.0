@@ -244,6 +244,7 @@ class TextModel:
         free_only: bool = False,
         check: Callable[[dict[str, Any]], bool] | None = None,
         label: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> Answer | None:
         """One JSON object, from the providers in order.
 
@@ -258,6 +259,11 @@ class TextModel:
         ``free_only`` leaves Claude out, for a caller with a Claude path of
         its own to fall back to. ``label`` says what is being read, on the
         record of the call kept by ``capture``.
+
+        ``reasoning_effort`` ("low", "medium", "high") is passed to the
+        gpt-oss models, which think before answering: low takes a short chat
+        answer from about three seconds to one. Left out, each model does as
+        it would — which is what reading a document wants.
         """
         for provider in self._providers:
             if provider.name == "anthropic":
@@ -266,7 +272,7 @@ class TextModel:
                 if claude_model:
                     provider = replace(provider, model=claude_model)
             try:
-                raw, used_in, used_out = await self._ask(provider, (system, user), max_tokens)
+                raw, used_in, used_out = await self._ask(provider, (system, user), max_tokens, reasoning_effort)
             except ModelError as exc:
                 logger.info("model %s declined: %s", provider.name, exc)
                 continue
@@ -296,7 +302,7 @@ class TextModel:
         return system, body
 
     async def _ask(
-        self, provider: Provider, prompt: tuple[str, str], max_tokens: int
+        self, provider: Provider, prompt: tuple[str, str], max_tokens: int, reasoning_effort: str | None = None
     ) -> tuple[str, int, int]:
         """The reply's text, and the tokens it took in and gave out."""
         system, body = prompt
@@ -341,6 +347,12 @@ class TextModel:
                         "temperature": 0,
                         "max_tokens": max_tokens,
                         "response_format": {"type": "json_object"},
+                        # Only the gpt-oss models take it; others would refuse the field.
+                        **(
+                            {"reasoning_effort": reasoning_effort}
+                            if reasoning_effort and "gpt-oss" in provider.model
+                            else {}
+                        ),
                     },
                     timeout=timeout,
                 )

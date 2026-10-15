@@ -246,28 +246,41 @@ class Settings(BaseSettings):
 
         return bool(providers_from(self))
 
-    # ── OpenAI (the assistant) ─────────────────────────────────────────
-    #: The assistant's chat agent runs on the OpenAI API; Claude above is used
-    #: only for reading supplier quotes. Create the key at platform.openai.com.
-    #: Everything else about the assistant — model, effort, who may use it —
-    #: is set by a super admin at runtime, not here.
-    openai_api_key: str = ""
-    #: Left empty the SDK talks to api.openai.com. Set for a proxy or a
-    #: compatible gateway; not needed for direct use.
-    openai_base_url: str = ""
-    #: One model call, including streaming. Tool calls have their own budget.
-    openai_timeout_seconds: float = 120.0
-    #: A single tool call — one request to one of this app's own routes.
-    #: Generous because SharePoint, Zoho and Graph are behind some of them.
-    assistant_tool_timeout_seconds: float = 60.0
-    #: A tool result longer than this is cut before the model sees it, so a
-    #: full quote list cannot fill the context window in one call.
-    assistant_tool_result_max_chars: int = 12_000
-    #: What the Proposals mirror embeds rows with, so an incoming email can be
-    #: matched to one by meaning rather than by spelling. Small and cheap: the
-    #: text being compared is a title and a few notes, and the larger models
-    #: buy almost nothing on that. See app/proposals/mirror.py.
-    embedding_model: str = "text-embedding-3-small"
+    # ── AI agents ──────────────────────────────────────────────────────
+    #: The model behind every agent step that needs one (reading documents,
+    #: thinking, summaries, drafts). Haiku 5.5 because the user asked for low
+    #: cost (2026-10-15): $0.10 in / $0.50 out per million tokens, so a run is
+    #: a fraction of a cent. Everything that can be done without a model is.
+    agent_model: str = "claude-haiku-5-5"
+    #: low, medium, high. Low keeps answers short and the bill small.
+    agent_effort: str = "low"
+    #: Whether a step may search the web when its own switch asks to. Off
+    #: switches it off for every agent: each search carries a fee on top.
+    agent_web_search: bool = True
+    #: Searches one step may make.
+    agent_web_max_uses: int = 5
+    #: The companion's "what is this?" asks the free models first (Groq and the
+    #: rest of LLM_PROVIDERS, Claude left out). When every free one is busy it
+    #: falls back to AGENT_MODEL — fractions of a cent — unless this is off,
+    #: in which case it says it is busy instead. The user wanted it free
+    #: (2026-10-15).
+    agent_explain_paid_fallback: bool = True
+    #: Mail an agent's owner when a run needs their answer and when it ends —
+    #: sent as them, to them, through Graph. Only ever the owner.
+    agent_email_notify: bool = True
+    #: A Teams Workflows webhook ("When a Teams webhook request is received" →
+    #: "Post card in a chat or channel"). Each card carries the owner's email
+    #: as ``recipient`` so one flow can post to each person's chat. Empty: no
+    #: Teams cards.
+    agent_teams_webhook_url: str = ""
+    #: A second Power Automate flow, for questions: "When an HTTP request is
+    #: received" → "Post adaptive card and wait for a response" (to
+    #: ``recipient``) → HTTP POST the answer to ``callback_url``. When set, an
+    #: agent waiting on its owner asks in Teams as well as in the app, and the
+    #: run carries on from whichever is answered first. The callback must be
+    #: reachable from the internet, so it works from the deployed API (set
+    #: PUBLIC_BASE_URL), not from a laptop.
+    agent_teams_ask_url: str = ""
 
     # ── enquiry analysis ───────────────────────────────────────────────
     #: The Claude model that reads a tender's documents and looks new items up
@@ -277,33 +290,6 @@ class Settings(BaseSettings):
     #: How hard it thinks: low, medium, high. Medium is the model's default.
     enquiry_effort: str = "medium"
 
-    # ── AI employees in Teams and Outlook (their own Microsoft 365 accounts) ─
-    #: The loop that reads each connected AI employee's Teams chats and answers
-    #: as them, through Graph. Off until a super admin has connected an
-    #: account and wants it answering. See app/msteams.
-    ai_teams_enabled: bool = False
-    #: How often each connected AI employee's chats are checked.
-    ai_teams_poll_seconds: int = 3
-    #: **Test lock.** Comma-separated app emails. When set, an AI employee
-    #: READS AND ANSWERS ONLY its one-to-one chat with each of these people —
-    #: no other chat is listed, previewed or opened, and nothing is sent
-    #: anywhere else. For trials on a real person's account (2026-10-06: Sebin's
-    #: account playing Luna, Krishnendu the only sender). Blank answers everyone.
-    ai_teams_test_senders: str = ""
-
-    @property
-    def ai_teams_test_list(self) -> frozenset[str]:
-        return frozenset(e.strip().lower() for e in self.ai_teams_test_senders.split(",") if e.strip())
-
-    @property
-    def ai_connect_redirect_uri(self) -> str:
-        """Where Microsoft returns after an AI employee's account is connected.
-
-        Beside the login callback, so it lives on the same host: register it
-        on the app registration as a Web redirect URI too.
-        """
-        base = self.azure_redirect_uri.rsplit("/auth/callback", 1)[0]
-        return f"{base}/ai-employees/oauth/callback"
     #: Look new items up on the web during every analysis. The user asked for
     #: it automatic (2026-10-05); it is the part of a run that costs the most.
     enquiry_web_search: bool = True
@@ -313,10 +299,6 @@ class Settings(BaseSettings):
     enquiry_recent_months: int = 12
     #: The task folder's subfolder the analysis reports are filed into.
     enquiry_report_folder: str = "Enquiry analysis"
-
-    @property
-    def openai_configured(self) -> bool:
-        return bool(self.openai_api_key)
 
     # ── the background loops ───────────────────────────────────────────
     #: How often the local copy of the Proposals list is refreshed. Every read

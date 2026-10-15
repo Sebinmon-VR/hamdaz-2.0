@@ -12,9 +12,11 @@ pyjwt[crypto]>=2.10
 httpx>=0.28
 playwright>=1.47
 anthropic>=0.69
-openai>=3.8
 python-multipart>=0.0.20
 openpyxl>=3.1
+# Old Excel 97-2003 workbooks (.xls), which openpyxl cannot open: SAP and Ariba
+# still export RFQs in this format. Pure Python.
+xlrd>=2.0.1
 python-docx>=1.1
 pdfplumber>=0.11
 # Writes the PDF a report is exported as. Named here rather than left as

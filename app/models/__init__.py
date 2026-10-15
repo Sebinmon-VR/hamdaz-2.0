@@ -1,20 +1,8 @@
 from app.models.access import Module, ModulePage, TeamModuleAccess, TeamPageAccess
+from app.models.agent import AgentRun, UserAgent
 from app.models.analytics import AnalyticsRun, LiveScore, UserAnalytics
 from app.models.ariba import AribaBcdFix, AribaEvent, AribaState
 from app.models.assignment import AssignmentPolicy
-from app.models.assistant import (
-    AssistantAccessRule,
-    AssistantConversation,
-    AssistantMessage,
-    AssistantModel,
-    AssistantModulePolicy,
-    AssistantRun,
-    AssistantRunEvent,
-    AssistantSettings,
-    AssistantToolPolicy,
-    AssistantVoiceModel,
-    AssistantVoiceUsage,
-)
 from app.models.base import Base
 from app.models.intake import (
     CREATING_CATEGORIES,
@@ -85,8 +73,6 @@ from app.models.status_reminder import ReminderStatus, StatusReminder, StatusRem
 from app.models.bcd_check import BcdCheck, BcdCheckSettings, BcdCheckStatus
 from app.models.task_calendar import TaskCalendarEvent, TaskCalendarSettings
 from app.models.enquiry import EnquiryAnalysis, EnquiryDocument, EnquiryLine
-from app.models.ai_employee import AIEmployee
-from app.models.teams_chat import AIEmployeeAccount, TeamsChat
 from app.models.hr import (
     CLOSED_STAGES,
     ApplicationFile,
@@ -120,42 +106,15 @@ from app.models.role import Role, RoleScope, UserRole
 from app.models.team import Team, TeamMembership
 from app.models.templates import FieldType, FormTemplate, TemplateGrant, TemplateStatus
 from app.models.user import User
-from app.models.workflow import (
-    FileSource,
-    OPEN_RUN_STATUSES,
-    RunEventKind,
-    RunStatus as WorkflowRunStatus,
-    Workflow,
-    WorkflowRun,
-    WorkflowRunEvent,
-    WorkflowRunFile,
-    WorkflowRunMessage,
-    WorkflowSettings,
-    WorkflowTrigger,
-)
 from app.models.zoho import ZohoToken
 
 __all__ = [
     "AribaBcdFix",
     "AribaEvent",
     "AribaState",
-    "Workflow", "WorkflowRun", "WorkflowRunEvent", "WorkflowRunFile", "WorkflowRunMessage",
-    "WorkflowSettings", "WorkflowTrigger", "WorkflowRunStatus", "RunEventKind", "FileSource",
-    "OPEN_RUN_STATUSES",
     "AnalyticsRun",
     "ApplicationFile",
     "ApplicationStage",
-    "AssistantAccessRule",
-    "AssistantConversation",
-    "AssistantMessage",
-    "AssistantModel",
-    "AssistantModulePolicy",
-    "AssistantRun",
-    "AssistantRunEvent",
-    "AssistantSettings",
-    "AssistantToolPolicy",
-    "AssistantVoiceModel",
-    "AssistantVoiceUsage",
     "AssignmentPolicy",
     "Base",
     "CREATING_CATEGORIES",
@@ -169,6 +128,8 @@ __all__ = [
     "MailCategory",
     "MirrorState",
     "Notification",
+    "AgentRun",
+    "UserAgent",
     "NotificationKind",
     "ProposalIndexItem",
     "CLOSED_PROJECT_STATUSES",
@@ -228,9 +189,6 @@ __all__ = [
     "EnquiryAnalysis",
     "EnquiryDocument",
     "EnquiryLine",
-    "AIEmployee",
-    "TeamsChat",
-    "AIEmployeeAccount",
     "TaskCalendarSettings",
     "FormTemplate",
     "JobApplication",

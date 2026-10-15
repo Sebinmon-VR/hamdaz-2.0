@@ -18,13 +18,6 @@ from app.ariba.mailer import AribaMailer
 from app.ariba.router import router as ariba_router
 from app.ariba.worker import AribaWorker
 from app.assignment.router import router as assignment_router
-from app.assistant.agent import Assistant
-from app.assistant.cache import ActorCache, ConfigCache, PlacesCache
-from app.assistant.claude_chat import ClaudeChat, ModelRouter
-from app.assistant.executor import ToolExecutor
-from app.assistant.llm import OpenAIChat
-from app.assistant.router import admin_router as assistant_admin_router
-from app.assistant.router import router as assistant_router
 from app.auth.oidc import EntraOIDC
 from app.auth.router import router as auth_router
 from app.comparison.extraction import QuoteExtractor
@@ -36,6 +29,9 @@ from app.dashboards.router import router as dashboards_router
 from app.directory.graph import GraphDirectory
 from app.directory.router import router as directory_router
 from app.enquiries.claude import ClaudeEnquiry
+from app.agents.model import AgentModel
+from app.core.mail import GraphMailer
+from app.agents.router import router as agents_router
 from app.enquiries.router import router as enquiries_router
 from app.finance.cache import PnlCache
 from app.finance.router import router as finance_router
@@ -49,11 +45,6 @@ from app.bcd.mailer import BcdMailer
 from app.bcd.router import router as bcd_router
 from app.bcd.worker import BcdWorker
 from app.taskcalendar.graph import TaskCalendar
-from app.msteams.bridge import AppCaller
-from app.msteams.graph import EmployeeGraph
-from app.msteams.router import admin_router as employee_accounts_router
-from app.msteams.router import callback_router as teams_callback_router
-from app.msteams.worker import TeamsWorker
 from app.taskcalendar.router import router as task_calendar_router
 from app.taskcalendar.worker import TaskCalendarWorker
 from app.forms.router import router as templates_router
@@ -79,16 +70,11 @@ from app.quoting.mailer import QuoteMailer
 from app.quoting.probability import WinRates
 from app.quoting.router import router as quoting_router
 from app.quoting.storage import QuoteDrive
-from app.reports.brief import Briefer
 from app.reports.mailer import ReportMailer
 from app.reports.router import admin_router as reports_admin_router
 from app.reports.router import router as reports_router
 from app.roles.router import router as roles_router
 from app.teams.router import router as teams_router
-from app.workflows.engine import Services as WorkflowServices
-from app.workflows.router import admin_router as workflows_admin_router
-from app.workflows.router import router as workflows_router
-from app.workflows.worker import WorkflowWorker
 from app.zoho.cache import QuoteCache
 from app.zoho.client import ZohoBooks
 from app.zoho.router import router as zoho_router
@@ -146,6 +132,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Reads tender documents and looks new items up on the web, with Claude.
     # No key means the enquiry page says so; nothing else depends on it.
     app.state.enquiry_llm = ClaudeEnquiry(settings)
+    # Each person's own agents: Haiku, low effort, asked only after the app.
+    app.state.agent_model = AgentModel(settings)
+    # Mails an agent's owner about their own runs — as them, to them.
+    app.state.agent_mailer = GraphMailer(settings, http)
     # Approvers are told a quote is waiting, from the requester's own mailbox.
     app.state.quote_mailer = QuoteMailer(settings, http)
     # Files the supplier documents people upload into OneDrive. Inert
@@ -154,91 +144,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # A filed report is mailed to whoever it goes to, from its author's mailbox.
     # A failure to send never fails the filing — see app/reports/router.py.
     app.state.report_mailer = ReportMailer(settings, http)
-    # The assistant. It reaches every module by calling this very app's routes
-    # in-process, carrying the caller's own session cookie — so each route's
-    # existing guard is the assistant's permission model too, and there is no
-    # second copy of it to keep in step. See app/assistant/executor.py.
-    #
-    # Holds no connection at boot: an unset OpenAI key fails at the first turn
-    # with a message a super admin can act on, rather than stopping the app for
-    # everyone who never opens the chat.
-    # Both stand in front of a database a third of a second away, and both
-    # are dropped by the admin routes that change what they hold. See
-    # app/assistant/cache.py for why the permission one may be stale.
-    app.state.assistant_config = ConfigCache()
-    app.state.assistant_actors = ActorCache()
-    # Where each person can be sent. Its own cache because the assistant's
-    # navigation reads a different thing from its permissions, and reading it
-    # uncached costs 2.4 seconds of an ordinary member's turn.
-    app.state.assistant_places = PlacesCache()
-    #: One client, two callers. The assistant drives a tool loop with it; the
-    #: report briefer makes a single call with it. Shared so an OpenAI key, a
-    #: base URL or a timeout is configured once and means the same thing to
-    #: both, rather than two clients that drift apart on the third setting.
-    #: Claude for a ``claude-*`` model key, OpenAI otherwise — chosen per call
-    #: by the model the super admin picked. See app/assistant/claude_chat.py.
-    openai = ModelRouter(OpenAIChat(settings), ClaudeChat(settings))
-    # Held on the state as well: the workflow steps that ask the model reach
-    # it here, so a flow and a chat use the same client and the same key.
-    app.state.openai = openai
-    # The one way anything reaches a module: the app's own routes, in-process,
-    # carrying the caller's session. Held on the state as well as inside the
-    # assistant because navigation-by-name uses it too — see
-    # app/assistant/records.py — and reaching into another object's privates
-    # for it would be a worse kind of coupling than naming it here.
-    app.state.assistant_executor = ToolExecutor(
-        app,
-        api_prefix=settings.api_prefix,
-        cookie_name=settings.session_cookie_name,
-        max_chars=settings.assistant_tool_result_max_chars,
-        timeout=settings.assistant_tool_timeout_seconds,
-    )
-    app.state.assistant = Assistant(
-        openai,
-        app.state.assistant_executor,
-        get_session_factory(),
-    )
-    # Writes the short version of a filed report, for the managers who have
-    # several to read. Off until a super admin turns it on: it is the only part
-    # of reporting that spends money per report. See app/reports/brief.py.
-    app.state.report_briefer = Briefer(openai)
-    # Reads the watched mailbox. Shares the HTTP client and inherits the
-    # mailer's token cache — same token, no reason for a second copy.
+    # Reads a mailbox for the quote pages, which attach emails to a quote.
+    # Shares the HTTP client and inherits the mailer's token cache.
     app.state.mail_reader = MailReader(settings, http)
     # The background half: keep the local copy of the Proposals list current,
-    # keep the ranking current with it, and watch the mailbox. Only one
-    # instance runs each loop — see app/intake/worker.py — and the loops are
-    # off unless somebody turns them on, because a timer that reads a live
-    # SharePoint list from a laptop is not what anybody meant.
+    # and the ranking current with it. One instance runs the loop — see
+    # app/intake/worker.py — and it is off unless MIRROR_SYNC_ENABLED is set,
+    # because a timer that reads a live SharePoint list from a laptop is not
+    # what anybody meant.
     app.state.intake_worker = Worker(
         factory=get_session_factory(),
         settings=settings,
         sharepoint=app.state.sharepoint,
-        mail=app.state.mail_reader,
-        http=http,
     )
-    # Started always. Both loops decide for themselves whether to do anything,
-    # by reading the intake settings each tick — so turning the intake on
-    # through the API is enough, and does not also need an environment
-    # variable and a restart. Two sleeping tasks cost nothing; an admin switch
-    # that silently does not take effect costs an afternoon.
+    # Started always; the loop decides each tick whether to do anything.
     app.state.intake_worker.start()
-    # Wakes the workflow runs that are waiting on the world — a supplier's
-    # reply, a quote's approval. One instance runs it; see app/workflows/worker.py.
-    app.state.workflow_worker = WorkflowWorker(
-        factory=get_session_factory(),
-        services=WorkflowServices(
-            settings=settings,
-            sharepoint=app.state.sharepoint,
-            mail=app.state.mail_reader,
-            zoho=app.state.zoho,
-            extractor=app.state.quote_extractor,
-            llm=openai,
-            executor=app.state.assistant_executor,
-            text_model=app.state.text_model,
-        ),
-    )
-    app.state.workflow_worker.start()
     # Asks the holder of a task that went past its due date why, and passes
     # the answer to their team's managers. Off until a super admin turns it
     # on, and scoped by its settings to one team — see app/followups.
@@ -278,17 +198,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         calendar=app.state.task_calendar,
     )
     app.state.task_calendar_worker.start()
-    # AI employees in Teams: each connected employee's chats, read and answered
-    # as its own account through Graph. Off unless AI_TEAMS_ENABLED is set —
-    # see app/msteams.
-    app.state.employee_graph = EmployeeGraph(settings, http)
-    app.state.teams_worker = TeamsWorker(
-        factory=get_session_factory(),
-        settings=settings,
-        graph=app.state.employee_graph,
-        caller=AppCaller(app, settings),
-    )
-    app.state.teams_worker.start()
     # Reads the open tenders from the Ariba supplier portal — only when a new
     # tender reaches the Proposals mirror, and within a gap and a daily cap.
     # Off unless ARIBA_ENABLED is set. With ARIBA_FIX_BCD it also corrects the
@@ -308,12 +217,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Stopped before the client closes: a loop mid-request against a
         # closed connection pool is a noisy shutdown for no reason.
         await app.state.intake_worker.stop()
-        await app.state.workflow_worker.stop()
         await app.state.followup_worker.stop()
         await app.state.reminder_worker.stop()
         await app.state.bcd_worker.stop()
         await app.state.task_calendar_worker.stop()
-        await app.state.teams_worker.stop()
         await app.state.ariba_worker.stop()
         await http.aclose()
         await dispose_engine()
@@ -378,6 +285,7 @@ def create_app() -> FastAPI:
     app.include_router(analytics_router, prefix=settings.api_prefix)
     app.include_router(quoting_router, prefix=settings.api_prefix)
     app.include_router(enquiries_router, prefix=settings.api_prefix)
+    app.include_router(agents_router, prefix=settings.api_prefix)
     app.include_router(templates_router, prefix=settings.api_prefix)
     app.include_router(hr_router, prefix=settings.api_prefix)
     app.include_router(finance_router, prefix=settings.api_prefix)
@@ -396,13 +304,6 @@ def create_app() -> FastAPI:
     app.include_router(intake_router, prefix=settings.api_prefix)
     app.include_router(reports_admin_router, prefix=settings.api_prefix)
     app.include_router(reports_router, prefix=settings.api_prefix)
-    app.include_router(assistant_router, prefix=settings.api_prefix)
-    app.include_router(assistant_admin_router, prefix=settings.api_prefix)
-    app.include_router(employee_accounts_router, prefix=settings.api_prefix)
-    app.include_router(teams_callback_router, prefix=settings.api_prefix)
-    app.include_router(workflows_admin_router, prefix=settings.api_prefix)
-    app.include_router(workflows_router, prefix=settings.api_prefix)
-
     # Mounted at the root, NOT under the API prefix, and holding no
     # authentication dependency of any kind. That separation is the whole
     # of the candidate-facing security model — see app/hr/public.py.

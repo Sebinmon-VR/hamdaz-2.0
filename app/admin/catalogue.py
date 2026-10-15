@@ -1,8 +1,8 @@
 """The new admin surfaces, described as data so a frontend can render them.
 
-Scoped deliberately to what was built recently — the mail intake with its
-Proposals mirror and live ranking, notifications, and team reports. The older
-admin areas (roles, access, templates, leave, the assistant) already have their
+Scoped deliberately to what was built recently — the Proposals mirror and
+its live ranking, notifications, and team reports. The older admin areas
+(roles, access, templates, leave) already have their
 own screens and are left alone; adding them here would be a second index of
 things that are not lost.
 
@@ -55,38 +55,16 @@ def _e(method: str, path: str, what: str, *, writes: bool = False) -> Endpoint:
 
 SECTIONS: Final[tuple[Section, ...]] = (
     Section(
-        "intake",
-        "Mail intake",
-        "super_admin",
-        "Watches a mailbox, decides what each message is, looks for it in the "
-        "Proposals list, and either raises a task or tells whoever holds it.",
-        caution=(
-            "create_in_sharepoint ships off. Turning it on is the moment this "
-            "starts writing rows into the live Proposals list the team works "
-            "in — the only thing here that cannot be undone. update_negotiation "
-            "and update_order_status each set one column on a task that already "
-            "exists; both ship off too."
-        ),
-        endpoints=(
-            _e("GET", "/intake/settings", "What is watched, and what it may do"),
-            _e("PATCH", "/intake/settings", "Change it", writes=True),
-            _e("GET", "/intake/messages", "Every mail seen, including the ignored"),
-            _e("GET", "/intake/messages/{id}", "One mail: reasoning, shortlist, payload"),
-            _e("POST", "/intake/messages/{id}/retry", "Run one through again", writes=True),
-            _e("POST", "/intake/subscription", "Ask Graph to notify us", writes=True),
-        ),
-    ),
-    Section(
         "mirror",
         "Proposals mirror",
         "super_admin",
         "The local copy of the Proposals list. Every question about that list — "
-        "matching an email to a task, counting somebody's workload — is "
+        "counting somebody's workload, a follow-up, a quote's task — is "
         "answered from here rather than from SharePoint, which is what keeps "
         "both fast however large the list grows.",
         caution="Reads SharePoint on a timer. Writes nothing to it, ever.",
         endpoints=(
-            _e("GET", "/intake/mirror", "Row count, embedding coverage, last sync"),
+            _e("GET", "/intake/mirror", "Row count, last sync"),
             _e("POST", "/intake/mirror/sync", "Refresh it now", writes=True),
         ),
     ),
@@ -95,8 +73,7 @@ SECTIONS: Final[tuple[Section, ...]] = (
         "Who gets the next task",
         "super_admin",
         "The live priority ranking, recomputed whenever the mirror changes "
-        "rather than when somebody asks. Rank 1 is who the intake will assign "
-        "the next new tender to.",
+        "rather than when somebody asks. Rank 1 is who is next for a new tender.",
         endpoints=(
             _e("GET", "/intake/standing", "The current ranking, and why"),
             _e("GET", "/analytics/runs", "Saved rankings, for past decisions"),
@@ -142,7 +119,7 @@ SECTIONS_BY_KEY: Final[dict[str, Section]] = {s.key: s for s in SECTIONS}
 class Rule:
     """One permission rule, in words a screen can print.
 
-    These live in code — in ``app.reports.access``, in the intake router, in
+    These live in code — in ``app.reports.access``, in the mirror's router, in
     the role catalogue — and a frontend cannot derive them from any endpoint.
     Restating them here is the only way an admin screen can explain to somebody
     why they are being refused, so the wording is the product rather than a
@@ -157,19 +134,6 @@ class Rule:
 
 
 PERMISSION_RULES: Final[tuple[Rule, ...]] = (
-    Rule(
-        "intake", "Configure the mail intake and read its log",
-        ("super_admin",),
-        "The log holds who was told what about whose work, and the settings "
-        "decide whose mailbox is read. Narrower than the admin role on "
-        "purpose — a CEO cannot open it either.",
-    ),
-    Rule(
-        "intake", "Turn on writing to the live Proposals list",
-        ("super_admin",),
-        "The one irreversible switch. Off, a tender records the payload it "
-        "would post and posts nothing.",
-    ),
     Rule(
         "mirror", "Refresh the local copy of the Proposals list",
         ("super_admin",),

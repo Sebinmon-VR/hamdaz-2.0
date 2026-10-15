@@ -1,18 +1,12 @@
-"""Keeping the local copy of the Proposals list current, and searching it.
+"""Keeping the local copy of the Proposals list current.
 
-Two jobs, in one file because the second is only correct if the first has run:
+Read the list and upsert it into ``proposal_index``, so the live workload, the
+ranking, follow-ups, Ariba and the quote pages can answer from Postgres instead
+of asking SharePoint every time. Nothing here writes to SharePoint: the list is
+read, and only read.
 
-* **sync** — read the list and upsert it into ``proposal_index``, re-embedding
-  only the rows whose words changed;
-* **search** — find the rows an incoming email might be about, without asking
-  SharePoint anything and without showing a language model a thousand rows.
-
-Nothing here writes to SharePoint. The list is read, and only read.
-
-The search is deliberately three stages, narrowing before it gets expensive —
-full-text, then vectors, then the model. The reasoning is in
-``app.models.proposal_index``; what matters here is that each stage is bounded,
-so the cost of matching one email does not grow with the list.
+The mail intake's search over this copy — full-text, then OpenAI embeddings,
+then a model — was removed on 2026-10-14 with the intake's mail sorting.
 """
 
 from __future__ import annotations
@@ -22,12 +16,11 @@ import hashlib
 import logging
 import re
 import time
-from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from typing import Any
 
-from sqlalchemy import bindparam, cast, func, literal_column, or_, select
+from sqlalchemy import bindparam, cast, func, literal_column, select
 from sqlalchemy.dialects.postgresql import REGCONFIG, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -45,37 +38,6 @@ MIRROR_FIELDS = (
     # files and will not say what they are called. See ProposalTask.
     "Remarks,WorkingNotes,Created,Modified,Attachments"
 )
-
-#: How many rows the first stage hands to the second. Wide enough that the
-#: right row is in it even when the wording is unhelpful, small enough that the
-#: cosine over it is a rounding error.
-CANDIDATE_LIMIT = 250
-
-#: What comes out, for a model to adjudicate. More than this and the model gets
-#: worse rather than better — the whole reason for the funnel.
-SHORTLIST = 10
-
-#: Small on purpose. The full 1536 dimensions buy very little on text this
-#: short and cost three times the memory and storage.
-EMBED_DIMENSIONS = 512
-
-#: A reference that looks like a tender or quote number: letters, digits,
-#: dashes and slashes, with at least one digit and some length to it. Used to
-#: pull identifiers out of an email and to match them exactly, which is the
-#: half of matching that no embedding does well.
-_REFERENCE = re.compile(r"\b(?=[A-Za-z0-9/\-]{4,40}\b)(?=[^\s]*\d)[A-Za-z0-9][A-Za-z0-9/\-]{3,39}\b")
-
-
-def references_in(*texts: str | None) -> list[str]:
-    """Every plausible reference number in some text, upper-cased and unique."""
-    found: list[str] = []
-    for chunk in texts:
-        for hit in _REFERENCE.findall(chunk or ""):
-            token = hit.upper().strip("-/")
-            if token and token not in found:
-                found.append(token)
-    return found
-
 
 def normalise(value: str | None) -> str:
     """Reference numbers with the punctuation taken out, for comparing.
@@ -139,51 +101,6 @@ class SyncReport:
     duration_ms: int = 0
     full: bool = True
     error: str | None = None
-
-
-class Embedder:
-    """Turns text into vectors, or into nothing at all.
-
-    An unconfigured key is not an error here. Without embeddings the funnel
-    still works — full-text finds the candidates and the model adjudicates
-    them — it is only the middle stage that is skipped. Refusing to sync
-    because a model key is missing would make the mirror, and therefore the
-    live workload counts, depend on something they have nothing to do with.
-    """
-
-    def __init__(self, settings: Any) -> None:
-        self._settings = settings
-        self._client: Any = None
-
-    @property
-    def available(self) -> bool:
-        return bool(getattr(self._settings, "openai_api_key", ""))
-
-    def _openai(self) -> Any:
-        if self._client is None:
-            import openai
-
-            self._client = openai.AsyncOpenAI(
-                api_key=self._settings.openai_api_key,
-                base_url=self._settings.openai_base_url or None,
-                timeout=self._settings.openai_timeout_seconds,
-            )
-        return self._client
-
-    async def embed(self, texts: Sequence[str]) -> list[list[float]] | None:
-        """One vector per text, or None if embeddings are not available."""
-        if not texts or not self.available:
-            return None
-        try:
-            response = await self._openai().embeddings.create(
-                model=getattr(self._settings, "embedding_model", "text-embedding-3-small"),
-                input=list(texts),
-                dimensions=EMBED_DIMENSIONS,
-            )
-        except Exception as exc:  # noqa: BLE001 - never fail a sync over this
-            logger.warning("embedding failed, continuing without: %s", exc)
-            return None
-        return [row.embedding for row in response.data]
 
 
 # ── syncing ────────────────────────────────────────────────────────────
@@ -345,9 +262,6 @@ def _vector_expression():
 async def sync(
     session: AsyncSession,
     sharepoint: SharePointProposals,
-    embedder: Embedder,
-    *,
-    embed: bool = True,
 ) -> SyncReport:
     """Bring the mirror in line with the list.
 
@@ -394,17 +308,16 @@ async def sync(
         ).all()
     ) if tasks else {}
 
-    needs_embedding: list[tuple[str, str]] = []
     rows: list[dict[str, Any]] = []
     for task in tasks:
         text_value = search_text_of(task)
         digest = _hash(text_value)
-        rows.append(_row_values(task, text_value, people))
+        values = _row_values(task, text_value, people)
+        values["text_hash"] = digest
+        rows.append(values)
 
         if str(task.id) not in hashes or hashes[str(task.id)] != digest:
             report.changed += 1
-            if embed:
-                needs_embedding.append((str(task.id), text_value))
 
     if rows:
         # One statement, many parameter sets. Every column is a bound
@@ -443,9 +356,6 @@ async def sync(
 
     await session.flush()
 
-    if needs_embedding:
-        report.embedded = await _embed_rows(session, embedder, needs_embedding)
-
     report.duration_ms = int((time.monotonic() - started) * 1000)
     record.last_sync_at = datetime.now(UTC)
     record.last_full_sync_at = record.last_sync_at
@@ -461,212 +371,6 @@ async def sync(
 #: Rows per upsert statement. Large enough that a full list is a handful of
 #: calls; small enough that one refused row is findable.
 _UPSERT_BATCH = 200
-
-#: Embedding requests are batched. One call per row would be a thousand round
-#: trips on a first sync; the API takes many inputs at once and bills the same.
-_EMBED_BATCH = 128
-
-
-async def _embed_rows(
-    session: AsyncSession, embedder: Embedder, rows: list[tuple[str, str]]
-) -> int:
-    done = 0
-    for start in range(0, len(rows), _EMBED_BATCH):
-        chunk = rows[start : start + _EMBED_BATCH]
-        vectors = await embedder.embed([text_value for _, text_value in chunk])
-        if vectors is None:
-            # No key, or the call failed. The mirror is still correct and the
-            # funnel still works without its middle stage.
-            return done
-        now = datetime.now(UTC)
-        for (item_id, text_value), vector in zip(chunk, vectors, strict=False):
-            item = await session.get(ProposalIndexItem, item_id)
-            if item is None:
-                continue
-            item.embedding = list(vector)
-            item.text_hash = _hash(text_value)
-            item.embedded_at = now
-            done += 1
-        await session.flush()
-    return done
-
-
-# ── searching ──────────────────────────────────────────────────────────
-
-
-@dataclass(slots=True)
-class Candidate:
-    """One row the email might be about, and why it is being considered."""
-
-    item: ProposalIndexItem
-    #: Postgres' own ranking of the words. 0 when the row arrived by reference.
-    text_rank: float = 0.0
-    #: Cosine against the email, or None when nothing was embedded.
-    similarity: float | None = None
-    #: A reference number that matched exactly. The strongest signal there is,
-    #: because nobody types a tender number by accident.
-    matched_reference: str | None = None
-
-    @property
-    def score(self) -> float:
-        """One number to order by, weighted by how much each signal is worth.
-
-        An exact reference dominates deliberately: two rows whose words look
-        alike are common, and two rows sharing a tender number are the same
-        tender. The similarity leads the rest, because it is the part that
-        understands wording; the text rank breaks its ties.
-        """
-        total = 0.0
-        if self.matched_reference:
-            total += 1.0
-        if self.similarity is not None:
-            total += 0.6 * self.similarity
-        total += 0.2 * min(self.text_rank, 1.0)
-        return total
-
-
-def _cosine(query: Sequence[float], rows: list[Sequence[float]]) -> list[float]:
-    """Cosine of one vector against many, in one matrix multiply.
-
-    numpy rather than the database because ``pgvector`` cannot be created on
-    this server. Over a few hundred candidates the difference is microseconds;
-    the reason to move it into Postgres would be scale, not speed here.
-    """
-    import numpy as np
-
-    if not rows:
-        return []
-    matrix = np.asarray(rows, dtype="float32")
-    vector = np.asarray(query, dtype="float32")
-    matrix_norms = np.linalg.norm(matrix, axis=1)
-    query_norm = float(np.linalg.norm(vector))
-    if query_norm == 0:
-        return [0.0] * len(rows)
-    # Guard the division rather than filtering: a zero-length row is a row that
-    # failed to embed, and it should score nothing rather than raise.
-    matrix_norms[matrix_norms == 0] = 1e-9
-    return (matrix @ vector / (matrix_norms * query_norm)).tolist()
-
-
-async def candidates(
-    session: AsyncSession,
-    *,
-    query_text: str,
-    references: Iterable[str] = (),
-    limit: int = CANDIDATE_LIMIT,
-    include_closed: bool = True,
-) -> list[Candidate]:
-    """Stage one: the rows worth looking at, by words and by reference.
-
-    Two queries rather than one, unioned in Python, because they answer
-    different questions and one must not crowd out the other. A tender number
-    that matches exactly has to survive into the shortlist even when the words
-    around it match nothing, which is exactly the email that says little more
-    than "re: T-2291, please reopen".
-    """
-    found: dict[str, Candidate] = {}
-
-    wanted = [normalise(r) for r in references if normalise(r)]
-    if wanted:
-        # Compared with the punctuation stripped from both sides, because the
-        # list holds QT-1001, QT/1001 and QT 1001 for the same number.
-        stripped = func.upper(
-            func.regexp_replace(
-                func.coalesce(ProposalIndexItem.quote_no, ""), r"[^A-Za-z0-9]", "", "g"
-            )
-        )
-        rows = (
-            await session.scalars(
-                select(ProposalIndexItem)
-                .where(ProposalIndexItem.deleted.is_(False), stripped.in_(wanted))
-                .limit(limit)
-            )
-        ).all()
-        for row in rows:
-            found[row.item_id] = Candidate(item=row, matched_reference=row.quote_no)
-
-        # A reference is often written only in the notes, so look there too —
-        # but as a plain containment test, which is cheap and precise.
-        like = [f"%{r}%" for r in references if r]
-        if like:
-            clauses = [
-                or_(
-                    ProposalIndexItem.title.ilike(pattern),
-                    ProposalIndexItem.remarks.ilike(pattern),
-                    ProposalIndexItem.working_notes.ilike(pattern),
-                )
-                for pattern in like
-            ]
-            rows = (
-                await session.scalars(
-                    select(ProposalIndexItem)
-                    .where(ProposalIndexItem.deleted.is_(False), or_(*clauses))
-                    .limit(limit)
-                )
-            ).all()
-            for row in rows:
-                found.setdefault(row.item_id, Candidate(item=row, matched_reference=None))
-
-    words = (query_text or "").strip()
-    if words:
-        query = func.websearch_to_tsquery(cast("english", REGCONFIG), words)
-        rank = func.ts_rank(ProposalIndexItem.search_vector, query)
-        statement = (
-            select(ProposalIndexItem, rank.label("rank"))
-            .where(
-                ProposalIndexItem.deleted.is_(False),
-                ProposalIndexItem.search_vector.op("@@")(query),
-            )
-            .order_by(rank.desc())
-            .limit(limit)
-        )
-        if not include_closed:
-            statement = statement.where(ProposalIndexItem.is_open.is_(True))
-        for row, ranked in (await session.execute(statement)).all():
-            entry = found.get(row.item_id)
-            if entry is None:
-                found[row.item_id] = Candidate(item=row, text_rank=float(ranked or 0))
-            else:
-                entry.text_rank = float(ranked or 0)
-
-    return list(found.values())
-
-
-async def search(
-    session: AsyncSession,
-    embedder: Embedder,
-    *,
-    query_text: str,
-    references: Iterable[str] = (),
-    shortlist: int = SHORTLIST,
-    include_closed: bool = True,
-) -> list[Candidate]:
-    """The shortlist an email should be adjudicated against.
-
-    Stage one narrows the list to a few hundred by words and reference; stage
-    two orders those by meaning. What comes back is small enough to hand to a
-    model, and the model never sees the list.
-    """
-    pool = await candidates(
-        session,
-        query_text=query_text,
-        references=references,
-        include_closed=include_closed,
-    )
-    if not pool:
-        return []
-
-    embedded = [c for c in pool if c.item.embedding]
-    if embedded and embedder.available:
-        vectors = await embedder.embed([query_text])
-        if vectors:
-            scores = _cosine(vectors[0], [c.item.embedding or [] for c in embedded])
-            for candidate, similarity in zip(embedded, scores, strict=False):
-                candidate.similarity = float(similarity)
-
-    pool.sort(key=lambda c: c.score, reverse=True)
-    return pool[:shortlist]
-
 
 # ── the numbers the mirror can answer without SharePoint ───────────────
 
@@ -858,10 +562,7 @@ class MirrorSync:
         self,
         session: AsyncSession,
         sharepoint: SharePointProposals,
-        embedder: Embedder,
-        *,
-        embed: bool = True,
     ) -> SyncReport:
         async with self._lock:
-            self.last = await sync(session, sharepoint, embedder, embed=embed)
+            self.last = await sync(session, sharepoint)
             return self.last

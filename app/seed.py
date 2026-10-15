@@ -21,14 +21,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 import app  # noqa: F401 — sets the Windows event-loop policy
 from app.access.service import seed_modules
-from app.assistant.service import seed_models as seed_assistant_models
-from app.assistant.service import seed_policies as seed_assistant_policies
-from app.assistant.service import seed_voice_models as seed_assistant_voice_models
 from app.core.config import get_settings
 from app.directory.graph import GraphDirectory, GraphError
 from app.forms.service import seed_templates
 from app.reports.service import seed_templates as seed_report_templates
-from app.workflows.service import seed_flows
 from app.labels.service import seed_labels
 from app.models.user import User
 from app.roles.catalogue import BOOTSTRAP_SUPER_ADMIN_EMAIL, SUPER_ADMIN
@@ -94,20 +90,6 @@ async def seed() -> None:
         # things built on it.
         reports = await seed_report_templates(session)
         logger.info("report templates: %s", ", ".join(sorted(t.key for t in reports)))
-        # The shipped workflows. An edited one is left alone, like a template.
-        flows = await seed_flows(session)
-        logger.info("workflows seeded: %s", flows)
-
-        # The assistant's catalogue becomes editable rows. Existing switches are
-        # never overwritten — a super admin's decision survives every deploy.
-        models = await seed_assistant_models(session)
-        voice_models = await seed_assistant_voice_models(session)
-        module_count, tool_count = await seed_assistant_policies(session)
-        logger.info(
-            "assistant: %d models, %d voice models, %d modules, %d tools",
-            len(models), len(voice_models), module_count, tool_count,
-        )
-
         existing = await count_super_admins(session)
         if existing:
             logger.info("super admin already exists (%d); leaving grants alone", existing)

@@ -27,3 +27,9 @@ build/
 .idea/
 .DS_Store
 Thumbs.db
+
+# ── the AI lab's own database (app/ailab) ─────────────────────────────
+var/
+
+# ── tests: kept on the laptop, never pushed (the user, 2026-10-14) ─────
+tests/
