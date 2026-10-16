@@ -265,6 +265,28 @@ class QuoteDrive:
         best = max(candidates, key=lambda i: str(i.get("lastModifiedDateTime", "")))
         return FolderMatch(str(best["name"]), "number", best.get("webUrl"))
 
+    async def ensure_folder(self, name: str) -> str | None:
+        """Make ``<root>/<name>`` if it is not there yet; its link either way.
+
+        For a task whose folder nobody has made yet, so there is somewhere to
+        point a person when they are asked for its documents. None when the
+        drive answers anything but the folder.
+        """
+        if not self.enabled:
+            raise DriveError("No drive is configured for quote documents")
+        headers = await self._headers()
+        response = await self._http.post(
+            self._path_url(self.root, "/children"),
+            headers=headers,
+            json={"name": name, "folder": {}, "@microsoft.graph.conflictBehavior": "fail"},
+        )
+        if response.status_code in (200, 201):
+            return response.json().get("webUrl")
+        if response.status_code == 409:
+            return await self.folder_url(f"{self.root}/{name}")
+        logger.info("could not make folder %s (%s)", name, response.status_code)
+        return None
+
     async def folder_url(self, path: str) -> str | None:
         """The link to a folder, once something has been put in it."""
         response = await self._http.get(self._path_url(path), headers=await self._headers())

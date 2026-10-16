@@ -152,6 +152,23 @@ class MailReader(GraphMailer):
             {"$select": f"{MESSAGE_FIELDS},body"},
         )
 
+    async def inbox_since(self, mailbox: str, since: str, *, top: int = 50) -> list[dict[str, Any]]:
+        """The newest messages in the inbox received at or after ``since`` (ISO, UTC).
+
+        For the agents watching for a supplier's reply to their RFQ: a reply
+        is matched on who sent it and what it says it is about. Read only.
+        """
+        payload = await self._graph(
+            f"{GRAPH_BASE}/users/{mailbox}/mailFolders/inbox/messages",
+            {
+                "$filter": f"receivedDateTime ge {since}",
+                "$orderby": "receivedDateTime desc",
+                "$top": str(max(1, min(top, 100))),
+                "$select": "id,subject,from,receivedDateTime,hasAttachments,bodyPreview,conversationId",
+            },
+        )
+        return list(payload.get("value") or [])
+
     async def attachments(
         self, mailbox: str, message_id: str
     ) -> list[tuple[str, str | None, bytes]]:

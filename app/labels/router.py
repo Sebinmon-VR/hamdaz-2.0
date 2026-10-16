@@ -16,6 +16,7 @@ is to change those, not to argue with the label.
 from __future__ import annotations
 
 import uuid
+from dataclasses import asdict
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -193,7 +194,7 @@ async def people(
             display_name=user.display_name,
             email=user.email,
             joined_on=user.joined_on,
-            labels=[HeldLabelOut(**vars(label)) for label in held.get(user.id, [])],
+            labels=[HeldLabelOut(**asdict(label)) for label in held.get(user.id, [])],
         )
         for user in users
     ]
@@ -284,7 +285,7 @@ async def _person(
         display_name=user.display_name,
         email=user.email,
         joined_on=user.joined_on,
-        labels=[HeldLabelOut(**vars(label)) for label in held.get(user.id, [])],
+        labels=[HeldLabelOut(**asdict(label)) for label in held.get(user.id, [])],
     )
 
 

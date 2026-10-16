@@ -15,18 +15,31 @@ quotes, a web page — and anything the material does not say is "not given",
 never guessed. A run always ends with a summary on its page and a
 notification to its owner, whatever happened.
 
-**Nothing leaves the app.** The task's documents are read, not written; the
-Proposals list and Zoho are not touched; emails are drafts the owner sends
-themselves. A step whose block would act on the outside world drafts instead.
+**Nothing leaves the app without a yes.** The task's documents are read, not
+written; the Proposals list and Zoho are not touched. Emails are drafts —
+except through "Send the emails, once I say yes", which shows its owner every
+email in full in the app to read and edit, and sends only the ones they tick
+and then confirm, from their own mailbox. Teams can only point to the app or
+say don't send.
 
-A run lives in this process (``RUNNING``) while it works or waits for its
-owner's answer; its row is written after every step, so the page can follow
-it. A server restart ends it, and the page says so.
+**It talks in Teams.** A question (the task's documents, sending the RFQs)
+goes to its owner as a card through their Power Automate flow, and the
+answer comes back to ``/agents/teams/answer``; the results go there too. Not
+by mail unless AGENT_EMAIL_NOTIFY is on.
+
+A run lives in this process (``RUNNING``) while it works or waits; its row is
+written after every step, so the page can follow it, and it beats
+(``heartbeat_at``) while it waits. An answer is written to the run itself
+(``question.answer``) as well as handed to the runner, so it reaches a run in
+another process, or one a restart cut off: a run waiting for documents starts
+again from the top, and one waiting to send sends from its saved drafts (see
+``app.agents.worker`` and ``answer_cut_off``).
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import re
@@ -48,7 +61,7 @@ from app.core.llm import TextModel
 from app.core.mail import GraphMailer
 from app.enquiries import matching, reading
 from app.enquiries.claude import LLMError
-from app.models.agent import AgentRun
+from app.models.agent import AgentRun, UserAgent
 from app.models.comparison import SupplierQuote
 from app.models.enquiry import EnquiryAnalysis
 from app.models.notification import NotificationKind
@@ -64,6 +77,16 @@ logger = logging.getLogger("hamdaz.agents")
 MAX_DOCUMENTS: Final = 25
 #: How long a run waits for its owner to answer before it gives up.
 ANSWER_TIMEOUT: Final = timedelta(hours=24)
+#: A waiting run looks for an answer written by another process this often.
+ANSWER_POLL_SECONDS: Final = 5
+#: And says it is still alive this often.
+HEARTBEAT_SECONDS: Final = 30
+#: A live run whose heartbeat is older than this was cut off.
+CUT_OFF_AFTER: Final = timedelta(minutes=3)
+#: Questions a cut-off run can still be answered on: documents start it
+#: again, sending sends from the saved drafts.
+RESUMABLE: Final = frozenset({"docs", "send"})
+_EMAIL: Final = re.compile(r"^[^@\s,;<>]+@[^@\s,;<>]+\.[A-Za-z]{2,}$")
 #: Characters of material handed to the model in one step.
 MATERIAL_BUDGET: Final = 40_000
 NOT_GIVEN: Final = "not given"
@@ -93,9 +116,11 @@ KINDS: Final[dict[str, tuple[str, str]]] = {
     "compare_quotes": ("Compare supplier quotes", "think"),
     "summarise": ("Summarise", "think"),
     "check": ("Check a condition", "think"),
+    "ask_documents": ("Ask for the documents", "ask"),
     "ask_me": ("Ask me", "ask"),
     "get_approval": ("Get approval", "ask"),
     "draft_email": ("Draft an email", "act"),
+    "send_emails": ("Send the emails, once I say yes", "act"),
     "draft_quote_request": ("Draft a quote request", "act"),
     "make_document": ("Make a document", "act"),
     "notify_me": ("Tell me", "act"),
@@ -190,6 +215,11 @@ class Context:
     suppliers: list[dict[str, Any]] = field(default_factory=list)
     offers: list[dict[str, Any]] = field(default_factory=list)
     tasks: list[dict[str, Any]] | None = None
+    #: The last "Draft an email" step's drafts, for "Send the emails".
+    drafts: list[dict[str, Any]] = field(default_factory=list)
+    drafts_step_id: str | None = None
+    #: The task's folder in the Proposal Team Channel, once looked up.
+    folder_url: str | None = None
     answers: list[str] = field(default_factory=list)
     headlines: list[str] = field(default_factory=list)
     notified: bool = False
@@ -271,6 +301,30 @@ def _column(header: list[str], pattern: re.Pattern[str], *, avoid: set[int]) -> 
     return None
 
 
+#: The headers that name the words of an item; "item" alone is as often the line number.
+_DESC_STRONG = re.compile(r"\b(description|particulars?|specification|scope|goods)\b", re.I)
+_HAS_LETTERS = re.compile(r"[^\W\d_]{2,}")
+
+
+def _desc_column(header: list[str], rows: list[list[Any]], *, avoid: set[int]) -> int | None:
+    """The column that describes each item: one whose cells are words, not line numbers.
+
+    "Item | Description | Qty" is common, and "Item" there is 1, 2, 3 — so a
+    real description header wins over "item", and a column whose cells are only
+    numbers is never taken, whatever its header says (2026-10-16: a PDF read
+    "8", "9", "10" as the items).
+    """
+    sample = rows[:15]
+
+    def wordy(index: int) -> bool:
+        cells = [_s(r[index]) for r in sample if index < len(r) and _s(r[index])]
+        return bool(cells) and sum(1 for c in cells if _HAS_LETTERS.search(c)) * 2 >= len(cells)
+
+    candidates = [i for i, cell in enumerate(header) if i not in avoid and _DESC_HEAD.search(cell or "")]
+    candidates.sort(key=lambda i: 0 if _DESC_STRONG.search(header[i] or "") else 1)
+    return next((i for i in candidates if wordy(i)), None)
+
+
 def table_items(readable: Readable) -> list[dict[str, Any]]:
     """Item lines from a document's own tables: a description column and a quantity column.
 
@@ -283,7 +337,7 @@ def table_items(readable: Readable) -> list[dict[str, Any]]:
             qty_col = _column(header, _QTY_HEAD, avoid=set())
             if qty_col is None:
                 continue
-            desc_col = _column(header, _DESC_HEAD, avoid={qty_col})
+            desc_col = _desc_column(header, table[h_index + 1:], avoid={qty_col})
             if desc_col is None:
                 continue
             taken = {qty_col, desc_col}
@@ -311,10 +365,17 @@ def table_items(readable: Readable) -> list[dict[str, Any]]:
 
 
 def _dedupe(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    seen: set[tuple[str, str]] = set()
+    """One line per item, across documents: the same list in a PDF and a spreadsheet is one list.
+
+    Compared without case, spaces or punctuation, and with the quantity, so
+    "VALVE,3-WAY,1/2IN" and "Valve 3-way 1/2in" are one item while two lines of
+    the same thing in different quantities stay two.
+    """
+    seen: set[tuple[str, str, str]] = set()
     out = []
     for item in items:
-        key = (_s(item.get("description")).casefold(), _s(item.get("part_number")).casefold())
+        flat = lambda v: re.sub(r"[\W_]+", "", _s(v).casefold())  # noqa: E731
+        key = (flat(item.get("description")), flat(item.get("part_number")), _qty(item.get("quantity")))
         if key in seen:
             continue
         seen.add(key)
@@ -338,6 +399,9 @@ class Deps:
     mailer: GraphMailer | None = None
     #: For the Teams card, posted to AGENT_TEAMS_WEBHOOK_URL when it is set.
     http: Any = None
+    #: The application's state, for what the RFQ follow-up drives: the mail
+    #: reader, the quote extractor, Zoho, the quote mailer (``app.agents.rfqs``).
+    state: Any = None
 
 
 SYSTEM: Final = """\
@@ -352,10 +416,15 @@ label of where it came from, exactly as the material labels it (for example \
 
 
 class Runner:
-    def __init__(self, deps: Deps, run_id: uuid.UUID, uploads: list[tuple[str, bytes, str | None]]) -> None:
+    def __init__(
+        self, deps: Deps, run_id: uuid.UUID, uploads: list[tuple[str, bytes, str | None]], *, resume: bool = False
+    ) -> None:
         self.deps = deps
         self.run_id = run_id
         self.uploads = uploads
+        #: Started again after a restart cut it off: the question it was
+        #: waiting on is kept, and not asked twice.
+        self.resume = resume
         self.ctx = Context()
         self.answer: dict[str, Any] | None = None
         self.answered = asyncio.Event()
@@ -365,17 +434,20 @@ class Runner:
         self.user: User
         self.agent_name = "Your agent"
         self.instructions = ""
+        #: The agent's picture for Teams cards, once one has been saved.
+        self.face: str | None = None
         self.task: asyncio.Task[None] | None = None
 
     # ── control from the routes ──
 
-    def give_answer(self, go: bool, text: str) -> None:
-        self.answer = {"go": go, "text": text.strip()[:4000]}
+    def give_answer(self, answer: dict[str, Any]) -> None:
+        """An answer from the routes. They have written it to the run as well."""
+        self.answer = answer
         self.answered.set()
 
     def stop(self) -> None:
         self.stopping = True
-        self.answer = {"go": False, "text": ""}
+        self.answer = {"go": False, "text": "", "stop": True}
         self.answered.set()
 
     # ── the run ──
@@ -387,6 +459,8 @@ class Runner:
             if run is None or user is None:
                 return
             self.session, self.run, self.user = session, run, user
+            agent = await session.get(UserAgent, run.agent_id)
+            self.face = face_url(self.deps.settings, agent)
             try:
                 await self._go()
             except Exception as exc:  # noqa: BLE001 — a run must end in a state, whatever happened
@@ -412,7 +486,9 @@ class Runner:
             for s in steps
         ]
         run.results = results
-        run.status, run.started_at, run.model = "running", datetime.now(UTC), self.deps.model.model
+        run.status, run.model = "running", self.deps.model.model
+        run.started_at = run.started_at or datetime.now(UTC)
+        run.heartbeat_at = datetime.now(UTC)
         await self._load_task()
         await self.session.commit()
 
@@ -426,6 +502,7 @@ class Runner:
             result = results[index]
             result["status"], result["started_at"] = "running", _now()
             self._write(results)
+            run.heartbeat_at = datetime.now(UTC)
             await self.session.commit()
 
             spent = Spent()
@@ -462,7 +539,13 @@ class Runner:
                 run.cost_usd = (run.cost_usd or Decimal(0)) + cost
             if out.status == "done" and KINDS[step["kind"]][1] != "start":
                 ctx.headlines.append(out.headline)
-            run.question = None
+            if step["kind"] == "draft_email" and out.status == "done":
+                ctx.drafts_step_id = step["id"]
+            # Only this step's own question: one kept from before a restart
+            # belongs to a step still ahead.
+            if (run.question or {}).get("step_id") == step["id"]:
+                run.question = None
+            run.heartbeat_at = datetime.now(UTC)
             self._write(results)
             await self.session.commit()
 
@@ -486,6 +569,7 @@ class Runner:
             if failed:
                 run.summary += f" {failed} step(s) could not finish — see the run."
         run.finished_at = datetime.now(UTC)
+        run.question = None
         # Every run ends somewhere its owner will see it.
         if not ctx.notified:
             await notify(
@@ -494,34 +578,36 @@ class Runner:
                 body=run.summary[:1000], link=self.link(), source="agent_run", source_id=str(run.id),
             )
         await self.session.commit()
-        # And in their inbox, for when they are not in the app.
+        points = [
+            f"{r['name']}: {r['headline']}" for r in run.results
+            if r.get("headline") and r["status"] in ("done", "failed") and KINDS.get(r["kind"], ("", ""))[1] != "start"
+        ]
+        # And in Teams, for when they are not in the app.
+        await tell_in_teams(
+            self.deps, self.user, run, agent=self.agent_name,
+            title=f"{self.agent_name} {'stopped' if stopped else 'finished'}{where}",
+            lead=stopped or ("Here is what I did." if points else "Nothing to report."),
+            points=points, button="See the results", face=self.face,
+        )
         await self.email_owner(
             subject=f"{self.agent_name} {'stopped' if stopped else 'finished'}{where}",
-            lead=run.summary or "",
-            points=[f"{r['name']}: {r['headline']}" for r in run.results if r.get("headline") and r["status"] in ("done", "failed")],
-            button="See the results",
+            lead=run.summary or "", points=points, button="See the results",
         )
 
     def link(self) -> str:
-        return f"/agents/{self.run.agent_id}?run={self.run.id}"
+        return run_link(self.run)
 
     async def email_owner(self, *, subject: str, lead: str, points: list[str], button: str) -> None:
-        """Tell the owner outside the app: a Teams card when a webhook is set, and a mail.
+        """Mail the owner as well — only when AGENT_EMAIL_NOTIFY is on. Teams is the usual way.
 
-        Never fails the run: both are copies of a notification already in the bell.
+        Never fails the run: it is a copy of a notification already in the bell.
         """
         deps = self.deps
-        url = f"{deps.settings.frontend_url.rstrip('/')}{self.link()}"
-        if deps.http is not None and deps.settings.agent_teams_webhook_url:
-            await send_to_teams(
-                deps.http, deps.settings.agent_teams_webhook_url, title=subject[:200],
-                body="\n\n".join([lead, *[f"• {p}" for p in points[:8]]])[:1800], link=url,
-                recipient=self.user.email,
-            )
         if deps.mailer is None or not deps.settings.agent_email_notify:
             return
         if not self.user.email or not getattr(self.user, "entra_object_id", None):
             return
+        url = f"{deps.settings.frontend_url.rstrip('/')}{self.link()}"
         items = "".join(f"<li style='margin:4px 0'>{_html(p)}</li>" for p in points[:12])
         html = (
             "<div style='font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#111;max-width:620px'>"
@@ -529,8 +615,8 @@ class Runner:
             + (f"<ul style='padding-left:18px;margin:0 0 16px;color:#333'>{items}</ul>" if items else "")
             + f"<p><a href='{url}' style='display:inline-block;background:#111;color:#fff;padding:9px 16px;"
             f"border-radius:10px;text-decoration:none'>{_html(button)}</a></p>"
-            "<p style='color:#888;font-size:12px'>From your agent in the Hamdaz app. Drafts are never sent "
-            "for you — you send them yourself.</p></div>"
+            "<p style='color:#888;font-size:12px'>From your agent in the Hamdaz app. Nothing is sent for "
+            "you unless you say yes.</p></div>"
         )
         try:
             await deps.mailer.send(sender=self.user.entra_object_id, recipients=[self.user.email], subject=subject[:200], html=html)
@@ -542,41 +628,31 @@ class Runner:
 
         The flow posts ``card`` to ``recipient`` with "Post adaptive card and
         wait for a response", then POSTs the answer to ``callback_url`` with
-        ``run_id``, ``step_id`` and ``token`` handed back unchanged. The token
-        is this run's and this question's alone (see ``answer_token``), so the
+        ``run_id``, ``step_id`` and ``token`` handed back unchanged, ``go`` and
+        ``text`` from the card, and ``data`` — the card's whole response,
+        which carries the ticks on a "send these emails?" card. The token is
+        this run's and this question's alone (see ``answer_token``), so the
         callback cannot answer anything else. Never fails the run.
         """
-        deps = self.deps
-        url = deps.settings.agent_teams_ask_url
-        if not url or deps.http is None or not self.user.email:
-            return False
         step_id = results[index]["step_id"]
-        about = next((r for r in reversed(results[:index]) if r["status"] == "done"), None)
-        base = (deps.settings.public_base_url or "").rstrip("/")
-        payload = {
-            "recipient": self.user.email,
-            "run_id": str(self.run.id),
-            "step_id": step_id,
-            "token": answer_token(deps.settings.session_secret, self.run.id, step_id),
-            "callback_url": f"{base}{deps.settings.api_prefix}/agents/teams/answer" if base else "",
-            "agent": self.agent_name,
-            "task": self.ctx.task_title or "",
-            "title": str(question.get("title") or "Carry on?"),
-            "link": f"{deps.settings.frontend_url.rstrip('/')}{self.link()}",
-            "card": question_card(
-                agent=self.agent_name, task=self.ctx.task_title, question=question, about=about,
-                link=f"{deps.settings.frontend_url.rstrip('/')}{self.link()}",
-            ),
-        }
-        try:
-            response = await deps.http.post(url, json=payload, timeout=20)
-            if response.status_code >= 400:
-                logger.warning("agent run %s: the Teams flow refused the question (%s)", self.run.id, response.status_code)
-                return False
-        except Exception:  # noqa: BLE001 — Teams is a copy; the app still waits for the answer
-            logger.warning("agent run %s: the Teams flow could not be reached", self.run.id, exc_info=True)
-            return False
-        return True
+        about = next((r for r in results[:index] if r["step_id"] == question.get("about_step_id")), None) or next(
+            (r for r in reversed(results[:index]) if r["status"] == "done"), None
+        )
+        link = f"{self.deps.settings.frontend_url.rstrip('/')}{self.link()}"
+        mode = question.get("mode")
+        if mode == "docs":
+            card = docs_card(agent=self.agent_name, task=self.ctx.task_title, closing=self.ctx.when(),
+                             question=question, link=link, face=self.face)
+        elif mode == "send":
+            card = send_card(agent=self.agent_name, task=self.ctx.task_title, question=question, link=link,
+                             face=self.face)
+        else:
+            card = question_card(agent=self.agent_name, task=self.ctx.task_title, question=question, about=about,
+                                 link=link, face=self.face)
+        return await post_card(
+            self.deps, self.user, self.run, step_id=step_id, title=str(question.get("title") or "Carry on?"),
+            agent=self.agent_name, task=self.ctx.task_title, card=card,
+        )
 
     async def ask_json(
         self, *, system: str, text: str, schema: dict[str, Any], spent: Spent, max_tokens: int = 4000,
@@ -628,36 +704,97 @@ class Runner:
 
     # ── waiting for the owner ──
 
-    async def wait_for_answer(self, question: dict[str, Any], results: list[dict[str, Any]], index: int) -> dict[str, Any]:
+    async def wait_for_answer(
+        self,
+        question: dict[str, Any],
+        results: list[dict[str, Any]],
+        index: int,
+        *,
+        give_up_after: timedelta = ANSWER_TIMEOUT,
+        timeout_message: str = "No answer came within a day.",
+        poll: Any = None,
+        poll_every: float = 120,
+    ) -> dict[str, Any]:
+        """Ask the owner, in the app and in Teams, and wait for the answer.
+
+        The answer comes from whichever is first: the app or the Teams flow
+        (handed over directly when they reach this process, and written to
+        ``run.question.answer`` either way), or ``poll`` — a check of its own
+        that can answer for the owner, e.g. documents turning up in the task's
+        folder. A question already asked before a restart is not asked again.
+        """
         if self.stopping:
             raise Stop("Stopped by you.")
+        run = self.run
+        step_id = results[index]["step_id"]
         self.answer = None
         self.answered.clear()
         results[index]["status"] = "waiting"
-        self.run.status = "waiting"
-        self.run.question = {**question, "step_id": results[index]["step_id"], "asked_at": _now()}
+        run.status = "waiting"
+        held = run.question or {}
+        again = held.get("step_id") == step_id
+        if again:
+            run.question = {**held, **question, "step_id": step_id}
+        else:
+            run.question = {**question, "step_id": step_id, "asked_at": _now()}
+        run.heartbeat_at = datetime.now(UTC)
         self._write(results)
-        await notify(
-            self.session, users=[self.user.id], kind=NotificationKind.GENERAL,
-            title=f"{self.agent_name} needs your answer", body=str(question.get("title") or "")[:500],
-            link=self.link(), source="agent_wait", source_id=f"{self.run.id}:{index}",
-        )
+        if not again:
+            await notify(
+                self.session, users=[self.user.id], kind=NotificationKind.GENERAL,
+                title=f"{self.agent_name} needs your answer", body=str(question.get("title") or "")[:500],
+                link=self.link(), source="agent_wait", source_id=f"{run.id}:{index}:{run.question['asked_at']}",
+            )
         await self.session.commit()
-        await self.email_owner(
-            subject=f"{self.agent_name} needs your answer{f' — {self.ctx.task_title}' if self.ctx.task_title else ''}",
-            lead=f"{question.get('title') or 'Carry on?'} {question.get('message') or ''}".strip(),
-            points=[f"{r['name']}: {r['headline']}" for r in results[:index] if r.get("headline") and r["status"] == "done"],
-            button="Answer it",
-        )
-        # The answer may come back from Teams instead, through /agents/teams/answer.
-        await self.ask_in_teams(question, results, index)
-        try:
-            await asyncio.wait_for(self.answered.wait(), ANSWER_TIMEOUT.total_seconds())
-        except TimeoutError as exc:
-            raise Stop("No answer came within a day.") from exc
-        self.run.status = "running"
-        answer = self.answer or {"go": False, "text": ""}
-        if self.stopping:
+        if not again:
+            await self.email_owner(
+                subject=f"{self.agent_name} needs your answer{f' — {self.ctx.task_title}' if self.ctx.task_title else ''}",
+                lead=f"{question.get('title') or 'Carry on?'} {question.get('message') or ''}".strip(),
+                points=[f"{r['name']}: {r['headline']}" for r in results[:index] if r.get("headline") and r["status"] == "done"],
+                button="Answer it",
+            )
+            # The answer may come back from Teams instead, through /agents/teams/answer.
+            if await self.ask_in_teams(question, results, index):
+                run.question = {**run.question, "teams": True}
+                await self.session.commit()
+
+        asked = parse_time(run.question.get("asked_at")) or datetime.now(UTC)
+        until = asked + give_up_after
+        beat = polled = time.monotonic()
+        answer: dict[str, Any] | None = None
+        while answer is None:
+            if self.answered.is_set():
+                answer = self.answer or {"go": False, "text": ""}
+                break
+            # Written by another process, or before a restart.
+            await self.session.refresh(run, ["question"])
+            # Ended at once: a wait can last days, and must not hold a connection.
+            await self.session.commit()
+            held = run.question or {}
+            if held.get("step_id") == step_id and isinstance(held.get("answer"), dict):
+                answer = held["answer"]
+                break
+            if datetime.now(UTC) >= until:
+                raise Stop(timeout_message)
+            now = time.monotonic()
+            if poll is not None and now - polled >= poll_every:
+                polled = now
+                try:
+                    answer = await poll()
+                except Exception:  # noqa: BLE001 — a check that fails is tried again
+                    logger.warning("agent run %s: a check while waiting failed", run.id, exc_info=True)
+                if answer is not None:
+                    break
+            if now - beat >= HEARTBEAT_SECONDS:
+                beat = now
+                run.heartbeat_at = datetime.now(UTC)
+                await self.session.commit()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self.answered.wait(), ANSWER_POLL_SECONDS)
+        run.status = "running"
+        run.heartbeat_at = datetime.now(UTC)
+        if self.stopping or answer.get("stop"):
+            self.stopping = True
             raise Stop("Stopped by you.")
         return answer
 
@@ -711,49 +848,137 @@ class Runner:
         handler = getattr(self, f"s_{kind}", None)
         if handler is None:
             return skipped("This block cannot run yet.")
-        if kind in ("ask_me", "get_approval", "check"):
+        if kind in ("ask_me", "get_approval", "check", "ask_documents", "send_emails"):
             return await handler(cfg, spent, results, index)
         return await handler(cfg, spent)
 
     def start(self, kind: str) -> Out:
         who = self.user.display_name
         where = f" on “{self.ctx.task_title}”" if self.ctx.task_title else ""
-        out = Out(headline=f"Started by {who}{where}")
-        if kind != "start_manual":
-            out.notes.append(f"“{KINDS[kind][0]}” will start it on its own once triggers are switched on. This run was started by hand.")
+        if self.run.started_by == "trigger":
+            out = Out(headline=f"Started on its own: “{self.ctx.task_title or 'a task'}” was assigned to {who}")
+        else:
+            out = Out(headline=f"Started by {who}{where}")
+            if kind not in ("start_manual", "start_new_task"):
+                out.notes.append(f"“{KINDS[kind][0]}” does not start it on its own yet. This run was started by hand.")
         if self.ctx.task_title:
             out.sources.append(source("Proposals list", self.ctx.task_title))
         return out
+
+    async def _task_documents(self) -> tuple[list[tuple[str, str, str | None, Any]], list[str]]:
+        """The task's files — list attachments and its channel folder: (name, origin, url, fetch), notes."""
+        ctx, deps = self.ctx, self.deps
+        found: list[tuple[str, str, str | None, Any]] = []
+        notes: list[str] = []
+        if not ctx.task_id:
+            return found, notes
+        try:
+            for att in await deps.sharepoint.attachments_of(ctx.task_id):
+                name = att["file_name"]
+                found.append((name, "task attachment", None, ("attachment", name)))
+        except SharePointConsentError:
+            notes.append("The task's list attachments could not be read (the app lacks SharePoint permission); its folder was read instead.")
+        except SharePointError as exc:
+            notes.append(f"The task's attachments could not be read: {exc}")
+        if deps.drive.enabled and ctx.task_title:
+            try:
+                folder = await deps.drive.find_task_folder(ctx.task_title)
+                if folder.how != "created":
+                    ctx.folder_url = ctx.folder_url or folder.web_url
+                    for f in await deps.drive.list_files(folder.name):
+                        if reading.is_own_output(f["name"], f["path"], deps.settings.enquiry_report_folder):
+                            continue
+                        found.append((f["name"], f"task folder: {f['path']}", f.get("web_url"), ("drive", f["id"])))
+                else:
+                    notes.append("The task has no folder in the Proposal Team Channel yet.")
+            except DriveError as exc:
+                notes.append(f"The task folder could not be read: {exc}")
+        return found, notes
+
+    async def _folder_link(self) -> str | None:
+        """The task's channel folder, made if it is not there yet — somewhere to put the documents."""
+        ctx, drive = self.ctx, self.deps.drive
+        if ctx.folder_url or not drive.enabled or not ctx.task_title:
+            return ctx.folder_url
+        try:
+            folder = await drive.find_task_folder(ctx.task_title)
+            ctx.folder_url = folder.web_url if folder.how != "created" else await drive.ensure_folder(folder.name)
+        except DriveError as exc:
+            logger.info("agent run %s: no folder link (%s)", self.run.id, exc)
+        return ctx.folder_url
+
+    async def s_ask_documents(self, cfg: dict[str, Any], spent: Spent, results: list[dict[str, Any]], index: int) -> Out:
+        """Make sure the task has its documents: start at once if it does, else ask for them and wait.
+
+        The owner is asked in Teams (and in the app) to put the RFQ or tender in
+        the task's channel folder; the folder is looked at every couple of
+        minutes meanwhile, so dropping the files in is answer enough.
+        """
+        ctx = self.ctx
+        if self.uploads:
+            return Out(headline=f"{len(self.uploads)} file(s) were added to this run — starting on those")
+        if not ctx.task_id:
+            return skipped("No task was chosen, so there were no documents to ask for.")
+        found, notes = await self._task_documents()
+        folder_url = await self._folder_link()
+        folder_source = [source("task folder", ctx.task_title, folder_url)] if folder_url else []
+        if found:
+            names = [f[0] for f in found]
+            if self.run.started_by == "trigger":
+                await tell_in_teams(
+                    self.deps, self.user, self.run, agent=self.agent_name,
+                    title=f"On it: {ctx.task_title}",
+                    lead=f"“{ctx.task_title}” was just assigned to you. I found {len(found)} document(s) on it and I'm starting now — I'll come back to you before anything is sent.",
+                    points=names[:8], button="Watch me work", face=self.face,
+                )
+            return Out(
+                headline=f"{len(found)} document(s) already on the task — started straight away",
+                output={"files": names, "folder_url": folder_url}, sources=folder_source, notes=notes,
+            )
+
+        days = max(1, min(int(_dec(cfg.get("days")) or 3), 14))
+
+        async def documents_arrived() -> dict[str, Any] | None:
+            now_found, _ = await self._task_documents()
+            return {"go": True, "text": "", "found": len(now_found)} if now_found else None
+
+        where = "the task's folder in the Proposal Team Channel" if folder_url else "the task (attach them to it in the Proposals list)"
+        message = (
+            f"I'll start working on it as soon as they're there: put the RFQ or tender files in {where}, "
+            "then press “They're in”. I look in the folder every couple of minutes, so dropping them in is enough."
+        )
+        nudged = False
+        for _ in range(3):
+            answer = await self.wait_for_answer(
+                {"title": f"Can you share the documents for “{ctx.task_title}”?",
+                 "message": ("I still can't see any documents on the task. " if nudged else "") + message,
+                 "mode": "docs", "folder_url": folder_url},
+                results, index, give_up_after=timedelta(days=days), poll=documents_arrived,
+                timeout_message=f"No documents came within {days} day(s), so I stopped. Run me by hand once they're in.",
+            )
+            if not answer.get("go"):
+                raise Stop("You said this task does not need me.")
+            if answer.get("text"):
+                ctx.answers.append(str(answer["text"]))
+            found, notes = await self._task_documents()
+            if found:
+                return Out(
+                    headline=f"{len(found)} document(s) arrived — starting",
+                    output={"files": [f[0] for f in found], "folder_url": folder_url},
+                    sources=folder_source + [source("your answer")] if answer.get("text") else folder_source,
+                    notes=notes,
+                )
+            # "They're in" pressed, and nothing there yet: ask once more.
+            self.run.question = None
+            nudged = True
+        raise Stop("The documents never reached the task.")
 
     async def s_read_documents(self, cfg: dict[str, Any], spent: Spent) -> Out:
         ctx, deps = self.ctx, self.deps
         if not ctx.task_id and not self.uploads:
             return skipped("No task was chosen and no files were added, so there was nothing to read.")
         which = _s(cfg.get("which")) or "all"
-        found: list[tuple[str, str, str | None, Any]] = []  # name, origin, url, fetch
-        notes: list[str] = []
-
-        if ctx.task_id:
-            try:
-                for att in await deps.sharepoint.attachments_of(ctx.task_id):
-                    name = att["file_name"]
-                    found.append((name, "task attachment", None, ("attachment", name)))
-            except SharePointConsentError:
-                notes.append("The task's list attachments could not be read (the app lacks SharePoint permission); its folder was read instead.")
-            except SharePointError as exc:
-                notes.append(f"The task's attachments could not be read: {exc}")
-            if deps.drive.enabled and ctx.task_title:
-                try:
-                    folder = await deps.drive.find_task_folder(ctx.task_title)
-                    if folder.how != "created":
-                        for f in await deps.drive.list_files(folder.name):
-                            if reading.is_own_output(f["name"], f["path"], deps.settings.enquiry_report_folder):
-                                continue
-                            found.append((f["name"], f"task folder: {f['path']}", f.get("web_url"), ("drive", f["id"])))
-                    else:
-                        notes.append("The task has no folder in the Proposal Team Channel yet.")
-                except DriveError as exc:
-                    notes.append(f"The task folder could not be read: {exc}")
+        found, notes = await self._task_documents()
 
         wanted = {"pdf": (".pdf",), "excel": (".xlsx", ".xls", ".xlsm", ".csv")}.get(which)
         files_out: list[dict[str, Any]] = []
@@ -1337,6 +1562,9 @@ class Runner:
             if polished_count:
                 how = "wording by AI" if polished_count == len(drafts) else f"{polished_count} worded by AI"
         missing = sum(1 for d in drafts if not d["to_email"])
+        for n, draft in enumerate(drafts):
+            draft["n"] = n
+        ctx.drafts = drafts
         notes = ["Drafts only — nothing was sent. Copy one, or open it in your mail, and send it yourself."]
         if missing:
             notes.append(f"{missing} recipient(s) have no email address on record — {NOT_GIVEN}.")
@@ -1345,6 +1573,54 @@ class Runner:
             output={"drafts": drafts}, notes=notes,
             sources=[s["source"] for s in ctx.suppliers] if to == "suppliers" else [],
         )
+
+    async def s_send_emails(self, cfg: dict[str, Any], spent: Spent, results: list[dict[str, Any]], index: int) -> Out:
+        """Ask the owner which drafts to send, then send those from their own mailbox.
+
+        Nothing goes without the yes: the drafts are shown in full in the app,
+        where the owner edits what needs it, ticks the ones to send and
+        confirms (Teams only links there). Only those are sent — as the owner,
+        through Graph, so they sit in the owner's Sent Items and the replies
+        come back to them.
+        """
+        ctx, user = self.ctx, self.user
+        drafts = ctx.drafts
+        if not drafts:
+            return skipped("No drafts to send — put a “Draft an email” step before this one.")
+        sendable = [d["n"] for d in drafts if _EMAIL.match(_s(d.get("to_email")))]
+        if self.deps.mailer is None or not getattr(user, "entra_object_id", None):
+            return skipped("Your mailbox cannot be sent from here (no Microsoft account is linked), so nothing was sent.")
+        # Asked even when no draft has an address: one can be added in the app.
+        title = (
+            f"Review {len(sendable)} RFQ email(s) before they go" if sendable
+            else f"{len(drafts)} RFQ draft(s) ready — none has an email address yet"
+        )
+        message = (
+            f"Nothing has gone yet. Read each email, edit what needs it and tick the ones to send — they go "
+            f"from {user.email} only after you confirm."
+            if sendable else "Add an address to any of them, read and tick it, and confirm — then it goes from your mailbox."
+        )
+        test_to = test_mail_to(self.deps.settings)
+        if test_to:
+            message = f"TEST MODE — every email goes to {test_to} only; no supplier receives anything. " + message
+        answer = await self.wait_for_answer({
+            "title": title,
+            "message": message,
+            "mode": "send",
+            "about_step_id": ctx.drafts_step_id,
+            "test_to": test_to or None,
+            "drafts": [
+                {"n": d["n"], "to_name": d.get("to_name"), "to_email": d.get("to_email"),
+                 "subject": d.get("subject"), "body": str(d.get("body") or "")[:20_000],
+                 "sendable": d["n"] in sendable}
+                for d in drafts
+            ],
+        }, results, index, give_up_after=timedelta(days=3), timeout_message="No answer came within 3 days, so nothing was sent.")
+        out = await deliver(self.deps, user, drafts, answer)
+        from app.agents import rfqs
+
+        rfqs.record(self.session, self.run, out.output.get("sent") or [])
+        return out
 
     async def s_draft_quote_request(self, cfg: dict[str, Any], spent: Spent) -> Out:
         ctx = self.ctx
@@ -1391,8 +1667,15 @@ class Runner:
             link=self.link(), source="agent_notify", source_id=f"{self.run.id}:{len(ctx.headlines)}",
         )
         ctx.notified = True
-        notes = ["Email to yourself comes later; this went to the bell in the app."] if _s(cfg.get("via")) in ("email", "both") else []
-        return Out(headline="You were told in the app", output={"title": title, "message": message}, notes=notes)
+        via = _s(cfg.get("via")) or "app"
+        where = "in the app"
+        if via in ("teams", "both") and await tell_in_teams(
+            self.deps, self.user, self.run, agent=self.agent_name, title=title, lead=message,
+            points=[], button="Open in the app", face=self.face,
+        ):
+            where = "in the app and in Teams"
+        notes = ["Email to yourself comes later; this went to the bell in the app."] if via == "email" else []
+        return Out(headline=f"You were told {where}", output={"title": title, "message": message}, notes=notes)
 
     async def s_wait_replies(self, cfg: dict[str, Any], spent: Spent) -> Out:
         return skipped("Waiting for replies comes with the RFQ mail step. A run started by hand carries on.")
@@ -1495,11 +1778,13 @@ def _item_sources(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [source(f"document: {name}", f"{n} item(s)") for name, n in counts.items()]
 
 
-# ── starting ───────────────────────────────────────────────────────────
+# ── starting, and runs a restart cut off ───────────────────────────────
 
 
-def start(deps: Deps, run_id: uuid.UUID, uploads: list[tuple[str, bytes, str | None]]) -> Runner:
-    runner = Runner(deps, run_id, uploads)
+def start(deps: Deps, run_id: uuid.UUID, uploads: list[tuple[str, bytes, str | None]], *, resume: bool = False) -> Runner:
+    if run_id in RUNNING:
+        return RUNNING[run_id]
+    runner = Runner(deps, run_id, uploads, resume=resume)
     task = asyncio.create_task(runner.go(), name=f"agent-run-{run_id}")
     runner.task = task
     RUNNING[run_id] = runner
@@ -1507,9 +1792,41 @@ def start(deps: Deps, run_id: uuid.UUID, uploads: list[tuple[str, bytes, str | N
     return runner
 
 
-def settle_orphan(run: AgentRun) -> bool:
-    """A run this process is not running, left marked as live: say it was cut off."""
+def deps_for(state: Any, settings: Settings, factory: async_sessionmaker[AsyncSession]) -> Deps:
+    """What a run needs, from the application's state."""
+    return Deps(
+        settings=settings,
+        factory=factory,
+        sharepoint=state.sharepoint,
+        drive=state.quote_drive,
+        model=state.agent_model,
+        free=state.text_model,
+        mailer=getattr(state, "agent_mailer", None),
+        http=state.http,
+        state=state,
+    )
+
+
+def is_cut_off(run: AgentRun) -> bool:
+    """A live run no process is working on: not here, and its heartbeat has stopped."""
     if run.status not in ("running", "waiting") or run.id in RUNNING:
+        return False
+    beat = run.heartbeat_at or run.started_at or run.created_at
+    return beat is None or datetime.now(UTC) - beat > CUT_OFF_AFTER
+
+
+def resumable(run: AgentRun) -> bool:
+    """Cut off while waiting on a question it can still be answered on."""
+    return run.status == "waiting" and (run.question or {}).get("mode") in RESUMABLE
+
+
+def settle_orphan(run: AgentRun) -> bool:
+    """A run nobody is running, left marked as live: say it was cut off.
+
+    Not one waiting for documents or for a yes to send — those are picked up
+    again (``answer_cut_off`` and the worker).
+    """
+    if not is_cut_off(run) or resumable(run):
         return False
     run.status = "failed"
     run.error = "The run was cut off (the server restarted). Run it again."
@@ -1517,6 +1834,235 @@ def settle_orphan(run: AgentRun) -> bool:
     run.question = None
     run.finished_at = datetime.now(UTC)
     return True
+
+
+def record_answer(run: AgentRun, answer: dict[str, Any]) -> None:
+    """Write the owner's answer onto the run, where any process — or a restart — finds it."""
+    run.question = {**(run.question or {}), "answer": answer, "answered_at": _now()}
+
+
+async def answer_cut_off(deps: Deps, run_id: uuid.UUID) -> None:
+    """A cut-off run has its answer, or has been found by the worker.
+
+    Waiting for documents: it starts again from the top, finds the question
+    already asked, and carries on. Waiting to send, with the answer in: the
+    ticked drafts are sent from the saved results and the run finishes.
+    """
+    async with deps.factory() as session:
+        run = await session.get(AgentRun, run_id)
+        if run is None or not is_cut_off(run) or not resumable(run):
+            return
+        question = run.question or {}
+        if question.get("mode") == "docs":
+            run.heartbeat_at = datetime.now(UTC)  # claimed, so nobody else starts it too
+            await session.commit()
+            start(deps, run.id, [], resume=True)
+            return
+        answer = question.get("answer")
+        user = await session.get(User, run.owner_id)
+        results = [dict(r) for r in run.results or []]
+        index = next((i for i, r in enumerate(results) if r["step_id"] == question.get("step_id")), None)
+        if not isinstance(answer, dict) or user is None or index is None:
+            return
+        drafted = next((r for r in results if r["step_id"] == question.get("about_step_id")), None) or next(
+            (r for r in reversed(results[:index]) if r["kind"] == "draft_email"), None
+        )
+        drafts = list(((drafted or {}).get("output") or {}).get("drafts") or [])
+        for n, draft in enumerate(drafts):
+            draft.setdefault("n", n)
+        run.status, run.heartbeat_at = "running", datetime.now(UTC)
+        await session.commit()
+
+        out = await deliver(deps, user, drafts, answer)
+        from app.agents import rfqs
+
+        rfqs.record(session, run, out.output.get("sent") or [])
+        results[index].update(status=out.status, headline=out.headline, output=out.output, sources=out.sources,
+                              notes=out.notes, finished_at=_now())
+        for r in results[index + 1:]:
+            if r["status"] in ("pending", "running", "waiting"):
+                r.update(status="stopped", headline="Not run — a restart cut the run off before this step")
+        name = _s((run.plan or {}).get("name")) or "Your agent"
+        where = f" on “{run.task_title}”" if run.task_title else ""
+        run.results, run.question, run.status = results, None, "done"
+        run.summary = f"{name} finished{where}. {out.headline}."
+        run.finished_at = datetime.now(UTC)
+        await notify(session, users=[user.id], kind=NotificationKind.GENERAL, title=f"{name}: finished{where}",
+                     body=run.summary[:1000], link=run_link(run), source="agent_run", source_id=str(run.id))
+        await session.commit()
+        face = face_url(deps.settings, await session.get(UserAgent, run.agent_id))
+        await tell_in_teams(deps, user, run, agent=name, title=f"{name} finished{where}", lead=out.headline,
+                            points=_sent_lines(out.output), button="See the results", face=face)
+
+
+# ── sending, as the owner ──────────────────────────────────────────────
+
+
+def test_mail_to(settings: Any) -> str:
+    """The one inbox every agent email goes to while testing (AGENT_MAIL_REDIRECT); empty when live."""
+    return _s(getattr(settings, "agent_mail_redirect", ""))
+
+
+def sends_for_real(settings: Any) -> bool:
+    """Whether agent emails may reach the people they are addressed to.
+
+    All three, or no supplier hears from an agent: the live server, the
+    AGENT_MAIL_LIVE switch turned on, and no test redirect.
+    """
+    return (
+        getattr(settings, "environment", "local") == "production"
+        and getattr(settings, "agent_mail_live", False) is True
+        and not test_mail_to(settings)
+    )
+
+
+async def deliver(deps: Deps, user: User, drafts: list[dict[str, Any]], answer: dict[str, Any]) -> Out:
+    """Send the drafts the owner ticked, from their own mailbox. Each one's fate is recorded."""
+    by = "in Teams" if answer.get("by") == "teams" else "in the app"
+    said = [source("your answer", by)]
+    if not answer.get("go"):
+        return Out(headline="You said don't send — nothing was sent", output={"sent": [], "declined": True}, sources=said)
+    if deps.mailer is None or not getattr(user, "entra_object_id", None):
+        return Out(headline="Your mailbox could not be sent from, so nothing was sent", status="failed", sources=said)
+    by_n = {int(d.get("n", i)): d for i, d in enumerate(drafts)}
+    picks = answer.get("picks")
+    if not isinstance(picks, list) or not answer.get("reviewed"):
+        # The failsafe: only emails the owner picked one by one, after reviewing them in the app.
+        return Out(headline="Nothing was sent — the emails were not reviewed and confirmed in the app",
+                   output={"sent": [], "declined": True}, sources=said)
+    edits = answer.get("edits") if isinstance(answer.get("edits"), dict) else {}
+    chosen = sorted({int(n) for n in picks if str(n).lstrip("-").isdigit() and int(n) in by_n})
+    # AGENT_MAIL_REDIRECT: a test sends everything to one inbox, never to a supplier.
+    redirect = test_mail_to(getattr(deps, "settings", None))
+    if not redirect and not sends_for_real(getattr(deps, "settings", None)):
+        # Only the live server with AGENT_MAIL_LIVE writes to suppliers. Otherwise no redirect means no mail.
+        return Out(
+            headline="Not sent: sending to suppliers is off (AGENT_MAIL_LIVE), and no test address is set (AGENT_MAIL_REDIRECT)",
+            status="failed", sources=said,
+        )
+    sent: list[dict[str, Any]] = []
+    for n in chosen:
+        draft, edit = by_n[n], edits.get(str(n)) or {}
+        to = _s(edit.get("to_email")) or _s(draft.get("to_email"))
+        subject = (_s(edit.get("subject")) or _s(draft.get("subject")))[:250]
+        body = str(edit.get("body") or draft.get("body") or "")
+        entry = {"n": n, "to_name": draft.get("to_name"), "to_email": to, "subject": subject, "status": "sent", "error": None}
+        if not _EMAIL.match(to):
+            entry.update(status="skipped", error="no valid email address")
+        else:
+            really, title = to, subject
+            if redirect:
+                really, title = redirect, f"[TEST — for {to}] {subject}"[:250]
+                entry["redirected_to"] = redirect
+            entry["sent_subject"] = title
+            try:
+                await deps.mailer.send(sender=user.entra_object_id, recipients=[really], subject=title, html=_mail_html(body))
+            except Exception as exc:  # noqa: BLE001 — one refused mail must not stop the rest
+                logger.warning("agent mail to %s failed", to, exc_info=True)
+                entry.update(status="failed", error=str(exc)[:300])
+        sent.append(entry)
+    left_out = [{"to_name": d.get("to_name"), "to_email": d.get("to_email")} for n, d in by_n.items() if n not in chosen]
+    ok = sum(1 for s in sent if s["status"] == "sent")
+    failed = sum(1 for s in sent if s["status"] == "failed")
+    headline = f"Sent {ok} email(s) from {user.email}" if ok else "Nothing was sent"
+    if failed:
+        headline += f"; {failed} could not be sent"
+    notes = []
+    if redirect and ok:
+        headline += f" — test mode, all to {redirect}"
+        notes.append(f"Test mode (AGENT_MAIL_REDIRECT): every email went to {redirect}, not to the suppliers.")
+    if answer.get("text"):
+        notes.append(f"You said: {answer['text']}")
+    if left_out:
+        notes.append("Not sent: " + ", ".join(_s(d["to_name"]) or _s(d["to_email"]) for d in left_out[:10]) + ".")
+    if ok:
+        notes.append("They are in your Sent Items. I'm watching your inbox for the replies and will tell you in Teams.")
+    return Out(
+        headline=headline, output={"sent": sent, "left_out": left_out, "from": user.email},
+        sources=said, notes=notes, status="done" if ok or not failed else "failed",
+    )
+
+
+def _mail_html(body: str) -> str:
+    text = _html(body).replace("\r\n", "\n").replace("\n", "<br>")
+    return f"<div style='font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#111;line-height:1.5'>{text}</div>"
+
+
+def _sent_lines(output: dict[str, Any]) -> list[str]:
+    return [
+        f"{s.get('to_name')} — {s.get('to_email')}" + ("" if s.get("status") == "sent" else f" ({s.get('error') or s.get('status')})")
+        for s in output.get("sent") or []
+    ]
+
+
+# ── talking in Teams ───────────────────────────────────────────────────
+
+
+def run_link(run: AgentRun) -> str:
+    return f"/agents/{run.agent_id}?run={run.id}"
+
+
+async def post_card(
+    deps: Deps, user: User, run: AgentRun, *, step_id: str, title: str, agent: str, task: str | None,
+    card: dict[str, Any],
+) -> bool:
+    """One card to the owner's Teams chat through the ask flow (AGENT_TEAMS_ASK_URL). True if it went."""
+    url = deps.settings.agent_teams_ask_url
+    if not url or deps.http is None or not user.email:
+        return False
+    base = (deps.settings.public_base_url or "").rstrip("/")
+    payload = {
+        "recipient": user.email,
+        "run_id": str(run.id),
+        "step_id": step_id,
+        "token": answer_token(deps.settings.session_secret, run.id, step_id),
+        "callback_url": f"{base}{deps.settings.api_prefix}/agents/teams/answer" if base else "",
+        "agent": agent,
+        "task": task or "",
+        "title": title,
+        "link": f"{deps.settings.frontend_url.rstrip('/')}{run_link(run)}",
+        "card": card,
+    }
+    try:
+        response = await deps.http.post(url, json=payload, timeout=20)
+        if response.status_code >= 400:
+            logger.warning("agent run %s: the Teams flow refused the card (%s)", run.id, response.status_code)
+            return False
+    except Exception:  # noqa: BLE001 — Teams is a copy; the app has it too
+        logger.warning("agent run %s: the Teams flow could not be reached", run.id, exc_info=True)
+        return False
+    return True
+
+
+async def tell_in_teams(
+    deps: Deps, user: User, run: AgentRun, *, agent: str, title: str, lead: str, points: list[str], button: str,
+    face: str | None = None,
+) -> bool:
+    """Tell the owner something in Teams — no question. True if it went.
+
+    The plain webhook (AGENT_TEAMS_WEBHOOK_URL) when there is one; otherwise
+    the ask flow, with a card whose only button is "Got it".
+    """
+    link = f"{deps.settings.frontend_url.rstrip('/')}{run_link(run)}"
+    if deps.http is not None and deps.settings.agent_teams_webhook_url:
+        return await send_to_teams(
+            deps.http, deps.settings.agent_teams_webhook_url, title=title[:200],
+            body="\n\n".join([lead, *[f"• {p}" for p in points[:10]]])[:1800], link=link, recipient=user.email,
+        )
+    return await post_card(
+        deps, user, run, step_id=f"info-{uuid.uuid4().hex[:12]}", title=title, agent=agent, task=run.task_title,
+        card=info_card(title=title, lead=lead, points=points, button=button, link=link, face=face, agent=agent),
+    )
+
+
+def parse_time(value: Any) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value)) if value else None
+    except ValueError:
+        return None
+    if parsed is not None and parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
 
 
 def _html(text: str) -> str:
@@ -1589,18 +2135,15 @@ def _preview(about: dict[str, Any] | None) -> list[str]:
 
 
 def question_card(
-    *, agent: str, task: str | None, question: dict[str, Any], about: dict[str, Any] | None, link: str
+    *, agent: str, task: str | None, question: dict[str, Any], about: dict[str, Any] | None, link: str,
+    face: str | None = None,
 ) -> dict[str, Any]:
     """The Adaptive Card the flow posts: the question, what it is about, a note box, two buttons.
 
     "Post adaptive card and wait for a response" hands back ``data.go`` (from
     the button pressed) and ``data.note`` (from the box).
     """
-    body: list[dict[str, Any]] = [
-        {"type": "TextBlock", "text": f"{agent} needs your answer", "weight": "Bolder", "size": "Medium", "wrap": True},
-    ]
-    if task:
-        body.append({"type": "TextBlock", "text": task, "isSubtle": True, "spacing": "None", "wrap": True})
+    body: list[dict[str, Any]] = _header(f"{agent} needs your answer", task, face)
     body.append({"type": "TextBlock", "text": str(question.get("title") or "Carry on?"), "weight": "Bolder", "wrap": True})
     if question.get("message"):
         body.append({"type": "TextBlock", "text": str(question["message"]), "wrap": True, "isSubtle": True})
@@ -1623,3 +2166,126 @@ def question_card(
             {"type": "Action.OpenUrl", "title": "Open in the app", "url": link},
         ],
     }
+
+
+def _card(body: list[dict[str, Any]], actions: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "type": "AdaptiveCard",
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "version": "1.4",
+        "body": body,
+        "actions": actions,
+    }
+
+
+def _text(text: str, **style: Any) -> dict[str, Any]:
+    return {"type": "TextBlock", "text": text, "wrap": True, **style}
+
+
+def face_url(settings: Any, agent: UserAgent | None) -> str | None:
+    """Where Teams can fetch the agent's picture: the API's public face route, once a picture is saved."""
+    base = _s(getattr(settings, "public_base_url", "")).rstrip("/")
+    if agent is None or not getattr(agent, "face_key", None) or not base.startswith("https://"):
+        return None
+    return f"{base}{settings.api_prefix}/agents/{agent.id}/face.png?v={agent.face_key}"
+
+
+def _header(title: str, task: str | None, face: str | None) -> list[dict[str, Any]]:
+    """The card's top: the agent's face beside the title and the task, when there is a face."""
+    texts = [_text(title, weight="Bolder", size="Medium")]
+    if task:
+        texts.append(_text(task, isSubtle=True, spacing="None"))
+    if not face:
+        return texts
+    return [{
+        "type": "ColumnSet",
+        "columns": [
+            {"type": "Column", "width": "auto", "verticalContentAlignment": "Center",
+             "items": [{"type": "Image", "url": face, "width": "56px", "height": "56px", "altText": "agent"}]},
+            {"type": "Column", "width": "stretch", "verticalContentAlignment": "Center", "items": texts},
+        ],
+    }]
+
+
+def docs_card(
+    *, agent: str, task: str | None, closing: date | None, question: dict[str, Any], link: str,
+    face: str | None = None,
+) -> dict[str, Any]:
+    """"Can you share the documents?" — a link to the task's folder, and "They're in" / "Not needed"."""
+    body = _header(f"{agent} here — a new task for you", task, face)
+    if closing:
+        body.append(_text(f"Closes {closing.strftime('%d %b %Y')}", isSubtle=True, spacing="Small", size="Small"))
+    body.append(_text(str(question.get("title") or "Can you share the documents?"), weight="Bolder", spacing="Medium"))
+    if question.get("message"):
+        body.append(_text(str(question["message"])))
+    body.append({"type": "Input.Text", "id": "note", "isMultiline": True,
+                 "placeholder": "Anything I should know? (optional) — e.g. only items 1 to 5"})
+    actions: list[dict[str, Any]] = []
+    if question.get("folder_url"):
+        actions.append({"type": "Action.OpenUrl", "title": "Open the task folder", "url": question["folder_url"]})
+    actions += [
+        {"type": "Action.Submit", "title": "They're in — start", "style": "positive", "data": {"go": True}},
+        {"type": "Action.Submit", "title": "Not needed", "style": "destructive", "data": {"go": False}},
+        {"type": "Action.OpenUrl", "title": "Open in the app", "url": link},
+    ]
+    return _card(body, actions)
+
+
+#: Emails whose full text goes on the card; the rest are read in the app. Keeps the card under Teams' size limit.
+_CARD_BODIES = 8
+
+
+def send_card(
+    *, agent: str, task: str | None, question: dict[str, Any], link: str, face: str | None = None
+) -> dict[str, Any]:
+    """The drafts to read, and a way to the app to review, edit and send them.
+
+    Nothing can be sent from this card. Supplier mail goes only after its
+    owner has read each email in full in the app, changed what needs it and
+    confirmed the list of who receives what (2026-10-16). Here they can only
+    look, or say don't send.
+    """
+    body = _header(f"{agent}: the RFQs are ready for you to review", task, face)
+    test_to = question.get("test_to")
+    if test_to:
+        body.append({
+            "type": "Container", "style": "warning", "spacing": "Medium",
+            "items": [_text(f"TEST MODE — every email goes to {test_to} only. No supplier receives anything.",
+                            weight="Bolder", size="Small")],
+        })
+    body.append(_text(str(question.get("title") or "Review these before they go"), weight="Bolder", spacing="Medium"))
+    body.append(_text("Nothing has been sent. Open the app to read each email, edit it if needed, and send.",
+                      isSubtle=True))
+    for count, d in enumerate(question.get("drafts") or []):
+        who = d.get("to_name") or d.get("to_email") or "supplier"
+        where = d.get("to_email") if d.get("sendable") else "no email address on record yet"
+        body.append(_text(f"{who} — {where}", size="Small", spacing="Medium"))
+        if d.get("body") and count < _CARD_BODIES:
+            box = f"mail_{d['n']}"
+            body.append({"type": "ActionSet", "spacing": "None", "actions": [
+                {"type": "Action.ToggleVisibility", "title": "Read the email", "targetElements": [box]},
+            ]})
+            body.append({
+                "type": "Container", "id": box, "isVisible": False, "style": "emphasis",
+                "items": [
+                    _text(f"Subject: {d.get('subject') or ''}", weight="Bolder", size="Small"),
+                    _text(str(d["body"])[:1500], size="Small"),
+                ],
+            })
+    return _card(body, [
+        {"type": "Action.OpenUrl", "title": "Review, edit and send in the app", "url": link},
+        {"type": "Action.Submit", "title": "Don't send", "style": "destructive", "data": {"go": False}},
+    ])
+
+
+def info_card(
+    *, title: str, lead: str, points: list[str], button: str, link: str, face: str | None = None, agent: str = "",
+) -> dict[str, Any]:
+    """Something to tell the owner, with nothing to decide."""
+    body = _header(title, None, face) + [_text(lead)]
+    if points:
+        body.append(_text("\n".join(f"- {p}" for p in points[:10]), size="Small", spacing="Medium"))
+    return _card(body, [
+        {"type": "Action.OpenUrl", "title": button, "url": link},
+        {"type": "Action.Submit", "title": "Got it", "data": {"go": True}},
+    ])

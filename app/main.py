@@ -31,7 +31,10 @@ from app.directory.router import router as directory_router
 from app.enquiries.claude import ClaudeEnquiry
 from app.agents.model import AgentModel
 from app.core.mail import GraphMailer
+from app.agents import ENABLED as AGENTS_ENABLED
 from app.agents.router import router as agents_router
+from app.agents import engine as agent_engine
+from app.agents.worker import AgentWorker
 from app.enquiries.router import router as enquiries_router
 from app.finance.cache import PnlCache
 from app.finance.router import router as finance_router
@@ -209,6 +212,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         mailer=AribaMailer(settings, http),
     )
     app.state.ariba_worker.start()
+    # The always-on agents: a task assigned to somebody starts their agent
+    # (Nova, for presales), and runs a restart cut off are picked up. Off
+    # unless AGENT_TRIGGERS_ENABLED is set — see app/agents/worker.py — and
+    # never while agents are paused (app.agents.ENABLED).
+    app.state.agent_worker = None
+    if AGENTS_ENABLED:
+        app.state.agent_worker = AgentWorker(
+            factory=get_session_factory(),
+            settings=settings,
+            deps=lambda: agent_engine.deps_for(app.state, settings, get_session_factory()),
+        )
+        app.state.agent_worker.start()
     logger.info("started environment=%s", settings.environment)
 
     try:
@@ -222,6 +237,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await app.state.bcd_worker.stop()
         await app.state.task_calendar_worker.stop()
         await app.state.ariba_worker.stop()
+        if app.state.agent_worker is not None:
+            await app.state.agent_worker.stop()
         await http.aclose()
         await dispose_engine()
 
@@ -285,7 +302,8 @@ def create_app() -> FastAPI:
     app.include_router(analytics_router, prefix=settings.api_prefix)
     app.include_router(quoting_router, prefix=settings.api_prefix)
     app.include_router(enquiries_router, prefix=settings.api_prefix)
-    app.include_router(agents_router, prefix=settings.api_prefix)
+    if AGENTS_ENABLED:  # paused: see app/agents/__init__.py
+        app.include_router(agents_router, prefix=settings.api_prefix)
     app.include_router(templates_router, prefix=settings.api_prefix)
     app.include_router(hr_router, prefix=settings.api_prefix)
     app.include_router(finance_router, prefix=settings.api_prefix)

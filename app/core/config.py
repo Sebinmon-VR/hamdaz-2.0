@@ -266,8 +266,28 @@ class Settings(BaseSettings):
     #: (2026-10-15).
     agent_explain_paid_fallback: bool = True
     #: Mail an agent's owner when a run needs their answer and when it ends —
-    #: sent as them, to them, through Graph. Only ever the owner.
-    agent_email_notify: bool = True
+    #: sent as them, to them, through Graph. Only ever the owner. Off: the
+    #: user wants agents to talk in Teams, not by mail (2026-10-15).
+    agent_email_notify: bool = False
+    #: The always-on half: start an agent whose trigger is "A task is assigned
+    #: to me" as soon as the Proposals mirror shows a new task in its owner's
+    #: name, and pick up runs a restart cut off. Off in development, like the
+    #: other loops — and it needs MIRROR_SYNC_ENABLED for a fresh mirror.
+    agent_triggers_enabled: bool = False
+    #: The team whose members are given Nova, the presales agent.
+    nova_team_slug: str = "presales"
+    #: For testing: every email an agent sends goes to this address instead
+    #: of the supplier, its subject naming who it was for. Empty: as addressed.
+    agent_mail_redirect: str = ""
+    #: The one switch that lets agent emails reach the suppliers they are
+    #: addressed to — and only on the live server, with no redirect set. Off
+    #: (the default), an agent's email goes to AGENT_MAIL_REDIRECT or nowhere.
+    #: The user's rule (2026-10-16): only to the test inbox until they say so.
+    agent_mail_live: bool = False
+    #: Watch owners' inboxes for replies to the RFQs their agents sent, every
+    #: few minutes, and tell them in Teams. Off in development like the other
+    #: loops; the run page's "Check for replies" works either way.
+    agent_watch_replies: bool = False
     #: A Teams Workflows webhook ("When a Teams webhook request is received" →
     #: "Post card in a chat or channel"). Each card carries the owner's email
     #: as ``recipient`` so one flow can post to each person's chat. Empty: no
