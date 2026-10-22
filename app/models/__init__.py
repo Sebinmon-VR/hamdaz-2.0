@@ -72,6 +72,7 @@ from app.models.followup import (
 from app.models.status_reminder import ReminderStatus, StatusReminder, StatusReminderSettings
 from app.models.bcd_check import BcdCheck, BcdCheckSettings, BcdCheckStatus
 from app.models.task_calendar import TaskCalendarEvent, TaskCalendarSettings
+from app.models.mailwatch import MailWatchSettings, WatchedMail
 from app.models.enquiry import EnquiryAnalysis, EnquiryDocument, EnquiryLine
 from app.models.hr import (
     CLOSED_STAGES,
@@ -184,6 +185,8 @@ __all__ = [
     "StatusReminderSettings",
     "BcdCheck",
     "BcdCheckSettings",
+    "MailWatchSettings",
+    "WatchedMail",
     "BcdCheckStatus",
     "TaskCalendarEvent",
     "EnquiryAnalysis",

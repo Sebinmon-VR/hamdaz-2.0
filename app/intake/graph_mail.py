@@ -152,6 +152,35 @@ class MailReader(GraphMailer):
             {"$select": f"{MESSAGE_FIELDS},body"},
         )
 
+    async def from_senders(
+        self, mailbox: str, senders: list[str], *, since: datetime, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        """Mail from these senders received since ``since``, newest first, with
+        bodies. For the mail watch's trial over mail that has already arrived.
+
+        ``receivedDateTime`` leads the filter because Graph refuses an
+        ``$orderby`` on a property the filter does not name first.
+        """
+        who = " or ".join(
+            f"from/emailAddress/address eq '{s.replace(chr(39), '')}'" for s in senders
+        )
+        url: str | None = f"{GRAPH_BASE}/users/{mailbox}/messages"
+        params: dict[str, str] | None = {
+            "$filter": (
+                f"receivedDateTime ge {since.astimezone(UTC):%Y-%m-%dT%H:%M:%SZ} and ({who})"
+            ),
+            "$orderby": "receivedDateTime desc",
+            "$select": f"{MESSAGE_FIELDS},body",
+            "$top": str(min(limit, PAGE_SIZE)),
+        }
+        out: list[dict[str, Any]] = []
+        while url and len(out) < limit:
+            payload = await self._graph(url, params)
+            params = None
+            out.extend(payload.get("value", []))
+            url = payload.get("@odata.nextLink")
+        return out[:limit]
+
     async def inbox_since(self, mailbox: str, since: str, *, top: int = 50) -> list[dict[str, Any]]:
         """The newest messages in the inbox received at or after ``since`` (ISO, UTC).
 
@@ -240,11 +269,15 @@ class MailReader(GraphMailer):
             immutable=True,
         )
 
-    async def attachment_names(self, mailbox: str, message_id: str) -> list[str]:
+    async def attachment_names(
+        self, mailbox: str, message_id: str, *, immutable: bool = True
+    ) -> list[str]:
+        """File names on a message. ``immutable`` for an id the quote pages
+        kept; the mail watch reads delta ids, which are the ordinary kind."""
         payload = await self._graph(
             f"{GRAPH_BASE}/users/{mailbox}/messages/{message_id}/attachments",
             {"$select": "name,isInline"},
-            immutable=True,
+            immutable=immutable,
         )
         return [
             str(a.get("name") or "attachment")

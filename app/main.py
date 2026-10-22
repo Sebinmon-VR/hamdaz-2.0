@@ -57,6 +57,9 @@ from app.intake.graph_mail import MailReader
 from app.intake.router import router as intake_router
 from app.intake.router import webhook_router as intake_webhook_router
 from app.intake.worker import Worker
+from app.mailwatch.router import router as mailwatch_router
+from app.mailwatch.router import webhook_router as mailwatch_webhook_router
+from app.mailwatch.worker import MailWatchWorker
 from app.labels.router import router as labels_router
 from app.leave.mailer import LeaveMailer
 from app.leave.router import router as leave_router
@@ -212,6 +215,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         mailer=AribaMailer(settings, http),
     )
     app.state.ariba_worker.start()
+    # The CEO's mails in the watched mailbox, read when Graph says one
+    # arrived — no timer reads the inbox. Off until a super admin switches it
+    # on in its settings; read only. See app/mailwatch.
+    app.state.mailwatch_worker = MailWatchWorker(
+        factory=get_session_factory(),
+        settings=settings,
+        reader=app.state.mail_reader,
+        model=app.state.agent_model,
+        sharepoint=app.state.sharepoint,
+    )
+    app.state.mailwatch_worker.start()
     # The always-on agents: a task assigned to somebody starts their agent
     # (Nova, for presales), and runs a restart cut off are picked up. Off
     # unless AGENT_TRIGGERS_ENABLED is set — see app/agents/worker.py — and
@@ -237,6 +251,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await app.state.bcd_worker.stop()
         await app.state.task_calendar_worker.stop()
         await app.state.ariba_worker.stop()
+        await app.state.mailwatch_worker.stop()
         if app.state.agent_worker is not None:
             await app.state.agent_worker.stop()
         await http.aclose()
@@ -320,6 +335,8 @@ def create_app() -> FastAPI:
     # inherit anything that would refuse Microsoft.
     app.include_router(intake_webhook_router, prefix=settings.api_prefix)
     app.include_router(intake_router, prefix=settings.api_prefix)
+    app.include_router(mailwatch_webhook_router, prefix=settings.api_prefix)
+    app.include_router(mailwatch_router, prefix=settings.api_prefix)
     app.include_router(reports_admin_router, prefix=settings.api_prefix)
     app.include_router(reports_router, prefix=settings.api_prefix)
     # Mounted at the root, NOT under the API prefix, and holding no
