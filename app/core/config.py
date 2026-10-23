@@ -53,6 +53,13 @@ class Settings(BaseSettings):
     azure_tenant_id: str = ""
     azure_client_id: str = ""
     azure_client_secret: str = ""
+    #: A certificate for SharePoint's own API (list attachments), which answers
+    #: an app-only token got with the client secret "Unsupported app only
+    #: token" — it takes certificate sign-in only. Base64 of one PEM holding the
+    #: private key and the certificate; the certificate (no key) is uploaded to
+    #: the app registration under Certificates & secrets. Blank: the secret is
+    #: used, and attachments can't be read.
+    azure_sharepoint_cert_b64: str = ""
     #: Must byte-for-byte match a Redirect URI on the app registration.
     azure_redirect_uri: str = "http://localhost:8000/api/v1/auth/callback"
 

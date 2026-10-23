@@ -19,9 +19,10 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.deps import CurrentUser
+from app.auth.router import LOGIN_STATE_AUDIENCE
 from app.core.config import Settings, get_settings
 from app.core.db import get_session
-from app.mailwatch import matching, service
+from app.mailwatch import matching, service, teams
 from app.mailwatch.classify import CATEGORIES, NEGOTIATION, NEW_TENDER, SURE, Reading
 from app.mailwatch.classify import references as refs_in
 from app.mailwatch.schemas import (
@@ -32,6 +33,8 @@ from app.mailwatch.schemas import (
     ReadingOut,
     ReadReportOut,
     SearchIn,
+    TeamsIn,
+    TeamsOut,
     TrialIn,
     TrialOut,
     TrialRowOut,
@@ -184,6 +187,8 @@ async def catch_up(admin: SuperAdmin, session: Session, request: Request) -> Rea
         session, reader=_reader(request), model=_model(request), sharepoint=_sharepoint(request)
     )
     await session.commit()
+    await teams.post_pending(session, poster=_poster(request), settings=get_settings())
+    await session.commit()
     return ReadReportOut(**report.as_dict())
 
 
@@ -253,6 +258,101 @@ async def search_proposals(
     out = _match_out(found)
     assert out is not None
     return out
+
+
+# ── Teams: negotiation updates to the locked channel ─────────────────
+
+
+async def _teams_out(session: AsyncSession) -> TeamsOut:
+    row = await teams.get_connection(session)
+    body = TeamsOut.model_validate(row)
+    body.connected = teams.is_connected(row)
+    body.locked_team, body.locked_channel = teams.CHANNEL_LOCK
+    body.posted = int(
+        await session.scalar(
+            select(func.count()).select_from(WatchedMail).where(WatchedMail.teams_posted_at.is_not(None))
+        )
+        or 0
+    )
+    return body
+
+
+def _poster(request: Request) -> teams.TeamsPoster:
+    return request.app.state.teams_poster
+
+
+@router.get("/teams", response_model=TeamsOut, summary="The connected Teams account and channel")
+async def teams_status(admin: SuperAdmin, session: Session) -> TeamsOut:
+    out = await _teams_out(session)
+    await session.commit()
+    return out
+
+
+@router.get("/teams/connect", summary="Connect your Teams account (opens Microsoft sign-in)")
+async def teams_connect(admin: SuperAdmin, config: Config):
+    """Open this in the browser, not from the API page: it redirects to
+    Microsoft, which asks the signed-in account to allow posting channel
+    messages, and comes back to the Mail watch page."""
+    return teams.start(
+        settings=config, user_id=admin.id,
+        login_state_cookie=config.login_state_cookie_name, audience=LOGIN_STATE_AUDIENCE,
+    )
+
+
+@router.patch("/teams", response_model=TeamsOut, summary="Switch negotiation posts on or off")
+async def teams_switch(body: TeamsIn, admin: SuperAdmin, session: Session) -> TeamsOut:
+    row = await teams.get_connection(session)
+    if body.post_negotiations and not teams.is_connected(row):
+        raise HTTPException(status_code=400, detail="Connect a Teams account first.")
+    if body.post_negotiations and not row.post_negotiations:
+        # From now on: switching on never posts the backlog.
+        row.posting_from = datetime.now(UTC)
+    row.post_negotiations = body.post_negotiations
+    await session.commit()
+    return await _teams_out(session)
+
+
+@router.delete("/teams", response_model=TeamsOut, summary="Disconnect the Teams account")
+async def teams_disconnect(admin: SuperAdmin, session: Session) -> TeamsOut:
+    teams.disconnect(await teams.get_connection(session))
+    await session.commit()
+    return await _teams_out(session)
+
+
+@router.post("/teams/test", response_model=TeamsOut, summary="Post a test message to the locked channel")
+async def teams_test(admin: SuperAdmin, session: Session, request: Request) -> TeamsOut:
+    row = await teams.get_connection(session)
+    if not teams.is_connected(row):
+        raise HTTPException(status_code=400, detail="Connect a Teams account first.")
+    try:
+        await _poster(request).post(row, teams.test_html(row))
+    except teams.TeamsError as exc:
+        row.last_error = str(exc)[:500]
+        await session.commit()
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    await session.commit()
+    return await _teams_out(session)
+
+
+@router.post(
+    "/mails/{mail_id}/teams",
+    response_model=WatchedMailDetailOut,
+    summary="Post this negotiation mail to the locked channel now",
+)
+async def post_mail_to_teams(
+    mail_id: uuid.UUID, admin: SuperAdmin, session: Session, request: Request, config: Config
+) -> WatchedMailDetailOut:
+    mail = await session.get(WatchedMail, mail_id)
+    if mail is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such mail.")
+    try:
+        await teams.post_mail(session, mail, poster=_poster(request), settings=config)
+    except teams.TeamsError as exc:
+        await session.commit()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await session.commit()
+    await session.refresh(mail)
+    return WatchedMailDetailOut.model_validate(mail)
 
 
 @router.get("/mails", response_model=list[WatchedMailOut], summary="Mails kept, newest first")

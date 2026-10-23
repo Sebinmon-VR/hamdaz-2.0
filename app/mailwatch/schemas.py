@@ -91,6 +91,8 @@ class WatchedMailOut(BaseModel):
     task: dict[str, Any] | None
     duplicate_of_id: uuid.UUID | None
     match_error: str | None
+    teams_posted_at: datetime | None
+    teams_error: str | None
 
 
 class WatchedMailDetailOut(WatchedMailOut):
@@ -182,3 +184,26 @@ class TrialOut(BaseModel):
     unsure: int
     model_cost_usd: Decimal
     rows: list[TrialRowOut]
+
+
+class TeamsOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    connected: bool = False
+    account_email: str | None
+    account_name: str | None
+    connected_at: datetime | None
+    #: The only channel posts can go to — fixed in code.
+    locked_team: str = ""
+    locked_channel: str = ""
+    team_name: str | None
+    channel_name: str | None
+    post_negotiations: bool
+    posting_from: datetime | None
+    last_used_at: datetime | None
+    last_error: str | None
+    posted: int = 0
+
+
+class TeamsIn(BaseModel):
+    post_negotiations: bool

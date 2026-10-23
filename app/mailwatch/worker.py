@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.agents.model import AgentModel
 from app.core.config import Settings
 from app.intake.graph_mail import MailReader
-from app.mailwatch import service
+from app.mailwatch import service, teams
 from app.proposals.sharepoint import SharePointProposals
 
 logger = logging.getLogger("hamdaz.mailwatch.worker")
@@ -54,12 +54,14 @@ class MailWatchWorker:
         reader: MailReader,
         model: AgentModel | None,
         sharepoint: SharePointProposals | None,
+        poster: teams.TeamsPoster | None = None,
     ) -> None:
         self._factory = factory
         self._settings = settings
         self._reader = reader
         self._model = model
         self._sharepoint = sharepoint
+        self._poster = poster
         self._tasks: set[asyncio.Task] = set()
         self._stopping = asyncio.Event()
         self._kick = asyncio.Event()
@@ -135,6 +137,8 @@ class MailWatchWorker:
                     await service.keep_subscribed(
                         session, reader=self._reader, settings=self._settings
                     )
+                    if self._poster is not None:
+                        await self._poster.keep_alive(await teams.get_connection(session))
                 if read:
                     report = await service.read_new(
                         session, reader=self._reader, model=self._model,
@@ -143,6 +147,13 @@ class MailWatchWorker:
                     if report.error:
                         logger.warning("mail watch read: %s", report.error)
                 await session.commit()
+                if read and self._poster is not None:
+                    # After the commit, so a post never names a mail that
+                    # was then rolled back; rows are locked one by one.
+                    await teams.post_pending(
+                        session, poster=self._poster, settings=self._settings
+                    )
+                    await session.commit()
         except Exception:  # noqa: BLE001 - a loop must not die
             logger.exception("mail watch pass failed")
         return True

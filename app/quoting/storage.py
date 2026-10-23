@@ -137,6 +137,17 @@ class QuoteDrive:
         self._http = http
         self._token: str | None = None
         self._expires_at = 0.0
+        self._root_item_id: str | None = None
+
+    async def _root_id(self, headers: dict[str, str]) -> str | None:
+        """The drive item id of the root folder; None when it can't be read."""
+        if self._root_item_id is None:
+            response = await self._http.get(
+                self._path_url(self.root), headers=headers, params={"$select": "id"}
+            )
+            if response.status_code == 200:
+                self._root_item_id = response.json().get("id")
+        return self._root_item_id
 
     @property
     def enabled(self) -> bool:
@@ -248,13 +259,19 @@ class QuoteDrive:
             logger.info("folder search for %s answered %s", number, response.status_code)
             return None
         root_path = f"/{self.root}".casefold()
+        root_id = await self._root_id(headers)
         candidates = []
         for item in response.json().get("value", []):
             if "folder" not in item:
                 continue
-            parent = str(item.get("parentReference", {}).get("path", ""))
-            # ".../root:/Proposal Team Channel" — directly under the root only.
-            if not parent.casefold().endswith(root_path):
+            parent = item.get("parentReference") or {}
+            # Directly under the root only. Search results carry the parent's
+            # id but usually no path, so the id decides; a path, when given,
+            # is ".../root:/Proposal Team Channel".
+            if not (
+                (root_id and parent.get("id") == root_id)
+                or str(parent.get("path") or "").casefold().endswith(root_path)
+            ):
                 continue
             name = str(item.get("name", ""))
             if leading_number(name) == number or name.casefold().startswith(number.casefold()):

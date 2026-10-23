@@ -19,12 +19,16 @@ from __future__ import annotations
 import base64
 import json
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, Final
 from urllib.parse import quote
 
 import httpx
+import jwt
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
 
 from app.core.config import Settings, get_settings
 
@@ -52,6 +56,35 @@ DONE_STATUSES: Final = frozenset({"completed"})
 #: Nothing is written back to SharePoint — the list is live and read-only from
 #: here. See ``ProposalTask.effective_status``.
 EXPIRED: Final = "Expired"
+
+
+#: Why an attachment upload or delete is refused.
+ATTACHMENTS_READ_ONLY: Final = (
+    "Task attachments are read only from this app; add or remove them in SharePoint."
+)
+
+
+def _client_assertion(settings: Settings, token_url: str) -> str:
+    """A short-lived JWT signed with the app's certificate: the credential
+    SharePoint's own API takes in place of the client secret."""
+    pem = base64.b64decode(settings.azure_sharepoint_cert_b64.strip())
+    key = serialization.load_pem_private_key(pem, password=None)
+    cert = x509.load_pem_x509_certificate(pem)
+    thumbprint = base64.urlsafe_b64encode(cert.fingerprint(hashes.SHA1())).decode().rstrip("=")
+    now = int(time.time())
+    return jwt.encode(
+        {
+            "aud": token_url,
+            "iss": settings.azure_client_id,
+            "sub": settings.azure_client_id,
+            "jti": str(uuid.uuid4()),
+            "nbf": now,
+            "exp": now + 600,
+        },
+        key,
+        algorithm="RS256",
+        headers={"x5t": thumbprint},
+    )
 
 
 class SharePointConsentError(Exception):
@@ -340,18 +373,26 @@ class SharePointProposals:
         if self._rest_token and time.monotonic() < self._rest_expires_at:
             return self._rest_token
 
-        response = await self._http.post(
-            f"{self._settings.authority}/oauth2/v2.0/token",
-            data={
-                "client_id": self._settings.azure_client_id,
-                "client_secret": self._settings.azure_client_secret,
-                "grant_type": "client_credentials",
-                "scope": f"https://{self._host}/.default",
-            },
-        )
+        token_url = f"{self._settings.authority}/oauth2/v2.0/token"
+        data = {
+            "client_id": self._settings.azure_client_id,
+            "grant_type": "client_credentials",
+            "scope": f"https://{self._host}/.default",
+        }
+        if self._settings.azure_sharepoint_cert_b64.strip():
+            # SharePoint refuses app-only tokens got with a secret; a signed
+            # assertion from the certificate is what it accepts.
+            data["client_assertion_type"] = (
+                "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+            )
+            data["client_assertion"] = _client_assertion(self._settings, token_url)
+        else:
+            data["client_secret"] = self._settings.azure_client_secret
+        response = await self._http.post(token_url, data=data)
         if response.status_code != 200:
             raise SharePointError(
-                f"SharePoint token request failed ({response.status_code})"
+                f"SharePoint token request failed ({response.status_code}): "
+                f"{response.text[:200]}"
             )
         payload = response.json()
         token = payload["access_token"]
@@ -377,10 +418,12 @@ class SharePointProposals:
         return token
 
     def _rest_item(self, item_id: str) -> str:
+        """The item in the list's own site (…/sites/ProposalTeam), not the
+        tenant's root site, which has no such list."""
         list_id = self._settings.sharepoint_proposals_list_id
-        return (
-            f"https://{self._host}/_api/web/lists(guid'{list_id}')/items({int(item_id)})"
-        )
+        list_url = self._settings.sharepoint_proposals_list_url
+        site = list_url.split("/Lists/")[0] if "/Lists/" in list_url else f"https://{self._host}"
+        return f"{site}/_api/web/lists(guid'{list_id}')/items({int(item_id)})"
 
     async def _rest(self, method: str, url: str, **kwargs) -> httpx.Response:
         token = await self._sp_rest_token()
@@ -392,6 +435,12 @@ class SharePointProposals:
         response = await self._http.request(method, url, headers=headers, **kwargs)
         if response.status_code == 401:
             self._rest_token, self._rest_expires_at = None, 0.0
+            if "unsupported app only token" in response.text.lower():
+                raise SharePointConsentError(
+                    "SharePoint accepts app sign-in by certificate only, not by client "
+                    "secret. Set AZURE_SHAREPOINT_CERT_B64 and upload that certificate "
+                    "to the app registration (Certificates & secrets)."
+                )
             raise SharePointError("SharePoint rejected the application token")
         return response
 
@@ -437,7 +486,10 @@ class SharePointProposals:
         return response.content
 
     async def add_attachment(self, item_id: str, file_name: str, content: bytes) -> None:
-        """Attach a file to a task. Needs Sites.ReadWrite.All on SharePoint."""
+        """Attach a file to a task — switched off: the Proposals list is read
+        only from this app. (These calls never worked until certificate
+        sign-in made SharePoint's API reachable; they stay off, on purpose.)"""
+        raise SharePointError(ATTACHMENTS_READ_ONLY)
         literal = file_name.replace("'", "''")
         url = f"{self._rest_item(item_id)}/AttachmentFiles/add(FileName='{quote(literal)}')"
         response = await self._rest("POST", url, content=content)
@@ -448,6 +500,8 @@ class SharePointProposals:
             )
 
     async def delete_attachment(self, item_id: str, file_name: str) -> None:
+        """Switched off, as :meth:`add_attachment`."""
+        raise SharePointError(ATTACHMENTS_READ_ONLY)
         literal = file_name.replace("'", "''")
         url = f"{self._rest_item(item_id)}/AttachmentFiles('{quote(literal)}')"
         response = await self._rest("DELETE", url, headers={"If-Match": "*"})

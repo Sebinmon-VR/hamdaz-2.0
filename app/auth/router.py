@@ -144,6 +144,15 @@ async def callback(
     if not secrets.compare_digest(str(login_state.get("state", "")), state):
         return _login_failed(settings, "state_mismatch")
 
+    # A super admin connecting their Teams account for the mail watch, not
+    # signing in: the same registered redirect address, a different errand.
+    if login_state.get("purpose") == "teams":
+        from app.mailwatch import teams as mailwatch_teams  # import here: no cycle
+
+        return await mailwatch_teams.finish(
+            request, session, settings, code=code, login_state=login_state
+        )
+
     try:
         id_token = await oidc.exchange_code(code=code, code_verifier=login_state["verifier"])
         identity = await oidc.verify_id_token(id_token, nonce=login_state["nonce"])

@@ -59,6 +59,7 @@ from app.intake.router import webhook_router as intake_webhook_router
 from app.intake.worker import Worker
 from app.mailwatch.router import router as mailwatch_router
 from app.mailwatch.router import webhook_router as mailwatch_webhook_router
+from app.mailwatch.teams import TeamsPoster
 from app.mailwatch.worker import MailWatchWorker
 from app.labels.router import router as labels_router
 from app.leave.mailer import LeaveMailer
@@ -218,12 +219,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # The CEO's mails in the watched mailbox, read when Graph says one
     # arrived — no timer reads the inbox. Off until a super admin switches it
     # on in its settings; read only. See app/mailwatch.
+    # Negotiations from that mail, posted to the locked Teams channel as the
+    # account a super admin connected. Off until switched on.
+    app.state.teams_poster = TeamsPoster(
+        settings, http, app.state.mail_reader,
+        sharepoint=app.state.sharepoint, drive=app.state.quote_drive,
+    )
     app.state.mailwatch_worker = MailWatchWorker(
         factory=get_session_factory(),
         settings=settings,
         reader=app.state.mail_reader,
         model=app.state.agent_model,
         sharepoint=app.state.sharepoint,
+        poster=app.state.teams_poster,
     )
     app.state.mailwatch_worker.start()
     # The always-on agents: a task assigned to somebody starts their agent

@@ -164,3 +164,44 @@ class WatchedMail(Base, UUIDPrimaryKey, Timestamped):
     )
     matched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     match_error: Mapped[str | None] = mapped_column(Text)
+
+    # ── Teams: the negotiation update posted to a channel (app/mailwatch/teams.py) ──
+    teams_posted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    teams_message_id: Mapped[str | None] = mapped_column(String(100))
+    teams_error: Mapped[str | None] = mapped_column(Text)
+    teams_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+
+
+class MailWatchTeams(Base, Timestamped):
+    """The Teams account negotiation updates are posted as (``id`` is always 1).
+
+    Graph lets no application post to a channel on its own, so a super admin
+    connects their account once; its refresh token is kept here, encrypted
+    with a key derived from the server's session secret.
+    """
+
+    __tablename__ = "mailwatch_teams"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    #: Post each negotiation mail to the channel. Off until switched on.
+    post_negotiations: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    #: Only mail received from here is posted — switching on sends no backlog.
+    posting_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    refresh_token_enc: Mapped[str | None] = mapped_column(Text)
+    account_email: Mapped[str | None] = mapped_column(String(320))
+    account_name: Mapped[str | None] = mapped_column(String(200))
+    account_id: Mapped[str | None] = mapped_column(String(64))
+    connected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    connected_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    team_id: Mapped[str | None] = mapped_column(String(64))
+    team_name: Mapped[str | None] = mapped_column(String(200))
+    channel_id: Mapped[str | None] = mapped_column(String(200))
+    channel_name: Mapped[str | None] = mapped_column(String(200))
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
