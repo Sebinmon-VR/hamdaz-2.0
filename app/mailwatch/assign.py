@@ -46,10 +46,6 @@ from app.proposals.sharepoint import (
 
 logger = logging.getLogger("hamdaz.mailwatch.assign")
 
-#: While this is tested every Teams card says so at the top
-#: (app/mailwatch/teams.py, whose channel lock goes with it).
-TESTING: Final = True
-
 #: Where a new tender's task can be created (MailWatchTeams.task_list).
 TEST_LIST, REAL_LIST, NO_LIST = "test", "real", "none"
 TASK_LISTS: Final = (TEST_LIST, REAL_LIST, NO_LIST)

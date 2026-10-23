@@ -193,9 +193,10 @@ class TeamsOut(BaseModel):
     account_email: str | None
     account_name: str | None
     connected_at: datetime | None
-    #: The only channel posts can go to — fixed in code.
-    locked_team: str = ""
-    locked_channel: str = ""
+    #: The test channel — the default — and whether posts go there now.
+    test_team: str = ""
+    test_channel: str = ""
+    is_test_channel: bool = True
     team_name: str | None
     channel_name: str | None
     post_negotiations: bool
@@ -218,6 +219,9 @@ class TeamsIn(BaseModel):
     post_negotiations: bool | None = None
     assign_new_tenders: bool | None = None
     task_list: Literal["test", "real", "none"] | None = None
+    #: Where cards are posted: both, or neither.
+    team_id: str | None = None
+    channel_id: str | None = None
 
 
 class TestTaskOut(BaseModel):

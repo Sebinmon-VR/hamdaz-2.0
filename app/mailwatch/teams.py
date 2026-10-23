@@ -12,9 +12,11 @@ The sign-in returns through the app's one registered redirect address,
 the auth router hands those back here (:func:`finish`). Nothing about ordinary
 sign-in changes.
 
-**Locked to the test channel.** :data:`CHANNEL_LOCK` is the only channel a post
-can go to, resolved by name with the app's own read permission. Moving to the
-real channel is a code change, on purpose.
+**The channel is chosen on the Mail watch page**, the test channel
+(:data:`TEST_CHANNEL`) until changed. Teams and channels are listed and
+resolved with the app's own read permission; the connected account must be a
+member of the team to post there. Cards carry a TESTING banner only while
+they go to the test channel.
 
 **Once each.** A negotiation mail is posted once; a failure is tried again on
 the next pass, three times at most. Only mail received after posting was
@@ -51,7 +53,6 @@ from app.core.config import Settings, get_settings
 from app.core.mail import GRAPH_BASE, GraphMailer
 from app.core.security import sign
 from app.mailwatch import assign
-from app.mailwatch.assign import TESTING
 from app.mailwatch.classify import NEGOTIATION, NEW_TENDER
 from app.models.mailwatch import MailWatchTeams, MailWatchTestTask, WatchedMail
 from app.proposals.sharepoint import SharePointConsentError, SharePointError, SharePointProposals
@@ -60,7 +61,7 @@ from app.quoting.storage import DriveError, QuoteDrive
 logger = logging.getLogger("hamdaz.mailwatch.teams")
 
 #: The only channel a post may go to: (team, channel), by display name.
-CHANNEL_LOCK: Final = ("Test", "test channel")
+TEST_CHANNEL: Final = ("Test", "test channel")
 
 #: What the connected account is asked for. Admin consent already covers it.
 SCOPES: Final = "openid profile offline_access User.Read ChannelMessage.Send"
@@ -209,9 +210,76 @@ async def finish(
     return _back(settings, teams="connected")
 
 
+def is_test_channel(row: MailWatchTeams) -> bool:
+    """Posts go to the test channel — the default, while none is chosen."""
+    if not row.channel_id:
+        return True
+    team, channel = TEST_CHANNEL
+    return (row.team_name or "").strip().lower() == team.lower() and (
+        (row.channel_name or "").strip().lower() == channel.lower()
+    )
+
+
+async def _graph_get(graph: GraphMailer, path: str, params: dict[str, str]) -> list[dict]:
+    """A Graph listing with the app's own token, every page of it."""
+    headers = {"Authorization": f"Bearer {await graph._access_token()}"}
+    url: str | None = f"{GRAPH_BASE}{path}"
+    out: list[dict] = []
+    query: dict[str, str] | None = params
+    while url:
+        response = await graph._http.get(url, params=query, headers=headers)
+        if response.status_code != 200:
+            raise TeamsError(f"Microsoft refused the listing ({response.status_code}).")
+        payload = response.json()
+        out += payload.get("value", [])
+        url, query = payload.get("@odata.nextLink"), None
+    return out
+
+
+async def list_teams(graph: GraphMailer) -> list[dict[str, str]]:
+    """Every team in the organisation, by name."""
+    groups = await _graph_get(graph, "/groups", {
+        "$filter": "resourceProvisioningOptions/Any(x:x eq 'Team')",
+        "$select": "id,displayName", "$top": "999",
+    })
+    return sorted(
+        ({"id": g["id"], "name": g.get("displayName") or ""} for g in groups),
+        key=lambda t: t["name"].lower(),
+    )
+
+
+async def list_channels(graph: GraphMailer, team_id: str) -> list[dict[str, str]]:
+    """A team's channels, General first."""
+    channels = await _graph_get(
+        graph, f"/teams/{team_id}/channels", {"$select": "id,displayName,membershipType"}
+    )
+    return sorted(
+        ({"id": c["id"], "name": c.get("displayName") or "",
+          "kind": c.get("membershipType") or "standard"} for c in channels),
+        key=lambda c: (c["name"].lower() != "general", c["name"].lower()),
+    )
+
+
+async def choose_channel(
+    row: MailWatchTeams, graph: GraphMailer, *, team_id: str, channel_id: str
+) -> None:
+    """Set where cards are posted, after checking the team and channel exist."""
+    team = next((t for t in await list_teams(graph) if t["id"] == team_id), None)
+    if team is None:
+        raise TeamsError("No such team.")
+    channel = next(
+        (c for c in await list_channels(graph, team_id) if c["id"] == channel_id), None
+    )
+    if channel is None:
+        raise TeamsError(f"No such channel in {team['name']}.")
+    row.team_id, row.team_name = team["id"], team["name"]
+    row.channel_id, row.channel_name = channel["id"], channel["name"]
+
+
 async def _resolve_channel(row: MailWatchTeams, graph: GraphMailer) -> None:
-    """Find the locked channel's ids, with the app's own read permission."""
-    team_name, channel_name = CHANNEL_LOCK
+    """Find the test channel's ids — the default — with the app's own read
+    permission."""
+    team_name, channel_name = TEST_CHANNEL
     token = await graph._access_token()
     headers = {"Authorization": f"Bearer {token}"}
     http = graph._http
@@ -435,13 +503,14 @@ class TeamsPoster:
     async def post(
         self, row: MailWatchTeams, content_html: str, *, card: dict | None = None
     ) -> str:
-        """Post to the locked channel; the new message's id. With ``card``, the
-        message is that Adaptive Card and ``content_html`` is ignored."""
-        team_name, channel_name = CHANNEL_LOCK
-        if not row.channel_id or (row.channel_name or "").lower() != channel_name.lower() or (
-            (row.team_name or "").lower() != team_name.lower()
-        ):
+        """Post to the chosen channel (the test channel until one is chosen);
+        the new message's id. With ``card``, the message is that Adaptive Card
+        and ``content_html`` is ignored."""
+        if not row.channel_id or not row.team_id:
             await _resolve_channel(row, self._graph)
+        if card is not None and not is_test_channel(row):
+            # A real channel: no TESTING banner.
+            card = {**card, "body": [b for b in card.get("body", []) if b.get("id") != "testing"]}
         token = await self._token(row)
         if card is not None:
             attachment_id = uuid.uuid4().hex
@@ -1292,11 +1361,10 @@ def _ai_helped(mail: WatchedMail) -> bool:
 
 
 def _testing_note(detail: str) -> list[dict[str, Any]]:
-    """The banner at the top of every card while :data:`TESTING` is on."""
-    if not TESTING:
-        return []
+    """The banner at the top of a card; taken off when it is posted to a
+    channel other than the test one (:meth:`TeamsPoster.post`)."""
     return [{
-        "type": "Container", "style": "warning", "bleed": True,
+        "type": "Container", "id": "testing", "style": "warning", "bleed": True,
         "items": [_with_icon(
             _icon("Beaker", color="Warning"),
             _text(f"**TESTING** — {detail}", size="Small"),
@@ -1306,7 +1374,7 @@ def _testing_note(detail: str) -> list[dict[str, Any]]:
 
 def test_html(row: MailWatchTeams) -> str:
     return (
-        ("<p><b>TESTING</b></p>" if TESTING else "")
+        ("<p><b>TESTING</b></p>" if is_test_channel(row) else "")
         + "<p><b>Hamdaz ERP — Teams connection test</b></p>"
         f"<p>Posted as {_e(row.account_name)} to {_e(row.team_name)} → {_e(row.channel_name)}. "
         "Negotiation updates from the CEO's mail will appear here.</p>"

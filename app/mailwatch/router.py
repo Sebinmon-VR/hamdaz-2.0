@@ -273,7 +273,8 @@ async def _teams_out(session: AsyncSession) -> TeamsOut:
     row = await teams.get_connection(session)
     body = TeamsOut.model_validate(row)
     body.connected = teams.is_connected(row)
-    body.locked_team, body.locked_channel = teams.CHANNEL_LOCK
+    body.test_team, body.test_channel = teams.TEST_CHANNEL
+    body.is_test_channel = teams.is_test_channel(row)
     body.posted = int(
         await session.scalar(
             select(func.count()).select_from(WatchedMail).where(WatchedMail.teams_posted_at.is_not(None))
@@ -315,7 +316,9 @@ async def teams_connect(admin: SuperAdmin, config: Config):
 
 
 @router.patch("/teams", response_model=TeamsOut, summary="Switch negotiation posts on or off")
-async def teams_switch(body: TeamsIn, admin: SuperAdmin, session: Session) -> TeamsOut:
+async def teams_switch(
+    body: TeamsIn, admin: SuperAdmin, session: Session, request: Request
+) -> TeamsOut:
     row = await teams.get_connection(session)
     if body.post_negotiations is not None:
         if body.post_negotiations and not teams.is_connected(row):
@@ -326,6 +329,15 @@ async def teams_switch(body: TeamsIn, admin: SuperAdmin, session: Session) -> Te
         row.post_negotiations = body.post_negotiations
     if body.task_list is not None:
         row.task_list = body.task_list
+    if body.team_id or body.channel_id:
+        if not (body.team_id and body.channel_id):
+            raise HTTPException(status_code=400, detail="Choose both a team and a channel.")
+        try:
+            await teams.choose_channel(
+                row, _reader(request), team_id=body.team_id, channel_id=body.channel_id
+            )
+        except teams.TeamsError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     if body.assign_new_tenders is not None:
         # Test tasks need no Teams account; the cards wait for one.
         if body.assign_new_tenders and not row.assign_new_tenders:
@@ -333,6 +345,24 @@ async def teams_switch(body: TeamsIn, admin: SuperAdmin, session: Session) -> Te
         row.assign_new_tenders = body.assign_new_tenders
     await session.commit()
     return await _teams_out(session)
+
+
+@router.get("/teams/teams", summary="The organisation's teams, to choose where cards go")
+async def list_teams(admin: SuperAdmin, request: Request) -> list[dict[str, str]]:
+    try:
+        return await teams.list_teams(_reader(request))
+    except teams.TeamsError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.get("/teams/channels", summary="One team's channels")
+async def list_channels(
+    admin: SuperAdmin, request: Request, team_id: Annotated[str, Query(min_length=1)]
+) -> list[dict[str, str]]:
+    try:
+        return await teams.list_channels(_reader(request), team_id)
+    except teams.TeamsError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @router.delete("/teams", response_model=TeamsOut, summary="Disconnect the Teams account")
