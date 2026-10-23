@@ -49,6 +49,17 @@ async def counts(session: AsyncSession) -> tuple[dict, dict]:
     return summarise(tasks, people), await last_assigned(session)
 
 
+async def ranked(session: AsyncSession, *, team: Team | None) -> list[Scored]:
+    """The standing worked out from the mirror this moment, not read from the
+    stored table — for choosing who gets the next tender when the stored one
+    may be a sync behind. Stores nothing."""
+    workload, seen = await counts(session)
+    candidates, policy, _ = await gather(
+        session, sharepoint=None, cache=None, team=team, workload=workload, last_seen=seen
+    )
+    return score(candidates, weights=weights_of(policy)) if candidates else []
+
+
 async def recompute(
     session: AsyncSession,
     *,

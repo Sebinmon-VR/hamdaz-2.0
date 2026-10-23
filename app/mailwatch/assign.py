@@ -24,19 +24,20 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Final
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.analytics import live
+from app.analytics import publisher as publishing
 from app.ariba.bcd import expected_bcd
-from app.assignment.service import max_open_for
 from app.core.config import Settings
+from app.intake.worker import MIRROR_LOCK
 from app.mailwatch.classify import NEW_TENDER
 from app.mailwatch.matching import NEW, STAGE_CHANGE
-from app.models.assignment import AssignmentPolicy
 from app.models.mailwatch import MailWatchTeams, MailWatchTestTask, WatchedMail
 from app.models.proposal_index import ProposalIndexItem
 from app.models.team import Team
+from app.proposals import mirror
 from app.proposals.sharepoint import (
     SharePointConsentError,
     SharePointError,
@@ -130,26 +131,33 @@ async def _team(session: AsyncSession) -> Team:
 
 
 async def _standing(session: AsyncSession, team: Team) -> list[dict[str, Any]]:
-    """The top of the team's ranking, with what shapes each person's share:
-    their labels, their capacity (1 is a full load) and the policy's ceiling
-    on their open tasks (None: no ceiling)."""
-    rows = await live.next_up(session, team=team, limit=STANDING_KEPT)
-    policy = await session.scalar(
-        select(AssignmentPolicy).where(AssignmentPolicy.team_id == team.id)
-    )
+    """The top of the team's ranking as it is this moment, from the Proposals
+    list as the mirror holds it — a task just created there is in it already
+    (:func:`refresh_ranking`). Tasks kept in the test list or the app are test
+    work and never count. With what shapes each person's share: their labels,
+    their capacity (1 is a full load) and the policy's ceiling on open tasks."""
+    scored = await live.ranked(session, team=team)
+    ranked = sorted(
+        (
+            r for r in scored
+            # As the stored standing: eligible, placed, and somebody who can sign in.
+            if not r.excluded and (r.priority or 0) > 0 and r.candidate.user_id is not None
+        ),
+        key=lambda r: r.priority,
+    )[:STANDING_KEPT]
     out = []
-    for row in rows:
-        labels = [str(label) for label in (row.labels or [])]
+    for result in ranked:
+        person = result.candidate
         out.append({
-            "rank": row.rank,
-            "name": row.display_name,
-            "email": (row.email or "").lower() or None,
-            "lookup_id": row.sharepoint_lookup_id,
-            "active": row.active_tasks,
-            "open": row.open_tasks,
-            "labels": labels,
-            "capacity": float(row.capacity) if row.capacity is not None else None,
-            "limit": max_open_for(policy, set(labels)) if policy is not None else None,
+            "rank": result.priority,
+            "name": person.display_name,
+            "email": (person.email or "").lower() or None,
+            "lookup_id": person.lookup_id,
+            "active": person.active_tasks,
+            "open": person.open_tasks,
+            "labels": sorted(str(label) for label in person.labels),
+            "capacity": float(person.capacity) if person.capacity is not None else None,
+            "limit": person.max_open,
         })
     return out
 
@@ -197,7 +205,10 @@ async def create(
     session.add(task)
     await session.flush()
     if sharepoint is not None:
-        await to_list(task, sharepoint=sharepoint, target=list_target(settings, choice))
+        target = list_target(settings, choice)
+        await to_list(task, sharepoint=sharepoint, target=target)
+        if target is not None and target.kind == REAL_LIST and task.list_item_id:
+            await refresh_ranking(session, task, sharepoint=sharepoint, settings=settings)
     logger.info(
         "mail watch test task: %r to %s (%s)", task.title, task.assigned_to_name, task.action
     )
@@ -227,6 +238,44 @@ async def to_list(
     task.list_item_id = str(item.get("id") or "")
     task.list_item_url = f"{target.list_url}/DispForm.aspx?ID={task.list_item_id}"
     task.list_error = None
+
+
+async def refresh_ranking(
+    session: AsyncSession,
+    task: MailWatchTestTask,
+    *,
+    sharepoint: SharePointProposals,
+    settings: Settings,
+) -> None:
+    """A task just created in the real Proposals list: put it in the mirror
+    now, recompute the stored standing (everybody's and the team's), and
+    publish it to the useranalytics list when publishing is on — so the next
+    tender, and anyone reading the standing, sees it without waiting for the
+    next sync. Never fails the assignment."""
+    try:
+        # After any sync in progress, and before the next: the same lock —
+        # waited for briefly, as a sync takes seconds; past that the next sync
+        # catches up instead.
+        await session.execute(text("SET LOCAL lock_timeout = '10s'"))
+        await session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": MIRROR_LOCK})
+        await session.execute(text("SET LOCAL lock_timeout = 0"))
+        created = await sharepoint.task(str(task.list_item_id))
+        people = {
+            str(created.assigned_to_lookup_id or ""): {
+                "name": task.assigned_to_name or "", "email": task.assigned_to_email or "",
+            }
+        }
+        await mirror.upsert_one(session, created, people=people)
+        team = await _team(session)
+        counted = await live.counts(session)
+        await live.recompute(session, team=None, reason="assign", counted=counted)
+        await live.recompute(session, team=team, reason="assign", counted=counted)
+        if settings.analytics_publish_enabled:
+            await publishing.publish_team(
+                session, publishing.Publisher(settings, sharepoint), team, reason="assign"
+            )
+    except Exception as exc:  # noqa: BLE001 - the next sync catches up
+        logger.warning("mail watch could not refresh the standing after %r: %s", task.title, exc)
 
 
 async def remove_from_list(
@@ -263,12 +312,16 @@ async def plan(
         end_user=(mail.customer or earlier.get("customer") or None),
         current_type=CURRENT_TYPE.get(mail.stage or ""),
         start_date=(mail.received_at or datetime.now(UTC)),
-        bcd=mail.closing_at,
+        # No closing date in the mail: today, for the assignee to correct —
+        # the BCD reminders ask them to.
+        bcd=mail.closing_at or datetime.now(UTC),
         standing=standing,
     )
     received = mail.received_at.strftime("%d %b %Y") if mail.received_at else "today"
     refs = ", ".join([*mail.reference_numbers, *([mail.ariba_doc] if mail.ariba_doc else [])])
     task.remarks = f"From the CEO's mail of {received}" + (f" ({refs})" if refs else "") + "."
+    if mail.closing_at is None:
+        task.remarks += " BCD not in the mail: set to today — please correct it."
     if choice != REAL_LIST:
         task.remarks = "TESTING — " + task.remarks
 

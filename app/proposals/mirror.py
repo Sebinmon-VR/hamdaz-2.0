@@ -259,6 +259,35 @@ def _vector_expression():
     )
 
 
+def _upsert(columns: list[str]):
+    """Insert-or-update of mirror rows with these columns, the search vector
+    worked out in the database from the same values."""
+    statement = insert(ProposalIndexItem).values(
+        {**{c: bindparam(c) for c in columns}, "search_vector": _vector_expression()}
+    )
+    return statement.on_conflict_do_update(
+        index_elements=[ProposalIndexItem.item_id],
+        set_={
+            c: getattr(statement.excluded, c)
+            for c in [*columns, "search_vector"]
+            if c != "item_id"
+        },
+    )
+
+
+async def upsert_one(
+    session: AsyncSession, task: ProposalTask, *, people: dict[str, dict[str, str]]
+) -> None:
+    """One task into the mirror now — one this app has just created, so the
+    counts see it before the next full sync, which writes the same row again.
+    ``people`` is ``{lookup id: {"name", "email"}}`` for its assignee."""
+    text_value = search_text_of(task)
+    values = _row_values(task, text_value, people)
+    values["text_hash"] = _hash(text_value)
+    await session.execute(_upsert([k for k in values if k != "notes_text"]), [values])
+    await session.flush()
+
+
 async def sync(
     session: AsyncSession,
     sharepoint: SharePointProposals,
@@ -324,18 +353,7 @@ async def sync(
         # parameter and the vector is an expression over those same
         # parameters, so the driver ships the list in batches rather than a
         # round trip per row.
-        columns = [k for k in rows[0] if k != "notes_text"]
-        statement = insert(ProposalIndexItem).values(
-            {**{c: bindparam(c) for c in columns}, "search_vector": _vector_expression()}
-        )
-        statement = statement.on_conflict_do_update(
-            index_elements=[ProposalIndexItem.item_id],
-            set_={
-                c: getattr(statement.excluded, c)
-                for c in [*columns, "search_vector"]
-                if c != "item_id"
-            },
-        )
+        statement = _upsert([k for k in rows[0] if k != "notes_text"])
         for start in range(0, len(rows), _UPSERT_BATCH):
             await session.execute(statement, rows[start : start + _UPSERT_BATCH])
 

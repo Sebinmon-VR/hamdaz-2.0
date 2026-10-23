@@ -1062,12 +1062,15 @@ def _new_tender_card(
         {**badge, "targetWidth": NARROW},
     ]
 
-    countdown = _countdown(mail.closing_at.isoformat() if mail.closing_at else None)
+    countdown = _countdown(task.bcd.isoformat() if task.bcd else None)
     bcd = (
         [_text(countdown[0], weight="Bolder", color=countdown[1], spacing="None"),
-         _text(mail.closing_at.strftime("%d %b %Y"), size="Small", isSubtle=True,
-               spacing="None")]
-        if countdown and mail.closing_at else [_text("Not given", isSubtle=True, spacing="None")]
+         _caption(
+             task.bcd.strftime("%d %b %Y") if mail.closing_at
+             else "Not in the mail — set to today, to be corrected",
+             size="Small", spacing="None",
+         )]
+        if countdown and task.bcd else [_text("Not given", isSubtle=True, spacing="None")]
     )
     why = f"Had the {(task.previous_stage or 'earlier stage').upper()}" if staged else (
         "Priority 1 in Presale"
