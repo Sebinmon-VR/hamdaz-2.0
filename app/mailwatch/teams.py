@@ -63,8 +63,29 @@ logger = logging.getLogger("hamdaz.mailwatch.teams")
 #: The only channel a post may go to: (team, channel), by display name.
 TEST_CHANNEL: Final = ("Test", "test channel")
 
+#: Where cards go (MailWatchTeams.target_kind): a team channel or a group chat.
+CHANNEL, CHAT = "channel", "chat"
+
+
+def _granted(tokens: dict[str, Any]) -> str:
+    """The scopes a token response granted, by name, for asking again."""
+    names = [s.rsplit("/", 1)[-1] for s in str(tokens.get("scope") or "").split()]
+    return " ".join(dict.fromkeys(["offline_access", *names]))
+
 #: What the connected account is asked for. Admin consent already covers it.
-SCOPES: Final = "openid profile offline_access User.Read ChannelMessage.Send"
+SCOPES: Final = (
+    "openid profile offline_access User.Read ChannelMessage.Send ChatMessage.Send Chat.ReadBasic"
+)
+
+#: What a connection made before group chats asked for. A refresh asks for
+#: what the connection was granted, so an older one keeps working unchanged.
+CHANNEL_SCOPES: Final = "openid profile offline_access User.Read ChannelMessage.Send"
+
+
+def can_chat(row: MailWatchTeams) -> bool:
+    """The connection may post to group chats (granted when connected)."""
+    granted = row.granted_scopes or ""
+    return "ChatMessage.Send" in granted and "Chat.ReadBasic" in granted
 
 #: Marks a login-state cookie as a Teams connection rather than a sign-in.
 PURPOSE: Final = "teams"
@@ -195,6 +216,7 @@ async def finish(
 
     row = await get_connection(session)
     row.refresh_token_enc = _fernet(settings).encrypt(tokens["refresh_token"].encode()).decode()
+    row.granted_scopes = _granted(tokens)
     row.account_email = (who.get("mail") or who.get("userPrincipalName") or "").lower() or None
     row.account_name = who.get("displayName")
     row.account_id = who.get("id")
@@ -212,6 +234,8 @@ async def finish(
 
 def is_test_channel(row: MailWatchTeams) -> bool:
     """Posts go to the test channel — the default, while none is chosen."""
+    if row.target_kind == CHAT and row.chat_id:
+        return False
     if not row.channel_id:
         return True
     team, channel = TEST_CHANNEL
@@ -274,6 +298,7 @@ async def choose_channel(
         raise TeamsError(f"No such channel in {team['name']}.")
     row.team_id, row.team_name = team["id"], team["name"]
     row.channel_id, row.channel_name = channel["id"], channel["name"]
+    row.target_kind = CHANNEL
 
 
 async def _resolve_channel(row: MailWatchTeams, graph: GraphMailer) -> None:
@@ -447,7 +472,7 @@ class TeamsPoster:
                 "client_secret": self._settings.azure_client_secret,
                 "grant_type": "refresh_token",
                 "refresh_token": refresh,
-                "scope": SCOPES,
+                "scope": row.granted_scopes or CHANNEL_SCOPES,
             },
         )
         if response.status_code != 200:
@@ -459,6 +484,8 @@ class TeamsPoster:
                 )
             raise TeamsError(f"Microsoft refused a Teams token ({response.status_code}).")
         payload = response.json()
+        if payload.get("scope"):
+            row.granted_scopes = _granted(payload)
         if payload.get("refresh_token"):
             row.refresh_token_enc = (
                 _fernet(self._settings).encrypt(payload["refresh_token"].encode()).decode()
@@ -467,6 +494,37 @@ class TeamsPoster:
             payload["access_token"], time.monotonic() + int(payload.get("expires_in", 3600)) - 300
         )
         return self._cached.token
+
+    async def chats(self, row: MailWatchTeams) -> list[dict[str, str]]:
+        """The connected account's group chats, by name — where cards can go
+        instead of a channel. Read as that account (Chat.ReadBasic)."""
+        if not can_chat(row):
+            raise TeamsError("Connect the account again to allow group chats.")
+        headers = {"Authorization": f"Bearer {await self._token(row)}"}
+        url: str | None = f"{GRAPH_BASE}/me/chats"
+        params: dict[str, str] | None = {
+            "$filter": "chatType eq 'group'", "$select": "id,topic,chatType", "$top": "50",
+        }
+        out: list[dict[str, str]] = []
+        while url and len(out) < 500:
+            response = await self._http.get(url, params=params, headers=headers)
+            if response.status_code != 200:
+                raise TeamsError(f"Microsoft refused the chat list ({response.status_code}).")
+            payload = response.json()
+            out += [
+                {"id": c["id"], "name": c.get("topic") or "(group chat without a name)"}
+                for c in payload.get("value", [])
+            ]
+            url, params = payload.get("@odata.nextLink"), None
+        return sorted(out, key=lambda c: c["name"].lower())
+
+    async def choose_chat(self, row: MailWatchTeams, chat_id: str) -> None:
+        """Send cards to this group chat, after checking the account is in it."""
+        chat = next((c for c in await self.chats(row) if c["id"] == chat_id), None)
+        if chat is None:
+            raise TeamsError("The connected account is not in that group chat.")
+        row.chat_id, row.chat_name = chat["id"], chat["name"]
+        row.target_kind = CHAT
 
     def can_read(self, row: MailWatchTeams) -> bool:
         """Whether this server can open the stored connection. One whose
@@ -503,10 +561,13 @@ class TeamsPoster:
     async def post(
         self, row: MailWatchTeams, content_html: str, *, card: dict | None = None
     ) -> str:
-        """Post to the chosen channel (the test channel until one is chosen);
-        the new message's id. With ``card``, the message is that Adaptive Card
-        and ``content_html`` is ignored."""
-        if not row.channel_id or not row.team_id:
+        """Post to the chosen channel or group chat (the test channel until
+        one is chosen); the new message's id. With ``card``, the message is
+        that Adaptive Card and ``content_html`` is ignored."""
+        to_chat = row.target_kind == CHAT and bool(row.chat_id)
+        if to_chat and not can_chat(row):
+            raise TeamsError("Posting to a group chat needs the account connected again.")
+        if not to_chat and (not row.channel_id or not row.team_id):
             await _resolve_channel(row, self._graph)
         if card is not None and not is_test_channel(row):
             # A real channel: no TESTING banner.
@@ -529,10 +590,12 @@ class TeamsPoster:
             }
         else:
             message = {"body": {"contentType": "html", "content": content_html}}
+        url = (
+            f"{GRAPH_BASE}/chats/{row.chat_id}/messages" if to_chat
+            else f"{GRAPH_BASE}/teams/{row.team_id}/channels/{row.channel_id}/messages"
+        )
         response = await self._http.post(
-            f"{GRAPH_BASE}/teams/{row.team_id}/channels/{row.channel_id}/messages",
-            headers={"Authorization": f"Bearer {token}"},
-            json=message,
+            url, headers={"Authorization": f"Bearer {token}"}, json=message
         )
         if response.status_code == 401:
             self._cached = None
@@ -1360,6 +1423,13 @@ def _ai_helped(mail: WatchedMail) -> bool:
     return mail.decided_by == "model" or mail.match_method == "model"
 
 
+def destination(row: MailWatchTeams) -> str:
+    """Where cards go, as a person would say it."""
+    if row.target_kind == CHAT and row.chat_id:
+        return f"the group chat {row.chat_name or ''}".strip()
+    return f"{row.team_name or TEST_CHANNEL[0]} → {row.channel_name or TEST_CHANNEL[1]}"
+
+
 def _testing_note(detail: str) -> list[dict[str, Any]]:
     """The banner at the top of a card; taken off when it is posted to a
     channel other than the test one (:meth:`TeamsPoster.post`)."""
@@ -1376,7 +1446,7 @@ def test_html(row: MailWatchTeams) -> str:
     return (
         ("<p><b>TESTING</b></p>" if is_test_channel(row) else "")
         + "<p><b>Hamdaz ERP — Teams connection test</b></p>"
-        f"<p>Posted as {_e(row.account_name)} to {_e(row.team_name)} → {_e(row.channel_name)}. "
+        f"<p>Posted as {_e(row.account_name)} to {_e(destination(row))}. "
         "Negotiation updates from the CEO's mail will appear here.</p>"
     )
 

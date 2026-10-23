@@ -197,6 +197,13 @@ class TeamsOut(BaseModel):
     test_team: str = ""
     test_channel: str = ""
     is_test_channel: bool = True
+    #: Where cards go: "channel" or "chat"; said in words.
+    target_kind: str = "channel"
+    chat_id: str | None = None
+    chat_name: str | None = None
+    destination: str = ""
+    #: The connection was granted group chats (else: connect again).
+    can_chat: bool = False
     team_name: str | None
     channel_name: str | None
     post_negotiations: bool
@@ -219,9 +226,10 @@ class TeamsIn(BaseModel):
     post_negotiations: bool | None = None
     assign_new_tenders: bool | None = None
     task_list: Literal["test", "real", "none"] | None = None
-    #: Where cards are posted: both, or neither.
+    #: Where cards are posted: a team and channel, or a group chat.
     team_id: str | None = None
     channel_id: str | None = None
+    chat_id: str | None = None
 
 
 class TestTaskOut(BaseModel):

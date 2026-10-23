@@ -219,6 +219,15 @@ class MailWatchTeams(Base, Timestamped):
     task_list: Mapped[str] = mapped_column(
         String(10), nullable=False, default="test", server_default=text("'test'")
     )
+    #: Where cards go: ``channel`` (team_id/channel_id) or ``chat`` (chat_id).
+    target_kind: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="channel", server_default=text("'channel'")
+    )
+    chat_id: Mapped[str | None] = mapped_column(String(200))
+    chat_name: Mapped[str | None] = mapped_column(String(300))
+    #: What the connected account granted, by scope name — a refresh asks for
+    #: exactly this; group chats need ChatMessage.Send and Chat.ReadBasic.
+    granted_scopes: Mapped[str | None] = mapped_column(Text)
 
 
 class MailWatchTestTask(Base, UUIDPrimaryKey, Timestamped):

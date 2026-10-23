@@ -275,6 +275,8 @@ async def _teams_out(session: AsyncSession) -> TeamsOut:
     body.connected = teams.is_connected(row)
     body.test_team, body.test_channel = teams.TEST_CHANNEL
     body.is_test_channel = teams.is_test_channel(row)
+    body.destination = teams.destination(row)
+    body.can_chat = teams.can_chat(row)
     body.posted = int(
         await session.scalar(
             select(func.count()).select_from(WatchedMail).where(WatchedMail.teams_posted_at.is_not(None))
@@ -329,7 +331,17 @@ async def teams_switch(
         row.post_negotiations = body.post_negotiations
     if body.task_list is not None:
         row.task_list = body.task_list
-    if body.team_id or body.channel_id:
+    if body.chat_id:
+        poster = _poster(request)
+        if not poster.can_read(row):
+            raise HTTPException(
+                status_code=409, detail="Connect a Teams account on this server first."
+            )
+        try:
+            await poster.choose_chat(row, body.chat_id)
+        except teams.TeamsError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    elif body.team_id or body.channel_id:
         if not (body.team_id and body.channel_id):
             raise HTTPException(status_code=400, detail="Choose both a team and a channel.")
         try:
@@ -355,6 +367,22 @@ async def list_teams(admin: SuperAdmin, request: Request) -> list[dict[str, str]
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+@router.get("/teams/chats", summary="The connected account's group chats")
+async def list_chats(
+    admin: SuperAdmin, session: Session, request: Request
+) -> list[dict[str, str]]:
+    row = await teams.get_connection(session)
+    poster = _poster(request)
+    if not poster.can_read(row):
+        raise HTTPException(status_code=409, detail="Connect a Teams account on this server first.")
+    try:
+        chats = await poster.chats(row)
+    except teams.TeamsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    await session.commit()  # a refreshed token is kept
+    return chats
+
+
 @router.get("/teams/channels", summary="One team's channels")
 async def list_channels(
     admin: SuperAdmin, request: Request, team_id: Annotated[str, Query(min_length=1)]
@@ -372,7 +400,7 @@ async def teams_disconnect(admin: SuperAdmin, session: Session) -> TeamsOut:
     return await _teams_out(session)
 
 
-@router.post("/teams/test", response_model=TeamsOut, summary="Post a test message to the locked channel")
+@router.post("/teams/test", response_model=TeamsOut, summary="Post a test message where cards go")
 async def teams_test(admin: SuperAdmin, session: Session, request: Request) -> TeamsOut:
     row = await teams.get_connection(session)
     if not teams.is_connected(row):
