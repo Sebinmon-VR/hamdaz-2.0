@@ -761,6 +761,22 @@ class SharePointProposals:
         self._users_at = time.monotonic()
         return mapping
 
+    async def ensure_user_on(self, site_url: str, email: str) -> str:
+        """A person's lookup id on another site (``https://…/sites/Test``),
+        adding them to that site's user list if they are not there yet — the
+        ids are per site, so ProposalTeam's id is no use elsewhere."""
+        response = await self._rest(
+            "POST", f"{site_url.rstrip('/')}/_api/web/ensureuser",
+            json={"logonName": f"i:0#.f|membership|{email.strip().lower()}"},
+            headers={"Content-Type": "application/json;odata=nometadata"},
+        )
+        if response.status_code != 200:
+            raise SharePointError(
+                f"SharePoint could not find {email} on {site_url} ({response.status_code}): "
+                f"{response.text[:200]}"
+            )
+        return str(response.json()["Id"])
+
     async def lookup_id_for(self, email: str) -> str | None:
         """The caller's id within this site, or None if they have never been added."""
         users = await self.site_users()

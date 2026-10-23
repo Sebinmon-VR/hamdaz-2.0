@@ -475,6 +475,21 @@ class Settings(BaseSettings):
     #: Where the browser lands after a successful sign-in, and the address the
     #: link in an approval email points at.
     frontend_url: str = "http://localhost:3000"
+    #: Where the mail watch creates the task for a new tender. The **Proposals
+    #: Test** list on the Test site — a copy of the Proposals list's columns —
+    #: while it is tested; the code refuses the real Proposals list for now.
+    #: Blank: tasks are kept only in the app's own test table.
+    mailwatch_task_site_url: str = "https://hamdaz1.sharepoint.com/sites/Test"
+    mailwatch_task_site_id: str = (
+        "hamdaz1.sharepoint.com,52e0ecb1-8055-49e9-b53e-0a09e104e909,"
+        "ba62d842-3d14-4a06-bdf5-ab56c9023b33"
+    )
+    mailwatch_task_list_id: str = "fb27f225-106f-4c8a-9925-d5b939511e05"
+    #: The logo in the footer of the Teams cards. Teams fetches it itself, so it
+    #: must be a public address — the live frontend's, not localhost.
+    teams_card_logo_url: str = (
+        "https://calm-sky-08cea4100.6.azurestaticapps.net/hamdaz-logo.png"
+    )
     #: Where the links in the overdue-task follow-up mails point. Its own
     #: setting, and production by default, because those mails reach real
     #: people from whichever backend sent them — a laptop included — and a

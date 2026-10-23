@@ -37,20 +37,23 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final
 from urllib.parse import quote, urlencode
+from zoneinfo import ZoneInfo
 
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import Request
 from fastapi.responses import RedirectResponse
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.oidc import generate_pkce_pair
-from app.core.config import Settings
+from app.core.config import Settings, get_settings
 from app.core.mail import GRAPH_BASE, GraphMailer
 from app.core.security import sign
-from app.mailwatch.classify import NEGOTIATION
-from app.models.mailwatch import MailWatchTeams, WatchedMail
+from app.mailwatch import assign
+from app.mailwatch.assign import TESTING
+from app.mailwatch.classify import NEGOTIATION, NEW_TENDER
+from app.models.mailwatch import MailWatchTeams, MailWatchTestTask, WatchedMail
 from app.proposals.sharepoint import SharePointConsentError, SharePointError, SharePointProposals
 from app.quoting.storage import DriveError, QuoteDrive
 
@@ -397,12 +400,24 @@ class TeamsPoster:
         )
         return self._cached.token
 
+    def can_read(self, row: MailWatchTeams) -> bool:
+        """Whether this server can open the stored connection. One whose
+        session secret differs (a laptop sharing the live database) can't, and
+        leaves posting to the server that made it."""
+        if not row.refresh_token_enc:
+            return False
+        try:
+            _fernet(self._settings).decrypt(row.refresh_token_enc.encode())
+        except InvalidToken:
+            return False
+        return True
+
     async def keep_alive(self, row: MailWatchTeams) -> bool:
         """Swap the refresh token for a fresh one when it has gone unused for a
         while. Microsoft drops a refresh token left unused for 90 days, and a
         quiet spell with no negotiations must not cost the connection. True
         when it was renewed."""
-        if not is_connected(row):
+        if not self.can_read(row):
             return False
         last = row.last_used_at or row.connected_at
         if last is not None and datetime.now(UTC) - last < KEEP_ALIVE_AFTER:
@@ -821,6 +836,7 @@ def _negotiation_card(
     customer = _v(mail.customer or task.get("customer"))
 
     body: list[dict[str, Any]] = [
+        *_testing_note("Posted to the test channel only; nothing is written anywhere."),
         {
             "type": "ColumnSet",
             "columns": [
@@ -960,6 +976,7 @@ def _negotiation_card(
     if tabs:
         body += _tabs(tabs)
 
+    body += _footer(ai=_ai_helped(mail))
     card: dict[str, Any] = {
         "type": "AdaptiveCard",
         "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
@@ -979,9 +996,315 @@ def _negotiation_card(
     return card
 
 
+# ── what a new-tender post says ─────────────────────────────────────
+
+
+def new_tender_card(
+    mail: WatchedMail,
+    task: MailWatchTestTask,
+    files: TaskFiles | None = None,
+    people: dict[str, dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    """The card, with as many of the earlier task's files as fit."""
+    shown = FILE_ROWS
+    while True:
+        card = _new_tender_card(mail, task, files, people, shown)
+        if shown == 0 or len(json.dumps(card, ensure_ascii=False)) <= CARD_BYTES:
+            return card
+        shown -= 1
+
+
+def _new_tender_card(
+    mail: WatchedMail,
+    task: MailWatchTestTask,
+    files: TaskFiles | None,
+    people: dict[str, dict[str, str]] | None,
+    shown: int,
+) -> dict[str, Any]:
+    """The Teams post for a new tender: the tender, who it went to and why,
+    then tabs — the task as it would go on the list, the team's standing (or,
+    on a stage change, the earlier task and its files), the mail's own
+    attachments."""
+    files = files or TaskFiles()
+    people = people or {}
+    earlier = mail.task or {}
+    staged = task.action == "stage_change"
+    customer = _v(mail.customer or task.end_user)
+    refs = " · ".join([*mail.reference_numbers, *([mail.ariba_doc] if mail.ariba_doc else [])])
+    stage = (mail.stage or "").upper() or "Tender"
+    badge = (
+        _badge(f"{(task.previous_stage or '?').upper()} → {stage}", icon="ArrowUp",
+               style="Warning")
+        if staged else _badge("New task", icon="AddCircle", style="Good")
+    )
+
+    body: list[dict[str, Any]] = [
+        *_testing_note(
+            "Posted to the test channel. The task is created in the real Proposals list."
+            if _in_real_list(task) else
+            "The task is created in the Proposals Test list (Test site), not the real list."
+            if task.list_item_id else
+            "The task is kept in the app only, not written to any list."
+        ),
+        {
+            "type": "ColumnSet", "spacing": "Small",
+            "columns": [
+                {
+                    "type": "Column", "width": "stretch",
+                    "items": [
+                        _text(_v(mail.title or task.title), size="Large", weight="Bolder"),
+                        _caption(f"{customer} · {refs or 'no reference'}", spacing="None"),
+                    ],
+                },
+                {"type": "Column", "width": "auto", "targetWidth": WIDE, "items": [badge]},
+            ],
+        },
+        {**badge, "targetWidth": NARROW},
+    ]
+
+    countdown = _countdown(mail.closing_at.isoformat() if mail.closing_at else None)
+    bcd = (
+        [_text(countdown[0], weight="Bolder", color=countdown[1], spacing="None"),
+         _text(mail.closing_at.strftime("%d %b %Y"), size="Small", isSubtle=True,
+               spacing="None")]
+        if countdown and mail.closing_at else [_text("Not given", isSubtle=True, spacing="None")]
+    )
+    why = f"Had the {(task.previous_stage or 'earlier stage').upper()}" if staged else (
+        "Priority 1 in Presale"
+    )
+    body += _facts([
+        ("Assigned to", [_persona(people.get((task.assigned_to_email or "").lower()),
+                                  task.assigned_to_name)]),
+        ("Why", [_with_icon(
+            _icon("History" if staged else "Trophy", color="Accent"),
+            _text(why, weight="Bolder"), spacing="None",
+        )]),
+        ("Type", [_text(_v(task.current_type or stage), weight="Bolder", spacing="None")]),
+        ("BCD", bcd),
+    ])
+
+    note, ask, _ = ask_of(mail.body)
+    when = mail.received_at.strftime("%d %b, %H:%M") if mail.received_at else ""
+    kind = {"invitation": "Invitation", "release": "Tender release"}.get(mail.kind or "", "Mail")
+    body.append(
+        {
+            "type": "ColumnSet", "separator": True, "spacing": "Medium",
+            "columns": [
+                {"type": "Column", "width": "auto", "verticalContentAlignment": "Center",
+                 "items": [_icon("Mail", size="Medium", color="Accent")]},
+                {
+                    "type": "Column", "width": "stretch", "spacing": "Small",
+                    "items": [
+                        _text(customer, weight="Bolder"),
+                        _caption(f"{kind} · {when} UTC", size="Small", spacing="None"),
+                    ],
+                },
+                {"type": "Column", "width": "auto", "verticalContentAlignment": "Center",
+                 "items": [_toggle(True), _toggle(False)]},
+            ],
+        }
+    )
+    message = ask or (mail.subject or "")
+    body += [
+        _text(message, id="ask-short", maxLines=3),
+        _text(message, id="ask-full", isVisible=False),
+    ]
+    if note:
+        body.append(
+            {
+                "type": "Container", "style": "warning", "spacing": "Medium",
+                "items": [_text("Note from the CEO", weight="Bolder", size="Small"),
+                          _text(note, spacing="Small")],
+            }
+        )
+
+    tabs: list[tuple[str, str, str, list[dict[str, Any]]]] = []
+    tabs.append(("task", "Task", "TaskListLtr", [
+        _caption(
+            f"Created in the {_list_name(task)} list (item {task.list_item_id}):"
+            if task.list_item_id else "As it would be created on the Proposals list:",
+            size="Small",
+        ),
+        {
+            "type": "FactSet", "spacing": "Small",
+            "facts": [
+                {"title": "Title", "value": task.title},
+                {"title": "Assigned To", "value": _v(task.assigned_to_name)},
+                {"title": "Status", "value": _v(task.status)},
+                {"title": "CurrentType", "value": _v(task.current_type)},
+                {"title": "End User", "value": _v(task.end_user)},
+                {"title": "Start Date", "value": _v(task.start_date and
+                                                    task.start_date.strftime("%d %b %Y"))},
+                {"title": "BCD UAE Time", "value": _v(task.bcd and task.bcd.astimezone(
+                    ZoneInfo("Asia/Dubai")).strftime("%d %b %Y %H:%M"))},
+                {"title": "Remarks", "value": _v(task.remarks)},
+            ],
+        },
+    ]))
+
+    if staged:
+        facts = [
+            {"title": "Task", "value": _v(task.previous_title)},
+            {"title": "Assigned to", "value": _v(earlier.get("assignee"))},
+            {"title": "Status", "value": _v(earlier.get("status"))
+             + (f" · {earlier['submission_status']}" if earlier.get("submission_status") else "")},
+            {"title": "Stage", "value": _v((task.previous_stage or "").upper())},
+            {"title": "Quote no.", "value": _v(earlier.get("quote_no"))},
+            {"title": "Created", "value": _day(earlier.get("created_at"))},
+        ]
+        panel: list[dict[str, Any]] = [
+            _text(task.assign_reason, isSubtle=True),
+            {"type": "FactSet", "spacing": "Small", "facts": facts},
+        ]
+        if files.files:
+            panel += [_heading(f"Its files ({len(files.files)})"), *_file_grid(files.files, shown)]
+        elif files.attachments_hidden:
+            panel.append(_caption("It has attachments — open the task to see them.",
+                                  size="Small"))
+        tabs.append(("earlier", "Earlier task", "History", panel))
+    else:
+        rows: list[dict[str, Any]] = [_text(task.assign_reason, isSubtle=True)]
+        rows += [_standing_row(person) for person in task.standing]
+        tabs.append(("standing", "Presale standing", "People", rows))
+
+    if mail.attachment_names:
+        tabs.append(("mail-files", f"Mail attachments ({len(mail.attachment_names)})", "Attach", [
+            _with_icon(_icon(_FILE_ICONS.get(n.rpartition(".")[2].lower(), "Document"),
+                             color="Accent", filled=False), _text(n), spacing="Small")
+            for n in mail.attachment_names[:15]
+        ]))
+    body += _tabs(tabs)
+
+    body += _footer(ai=_ai_helped(mail))
+    card: dict[str, Any] = {
+        "type": "AdaptiveCard",
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "version": "1.5",
+        "msteams": {"width": "Full"},
+        "body": body,
+    }
+    links = []
+    if task.list_item_url:
+        links.append({"type": "Action.OpenUrl", "title": f"Open in {_list_name(task)}",
+                      "url": task.list_item_url, "iconUrl": "icon:Open"})
+    if staged and earlier.get("url"):
+        links.append({"type": "Action.OpenUrl", "title": "Open earlier task",
+                      "url": earlier["url"], "iconUrl": "icon:History"})
+    if links:
+        card["actions"] = links
+    return card
+
+
+def _standing_row(person: dict[str, Any]) -> dict[str, Any]:
+    """One person in the team's standing: rank, name and labels, and what
+    shapes their share — open work, capacity, the ceiling on open tasks."""
+    first = person.get("rank") == 1
+    labels = person.get("labels") or []
+    capacity = person.get("capacity")
+    limit = person.get("limit")
+    share = (f"Capacity {capacity:g}" if capacity is not None else "Capacity —") + " · " + (
+        f"Limit {limit} open" if limit is not None else "No limit"
+    )
+    tags: dict[str, Any] = (
+        {
+            "type": "ColumnSet", "spacing": "Small",
+            "columns": [
+                {"type": "Column", "width": "auto", "spacing": "Small", "items": [{
+                    "type": "Badge", "text": label, "size": "Medium", "shape": "Rounded",
+                    "style": "Informative", "appearance": "Tint",
+                    "fallback": _caption(label, size="Small"),
+                }]}
+                for label in labels[:4]
+            ],
+        }
+        if labels else _caption("No labels", size="Small", spacing="None")
+    )
+    return {
+        "type": "Container", "spacing": "Small", "roundedCorners": True,
+        "style": "emphasis" if first else "default",
+        "items": [{
+            "type": "ColumnSet",
+            "columns": [
+                {"type": "Column", "width": "auto", "verticalContentAlignment": "Center",
+                 "items": [_text(f"#{person.get('rank')}", size="Medium", weight="Bolder",
+                                 color="Good" if first else "Default")]},
+                {"type": "Column", "width": "stretch", "verticalContentAlignment": "Center",
+                 "items": [_text(_v(person.get("name")), weight="Bolder"), tags]},
+                {"type": "Column", "width": "auto", "verticalContentAlignment": "Center",
+                 "items": [
+                     _text(f"{person.get('active', 0)} active · {person.get('open', 0)} open",
+                           size="Small", horizontalAlignment="Right"),
+                     _caption(share, size="Small", spacing="None", horizontalAlignment="Right"),
+                 ]},
+            ],
+        }],
+    }
+
+
+def _footer(*, ai: bool) -> list[dict[str, Any]]:
+    """The note at the foot of every card: who sent it — the app, not a
+    person — with the logo, and whether a model had a hand in it."""
+    badge = (
+        {"type": "Badge", "text": "AI-assisted", "icon": "Sparkle", "size": "Medium",
+         "shape": "Rounded", "style": "Informative", "appearance": "Tint",
+         "fallback": _caption("AI-assisted", size="Small")}
+        if ai else
+        {"type": "Badge", "text": "Automated", "icon": "Bot", "size": "Medium",
+         "shape": "Rounded", "style": "Subtle", "appearance": "Tint",
+         "fallback": _caption("Automated", size="Small")}
+    )
+    note = (
+        "AI-generated message from **Hamdaz ERP**. Please check before acting on it."
+        if ai else "Automated message from **Hamdaz ERP**."
+    )
+    return [{
+        "type": "Container", "separator": True, "spacing": "Large",
+        "items": [{
+            "type": "ColumnSet",
+            "columns": [
+                {"type": "Column", "width": "auto", "verticalContentAlignment": "Center",
+                 "items": [{"type": "Image", "url": get_settings().teams_card_logo_url,
+                            "width": "32px", "altText": "Hamdaz"}]},
+                {"type": "Column", "width": "stretch", "verticalContentAlignment": "Center",
+                 "spacing": "Small",
+                 "items": [_caption(note, size="Small")]},
+                {"type": "Column", "width": "auto", "verticalContentAlignment": "Center",
+                 "items": [badge]},
+            ],
+        }],
+    }]
+
+
+def _in_real_list(task: MailWatchTestTask) -> bool:
+    return bool(task.list_id) and task.list_id == get_settings().sharepoint_proposals_list_id
+
+
+def _list_name(task: MailWatchTestTask) -> str:
+    return "Proposals" if _in_real_list(task) else "Proposals Test"
+
+
+def _ai_helped(mail: WatchedMail) -> bool:
+    """Whether a model read the mail or picked its task."""
+    return mail.decided_by == "model" or mail.match_method == "model"
+
+
+def _testing_note(detail: str) -> list[dict[str, Any]]:
+    """The banner at the top of every card while :data:`TESTING` is on."""
+    if not TESTING:
+        return []
+    return [{
+        "type": "Container", "style": "warning", "bleed": True,
+        "items": [_with_icon(
+            _icon("Beaker", color="Warning"),
+            _text(f"**TESTING** — {detail}", size="Small"),
+        )],
+    }]
+
+
 def test_html(row: MailWatchTeams) -> str:
     return (
-        "<p><b>Hamdaz ERP — Teams connection test</b></p>"
+        ("<p><b>TESTING</b></p>" if TESTING else "")
+        + "<p><b>Hamdaz ERP — Teams connection test</b></p>"
         f"<p>Posted as {_e(row.account_name)} to {_e(row.team_name)} → {_e(row.channel_name)}. "
         "Negotiation updates from the CEO's mail will appear here.</p>"
     )
@@ -990,17 +1313,32 @@ def test_html(row: MailWatchTeams) -> str:
 async def post_mail(
     session: AsyncSession, mail: WatchedMail, *, poster: TeamsPoster, settings: Settings
 ) -> str:
-    """Post one negotiation mail now, and record it on the mail."""
+    """Post one mail's card now — a negotiation, or a new tender with its
+    test task — and record it on the mail."""
     row = await get_connection(session)
     if not is_connected(row):
         raise TeamsError("No Teams account is connected.")
-    if mail.category != NEGOTIATION:
-        raise TeamsError("Only negotiation mails are posted to Teams.")
+    test_task = None
+    if mail.category == NEW_TENDER:
+        test_task = await assign.test_task_of(session, mail)
+        if test_task is None:
+            raise TeamsError("This new tender has no task assigned yet.")
+    elif mail.category != NEGOTIATION:
+        raise TeamsError("Only negotiations and assigned new tenders are posted to Teams.")
     mail.teams_attempts = (mail.teams_attempts or 0) + 1
     try:
-        files = await poster.task_files(mail.task) if mail.task else None
-        people = await poster.people([(mail.task or {}).get("assignee_email") or ""])
-        message_id = await poster.post(row, "", card=negotiation_card(mail, files, people))
+        if test_task is not None:
+            files = (
+                await poster.task_files(mail.task)
+                if mail.task and test_task.action == "stage_change" else None
+            )
+            people = await poster.people([test_task.assigned_to_email or ""])
+            card = new_tender_card(mail, test_task, files, people)
+        else:
+            files = await poster.task_files(mail.task) if mail.task else None
+            people = await poster.people([(mail.task or {}).get("assignee_email") or ""])
+            card = negotiation_card(mail, files, people)
+        message_id = await poster.post(row, "", card=card)
     except TeamsError as exc:
         mail.teams_error = str(exc)[:500]
         row.last_error = str(exc)[:500]
@@ -1012,19 +1350,33 @@ async def post_mail(
 
 
 async def post_pending(session: AsyncSession, *, poster: TeamsPoster, settings: Settings) -> int:
-    """Post the negotiation mails not yet posted, received since posting was
-    switched on. Locked row by row, so two instances never post one twice."""
+    """Post what is due and not yet posted: negotiations received since their
+    posting was switched on, and new tenders given a task since assigning was.
+    Locked row by row, so two instances never post one twice."""
     row = await get_connection(session)
-    if not row.post_negotiations or not is_connected(row) or row.posting_from is None:
+    if not poster.can_read(row):
+        # Not connected, or connected on another server: posting is theirs.
+        return 0
+    due = []
+    if row.post_negotiations and row.posting_from is not None:
+        due.append(and_(
+            WatchedMail.category == NEGOTIATION, WatchedMail.received_at >= row.posting_from
+        ))
+    if row.assign_new_tenders and row.assign_from is not None:
+        due.append(and_(
+            WatchedMail.category == NEW_TENDER,
+            WatchedMail.received_at >= row.assign_from,
+            WatchedMail.id.in_(select(MailWatchTestTask.mail_id)),
+        ))
+    if not due:
         return 0
     mails = (
         await session.scalars(
             select(WatchedMail)
             .where(
-                WatchedMail.category == NEGOTIATION,
+                or_(*due),
                 WatchedMail.teams_posted_at.is_(None),
                 WatchedMail.teams_attempts < MAX_ATTEMPTS,
-                WatchedMail.received_at >= row.posting_from,
             )
             .order_by(WatchedMail.received_at.asc())
             .limit(10)

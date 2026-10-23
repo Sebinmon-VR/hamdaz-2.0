@@ -22,7 +22,7 @@ from app.auth.deps import CurrentUser
 from app.auth.router import LOGIN_STATE_AUDIENCE
 from app.core.config import Settings, get_settings
 from app.core.db import get_session
-from app.mailwatch import matching, service, teams
+from app.mailwatch import assign, matching, service, teams
 from app.mailwatch.classify import CATEGORIES, NEGOTIATION, NEW_TENDER, SURE, Reading
 from app.mailwatch.classify import references as refs_in
 from app.mailwatch.schemas import (
@@ -35,13 +35,14 @@ from app.mailwatch.schemas import (
     SearchIn,
     TeamsIn,
     TeamsOut,
+    TestTaskOut,
     TrialIn,
     TrialOut,
     TrialRowOut,
     WatchedMailDetailOut,
     WatchedMailOut,
 )
-from app.models.mailwatch import WatchedMail
+from app.models.mailwatch import MailWatchTestTask, WatchedMail
 from app.models.user import User
 from app.roles.catalogue import SUPER_ADMIN
 from app.roles.deps import CurrentRoles
@@ -187,6 +188,11 @@ async def catch_up(admin: SuperAdmin, session: Session, request: Request) -> Rea
         session, reader=_reader(request), model=_model(request), sharepoint=_sharepoint(request)
     )
     await session.commit()
+    # New tenders get their test task (once assigning is on), as on a live pass.
+    await assign.create_pending(
+        session, settings=get_settings(), sharepoint=_sharepoint(request)
+    )
+    await session.commit()
     await teams.post_pending(session, poster=_poster(request), settings=get_settings())
     await session.commit()
     return ReadReportOut(**report.as_dict())
@@ -274,6 +280,15 @@ async def _teams_out(session: AsyncSession) -> TeamsOut:
         )
         or 0
     )
+    body.test_tasks = int(
+        await session.scalar(select(func.count()).select_from(MailWatchTestTask)) or 0
+    )
+    config = get_settings()
+    body.task_lists = [
+        {"key": key, "name": target.name, "url": target.list_url}
+        for key in (assign.TEST_LIST, assign.REAL_LIST)
+        if (target := assign.list_target(config, key)) is not None
+    ]
     return body
 
 
@@ -302,12 +317,20 @@ async def teams_connect(admin: SuperAdmin, config: Config):
 @router.patch("/teams", response_model=TeamsOut, summary="Switch negotiation posts on or off")
 async def teams_switch(body: TeamsIn, admin: SuperAdmin, session: Session) -> TeamsOut:
     row = await teams.get_connection(session)
-    if body.post_negotiations and not teams.is_connected(row):
-        raise HTTPException(status_code=400, detail="Connect a Teams account first.")
-    if body.post_negotiations and not row.post_negotiations:
-        # From now on: switching on never posts the backlog.
-        row.posting_from = datetime.now(UTC)
-    row.post_negotiations = body.post_negotiations
+    if body.post_negotiations is not None:
+        if body.post_negotiations and not teams.is_connected(row):
+            raise HTTPException(status_code=400, detail="Connect a Teams account first.")
+        if body.post_negotiations and not row.post_negotiations:
+            # From now on: switching on never posts the backlog.
+            row.posting_from = datetime.now(UTC)
+        row.post_negotiations = body.post_negotiations
+    if body.task_list is not None:
+        row.task_list = body.task_list
+    if body.assign_new_tenders is not None:
+        # Test tasks need no Teams account; the cards wait for one.
+        if body.assign_new_tenders and not row.assign_new_tenders:
+            row.assign_from = datetime.now(UTC)
+        row.assign_new_tenders = body.assign_new_tenders
     await session.commit()
     return await _teams_out(session)
 
@@ -353,6 +376,82 @@ async def post_mail_to_teams(
     await session.commit()
     await session.refresh(mail)
     return WatchedMailDetailOut.model_validate(mail)
+
+
+def _test_task_out(task: MailWatchTestTask, mail: WatchedMail | None) -> TestTaskOut:
+    out = TestTaskOut.model_validate(task)
+    if mail is not None:
+        out.subject, out.received_at = mail.subject, mail.received_at
+        out.teams_posted_at, out.teams_error = mail.teams_posted_at, mail.teams_error
+    return out
+
+
+@router.get(
+    "/test-tasks",
+    response_model=list[TestTaskOut],
+    summary="Tasks new tenders would have created on the Proposals list (the test list)",
+)
+async def list_test_tasks(
+    admin: SuperAdmin, session: Session, limit: Annotated[int, Query(ge=1, le=200)] = 50
+) -> list[TestTaskOut]:
+    rows = (
+        await session.execute(
+            select(MailWatchTestTask, WatchedMail)
+            .join(WatchedMail, WatchedMail.id == MailWatchTestTask.mail_id)
+            .order_by(MailWatchTestTask.created_at.desc())
+            .limit(limit)
+        )
+    ).all()
+    return [_test_task_out(task, mail) for task, mail in rows]
+
+
+@router.post(
+    "/mails/{mail_id}/assign",
+    response_model=TestTaskOut,
+    summary="Assign this new tender now and keep its task in the test list",
+)
+async def assign_mail(
+    mail_id: uuid.UUID, admin: SuperAdmin, session: Session, config: Config, request: Request
+) -> TestTaskOut:
+    """For trying it on a mail by hand, switch or no switch. Writes the test
+    list only — never the Proposals list."""
+    mail = await session.get(WatchedMail, mail_id)
+    if mail is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such mail.")
+    try:
+        task = await assign.create(
+            session, mail, settings=config, sharepoint=_sharepoint(request)
+        )
+    except assign.AssignError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await session.commit()
+    return _test_task_out(task, mail)
+
+
+@router.delete(
+    "/test-tasks/{task_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Remove a task from the test list (so its mail can be assigned again)",
+)
+async def delete_test_task(
+    task_id: uuid.UUID, admin: SuperAdmin, session: Session, config: Config, request: Request
+) -> Response:
+    """Its item in the Proposals Test list goes too."""
+    task = await session.get(MailWatchTestTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such test task.")
+    sharepoint = _sharepoint(request)
+    if sharepoint is not None:
+        try:
+            # From the test list only; an item in the real list stays.
+            await assign.remove_from_list(task, sharepoint=sharepoint, settings=config)
+        except Exception as exc:  # noqa: BLE001 - say so, keep the row
+            raise HTTPException(
+                status_code=502, detail=f"Could not remove it from the test list: {exc}"
+            ) from exc
+    await session.delete(task)
+    await session.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/mails", response_model=list[WatchedMailOut], summary="Mails kept, newest first")

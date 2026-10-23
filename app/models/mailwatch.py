@@ -205,3 +205,78 @@ class MailWatchTeams(Base, Timestamped):
     channel_name: Mapped[str | None] = mapped_column(String(200))
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error: Mapped[str | None] = mapped_column(Text)
+
+    #: New tenders: assign each (priority 1 of the team, or the earlier
+    #: assignee on a stage change), keep the task in the test list, post the
+    #: card. Off until switched on; only mail received from ``assign_from``.
+    assign_new_tenders: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    assign_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: Where a new tender's task is created: ``test`` (the Proposals Test list
+    #: on the Test site), ``real`` (the Proposals list) or ``none`` (kept in
+    #: the app only). Chosen on the Mail watch page; test until changed.
+    task_list: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="test", server_default=text("'test'")
+    )
+
+
+class MailWatchTestTask(Base, UUIDPrimaryKey, Timestamped):
+    """A task the mail watch would create on the Proposals list, kept here
+    instead while it is tested — the Proposals list is not written.
+
+    One per mail. The columns are the list's own (internal names in the
+    comments), and ``fields`` is the exact payload a create would send, so
+    going live is a matter of sending it.
+    """
+
+    __tablename__ = "mailwatch_test_tasks"
+    __table_args__ = (UniqueConstraint("mail_id", name="uq_mailwatch_test_tasks_mail"),)
+
+    mail_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("watched_mails.id", ondelete="CASCADE"), nullable=False
+    )
+    #: ``new`` (priority 1 of the team) or ``stage_change`` (the earlier assignee).
+    action: Mapped[str] = mapped_column(String(20), nullable=False)
+
+    # ── the Proposals list's columns ──
+    title: Mapped[str] = mapped_column(Text, nullable=False)  # Title
+    assigned_to_name: Mapped[str | None] = mapped_column(String(200))  # AssignedTo
+    assigned_to_email: Mapped[str | None] = mapped_column(String(320))
+    assigned_to_lookup_id: Mapped[str | None] = mapped_column(String(20))  # AssignedToLookupId
+    priority: Mapped[str | None] = mapped_column(String(20))  # Priority
+    start_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # StartDate
+    due_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # DueDate
+    bcd: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # BCD
+    status: Mapped[str | None] = mapped_column(String(40))  # Status
+    end_user: Mapped[str | None] = mapped_column(String(300))  # EndUser
+    submission_status: Mapped[str | None] = mapped_column(String(40))  # SubmissionStatus
+    quote_no: Mapped[str | None] = mapped_column(String(100))  # zohpquoteno
+    current_type: Mapped[str | None] = mapped_column(String(20))  # CurrentType
+    remarks: Mapped[str | None] = mapped_column(Text)  # Remarks
+    order_status: Mapped[str | None] = mapped_column(String(40))  # OrderStatus
+    negotiation: Mapped[str | None] = mapped_column(String(10))  # Negotiation
+    negotiation_notes: Mapped[str | None] = mapped_column(Text)  # NegotiationNotes
+    dev_notes: Mapped[str | None] = mapped_column(Text)  # devnotes
+    previous_owner: Mapped[str | None] = mapped_column(String(200))  # PreviousOwner
+    working_notes: Mapped[str | None] = mapped_column(Text)  # WorkingNotes
+    followup: Mapped[str | None] = mapped_column(String(10))  # Followup
+    #: The create payload, by internal name, as it would be sent.
+    fields: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+
+    # ── why it went to whom ──
+    assign_reason: Mapped[str] = mapped_column(Text, nullable=False)
+    #: The team's standing when it was assigned: [{rank, name, email, active, open}].
+    standing: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
+    #: On a stage change, the task the earlier stage was on.
+    previous_item_id: Mapped[str | None] = mapped_column(String(64))
+    previous_title: Mapped[str | None] = mapped_column(Text)
+    previous_stage: Mapped[str | None] = mapped_column(String(20))
+
+    # ── the item made in the Proposals Test list (settings.mailwatch_task_list_id) ──
+    #: Which list the item was made in (its id) — so removing a test task
+    #: deletes an item only from the test list, never from the real one.
+    list_id: Mapped[str | None] = mapped_column(String(64))
+    list_item_id: Mapped[str | None] = mapped_column(String(20))
+    list_item_url: Mapped[str | None] = mapped_column(Text)
+    list_error: Mapped[str | None] = mapped_column(Text)

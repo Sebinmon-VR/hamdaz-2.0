@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.agents.model import AgentModel
 from app.core.config import Settings
 from app.intake.graph_mail import MailReader
-from app.mailwatch import service, teams
+from app.mailwatch import assign, service, teams
 from app.proposals.sharepoint import SharePointProposals
 
 logger = logging.getLogger("hamdaz.mailwatch.worker")
@@ -147,7 +147,14 @@ class MailWatchWorker:
                     if report.error:
                         logger.warning("mail watch read: %s", report.error)
                 await session.commit()
-                if read and self._poster is not None:
+                # On every pass, the hourly one included: the mail may have
+                # been read by another instance, or before a restart.
+                # A test task for each new tender, once assigning is on.
+                await assign.create_pending(
+                    session, settings=self._settings, sharepoint=self._sharepoint
+                )
+                await session.commit()
+                if self._poster is not None:
                     # After the commit, so a post never names a mail that
                     # was then rolled back; rows are locked one by one.
                     await teams.post_pending(

@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -200,10 +200,59 @@ class TeamsOut(BaseModel):
     channel_name: str | None
     post_negotiations: bool
     posting_from: datetime | None
+    assign_new_tenders: bool
+    assign_from: datetime | None
+    #: Where new tenders' tasks are created: test / real / none.
+    task_list: str = "test"
+    #: The lists that choice can name, with their links: [{key, name, url}].
+    task_lists: list[dict[str, str]] = []
     last_used_at: datetime | None
     last_error: str | None
     posted: int = 0
+    test_tasks: int = 0
 
 
 class TeamsIn(BaseModel):
-    post_negotiations: bool
+    """Either switch, or both; one left out stays as it is."""
+
+    post_negotiations: bool | None = None
+    assign_new_tenders: bool | None = None
+    task_list: Literal["test", "real", "none"] | None = None
+
+
+class TestTaskOut(BaseModel):
+    """A task the mail watch would have created on the Proposals list."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    mail_id: uuid.UUID
+    action: str
+    title: str
+    assigned_to_name: str | None
+    assigned_to_email: str | None
+    assigned_to_lookup_id: str | None
+    status: str | None
+    current_type: str | None
+    end_user: str | None
+    start_date: datetime | None
+    bcd: datetime | None
+    remarks: str | None
+    previous_owner: str | None
+    fields: dict[str, Any]
+    assign_reason: str
+    standing: list[dict[str, Any]]
+    previous_item_id: str | None
+    previous_title: str | None
+    previous_stage: str | None
+    #: The item made for it — in the list ``list_id`` — or why there is none.
+    list_id: str | None = None
+    list_item_id: str | None = None
+    list_item_url: str | None = None
+    list_error: str | None = None
+    created_at: datetime
+    #: From the mail.
+    subject: str | None = None
+    received_at: datetime | None = None
+    teams_posted_at: datetime | None = None
+    teams_error: str | None = None
