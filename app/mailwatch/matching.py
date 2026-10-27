@@ -30,6 +30,7 @@ negotiation: **existing** with the task's details, **not found**, or unsure.
 from __future__ import annotations
 
 import logging
+import math
 import re
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -65,6 +66,9 @@ LEAD: Final = 0.1
 #: …and no other row may score this well: two good rows are usually one
 #: requirement at two stages (the EOI and the RFT), and the newer is wanted.
 RIVAL: Final = 0.65
+#: The model's "none of these" is taken at this confidence when the mail's
+#: tender numbers are on no task (otherwise it must be 0.7, as a pick).
+NONE_BAR_NO_NUMBER: Final = 0.6
 
 #: Earlier stages first. A task at a lower rank than the mail is a stage change.
 STAGE_RANK: Final = {
@@ -136,14 +140,33 @@ def _customer_key(value: str | None) -> str:
     return re.sub(r"[^a-z]", "", v)[:20]
 
 
-def title_score(query: str, row_title: str) -> float:
-    """How alike two titles are, 0 to 1, on their meaningful words."""
+def word_weights(query: str, titles: list[str]) -> dict[str, float]:
+    """How much each of the query's words counts, from how many of the candidate
+    titles carry it. A word most titles share ("services") says little; one only
+    this mail has ("ayp") says a lot. A word no title carries counts as rare."""
+    rows = len(titles) or 1
+    carried = [set(words(t)) for t in titles]
+    return {
+        w: math.log(1 + rows / max(1, sum(w in c for c in carried)))
+        for w in set(words(query))
+    }
+
+
+def title_score(query: str, row_title: str, weights: dict[str, float] | None = None) -> float:
+    """How alike two titles are, 0 to 1, on their meaningful words. ``weights``
+    (see :func:`word_weights`) make the shared distinctive words count for more;
+    without them every word counts the same."""
     a, b = set(words(query)), set(words(row_title))
     if not a or not b:
         return 0.0
-    shared = len(a & b)
-    containment = shared / min(len(a), len(b))
-    jaccard = shared / len(a | b)
+    w = weights or {}
+
+    def mass(s: set[str]) -> float:
+        return sum(w.get(x, 1.0) for x in s)
+
+    shared = mass(a & b)
+    containment = shared / min(mass(a), mass(b))
+    jaccard = shared / mass(a | b)
     ratio = SequenceMatcher(None, " ".join(sorted(a)), " ".join(sorted(b))).ratio()
     return round(0.5 * containment + 0.25 * jaccard + 0.25 * ratio, 3)
 
@@ -168,11 +191,18 @@ def _refs(references: list[str]) -> tuple[list[str], list[str]]:
     return list(dict.fromkeys(tender)), list(dict.fromkeys(pr))
 
 
-def _live_rows():
-    return select(ProposalIndexItem).where(ProposalIndexItem.deleted.is_(False))
+def _live_rows(as_of: datetime | None = None):
+    """Rows not deleted; with ``as_of``, only those created by then (a replay
+    of an old mail sees the list as it stood when the mail came)."""
+    query = select(ProposalIndexItem).where(ProposalIndexItem.deleted.is_(False))
+    if as_of is not None:
+        query = query.where(ProposalIndexItem.sp_created_at <= as_of)
+    return query
 
 
-async def by_number(session: AsyncSession, numbers: list[str]) -> list[ProposalIndexItem]:
+async def by_number(
+    session: AsyncSession, numbers: list[str], *, as_of: datetime | None = None
+) -> list[ProposalIndexItem]:
     """Rows carrying any of these numbers as a whole number, newest first."""
     if not numbers:
         return []
@@ -186,14 +216,15 @@ async def by_number(session: AsyncSession, numbers: list[str]) -> list[ProposalI
             ProposalIndexItem.working_notes.op("~")(pattern),
         ]
     rows = await session.scalars(
-        _live_rows().where(or_(*conditions))
+        _live_rows(as_of).where(or_(*conditions))
         .order_by(ProposalIndexItem.sp_created_at.desc().nulls_last()).limit(10)
     )
     return list(rows.all())
 
 
 async def by_words(
-    session: AsyncSession, query: str, *, customer: str | None, numbers: set[str]
+    session: AsyncSession, query: str, *, customer: str | None, numbers: set[str],
+    as_of: datetime | None = None,
 ) -> list[Candidate]:
     """The rows whose titles are most like ``query``, scored, best first."""
     tokens = list(dict.fromkeys(words(query)))
@@ -202,16 +233,17 @@ async def by_words(
     tsquery = func.to_tsquery(text("'english'::regconfig"), " | ".join(tokens))
     rows = (
         await session.scalars(
-            _live_rows()
+            _live_rows(as_of)
             .where(ProposalIndexItem.search_vector.op("@@")(tsquery))
             .order_by(func.ts_rank(ProposalIndexItem.search_vector, tsquery).desc())
             .limit(30)
         )
     ).all()
     want = _customer_key(customer)
+    weights = word_weights(query, [row.title or "" for row in rows])
     out: list[Candidate] = []
     for row in rows:
-        score = title_score(query, row.title)
+        score = title_score(query, row.title, weights)
         why = [f"words {score:.2f}"]
         if want and want == _customer_key(row.end_user):
             score += 0.05
@@ -278,7 +310,13 @@ between stages (an EOI becomes an RFQ or RFT with a new number), and different
 tenders can have near-identical titles (two separate RFQs for "belts and
 pulleys"). Pick a task only when it is clearly the same requirement from the
 same customer; otherwise answer -1. When several tasks are the same
-requirement at different stages, pick the most recently created one."""
+requirement at different stages, pick the most recently created one.
+
+Look at each task's scope, not only its words. Two tenders from one customer
+with shared words ("Managed Services") are usually different work: an ERP
+programme is not a digital screens rollout. A different reference number is
+a different tender, unless the stage change explains it. When every task is a
+different piece of work, answer -1 with high confidence."""
 
 PICK_SCHEMA: Final[dict[str, Any]] = {
     "type": "object",
@@ -388,8 +426,10 @@ async def match(
     sharepoint: SharePointProposals | None,
     model: AgentModel | None,
     use_model: bool,
+    as_of: datetime | None = None,
 ) -> Match | None:
-    """The verdict for one mail, or None for a category that is not matched."""
+    """The verdict for one mail, or None for a category that is not matched.
+    ``as_of`` (replays only) limits the list to what existed by then."""
     if category not in (NEW_TENDER, NEGOTIATION):
         return None
     tender_numbers, pr_numbers = _refs(references)
@@ -406,7 +446,10 @@ async def match(
         )
 
     if found is None:
-        rows = await by_number(session, tender_numbers) or await by_number(session, pr_numbers)
+        rows = (
+            await by_number(session, tender_numbers, as_of=as_of)
+            or await by_number(session, pr_numbers, as_of=as_of)
+        )
         if rows:
             which = "tender number" if tender_numbers else "PR number"
             candidates = [_candidate(r, 1.0, f"same {which}") for r in rows[:5]]
@@ -418,10 +461,13 @@ async def match(
                 candidates=candidates,
             )
 
+    # The mail names its tender, and no task on the list carries that number.
+    numbers_missing = bool(tender_numbers) and found is None
+
     if found is None:
         query = title or subject or ""
         candidates = await by_words(
-            session, query, customer=customer, numbers=set(tender_numbers)
+            session, query, customer=customer, numbers=set(tender_numbers), as_of=as_of
         )
         best = candidates[0] if candidates else None
         second = candidates[1].score if len(candidates) > 1 else 0.0
@@ -440,16 +486,24 @@ async def match(
                     f"Subject: {subject or ''}\nTask title read from it: {title or ''}\n"
                     f"Customer: {customer or ''}\nReferences: {', '.join(references) or 'none'}"
                 )
+                if numbers_missing:
+                    mail_text += (
+                        "\nNone of the mail's reference numbers is on any task listed: "
+                        "a task that is the same tender carries the same number."
+                    )
                 try:
                     pick, confidence, reason, cost = await model_pick(
                         model, mail=mail_text, candidates=candidates
                     )
                     found.model_cost_usd = cost
+                    # With the numbers absent the model may say "none" more readily:
+                    # the number is the evidence it would otherwise lack.
+                    none_bar = NONE_BAR_NO_NUMBER if numbers_missing else 0.7
                     if pick is not None and confidence >= 0.7:
                         found.verdict, found.method = EXISTING, "model"
                         found.item_id, found.score = pick.item_id, confidence
                         found.reason = f"Haiku: {reason}"
-                    elif pick is None and confidence >= 0.7:
+                    elif pick is None and confidence >= none_bar:
                         found.verdict = NEW
                         found.reason = f"Haiku: none of these — {reason}"
                     else:
