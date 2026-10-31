@@ -317,7 +317,7 @@ async def teams_connect(admin: SuperAdmin, config: Config):
     )
 
 
-@router.patch("/teams", response_model=TeamsOut, summary="Switch negotiation posts on or off")
+@router.patch("/teams", response_model=TeamsOut, summary="Switch the posts and assigning")
 async def teams_switch(
     body: TeamsIn, admin: SuperAdmin, session: Session, request: Request
 ) -> TeamsOut:
@@ -329,6 +329,12 @@ async def teams_switch(
             # From now on: switching on never posts the backlog.
             row.posting_from = datetime.now(UTC)
         row.post_negotiations = body.post_negotiations
+    if body.post_orders is not None:
+        if body.post_orders and not teams.is_connected(row):
+            raise HTTPException(status_code=400, detail="Connect a Teams account first.")
+        if body.post_orders and not row.post_orders:
+            row.orders_from = datetime.now(UTC)
+        row.post_orders = body.post_orders
     if body.task_list is not None:
         row.task_list = body.task_list
     if body.chat_id:
@@ -418,7 +424,7 @@ async def teams_test(admin: SuperAdmin, session: Session, request: Request) -> T
 @router.post(
     "/mails/{mail_id}/teams",
     response_model=WatchedMailDetailOut,
-    summary="Post this negotiation mail to the locked channel now",
+    summary="Post this mail's card to Teams now (an order: to the test channel only)",
 )
 async def post_mail_to_teams(
     mail_id: uuid.UUID, admin: SuperAdmin, session: Session, request: Request, config: Config

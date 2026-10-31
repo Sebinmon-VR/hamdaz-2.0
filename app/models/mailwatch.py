@@ -229,6 +229,14 @@ class MailWatchTeams(Base, Timestamped):
     #: exactly this; group chats need ChatMessage.Send and Chat.ReadBasic.
     granted_scopes: Mapped[str | None] = mapped_column(Text)
 
+    #: Post a card for each customer order (purchase order) — to the test
+    #: channel only, whatever ``target_kind`` says, while it is tested. Off
+    #: until switched on; only mail received from ``orders_from``.
+    post_orders: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    orders_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
 
 class MailWatchTestTask(Base, UUIDPrimaryKey, Timestamped):
     """A task the mail watch would create on the Proposals list, kept here

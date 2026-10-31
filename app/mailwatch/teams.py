@@ -21,6 +21,13 @@ they go to the test channel.
 **Once each.** A negotiation mail is posted once; a failure is tried again on
 the next pass, three times at most. Only mail received after posting was
 switched on is posted — switching on never sends the backlog.
+
+**Orders** (a customer's purchase order) get a card of their own, and go to
+the test channel only (:data:`ORDERS_TEST_ONLY`), whatever the page has chosen
+for the others. One order is one card: SAP Business Network sends the purchase
+order and a short notice of it a minute apart, and the card is made from the
+purchase order, with the notice's order date; the other mail is marked posted
+with it.
 """
 
 from __future__ import annotations
@@ -53,7 +60,17 @@ from app.core.config import Settings, get_settings
 from app.core.mail import GRAPH_BASE, GraphMailer
 from app.core.security import sign
 from app.mailwatch import assign
-from app.mailwatch.classify import NEGOTIATION, NEW_TENDER
+from app.mailwatch.classify import (
+    NEGOTIATION,
+    NEW_TENDER,
+    ORDER,
+    ORDER_CANCELLED,
+    ORDER_CHANGED,
+    ORDER_KINDS,
+    ORDER_NOTICE,
+    Order,
+    read_order,
+)
 from app.models.mailwatch import MailWatchTeams, MailWatchTestTask, WatchedMail
 from app.proposals.sharepoint import SharePointConsentError, SharePointError, SharePointProposals
 from app.quoting.storage import DriveError, QuoteDrive
@@ -62,6 +79,21 @@ logger = logging.getLogger("hamdaz.mailwatch.teams")
 
 #: The only channel a post may go to: (team, channel), by display name.
 TEST_CHANNEL: Final = ("Test", "test channel")
+
+#: Order cards go to TEST_CHANNEL and nowhere else while they are tested —
+#: not to the channel or group chat chosen on the page for the other cards.
+ORDERS_TEST_ONLY: Final = True
+
+#: A short new-order notice whose purchase order has not come by then is
+#: posted on its own; the purchase order normally follows within a minute.
+NOTICE_WAIT: Final = timedelta(minutes=30)
+
+#: Mails about one order arrive together; a later one is a later version.
+ORDER_WINDOW: Final = timedelta(hours=1)
+
+#: Where an Ariba order is confirmed. The mail's own "Process order" link is
+#: a sign-in to the company's account, and is not put on a card.
+BUSINESS_NETWORK: Final = "https://supplier.ariba.com"
 
 #: Where cards go (MailWatchTeams.target_kind): a team channel or a group chat.
 CHANNEL, CHAT = "channel", "chat"
@@ -302,8 +334,13 @@ async def choose_channel(
 
 
 async def _resolve_channel(row: MailWatchTeams, graph: GraphMailer) -> None:
-    """Find the test channel's ids — the default — with the app's own read
-    permission."""
+    """Make the test channel — the default — the row's channel."""
+    row.team_id, row.team_name, row.channel_id, row.channel_name = await _test_channel(graph)
+
+
+async def _test_channel(graph: GraphMailer) -> tuple[str, str, str, str]:
+    """The test channel's (team id, team name, channel id, channel name),
+    found with the app's own read permission."""
     team_name, channel_name = TEST_CHANNEL
     token = await graph._access_token()
     headers = {"Authorization": f"Bearer {token}"}
@@ -331,8 +368,7 @@ async def _resolve_channel(row: MailWatchTeams, graph: GraphMailer) -> None:
     ) if channels.status_code == 200 else None
     if match is None:
         raise TeamsError(f"No channel called {channel_name!r} in {team_name!r}.")
-    row.team_id, row.team_name = team_id, found[0]["displayName"]
-    row.channel_id, row.channel_name = match["id"], match["displayName"]
+    return team_id, found[0]["displayName"], match["id"], match["displayName"]
 
 
 def disconnect(row: MailWatchTeams) -> None:
@@ -340,6 +376,7 @@ def disconnect(row: MailWatchTeams) -> None:
     row.account_email = row.account_name = row.account_id = None
     row.connected_at = None
     row.post_negotiations = False
+    row.post_orders = False
 
 
 # ── posting ─────────────────────────────────────────────────────────
@@ -385,6 +422,8 @@ class TeamsPoster:
         self._sharepoint = sharepoint
         self._drive = drive
         self._cached: _Cached | None = None
+        #: The test channel's ids, for test-only posts; found once.
+        self._test_ids: tuple[str, str, str, str] | None = None
 
     async def people(self, emails: list[str]) -> dict[str, dict[str, str]]:
         """Directory entries for the card's people, by lower-case email, so
@@ -559,17 +598,26 @@ class TeamsPoster:
         return True
 
     async def post(
-        self, row: MailWatchTeams, content_html: str, *, card: dict | None = None
+        self, row: MailWatchTeams, content_html: str, *, card: dict | None = None,
+        test_only: bool = False,
     ) -> str:
         """Post to the chosen channel or group chat (the test channel until
         one is chosen); the new message's id. With ``card``, the message is
-        that Adaptive Card and ``content_html`` is ignored."""
-        to_chat = row.target_kind == CHAT and bool(row.chat_id)
+        that Adaptive Card and ``content_html`` is ignored. ``test_only``
+        posts to the test channel whatever is chosen, and leaves the choice
+        as it is."""
+        to_chat = not test_only and row.target_kind == CHAT and bool(row.chat_id)
         if to_chat and not can_chat(row):
             raise TeamsError("Posting to a group chat needs the account connected again.")
-        if not to_chat and (not row.channel_id or not row.team_id):
-            await _resolve_channel(row, self._graph)
-        if card is not None and not is_test_channel(row):
+        if test_only:
+            if self._test_ids is None:
+                self._test_ids = await _test_channel(self._graph)
+            team_id, _, channel_id, _ = self._test_ids
+        else:
+            if not to_chat and (not row.channel_id or not row.team_id):
+                await _resolve_channel(row, self._graph)
+            team_id, channel_id = row.team_id, row.channel_id
+        if card is not None and not test_only and not is_test_channel(row):
             # A real channel: no TESTING banner.
             card = {**card, "body": [b for b in card.get("body", []) if b.get("id") != "testing"]}
         token = await self._token(row)
@@ -592,7 +640,7 @@ class TeamsPoster:
             message = {"body": {"contentType": "html", "content": content_html}}
         url = (
             f"{GRAPH_BASE}/chats/{row.chat_id}/messages" if to_chat
-            else f"{GRAPH_BASE}/teams/{row.team_id}/channels/{row.channel_id}/messages"
+            else f"{GRAPH_BASE}/teams/{team_id}/channels/{channel_id}/messages"
         )
         response = await self._http.post(
             url, headers={"Authorization": f"Bearer {token}"}, json=message
@@ -666,6 +714,11 @@ def _v(value: Any) -> str:
 def _when(value: str | None) -> datetime | None:
     try:
         return datetime.fromisoformat((value or "").replace("Z", "+00:00"))
+    except ValueError:
+        pass
+    # The app's copy of the list can give "2026-06-04T10:06:54+00:00T00:00:00Z".
+    try:
+        return datetime.fromisoformat((value or "")[:10]).replace(tzinfo=UTC)
     except ValueError:
         return None
 
@@ -774,16 +827,22 @@ def _facts(facts: list[tuple[str, list[dict[str, Any]]]]) -> list[dict[str, Any]
     return [wide, narrow]
 
 
-def _tracker(task: dict[str, Any]) -> list[dict[str, Any]]:
+def _tracker(task: dict[str, Any], *, at: str = NEGOTIATION) -> list[dict[str, Any]]:
     """Where the tender stands: received → submitted → negotiation → order.
-    A negotiation mail puts it at negotiation, so that step is always lit."""
+    A negotiation mail puts it at negotiation, so that step is always lit; an
+    order mail at the order, with negotiation done only if there was one."""
     submitted = "submit" in (task.get("submission_status") or "").lower()
     ordered = bool(task.get("order_status"))
+    if at == ORDER:
+        negotiated = (task.get("negotiation") or "").strip().lower() not in ("", "no", "none")
+        middle, last = ("done" if negotiated else "missed"), ("Order received", "now")
+    else:
+        middle, last = ("done" if ordered else "now"), ("Order", "done" if ordered else "next")
     steps = [
         (f"{task.get('current_type') or 'Enquiry'} received", "done"),
         ("Submitted", "done" if submitted else "missed"),
-        ("Negotiation", "done" if ordered else "now"),
-        ("Order", "done" if ordered else "next"),
+        ("Negotiation", middle),
+        last,
     ]
     looks = {
         "done": ("CheckmarkCircle", "Good", True),
@@ -1330,6 +1389,297 @@ def _new_tender_card(
     return card
 
 
+# ── what an order post says ─────────────────────────────────────────
+
+
+def order_card(
+    mail: WatchedMail,
+    order: Order,
+    task: dict[str, Any] | None,
+    files: TaskFiles | None = None,
+    people: dict[str, dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    """The card, with as many of the task's files as fit."""
+    shown = FILE_ROWS
+    while True:
+        card = _order_card(mail, order, task, files, people, shown)
+        if shown == 0 or len(json.dumps(card, ensure_ascii=False)) <= CARD_BYTES:
+            return card
+        shown -= 1
+
+
+def _money(order: Order) -> str:
+    if not order.amount:
+        return "—"
+    return f"{order.currency} {order.amount}" if order.currency else order.amount
+
+
+def _ordered_on(order: Order, mail: WatchedMail) -> str:
+    """The order date as the network gives it ("29 Oct 2026 9:55:13 AM
+    GMT+04:00"), as a day; the mail's arrival when it gives none."""
+    if order.order_date and (m := re.match(r"\d{1,2} \w{3} \d{4}", order.order_date)):
+        return m.group(0)
+    return mail.received_at.strftime("%d %b %Y") if mail.received_at else "—"
+
+
+def _order_card(
+    mail: WatchedMail,
+    order: Order,
+    task: dict[str, Any] | None,
+    files: TaskFiles | None,
+    people: dict[str, dict[str, str]] | None,
+    shown: int,
+) -> dict[str, Any]:
+    """The Teams post for a customer's order. On top the customer and the
+    order's value; then whose task it was and how far it came — now at the
+    order; what to do next; the customer's message; then tabs — the order in
+    full, the task, its files, the mail's attachments."""
+    task = task or {}
+    files = files or TaskFiles()
+    people = people or {}
+    customer = _v(order.customer or mail.customer or task.get("customer"))
+    number = f"PO {order.number}" if order.number else "Purchase order"
+    on_network = "ariba" in (mail.original_sender or "").lower()
+    badge = (
+        _badge("Order cancelled", icon="DismissCircle", style="Attention")
+        if mail.kind == ORDER_CANCELLED or order.status == "Cancelled" else
+        _badge("Order changed", icon="Edit", style="Warning")
+        if mail.kind == ORDER_CHANGED or order.status == "Changed" else
+        _badge("New order", icon="Receipt", style="Good")
+    )
+
+    body: list[dict[str, Any]] = [
+        *_testing_note("Order cards go to the test channel only; nothing is written anywhere."),
+        {
+            "type": "ColumnSet",
+            "columns": [
+                {
+                    "type": "Column", "width": "stretch",
+                    "items": [
+                        _text(customer, size="Large", weight="Bolder"),
+                        _caption(
+                            " · ".join(filter(None, [
+                                number, f"version {order.version}" if order.version else None,
+                                order.buyer if order.buyer and order.buyer != customer else None,
+                            ])),
+                            spacing="None",
+                        ),
+                    ],
+                },
+                {"type": "Column", "width": "auto", "targetWidth": WIDE, "items": [badge]},
+            ],
+        },
+        {**badge, "targetWidth": NARROW},
+    ]
+
+    owner = (
+        [_persona(people.get((task.get("assignee_email") or "").lower()), task.get("assignee"))]
+        if task else [_text("No task found", weight="Bolder", color="Attention", spacing="None")]
+    )
+    body += _facts([
+        ("Order value", [_text(_money(order), size="Large", weight="Bolder", color="Good",
+                               spacing="None")]),
+        ("Ordered on", [_text(_ordered_on(order, mail), weight="Bolder", spacing="None")]),
+        ("Payment terms", [_text(_v(order.payment_terms), weight="Bolder", spacing="None",
+                                 maxLines=2)]),
+        ("Task owner", owner),
+    ])
+
+    if task:
+        body.append({"type": "Container", "separator": True, "spacing": "Medium",
+                     "items": _tracker(task, at=ORDER)})
+    else:
+        body.append(
+            {
+                "type": "Container", "style": "attention", "spacing": "Medium",
+                "items": [_with_icon(
+                    _icon("Warning", color="Attention"),
+                    _text("No task on the Proposals list carries this order's tender, PR or "
+                          "order number — please check whose order it is.", weight="Bolder"),
+                )],
+            }
+        )
+
+    if mail.kind == ORDER_CANCELLED or order.status == "Cancelled":
+        step = "The customer **cancelled** this order — stop any purchase made for it."
+    elif mail.kind == ORDER_CHANGED or order.status == "Changed":
+        step = ("The customer **changed** this order"
+                + (f" (version {order.version})" if order.version else "")
+                + " — check what changed before confirming it.")
+    elif on_network:
+        step = "**Next:** confirm this order on SAP Business Network, then raise the purchase."
+    else:
+        step = "**Next:** acknowledge the order to the customer, then raise the purchase."
+    body.append(
+        {
+            "type": "Container", "style": "accent", "spacing": "Medium", "roundedCorners": True,
+            "items": [_with_icon(_icon("TaskListLtr", color="Accent"), _text(step))],
+        }
+    )
+
+    note, ask, _ = ask_of(mail.body)
+    said = order.message or ("" if on_network else ask)
+    if said:
+        when = mail.received_at.strftime("%d %b, %H:%M") if mail.received_at else ""
+        body.append(
+            {
+                "type": "ColumnSet", "separator": True, "spacing": "Medium",
+                "columns": [
+                    {"type": "Column", "width": "auto", "verticalContentAlignment": "Center",
+                     "items": [_icon("Mail", size="Medium", color="Accent")]},
+                    {
+                        "type": "Column", "width": "stretch", "spacing": "Small",
+                        "items": [
+                            _text(customer, weight="Bolder"),
+                            _caption(f"Customer message · {when} UTC", size="Small",
+                                     spacing="None"),
+                        ],
+                    },
+                    {"type": "Column", "width": "auto", "verticalContentAlignment": "Center",
+                     "items": [_toggle(True), _toggle(False)]},
+                ],
+            }
+        )
+        body += [
+            _text(f"“{said}”", id="ask-short", maxLines=3),
+            _text(f"“{said}”", id="ask-full", isVisible=False),
+        ]
+    if note:
+        body.append(
+            {
+                "type": "Container", "style": "warning", "spacing": "Medium",
+                "items": [_text("Note from the CEO", weight="Bolder", size="Small"),
+                          _text(note, spacing="Small")],
+            }
+        )
+
+    refs = [*(f"RFQ {n}" for n in order.tenders), *(f"PR {n}" for n in order.prs)]
+    order_facts = [
+        ("Order no.", order.number),
+        ("Status", order.status),
+        ("Version", order.version),
+        ("Customer", order.customer or mail.customer),
+        ("Ordered by", order.buyer),
+        ("Value", _money(order) if order.amount else None),
+        ("Payment terms", order.payment_terms),
+        ("Ordered on", order.order_date),
+        ("Buyer's references", " · ".join(refs) or None),
+        ("Project", order.project),
+        ("Header text", order.header),
+    ]
+    tabs: list[tuple[str, str, str, list[dict[str, Any]]]] = [
+        ("order", "Order", "Receipt", [{
+            "type": "FactSet",
+            "facts": [{"title": t, "value": _v(v)} for t, v in order_facts if v],
+        }]),
+    ]
+    if task:
+        status = _v(task.get("status"))
+        if task.get("submission_status"):
+            status += f" · {task['submission_status']}"
+        tabs.append(("task", "Task", "TaskListLtr", [{
+            "type": "FactSet",
+            "facts": [
+                {"title": "Task", "value": _v(task.get("title"))},
+                {"title": "Assigned to", "value": _v(task.get("assignee"))},
+                {"title": "Status", "value": status},
+                {"title": "Quote no.", "value": _v(task.get("quote_no"))},
+                {"title": "Stage", "value": _v(task.get("current_type"))},
+                {"title": "Negotiation", "value": _v(task.get("negotiation"))},
+                {"title": "Order status", "value": _v(task.get("order_status"))},
+                {"title": "Created", "value": _day(task.get("created_at"))},
+            ],
+        }]))
+        if files.files:
+            tabs.append(("files", f"Task files ({len(files.files)})", "Folder",
+                         _file_grid(files.files, shown)))
+        elif files.attachments_hidden:
+            tabs.append(("files", "Task files", "Folder", [
+                _caption("The task has attachments — open the task to see them.")
+            ]))
+    if mail.attachment_names:
+        tabs.append(("mail-files", f"Mail attachments ({len(mail.attachment_names)})", "Attach", [
+            _with_icon(_icon(_FILE_ICONS.get(n.rpartition(".")[2].lower(), "Document"),
+                             color="Accent", filled=False), _text(n), spacing="Small")
+            for n in mail.attachment_names[:15]
+        ]))
+    body += _tabs(tabs)
+
+    body += _footer(ai=_ai_helped(mail))
+    card: dict[str, Any] = {
+        "type": "AdaptiveCard",
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "version": "1.5",
+        "msteams": {"width": "Full"},
+        "body": body,
+    }
+    links = []
+    if on_network:
+        links.append({"type": "Action.OpenUrl", "title": "Open SAP Business Network",
+                      "url": BUSINESS_NETWORK, "iconUrl": "icon:Open"})
+    if task.get("url"):
+        links.append({"type": "Action.OpenUrl", "title": "Open task", "url": task["url"],
+                      "iconUrl": "icon:TaskListLtr"})
+    if files.folder_url:
+        links.append({"type": "Action.OpenUrl", "title": "Open folder",
+                      "url": files.folder_url, "iconUrl": "icon:Folder"})
+    if links:
+        card["actions"] = links
+    return card
+
+
+def _po_of(mail: WatchedMail) -> str | None:
+    return next((r for r in mail.reference_numbers or [] if r.startswith("PO ")), None)
+
+
+async def order_group(session: AsyncSession, mail: WatchedMail) -> list[WatchedMail]:
+    """The mails about this one order — the purchase order, its short notice,
+    a second forward of either — the fullest first: a purchase order before a
+    notice, then the earliest."""
+    group = [mail]
+    po = _po_of(mail)
+    if po and mail.received_at is not None:
+        group += (
+            await session.scalars(
+                select(WatchedMail).where(
+                    WatchedMail.id != mail.id,
+                    WatchedMail.category == ORDER,
+                    WatchedMail.kind.in_(ORDER_KINDS),
+                    WatchedMail.reference_numbers.overlap([po]),
+                    WatchedMail.received_at.between(
+                        mail.received_at - ORDER_WINDOW, mail.received_at + ORDER_WINDOW
+                    ),
+                )
+            )
+        ).all()
+    last = datetime.max.replace(tzinfo=UTC)
+    return sorted(group, key=lambda m: (m.kind == ORDER_NOTICE, m.received_at or last))
+
+
+def merged_order(group: list[WatchedMail]) -> Order:
+    """The order as its mails say it together: the first's details, and what
+    only the others have (the notice's order date)."""
+    readings = [read_order(m.subject, m.body) for m in group]
+    out = readings[0]
+    for other in readings[1:]:
+        for name in out.__dataclass_fields__:
+            if not getattr(out, name) and getattr(other, name):
+                setattr(out, name, getattr(other, name))
+    return out
+
+
+async def _order_ready(session: AsyncSession, mail: WatchedMail) -> bool:
+    """Whether this order mail's card is due now. A notice waits for its
+    purchase order, which makes the card and marks the notice posted; it is
+    posted itself only when none has come within NOTICE_WAIT."""
+    if mail.kind != ORDER_NOTICE:
+        return True
+    group = await order_group(session, mail)
+    if group[0].kind != ORDER_NOTICE:
+        return False
+    return mail.received_at is None or datetime.now(UTC) - mail.received_at >= NOTICE_WAIT
+
+
 def _standing_row(person: dict[str, Any]) -> dict[str, Any]:
     """One person in the team's standing: rank, name and labels, and what
     shapes their share — open work, capacity, the ceiling on open tasks."""
@@ -1454,19 +1804,26 @@ def test_html(row: MailWatchTeams) -> str:
 async def post_mail(
     session: AsyncSession, mail: WatchedMail, *, poster: TeamsPoster, settings: Settings
 ) -> str:
-    """Post one mail's card now — a negotiation, or a new tender with its
-    test task — and record it on the mail."""
+    """Post one mail's card now — a negotiation, an order, or a new tender
+    with its test task — and record it on the mail. An order's card covers
+    the other mails about the same order, which are recorded as posted too."""
     row = await get_connection(session)
     if not is_connected(row):
         raise TeamsError("No Teams account is connected.")
     test_task = None
+    group: list[WatchedMail] = [mail]
     if mail.category == NEW_TENDER:
         test_task = await assign.test_task_of(session, mail)
         if test_task is None:
             raise TeamsError("This new tender has no task assigned yet.")
+    elif mail.category == ORDER:
+        if mail.kind not in ORDER_KINDS:
+            raise TeamsError("The weekly list of unconfirmed orders gets no card.")
+        group = await order_group(session, mail)
     elif mail.category != NEGOTIATION:
-        raise TeamsError("Only negotiations and assigned new tenders are posted to Teams.")
+        raise TeamsError("Only negotiations, orders and assigned new tenders are posted to Teams.")
     mail.teams_attempts = (mail.teams_attempts or 0) + 1
+    test_only = False
     try:
         if test_task is not None:
             files = (
@@ -1475,25 +1832,33 @@ async def post_mail(
             )
             people = await poster.people([test_task.assigned_to_email or ""])
             card = new_tender_card(mail, test_task, files, people)
+        elif mail.category == ORDER:
+            task = next((m.task for m in group if m.task), None)
+            files = await poster.task_files(task) if task else None
+            people = await poster.people([(task or {}).get("assignee_email") or ""])
+            card = order_card(group[0], merged_order(group), task, files, people)
+            test_only = ORDERS_TEST_ONLY
         else:
             files = await poster.task_files(mail.task) if mail.task else None
             people = await poster.people([(mail.task or {}).get("assignee_email") or ""])
             card = negotiation_card(mail, files, people)
-        message_id = await poster.post(row, "", card=card)
+        message_id = await poster.post(row, "", card=card, test_only=test_only)
     except TeamsError as exc:
         mail.teams_error = str(exc)[:500]
         row.last_error = str(exc)[:500]
         raise
-    mail.teams_posted_at = datetime.now(UTC)
-    mail.teams_message_id = message_id
-    mail.teams_error = None
+    now = datetime.now(UTC)
+    for each in group:
+        if each is mail or each.teams_posted_at is None:
+            each.teams_posted_at, each.teams_message_id, each.teams_error = now, message_id, None
     return message_id
 
 
 async def post_pending(session: AsyncSession, *, poster: TeamsPoster, settings: Settings) -> int:
     """Post what is due and not yet posted: negotiations received since their
-    posting was switched on, and new tenders given a task since assigning was.
-    Locked row by row, so two instances never post one twice."""
+    posting was switched on, orders since theirs was, and new tenders given a
+    task since assigning was. Locked row by row, so two instances never post
+    one twice."""
     row = await get_connection(session)
     if not poster.can_read(row):
         # Not connected, or connected on another server: posting is theirs.
@@ -1508,6 +1873,12 @@ async def post_pending(session: AsyncSession, *, poster: TeamsPoster, settings: 
             WatchedMail.category == NEW_TENDER,
             WatchedMail.received_at >= row.assign_from,
             WatchedMail.id.in_(select(MailWatchTestTask.mail_id)),
+        ))
+    if row.post_orders and row.orders_from is not None:
+        due.append(and_(
+            WatchedMail.category == ORDER,
+            WatchedMail.kind.in_(ORDER_KINDS),
+            WatchedMail.received_at >= row.orders_from,
         ))
     if not due:
         return 0
@@ -1526,6 +1897,10 @@ async def post_pending(session: AsyncSession, *, poster: TeamsPoster, settings: 
     ).all()
     posted = 0
     for mail in mails:
+        if mail.teams_posted_at is not None:
+            continue  # covered by an earlier card in this pass: the same order
+        if mail.category == ORDER and not await _order_ready(session, mail):
+            continue
         try:
             await post_mail(session, mail, poster=poster, settings=settings)
             posted += 1

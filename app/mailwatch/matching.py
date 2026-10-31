@@ -24,7 +24,9 @@ The funnel, cheapest and surest first:
 The verdict for a new tender: **new**, **existing**, **stage change** (the
 task is at an earlier stage — EOI then RFQ), **duplicate mail** (no task yet,
 but an earlier mail brought the same tender), or **unsure**. For a
-negotiation: **existing** with the task's details, **not found**, or unsure.
+negotiation or an order: **existing** with the task's details, **not found**,
+or unsure. An order is found by the tender and PR numbers the buyer quoted on
+it, then by its own number in case a task notes it, then by its project.
 """
 
 from __future__ import annotations
@@ -43,7 +45,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.model import AgentModel, Spent
 from app.enquiries.claude import LLMError
-from app.mailwatch.classify import NEGOTIATION, NEW_TENDER, stage_of
+from app.mailwatch.classify import NEGOTIATION, NEW_TENDER, ORDER, stage_of
 from app.models.mailwatch import WatchedMail
 from app.models.proposal_index import ProposalIndexItem
 from app.proposals.mirror import to_task
@@ -293,7 +295,7 @@ async def earlier_mail(
     if not conditions:
         return None
     query = select(WatchedMail).where(
-        or_(*conditions), WatchedMail.category.in_((NEW_TENDER, NEGOTIATION))
+        or_(*conditions), WatchedMail.category.in_((NEW_TENDER, NEGOTIATION, ORDER))
     )
     if exclude_id is not None:
         query = query.where(WatchedMail.id != exclude_id)
@@ -430,9 +432,12 @@ async def match(
 ) -> Match | None:
     """The verdict for one mail, or None for a category that is not matched.
     ``as_of`` (replays only) limits the list to what existed by then."""
-    if category not in (NEW_TENDER, NEGOTIATION):
+    if category not in (NEW_TENDER, NEGOTIATION, ORDER):
         return None
     tender_numbers, pr_numbers = _refs(references)
+    po_numbers = [
+        re.sub(r"\D", "", r) for r in references if category == ORDER and r.startswith("PO")
+    ]
 
     earlier = await earlier_mail(
         session, ariba_doc=ariba_doc, conversation_id=conversation_id,
@@ -446,12 +451,13 @@ async def match(
         )
 
     if found is None:
-        rows = (
-            await by_number(session, tender_numbers, as_of=as_of)
-            or await by_number(session, pr_numbers, as_of=as_of)
-        )
+        which = "tender number"
+        rows = await by_number(session, tender_numbers, as_of=as_of)
+        if not rows:
+            which, rows = "PR number", await by_number(session, pr_numbers, as_of=as_of)
+        if not rows:
+            which, rows = "order number", await by_number(session, po_numbers, as_of=as_of)
         if rows:
-            which = "tender number" if tender_numbers else "PR number"
             candidates = [_candidate(r, 1.0, f"same {which}") for r in rows[:5]]
             found = Match(
                 verdict=EXISTING, method="reference", item_id=rows[0].item_id, score=1.0,
@@ -520,7 +526,7 @@ async def match(
             found.verdict, found.item_id = NEW, None
             found.reason = "the matched task is no longer on the list"
 
-    if category == NEGOTIATION:
+    if category in (NEGOTIATION, ORDER):
         if found.verdict == NEW:
             found.verdict = NOT_FOUND
         return found
