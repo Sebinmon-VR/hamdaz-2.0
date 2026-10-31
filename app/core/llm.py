@@ -4,8 +4,9 @@ Deterministic readers do the work in this application. This is the second
 pass they hand a document to when the words and tables did not settle it: a
 supplier quotation laid out in a way the table reader cannot follow, a tender
 whose requirements are paragraphs rather than rows. It is optional, it is
-text only, and everything it answers goes through the same validation the
-parsers' answers do.
+text only — save that Claude, when configured, is shown the file itself where
+there is no text to read (:meth:`TextModel.see`) — and everything it answers
+goes through the same validation the parsers' answers do.
 
 **Providers, in order, with fallback.** The free tiers ration by requests per
 day and tokens per minute, and a 429 from one is not a reason to fail an
@@ -30,6 +31,7 @@ of a forty-page tender is boilerplate this is not asked about.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import re
@@ -234,6 +236,60 @@ class TextModel:
         answer = await self.ask(system=system, user=body, max_tokens=max_tokens, label=label)
         return (answer.payload, answer.who) if answer else None
 
+    @property
+    def can_see(self) -> bool:
+        """Whether a provider here can look at a page rather than read its
+        text. Only Claude can; the free tiers are text only."""
+        return any(p.name == "anthropic" for p in self._providers)
+
+    async def see(
+        self,
+        *,
+        instructions: str,
+        file_name: str,
+        media_type: str,
+        data: bytes,
+        shape: dict[str, Any],
+        max_tokens: int = 4000,
+        label: str | None = None,
+    ) -> tuple[dict[str, Any], str] | None:
+        """A JSON object in ``shape``, read off the file itself, and who answered.
+
+        For what has no text to read — a scan, a photograph, a PDF printed from
+        a web page with its table as a picture. Claude takes a PDF page by page
+        and an image as it is, so the file goes as it came. ``None`` when Claude
+        is not configured, refused, or answered nothing parseable, exactly as
+        :meth:`extract`.
+        """
+        provider = next((p for p in self._providers if p.name == "anthropic"), None)
+        if provider is None:
+            return None
+        system, body = self._prompt(instructions, "(the attached file)", shape)
+        source = {
+            "type": "base64",
+            "media_type": media_type,
+            "data": base64.standard_b64encode(data).decode(),
+        }
+        page = (
+            {"type": "image", "source": source}
+            if media_type.startswith("image/")
+            else {"type": "document", "source": source, "title": file_name[:200]}
+        )
+        try:
+            raw, used_in, used_out = await self._ask(
+                provider, (system, [page, {"type": "text", "text": body}]), max_tokens
+            )
+        except ModelError as exc:
+            logger.info("model %s declined to look at %s: %s", provider.name, file_name, exc)
+            return None
+        call = _record(provider, label, used_in, used_out)
+        parsed = parse_json_object(raw)
+        if parsed is None:
+            logger.info("model %s answered nothing parseable for %s", provider.name, file_name)
+            return None
+        call.used = True
+        return parsed, f"{provider.name}:{provider.model}"
+
     async def ask(
         self,
         *,
@@ -302,9 +358,14 @@ class TextModel:
         return system, body
 
     async def _ask(
-        self, provider: Provider, prompt: tuple[str, str], max_tokens: int, reasoning_effort: str | None = None
+        self,
+        provider: Provider,
+        prompt: tuple[str, str | list[dict[str, Any]]],
+        max_tokens: int,
+        reasoning_effort: str | None = None,
     ) -> tuple[str, int, int]:
-        """The reply's text, and the tokens it took in and gave out."""
+        """The reply's text, and the tokens it took in and gave out. The body is
+        a list of content blocks only for Claude, when a file goes with it."""
         system, body = prompt
         timeout = httpx.Timeout(self._settings.llm_timeout_seconds, connect=10.0)
         try:

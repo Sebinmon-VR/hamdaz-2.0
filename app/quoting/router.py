@@ -60,7 +60,7 @@ from app.auth.deps import CurrentUser
 from app.comparison import service as comparison_service
 from app.comparison import supplier_details
 from app.comparison.documents import DocumentError, prepare
-from app.comparison.extraction import ExtractionError, QuoteExtractor
+from app.comparison.extraction import ExtractionError, NoPricesError, QuoteExtractor
 from app.comparison.router import _dec, _txt
 from app.comparison.schemas import ChargeIn, ComparisonIn
 from app.comparison.schemas import ItemIn as SupplierItemIn
@@ -1307,7 +1307,11 @@ async def attach_suppliers(
     _keep_ai_calls(session, request, user, "supplier_quote", calls)
 
     quotes: list[SupplierQuoteIn] = []
+    priceless: list[str] = []
     for readable, result in zip(readables, results, strict=True):
+        if isinstance(result, NoPricesError):
+            priceless.append(readable.file_name)
+            continue
         if isinstance(result, ExtractionError):
             failures.append(f"{readable.file_name}: {result}")
             continue
@@ -1354,16 +1358,63 @@ async def attach_suppliers(
             )
         )
 
-    if not quotes:
+    if not quotes and not priceless:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No supplier quote could be read. " + ("; ".join(failures) or ""),
         )
 
-    return await _attach(
-        session, request, quotes, originals=originals, failures=failures,
-        extractor=extractor, drive=drive, zoho=zoho, user=user, roles=roles,
-    )
+    if quotes:
+        out = await _attach(
+            session, request, quotes, originals=originals, failures=failures,
+            extractor=extractor, drive=drive, zoho=zoho, user=user, roles=roles,
+        )
+    else:
+        out = None
+    filed = await _file_priceless(session, drive, request, priceless, originals, user)
+    if out is None:
+        await session.flush()
+        out = await _out(session, request, user=user, roles=roles)
+        out.failed = [
+            {"file_name": name, "error": reason}
+            for name, _, reason in (f.partition(": ") for f in failures)
+        ]
+    out.failed.extend(filed)
+    return out
+
+
+async def _file_priceless(
+    session: AsyncSession,
+    drive: QuoteDrive,
+    request: QuoteRequest,
+    names: list[str],
+    originals: dict[str, tuple[bytes, str | None]],
+    user,
+) -> list[dict[str, str]]:
+    """A datasheet dropped in with the quotes, filed with the quote rather
+    than refused: it was looked at and has no prices, so it is not a quote the
+    readers failed on, and refusing it only sent people round again. Said back
+    beside the failures, marked ``filed`` so the panel shows it as done."""
+    filed: list[dict[str, str]] = []
+    for name in names:
+        raw, content_type = originals[name]
+        try:
+            document = await filing.file_upload(
+                session, drive, request, kind=DocumentKind.TECHNICAL_SPEC,
+                file_name=name, content=raw, content_type=content_type, user=user,
+            )
+        except DriveError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"{name}: could not be filed in the shared library. {exc}",
+            ) from exc
+        document.extracted = {"read": True, "fields": {}}
+        filed.append({
+            "file_name": name,
+            "error": "No prices in it, so it was filed with the quote as a datasheet.",
+            "filed": DocumentKind.TECHNICAL_SPEC.value,
+        })
+    return filed
 
 
 @router.post(

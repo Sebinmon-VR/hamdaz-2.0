@@ -14,7 +14,8 @@ parser needs each price under its own heading.
 * **A scanned PDF, and every image, has no text to read.** An OCR engine can
   be plugged in (``rapidocr_onnxruntime``, if installed) and its boxes go
   through the same positional builder; without one the document is handed
-  back as ``kind="document"`` and the extractor says plainly that it must be
+  back as ``kind="document"`` with its bytes, for a model that can see the
+  page (Claude, when configured) or for the extractor to say it must be
   typed in.
 
 * **Spreadsheets, CSVs and Word files are converted here.** A sheet already *is*
@@ -94,7 +95,8 @@ class Readable:
     ``kind`` is ``"text"`` when there is something to parse — ``text`` and
     ``tables`` are then set — and ``"document"`` or ``"image"`` when there is
     not: a scan or a photograph, carried as bytes for an OCR engine if one is
-    installed, and otherwise declined by the extractor.
+    installed, or for a model that can see it. A PDF or an image keeps its
+    bytes in ``data`` whatever its kind; a converted spreadsheet does not.
     """
 
     kind: str  # "document" | "image" | "text"
@@ -149,20 +151,22 @@ def prepare(
 
     media_type = resolve_type(file_name, declared_type)
 
+    # A PDF or an image keeps its bytes even when it has text: where the text
+    # holds no table to follow, the page itself can still be looked at.
     if media_type in PDF_TYPES:
         if not force_native and (extracted := _pdf_text(content)) is not None:
             text, tables = extracted
-            return Readable("text", media_type, file_name, text=text, tables=tables)
+            return Readable("text", media_type, file_name, data=content, text=text, tables=tables)
         # No text layer. OCR if an engine is installed; otherwise the bytes are
-        # carried so the extractor can say what this is and what to do instead.
+        # carried for a model that can see the page, or to say what to do instead.
         if ocr and (read := _ocr(content, media_type)) is not None:
             text, tables = read
-            return Readable("text", media_type, file_name, text=text, tables=tables)
+            return Readable("text", media_type, file_name, data=content, text=text, tables=tables)
         return Readable("document", media_type, file_name, data=content)
     if media_type in IMAGE_TYPES:
         if ocr and (read := _ocr(content, media_type)) is not None:
             text, tables = read
-            return Readable("text", media_type, file_name, text=text, tables=tables)
+            return Readable("text", media_type, file_name, data=content, text=text, tables=tables)
         return Readable("image", media_type, file_name, data=content)
     if media_type in SPREADSHEET_TYPES:
         text, tables = _from_spreadsheet(content, file_name)

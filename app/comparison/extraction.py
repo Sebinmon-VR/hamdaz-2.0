@@ -15,9 +15,11 @@ What it was for is covered two other ways:
   the words sit on the page (``documents.table_from_words``), and by a
   line-shape reader in ``parsing.py`` for text that is a table only in spirit.
 * **Scans and photographs** go through an OCR engine when one is installed
-  (``documents._ocr``). When none is, the document is declined with a message
-  that says so, and the supplier's lines are typed in on the screen instead —
-  a path that exists in its own right, not as a fallback.
+  (``documents._ocr``). Production has none, so where Claude is configured
+  the file itself is shown to it last of all (``_read_by_looking``) — a scan,
+  or a PDF printed from a web page with its table as a picture. When neither
+  can read it, the document is declined with a message that says so, and the
+  supplier's lines are typed in on the screen instead.
 
 Either way nothing here does arithmetic. The parser transcribes; the totals are
 computed in Python from what it read, because a figure a reader added up is a
@@ -30,13 +32,15 @@ can act on; an invented one is a fact they cannot.
 
 from __future__ import annotations
 
+import io
 import logging
 from decimal import Decimal, InvalidOperation
+from typing import Final
 
 from pydantic import BaseModel, Field, PrivateAttr, ValidationError
 
 from app.comparison.charges import ExtractedCharge, find_charges
-from app.comparison.documents import Readable, ocr_available
+from app.comparison.documents import IMAGE_TYPES, PDF_TYPES, Readable, ocr_available
 from app.comparison.supplier_details import OWN_COMPANY
 from app.comparison.supplier_details import suggest as suggest_details
 from app.core.config import Settings
@@ -163,6 +167,12 @@ class ExtractionError(Exception):
     """A document could not be read. Safe to show a user."""
 
 
+class NoPricesError(ExtractionError):
+    """The document was read — its pages looked at — and has no prices on it:
+    a datasheet or a covering letter dropped in with the quotes. Not a quote
+    the readers failed on, so it can be filed with the quote instead."""
+
+
 class QuoteExtractor:
     """Reads supplier quote documents. Holds no client and needs no key.
 
@@ -189,17 +199,34 @@ class QuoteExtractor:
             raise result
         return result
 
+    @property
+    def can_see(self) -> bool:
+        """Whether a model here can look at a scan rather than read its text."""
+        return bool(self.configured and getattr(self._model, "can_see", False))
+
     async def _read(self, readable: Readable) -> ExtractedQuote | ExtractionError:
+        if readable.kind == "text":
+            if (parsed := parse_locally(readable)) is not None:
+                return with_charges(parsed, readable.text)
+            if (modelled := await self._read_with_model(readable)) is not None:
+                return with_charges(modelled, readable.text)
+        # Last: the page itself, for a scan and for a PDF whose table is a
+        # picture — a web page printed to PDF, a quote pasted in as a screenshot.
+        seen, priceless = await self._read_by_looking(readable)
+        if seen is not None:
+            return with_charges(seen, readable.text)
+        if priceless:
+            return NoPricesError(
+                f"No prices could be found in {readable.file_name!r}: it reads as a "
+                f"datasheet or a covering letter, not a quotation."
+            )
         if readable.kind != "text":
-            return ExtractionError(cannot_read_scan(readable.file_name))
-        if (parsed := parse_locally(readable)) is not None:
-            return with_charges(parsed, readable.text)
-        if (modelled := await self._read_with_model(readable)) is not None:
-            return with_charges(modelled, readable.text)
+            return ExtractionError(cannot_read_scan(readable.file_name, looked=self.can_see))
         return ExtractionError(
-            f"No price table could be found in {readable.file_name!r}. It may be a "
-            f"covering letter rather than a quotation, or laid out in a way this "
-            f"cannot follow. Type the supplier's lines in instead."
+            f"No prices could be found in {readable.file_name!r}. If it is a datasheet "
+            f"or a covering letter, choose \"Technical spec / datasheet\" or \"Other\" "
+            f"above and drop it in again to file it with the quote. If it is the "
+            f"supplier's quotation, type their lines in instead."
         )
 
     async def _read_with_model(self, readable: Readable) -> ExtractedQuote | None:
@@ -209,37 +236,37 @@ class QuoteExtractor:
         if not self.configured or not readable.text:
             return None
         answer = await self._model.extract(
-            instructions=(
-                f"Transcribe this supplier quotation ({readable.file_name}). One entry "
-                f"in `items` per priced line; do not include subtotal, VAT or total rows "
-                f"as items — those go in the header fields. Copy prices digit for digit. "
-                f"`quantity` is the quantity as printed, and 1 when the quote prints none "
-                f"beside the price. `unit_price` is the price for ONE unit. `currency` is "
-                f"the ISO code; infer it from a symbol when it is not spelled out "
-                f"($ is USD, Dhs or AED is AED, € is EUR, £ is GBP)."
-            ),
+            instructions=_transcribe(readable.file_name),
             text=readable.text,
             shape=JSON_SHAPE,
             max_tokens=6000,
             label=f"Supplier quote · {readable.file_name}",
         )
-        if answer is None:
-            return None
-        payload, who = answer
-        try:
-            quote = ExtractedQuote.model_validate(payload)
-        except ValidationError as exc:
-            logger.info("model answer for %s did not validate: %s", readable.file_name, exc)
-            return None
-        if not quote.items:
-            return None
-        settle_model_reading(quote, readable.text)
-        quote.note = (
-            f"Read by a model ({who}) because no price table could be followed. "
-            f"Check every figure against the document. "
-            + (quote.note or "")
-        ).strip()
-        return quote
+        return _settled(answer, readable, "because no price table could be followed")
+
+    async def _read_by_looking(self, readable: Readable) -> tuple[ExtractedQuote | None, bool]:
+        """The third pass: the file itself shown to a model that can see it,
+        when there is no text to read or the text gave up no priced lines.
+
+        Second in the pair: the model looked and answered that there are no
+        priced lines at all — a datasheet, not a quote it failed to read.
+        """
+        if not self.can_see or (sent := _for_claude(readable)) is None:
+            return None, False
+        data, media_type = sent
+        answer = await self._model.see(
+            instructions=_transcribe(readable.file_name),
+            file_name=readable.file_name,
+            media_type=media_type,
+            data=data,
+            shape=JSON_SHAPE,
+            max_tokens=6000,
+            label=f"Supplier quote · {readable.file_name}",
+        )
+        if answer is not None and not answer[0].get("items"):
+            return None, True
+        how = "from the page itself, which had no table to follow"
+        return _settled(answer, readable, how), False
 
     async def read_all(
         self, readables: list[Readable]
@@ -317,8 +344,80 @@ def settle_model_reading(quote: ExtractedQuote, text: str | None) -> list[str]:
     return settled
 
 
-def cannot_read_scan(file_name: str) -> str:
-    """Why a scan or a photograph was declined, and what to do about it."""
+def _transcribe(file_name: str) -> str:
+    """What a model is asked to do with a supplier quotation, text or page."""
+    return (
+        f"Transcribe this supplier quotation ({file_name}). One entry "
+        f"in `items` per priced line; do not include subtotal, VAT or total rows "
+        f"as items — those go in the header fields. Copy prices digit for digit. "
+        f"`quantity` is the quantity as printed, and 1 when the quote prints none "
+        f"beside the price. `unit_price` is the price for ONE unit. `currency` is "
+        f"the ISO code; infer it from a symbol when it is not spelled out "
+        f"($ is USD, Dhs or AED is AED, € is EUR, £ is GBP). A document with no "
+        f"prices on it — a datasheet, a covering letter — has no items."
+    )
+
+
+def _settled(
+    answer: tuple[dict, str] | None, readable: Readable, how: str
+) -> ExtractedQuote | None:
+    """A model's answer, validated and settled, or ``None`` if it is unusable."""
+    if answer is None:
+        return None
+    payload, who = answer
+    try:
+        quote = ExtractedQuote.model_validate(payload)
+    except ValidationError as exc:
+        logger.info("model answer for %s did not validate: %s", readable.file_name, exc)
+        return None
+    if not quote.items:
+        return None
+    settle_model_reading(quote, readable.text)
+    quote.note = (
+        f"Read by a model ({who}) {how}. Check every figure against the document. "
+        + (quote.note or "")
+    ).strip()
+    return quote
+
+
+#: Claude refuses an image over 5 MB; a phone photograph is often more.
+_MAX_IMAGE_BYTES: Final = 4_500_000
+_IMAGE_LONG_SIDE: Final = 2000
+
+
+def _for_claude(readable: Readable) -> tuple[bytes, str] | None:
+    """The file as Claude takes it — a PDF as it is, an image shrunk to fit —
+    or ``None`` for what it cannot be shown (a converted spreadsheet)."""
+    data = readable.data
+    if not data:
+        return None
+    if readable.media_type in PDF_TYPES:
+        return data, readable.media_type
+    if readable.media_type not in IMAGE_TYPES:
+        return None
+    if len(data) <= _MAX_IMAGE_BYTES:
+        return data, readable.media_type
+    try:
+        from PIL import Image
+
+        image = Image.open(io.BytesIO(data)).convert("RGB")
+        image.thumbnail((_IMAGE_LONG_SIDE, _IMAGE_LONG_SIDE))
+        out = io.BytesIO()
+        image.save(out, format="JPEG", quality=85)
+    except Exception:  # noqa: BLE001 - an image that will not open is not seen
+        logger.info("could not shrink %s for the model", readable.file_name, exc_info=True)
+        return None
+    return out.getvalue(), "image/jpeg"
+
+
+def cannot_read_scan(file_name: str, *, looked: bool = False) -> str:
+    """Why a scan or a photograph was declined, and what to do about it.
+    ``looked`` when a model that can see was asked and gave no usable answer."""
+    if looked:
+        return (
+            f"{file_name!r} has no text to read, and its pages could not be read "
+            f"just now. Drop it in again in a minute, or type the supplier's lines in."
+        )
     if ocr_available():
         return (
             f"{file_name!r} is a scan or a photograph and the text recognition could "
