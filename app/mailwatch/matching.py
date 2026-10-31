@@ -536,7 +536,8 @@ async def match(
         if stage and theirs and STAGE_RANK.get(stage, -1) > STAGE_RANK.get(theirs, 99):
             found.verdict = STAGE_CHANGE
             found.reason += f"; the task is at {theirs.upper()}, this mail is {stage.upper()}"
-    if found.verdict == NEW and earlier is not None:
+    # Unsure too: the first mail's tender was assigned as new, so this is its repeat.
+    if found.verdict in (NEW, UNSURE) and earlier is not None:
         found.verdict = DUPLICATE_MAIL
         found.duplicate_of_id = earlier.id
         found.reason = "no task yet, but an earlier mail brought the same tender"

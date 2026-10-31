@@ -552,7 +552,7 @@ async def trial(
             reading.model_cost_usd += Decimal(str(found.model_cost_usd))
             keys = [k for k in (reading.ariba_doc, *matching._refs(reading.references)[0]) if k]
             earlier = next((first_seen[k] for k in keys if k in first_seen), None)
-            if earlier is not None and found.verdict == matching.NEW:
+            if earlier is not None and found.verdict in (matching.NEW, matching.UNSURE):
                 found.verdict = matching.DUPLICATE_MAIL
                 found.reason = "no task yet, but an earlier mail in this trial brought the same tender"
             for k in keys:

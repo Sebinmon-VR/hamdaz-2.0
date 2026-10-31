@@ -1266,13 +1266,20 @@ def _new_tender_card(
     why = f"Had the {(task.previous_stage or 'earlier stage').upper()}" if staged else (
         "Priority 1 in Presale"
     )
+    why_items = [_with_icon(
+        _icon("History" if staged else "Trophy", color="Accent"),
+        _text(why, weight="Bolder"), spacing="None",
+    )]
+    if task.action == "unsure":
+        closest = assign.closest_task(mail)
+        why_items.append(_caption(
+            "Match unsure — check it is not " + (closest or "an earlier task"),
+            size="Small", spacing="None",
+        ))
     body += _facts([
         ("Assigned to", [_persona(people.get((task.assigned_to_email or "").lower()),
                                   task.assigned_to_name)]),
-        ("Why", [_with_icon(
-            _icon("History" if staged else "Trophy", color="Accent"),
-            _text(why, weight="Bolder"), spacing="None",
-        )]),
+        ("Why", why_items),
         ("Type", [_text(_v(task.current_type or stage), weight="Bolder", spacing="None")]),
         ("BCD", bcd),
     ])

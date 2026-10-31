@@ -1,15 +1,17 @@
 """Mail watch → a task for each new tender, and who it goes to.
 
-Two cases, from the matcher's verdict on a new-tender mail:
+Three cases, from the matcher's verdict on a new-tender mail:
 
 * **new** — no task on the Proposals list has this tender: it goes to whoever
   is priority 1 of the team (the live standing kept in ``live_scores``, the
   same ranking published to the useranalytics list).
+* **unsure** — tasks with alike titles, none certainly this tender: as new,
+  to priority 1, with the likeliest earlier task named on it to check.
 * **stage change** — the tender is on the list at an earlier stage (an EOI
   that is now an RFP, say): it goes to whoever had it, as they know it.
 
 Anything else — a task already at this stage, a second mail about the same
-tender, a match the matcher was unsure of — gets no task.
+tender, a mail whose matching failed — gets no task.
 
 **Not written to SharePoint.** While this is tested the task is kept in
 ``mailwatch_test_tasks``, with the Proposals list's own columns and the exact
@@ -24,7 +26,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Final
 
-from sqlalchemy import select, text
+from sqlalchemy import and_, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.analytics import live
@@ -33,7 +35,7 @@ from app.ariba.bcd import expected_bcd
 from app.core.config import Settings
 from app.intake.worker import MIRROR_LOCK
 from app.mailwatch.classify import NEW_TENDER
-from app.mailwatch.matching import NEW, STAGE_CHANGE
+from app.mailwatch.matching import NEW, STAGE_CHANGE, UNSURE
 from app.models.mailwatch import MailWatchTeams, MailWatchTestTask, WatchedMail
 from app.models.proposal_index import ProposalIndexItem
 from app.models.team import Team
@@ -102,9 +104,40 @@ class AssignError(Exception):
     """Something a super admin can be shown as it is."""
 
 
+#: An unsure verdict the title search reached; one with no method is a mail
+#: whose matching failed, so nothing was checked and it gets no task.
+UNSURE_METHOD: Final = "title"
+
+
 def wanted(mail: WatchedMail) -> bool:
-    """A mail that should have a task: a new tender, new or at a later stage."""
-    return mail.category == NEW_TENDER and mail.verdict in (NEW, STAGE_CHANGE)
+    """A mail that should have a task: a new tender, new (or no task certainly
+    it) or at a later stage."""
+    if mail.category != NEW_TENDER:
+        return False
+    if mail.verdict == UNSURE:
+        return mail.match_method == UNSURE_METHOD and mail.duplicate_of_id is None
+    return mail.verdict in (NEW, STAGE_CHANGE)
+
+
+def _wanted_clause():
+    """:func:`wanted` as a query condition (the category aside)."""
+    return or_(
+        WatchedMail.verdict.in_((NEW, STAGE_CHANGE)),
+        and_(
+            WatchedMail.verdict == UNSURE,
+            WatchedMail.match_method == UNSURE_METHOD,
+            WatchedMail.duplicate_of_id.is_(None),
+        ),
+    )
+
+
+def closest_task(mail: WatchedMail) -> str | None:
+    """The best of the alike tasks an unsure match left, as "title (assignee)"."""
+    best = next(iter(mail.match_candidates or []), None)
+    if not best or not best.get("title"):
+        return None
+    who = f" ({best['assignee']})" if best.get("assignee") else ""
+    return f"{best['title'].strip()}{who}"
 
 
 def task_title(mail: WatchedMail) -> str:
@@ -294,7 +327,8 @@ async def plan(
     not kept. Reads the standing and the mirror; writes nothing."""
     if not wanted(mail):
         raise AssignError(
-            "Only a new tender that is new, or at a later stage than its task, gets a task."
+            "Only a new tender that is new, unsure, or at a later stage than its task, "
+            "gets a task."
         )
 
     team = await _team(session)
@@ -349,6 +383,12 @@ async def plan(
             f"Priority 1 in {team.name} by workload ({first['active']} active task"
             f"{'' if first['active'] == 1 else 's'})."
         )
+        if mail.verdict == UNSURE:
+            closest = closest_task(mail)
+            task.assign_reason += " Match unsure: assigned as a new tender."
+            if closest:
+                task.assign_reason += f" Closest task: {closest}."
+                task.remarks += f" May follow {closest} — please check."
     task.fields = _fields(task, settings)
     return task
 
@@ -371,7 +411,7 @@ async def create_pending(
             select(WatchedMail)
             .where(
                 WatchedMail.category == NEW_TENDER,
-                WatchedMail.verdict.in_((NEW, STAGE_CHANGE)),
+                _wanted_clause(),
                 WatchedMail.received_at >= row.assign_from,
                 WatchedMail.id.not_in(done),
             )
