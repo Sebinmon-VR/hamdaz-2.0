@@ -490,6 +490,9 @@ class Settings(BaseSettings):
     teams_card_logo_url: str = (
         "https://calm-sky-08cea4100.6.azurestaticapps.net/hamdaz-logo.png"
     )
+    #: The cards' other images (a won order's animated party poppers): the
+    #: live frontend's teams/ folder, public for the same reason.
+    teams_card_images_url: str = "https://calm-sky-08cea4100.6.azurestaticapps.net/teams"
     #: Where the links in the overdue-task follow-up mails point. Its own
     #: setting, and production by default, because those mails reach real
     #: people from whichever backend sent them — a laptop included — and a

@@ -1445,59 +1445,46 @@ def _won_in(task: dict[str, Any], order: Order, mail: WatchedMail) -> str | None
     return "Same day" if days == 0 else f"{days} day{'s' if days != 1 else ''}"
 
 
-#: Above and below the congratulations on a won order.
-CONFETTI: Final = "🎊   ✨   🎉   ✨   🎊   ✨   🎉   ✨   🎊"
-
-
-def _centred(item: dict[str, Any], **extra: Any) -> dict[str, Any]:
-    """An element that has no alignment of its own (a badge), centred."""
-    return {
-        "type": "ColumnSet", **extra,
-        "columns": [
-            {"type": "Column", "width": "stretch", "items": []},
-            {"type": "Column", "width": "auto", "items": [item]},
-            {"type": "Column", "width": "stretch", "items": []},
-        ],
-    }
-
-
 def _congrats(name: str | None, customer: str, value: str, details: str) -> dict[str, Any]:
     """The top of a won order's card: congratulations to whoever's task it
-    was, between party poppers and confetti, then the order's value."""
+    was and the order's value, between two party poppers bursting confetti —
+    animated GIFs on the live frontend, which Teams plays (a phone may show
+    them still). The right one is left out on a narrow card."""
     who = name.split()[0] if name and name.split() else None
+    images = get_settings().teams_card_images_url
 
-    def popper(emoji: str) -> dict[str, Any]:
-        return {"type": "Column", "width": "auto", "verticalContentAlignment": "Center",
-                "items": [_text(emoji, size="ExtraLarge", wrap=False)]}
+    def popper(side: str, **extra: Any) -> dict[str, Any]:
+        return {
+            "type": "Column", "width": "auto", "verticalContentAlignment": "Center", **extra,
+            "items": [{"type": "Image", "url": f"{images}/popper-{side}.gif", "width": "80px",
+                       "altText": "Party popper"}],
+        }
 
     return {
         "type": "Container", "style": "good", "bleed": True, "spacing": "None",
-        "items": [
-            _text(CONFETTI, size="Large", wrap=False, horizontalAlignment="Center"),
-            {
-                "type": "ColumnSet", "spacing": "Small",
-                "columns": [
-                    popper("🎉"),
-                    {
-                        "type": "Column", "width": "stretch", "verticalContentAlignment": "Center",
-                        "items": [_text(f"Congratulations, {who or 'team'}!", size="ExtraLarge",
-                                        weight="Bolder", horizontalAlignment="Center")],
-                    },
-                    popper("🎊"),
-                ],
-            },
-            _text(
-                (f"Your quote won an order from **{customer}**. Great work! 👏" if who else
-                 f"We've won an order from **{customer}**! 👏"),
-                horizontalAlignment="Center", spacing="Small",
-            ),
-            _centred(_badge("Order won", icon="Trophy", style="Good"), spacing="Medium"),
-            _text(value, size="ExtraLarge", weight="Bolder", color="Good",
-                  horizontalAlignment="Center", spacing="Small"),
-            _caption(details, horizontalAlignment="Center", spacing="None"),
-            _text(CONFETTI, size="Large", wrap=False, horizontalAlignment="Center",
-                  spacing="Medium"),
-        ],
+        "items": [{
+            "type": "ColumnSet",
+            "columns": [
+                popper("left"),
+                {
+                    "type": "Column", "width": "stretch", "verticalContentAlignment": "Center",
+                    "items": [
+                        _text(f"Congratulations, {who or 'team'}!", size="Large",
+                              weight="Bolder", horizontalAlignment="Center"),
+                        _text(
+                            (f"Your quote won an order from **{customer}**. Great work! 👏"
+                             if who else f"We've won an order from **{customer}**! 👏"),
+                            horizontalAlignment="Center", spacing="None",
+                        ),
+                        _text(value, size="Large", weight="Bolder", color="Good",
+                              horizontalAlignment="Center", spacing="Small"),
+                        _caption(details, size="Small", horizontalAlignment="Center",
+                                 spacing="None"),
+                    ],
+                },
+                popper("right", targetWidth=WIDE),
+            ],
+        }],
     }
 
 
