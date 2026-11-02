@@ -23,8 +23,9 @@ the next pass, three times at most. Only mail received after posting was
 switched on is posted — switching on never sends the backlog.
 
 **Orders** (a customer's purchase order) get a card of their own, and go to
-the test channel only (:data:`ORDERS_TEST_ONLY`), whatever the page has chosen
-for the others. One order is one card: SAP Business Network sends the purchase
+the test channel only, whatever the page has chosen for the others — until
+``orders_test_only`` is switched off on the page; then where the other cards
+go. One order is one card: SAP Business Network sends the purchase
 order and a short notice of it a minute apart, and the card is made from the
 purchase order, with the notice's order date; the other mail is marked posted
 with it.
@@ -68,6 +69,7 @@ from app.mailwatch.classify import (
     ORDER_CHANGED,
     ORDER_KINDS,
     ORDER_NOTICE,
+    PURCHASE_ORDER,
     Order,
     read_order,
 )
@@ -79,10 +81,6 @@ logger = logging.getLogger("hamdaz.mailwatch.teams")
 
 #: The only channel a post may go to: (team, channel), by display name.
 TEST_CHANNEL: Final = ("Test", "test channel")
-
-#: Order cards go to TEST_CHANNEL and nowhere else while they are tested —
-#: not to the channel or group chat chosen on the page for the other cards.
-ORDERS_TEST_ONLY: Final = True
 
 #: A short new-order notice whose purchase order has not come by then is
 #: posted on its own; the purchase order normally follows within a minute.
@@ -827,15 +825,18 @@ def _facts(facts: list[tuple[str, list[dict[str, Any]]]]) -> list[dict[str, Any]
     return [wide, narrow]
 
 
-def _tracker(task: dict[str, Any], *, at: str = NEGOTIATION) -> list[dict[str, Any]]:
+def _tracker(task: dict[str, Any], *, at: str = NEGOTIATION, won: bool = False
+             ) -> list[dict[str, Any]]:
     """Where the tender stands: received → submitted → negotiation → order.
     A negotiation mail puts it at negotiation, so that step is always lit; an
-    order mail at the order, with negotiation done only if there was one."""
+    order mail at the order, with negotiation done only if there was one — and
+    a trophy there when the order is won, not changed or cancelled."""
     submitted = "submit" in (task.get("submission_status") or "").lower()
     ordered = bool(task.get("order_status"))
     if at == ORDER:
         negotiated = (task.get("negotiation") or "").strip().lower() not in ("", "no", "none")
-        middle, last = ("done" if negotiated else "missed"), ("Order received", "now")
+        middle = "done" if negotiated else "missed"
+        last = ("Order won" if won else "Order received", "won" if won else "now")
     else:
         middle, last = ("done" if ordered else "now"), ("Order", "done" if ordered else "next")
     steps = [
@@ -847,6 +848,7 @@ def _tracker(task: dict[str, Any], *, at: str = NEGOTIATION) -> list[dict[str, A
     looks = {
         "done": ("CheckmarkCircle", "Good", True),
         "now": ("Circle", "Accent", True),
+        "won": ("Trophy", "Good", True),
         "missed": ("DismissCircle", "Default", False),
         "next": ("Circle", "Default", False),
     }
@@ -869,8 +871,8 @@ def _tracker(task: dict[str, Any], *, at: str = NEGOTIATION) -> list[dict[str, A
                     {**_icon(icon, size="Small", color=colour, filled=filled),
                      "horizontalAlignment": "Center"},
                     _text(name, size="Small", spacing="Small", horizontalAlignment="Center",
-                          weight="Bolder" if state == "now" else "Default",
-                          color="Accent" if state == "now" else "Default",
+                          weight="Bolder" if state in ("now", "won") else "Default",
+                          color={"now": "Accent", "won": "Good"}.get(state, "Default"),
                           isSubtle=state in ("next", "missed")),
                 ],
             }
@@ -1429,6 +1431,76 @@ def _ordered_on(order: Order, mail: WatchedMail) -> str:
     return mail.received_at.strftime("%d %b %Y") if mail.received_at else "—"
 
 
+def _won_in(task: dict[str, Any], order: Order, mail: WatchedMail) -> str | None:
+    """From the task's start to the order, as "12 days"; None when either
+    date is unknown."""
+    start = _when(task.get("created_at"))
+    try:
+        end = datetime.strptime(_ordered_on(order, mail), "%d %b %Y").date()
+    except ValueError:
+        return None
+    if start is None or end < start.date():
+        return None
+    days = (end - start.date()).days
+    return "Same day" if days == 0 else f"{days} day{'s' if days != 1 else ''}"
+
+
+#: Above and below the congratulations on a won order.
+CONFETTI: Final = "🎊   ✨   🎉   ✨   🎊   ✨   🎉   ✨   🎊"
+
+
+def _centred(item: dict[str, Any], **extra: Any) -> dict[str, Any]:
+    """An element that has no alignment of its own (a badge), centred."""
+    return {
+        "type": "ColumnSet", **extra,
+        "columns": [
+            {"type": "Column", "width": "stretch", "items": []},
+            {"type": "Column", "width": "auto", "items": [item]},
+            {"type": "Column", "width": "stretch", "items": []},
+        ],
+    }
+
+
+def _congrats(name: str | None, customer: str, value: str, details: str) -> dict[str, Any]:
+    """The top of a won order's card: congratulations to whoever's task it
+    was, between party poppers and confetti, then the order's value."""
+    who = name.split()[0] if name and name.split() else None
+
+    def popper(emoji: str) -> dict[str, Any]:
+        return {"type": "Column", "width": "auto", "verticalContentAlignment": "Center",
+                "items": [_text(emoji, size="ExtraLarge", wrap=False)]}
+
+    return {
+        "type": "Container", "style": "good", "bleed": True, "spacing": "None",
+        "items": [
+            _text(CONFETTI, size="Large", wrap=False, horizontalAlignment="Center"),
+            {
+                "type": "ColumnSet", "spacing": "Small",
+                "columns": [
+                    popper("🎉"),
+                    {
+                        "type": "Column", "width": "stretch", "verticalContentAlignment": "Center",
+                        "items": [_text(f"Congratulations, {who or 'team'}!", size="ExtraLarge",
+                                        weight="Bolder", horizontalAlignment="Center")],
+                    },
+                    popper("🎊"),
+                ],
+            },
+            _text(
+                (f"Your quote won an order from **{customer}**. Great work! 👏" if who else
+                 f"We've won an order from **{customer}**! 👏"),
+                horizontalAlignment="Center", spacing="Small",
+            ),
+            _centred(_badge("Order won", icon="Trophy", style="Good"), spacing="Medium"),
+            _text(value, size="ExtraLarge", weight="Bolder", color="Good",
+                  horizontalAlignment="Center", spacing="Small"),
+            _caption(details, horizontalAlignment="Center", spacing="None"),
+            _text(CONFETTI, size="Large", wrap=False, horizontalAlignment="Center",
+                  spacing="Medium"),
+        ],
+    }
+
+
 def _order_card(
     mail: WatchedMail,
     order: Order,
@@ -1437,64 +1509,80 @@ def _order_card(
     people: dict[str, dict[str, str]] | None,
     shown: int,
 ) -> dict[str, Any]:
-    """The Teams post for a customer's order. On top the customer and the
-    order's value; then whose task it was and how far it came — now at the
-    order; what to do next; the customer's message; then tabs — the order in
-    full, the task, its files, the mail's attachments."""
+    """The Teams post for a customer's order. A new order opens with
+    congratulations to whoever's task won it — party poppers, confetti, the
+    order's value; a changed or cancelled one with the customer and a badge
+    saying so. Then when it was ordered, on what terms, whose task it was and
+    how far it came — now at the order; what to do next; the customer's
+    message; then tabs — the order in full, the task, its files, the mail's
+    attachments."""
     task = task or {}
     files = files or TaskFiles()
     people = people or {}
     customer = _v(order.customer or mail.customer or task.get("customer"))
     number = f"PO {order.number}" if order.number else "Purchase order"
     on_network = "ariba" in (mail.original_sender or "").lower()
-    badge = (
-        _badge("Order cancelled", icon="DismissCircle", style="Attention")
-        if mail.kind == ORDER_CANCELLED or order.status == "Cancelled" else
-        _badge("Order changed", icon="Edit", style="Warning")
-        if mail.kind == ORDER_CHANGED or order.status == "Changed" else
-        _badge("New order", icon="Receipt", style="Good")
-    )
+    cancelled = mail.kind == ORDER_CANCELLED or order.status == "Cancelled"
+    changed = not cancelled and (mail.kind == ORDER_CHANGED or order.status == "Changed")
+    won = not cancelled and not changed
+    details = " · ".join(filter(None, [
+        number, f"version {order.version}" if order.version else None,
+        order.buyer if order.buyer and order.buyer != customer else None,
+    ]))
+    person = people.get((task.get("assignee_email") or "").lower())
 
     body: list[dict[str, Any]] = [
         *_testing_note("Order cards go to the test channel only; nothing is written anywhere."),
-        {
-            "type": "ColumnSet",
-            "columns": [
-                {
-                    "type": "Column", "width": "stretch",
-                    "items": [
-                        _text(customer, size="Large", weight="Bolder"),
-                        _caption(
-                            " · ".join(filter(None, [
-                                number, f"version {order.version}" if order.version else None,
-                                order.buyer if order.buyer and order.buyer != customer else None,
-                            ])),
-                            spacing="None",
-                        ),
-                    ],
-                },
-                {"type": "Column", "width": "auto", "targetWidth": WIDE, "items": [badge]},
-            ],
-        },
-        {**badge, "targetWidth": NARROW},
     ]
+    if won:
+        body.append(_congrats(
+            ((person or {}).get("displayName") or task.get("assignee")) if task else None,
+            customer, _money(order), details,
+        ))
+    else:
+        badge = (
+            _badge("Order cancelled", icon="DismissCircle", style="Attention") if cancelled else
+            _badge("Order changed", icon="Edit", style="Warning")
+        )
+        body += [
+            {
+                "type": "ColumnSet",
+                "columns": [
+                    {
+                        "type": "Column", "width": "stretch",
+                        "items": [_text(customer, size="Large", weight="Bolder"),
+                                  _caption(details, spacing="None")],
+                    },
+                    {"type": "Column", "width": "auto", "targetWidth": WIDE, "items": [badge]},
+                ],
+            },
+            {**badge, "targetWidth": NARROW},
+        ]
 
     owner = (
-        [_persona(people.get((task.get("assignee_email") or "").lower()), task.get("assignee"))]
+        [_persona(person, task.get("assignee"))]
         if task else [_text("No task found", weight="Bolder", color="Attention", spacing="None")]
     )
+    took = _won_in(task, order, mail) if won and task else None
     body += _facts([
-        ("Order value", [_text(_money(order), size="Large", weight="Bolder", color="Good",
-                               spacing="None")]),
+        *([] if won else [
+            ("Order value", [_text(_money(order), size="Large", weight="Bolder", color="Good",
+                                   spacing="None")]),
+        ]),
         ("Ordered on", [_text(_ordered_on(order, mail), weight="Bolder", spacing="None")]),
         ("Payment terms", [_text(_v(order.payment_terms), weight="Bolder", spacing="None",
                                  maxLines=2)]),
-        ("Task owner", owner),
+        *([("Won in", [
+            _text(f"⏱️ {took}", weight="Bolder", spacing="None"),
+            _caption(f"{task.get('current_type') or 'Enquiry'} to order", size="Small",
+                     spacing="None"),
+        ])] if took else []),
+        ("Won by" if won and task else "Task owner", owner),
     ])
 
     if task:
         body.append({"type": "Container", "separator": True, "spacing": "Medium",
-                     "items": _tracker(task, at=ORDER)})
+                     "items": _tracker(task, at=ORDER, won=won)})
     else:
         body.append(
             {
@@ -1507,9 +1595,9 @@ def _order_card(
             }
         )
 
-    if mail.kind == ORDER_CANCELLED or order.status == "Cancelled":
+    if cancelled:
         step = "The customer **cancelled** this order — stop any purchase made for it."
-    elif mail.kind == ORDER_CHANGED or order.status == "Changed":
+    elif changed:
         step = ("The customer **changed** this order"
                 + (f" (version {order.version})" if order.version else "")
                 + " — check what changed before confirming it.")
@@ -1632,6 +1720,38 @@ def _order_card(
                       "url": files.folder_url, "iconUrl": "icon:Folder"})
     if links:
         card["actions"] = links
+    return card
+
+
+def sample_order_card(
+    name: str, email: str, people: dict[str, dict[str, str]] | None = None
+) -> dict[str, Any]:
+    """A made-up order, all TEST text, as its card: what a won order looks
+    like, congratulating ``name``. For the sample button on the page."""
+    now = datetime.now(UTC)
+    mail = WatchedMail(
+        category=ORDER, kind=PURCHASE_ORDER, body="", subject="TEST order",
+        reference_numbers=["PO TEST-0001"], original_sender="ordersender-prod@ansmtp.ariba.com",
+        attachment_names=["TEST-PO-0001.pdf"], received_at=now,
+    )
+    order = Order(
+        number="TEST-0001", status="New", customer="TEST Customer LLC",
+        buyer="TEST Buyer Department", amount="1,234.56", currency="AED", version="1",
+        payment_terms="TEST Net 30", order_date=now.strftime("%d %b %Y"),
+        tenders=["TEST-RFQ-0001"], prs=["TEST-PR-0001"],
+        message="TEST — a sample order card with made-up text. Nothing to do.",
+    )
+    task = {
+        "title": "TEST order card — sample task", "assignee": name, "assignee_email": email,
+        "created_at": (now - timedelta(days=12)).isoformat(), "current_type": "RFQ",
+        "status": "Completed", "submission_status": "Submitted", "negotiation": "Yes",
+        "quote_no": "TEST-QT-0001",
+    }
+    card = order_card(mail, order, task, None, people)
+    card["body"] = [
+        *_testing_note("A sample card with made-up TEST text — nothing to do."),
+        *(b for b in card["body"] if b.get("id") != "testing"),
+    ]
     return card
 
 
@@ -1844,7 +1964,7 @@ async def post_mail(
             files = await poster.task_files(task) if task else None
             people = await poster.people([(task or {}).get("assignee_email") or ""])
             card = order_card(group[0], merged_order(group), task, files, people)
-            test_only = ORDERS_TEST_ONLY
+            test_only = row.orders_test_only
         else:
             files = await poster.task_files(mail.task) if mail.task else None
             people = await poster.people([(mail.task or {}).get("assignee_email") or ""])
@@ -1859,6 +1979,18 @@ async def post_mail(
         if each is mail or each.teams_posted_at is None:
             each.teams_posted_at, each.teams_message_id, each.teams_error = now, message_id, None
     return message_id
+
+
+async def post_sample_order(
+    session: AsyncSession, *, name: str, email: str, poster: TeamsPoster
+) -> str:
+    """Post the sample order card, congratulating whoever asked, to the test
+    channel — always, whatever is chosen for real cards. No mail is touched."""
+    row = await get_connection(session)
+    if not is_connected(row):
+        raise TeamsError("No Teams account is connected.")
+    card = sample_order_card(name, email, await poster.people([email]))
+    return await poster.post(row, "", card=card, test_only=True)
 
 
 async def post_pending(session: AsyncSession, *, poster: TeamsPoster, settings: Settings) -> int:

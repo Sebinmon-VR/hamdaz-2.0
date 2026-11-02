@@ -210,9 +210,11 @@ class TeamsOut(BaseModel):
     posting_from: datetime | None
     assign_new_tenders: bool
     assign_from: datetime | None
-    #: Order cards — always to the test channel while they are tested.
+    #: Order cards — to the test channel while ``orders_test_only``, else
+    #: where the other cards go.
     post_orders: bool = False
     orders_from: datetime | None = None
+    orders_test_only: bool = True
     #: Where new tenders' tasks are created: test / real / none.
     task_list: str = "test"
     #: The lists that choice can name, with their links: [{key, name, url}].
@@ -229,6 +231,8 @@ class TeamsIn(BaseModel):
     post_negotiations: bool | None = None
     assign_new_tenders: bool | None = None
     post_orders: bool | None = None
+    #: False sends order cards where the other cards go.
+    orders_test_only: bool | None = None
     task_list: Literal["test", "real", "none"] | None = None
     #: Where cards are posted: a team and channel, or a group chat.
     team_id: str | None = None

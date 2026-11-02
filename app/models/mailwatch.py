@@ -229,13 +229,17 @@ class MailWatchTeams(Base, Timestamped):
     #: exactly this; group chats need ChatMessage.Send and Chat.ReadBasic.
     granted_scopes: Mapped[str | None] = mapped_column(Text)
 
-    #: Post a card for each customer order (purchase order) — to the test
-    #: channel only, whatever ``target_kind`` says, while it is tested. Off
-    #: until switched on; only mail received from ``orders_from``.
+    #: Post a card for each customer order (purchase order). Off until
+    #: switched on; only mail received from ``orders_from``.
     post_orders: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false")
     )
     orders_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: Order cards go to the test channel, whatever ``target_kind`` says —
+    #: until switched off on the page; then where the other cards go.
+    orders_test_only: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=text("true")
+    )
 
 
 class MailWatchTestTask(Base, UUIDPrimaryKey, Timestamped):

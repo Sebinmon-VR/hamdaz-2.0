@@ -335,6 +335,8 @@ async def teams_switch(
         if body.post_orders and not row.post_orders:
             row.orders_from = datetime.now(UTC)
         row.post_orders = body.post_orders
+    if body.orders_test_only is not None:
+        row.orders_test_only = body.orders_test_only
     if body.task_list is not None:
         row.task_list = body.task_list
     if body.chat_id:
@@ -422,9 +424,28 @@ async def teams_test(admin: SuperAdmin, session: Session, request: Request) -> T
 
 
 @router.post(
+    "/teams/sample-order",
+    response_model=TeamsOut,
+    summary="Post a sample order card (TEST text) to the test channel",
+)
+async def teams_sample_order(admin: SuperAdmin, session: Session, request: Request) -> TeamsOut:
+    """A made-up order congratulating you, to the test channel whatever is
+    chosen for real cards — to see the card without a real order."""
+    try:
+        await teams.post_sample_order(
+            session, name=admin.display_name, email=admin.email, poster=_poster(request)
+        )
+    except teams.TeamsError as exc:
+        await session.commit()
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    await session.commit()
+    return await _teams_out(session)
+
+
+@router.post(
     "/mails/{mail_id}/teams",
     response_model=WatchedMailDetailOut,
-    summary="Post this mail's card to Teams now (an order: to the test channel only)",
+    summary="Post this mail's card to Teams now (an order: the test channel unless switched)",
 )
 async def post_mail_to_teams(
     mail_id: uuid.UUID, admin: SuperAdmin, session: Session, request: Request, config: Config
