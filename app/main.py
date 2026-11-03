@@ -61,6 +61,9 @@ from app.mailwatch.router import router as mailwatch_router
 from app.mailwatch.router import webhook_router as mailwatch_webhook_router
 from app.mailwatch.teams import TeamsPoster
 from app.mailwatch.worker import MailWatchWorker
+from app.nova.bot import TeamsBot
+from app.nova.chat import NovaChat
+from app.nova.router import router as nova_router
 from app.labels.router import router as labels_router
 from app.leave.mailer import LeaveMailer
 from app.leave.router import router as leave_router
@@ -120,6 +123,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # text model behind whichever free endpoint has a key, with fallback.
     # No key configured means no model, and everything still reads.
     app.state.text_model = TextModel(settings, http)
+    # Nova in Teams: chats answered from our data, worded by the model above
+    # (free ones first). Off unless NOVA_CHAT_ENABLED; see app/nova.
+    app.state.nova = NovaChat(
+        settings, TeamsBot(settings, http), app.state.text_model, get_session_factory()
+    )
     # Reads supplier quote documents: a parser over the document's own table,
     # OCR when an engine is installed, and the model above when the table
     # reader declines.
@@ -350,6 +358,8 @@ def create_app() -> FastAPI:
     app.include_router(intake_router, prefix=settings.api_prefix)
     app.include_router(mailwatch_webhook_router, prefix=settings.api_prefix)
     app.include_router(mailwatch_router, prefix=settings.api_prefix)
+    # Teams posts to it with the bot service's signature, not a session.
+    app.include_router(nova_router, prefix=settings.api_prefix)
     app.include_router(reports_admin_router, prefix=settings.api_prefix)
     app.include_router(reports_router, prefix=settings.api_prefix)
     # Mounted at the root, NOT under the API prefix, and holding no

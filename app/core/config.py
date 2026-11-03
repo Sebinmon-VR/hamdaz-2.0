@@ -309,6 +309,26 @@ class Settings(BaseSettings):
     #: PUBLIC_BASE_URL), not from a laptop.
     agent_teams_ask_url: str = ""
 
+    # ── Nova in Teams: the chat ────────────────────────────────────────
+    #: Answer chats with Nova, the Teams bot. Off until the bot is registered
+    #: and the trial is wanted. See app/nova.
+    nova_chat_enabled: bool = False
+    #: The bot's own app registration (Azure Bot, single tenant): its id and
+    #: secret. Incoming messages must be signed for this id; replies are sent
+    #: with a token got with the secret.
+    nova_app_id: str = ""
+    nova_app_secret: str = ""
+    #: Who may chat with it, by email, comma-separated; "*" lets in everyone
+    #: with an account here. The trial is Sebin only (the user's rule: live
+    #: tests with Sebin only).
+    nova_allowed_emails: str = "sebin@hamdaz.com"
+    #: Recent messages Nova keeps in view; older ones are folded into a
+    #: summary.
+    nova_history_messages: int = 12
+    #: A reply that takes longer than this is given without the model, from
+    #: what was found in the data.
+    nova_reply_seconds: float = 8.0
+
     # ── enquiry analysis ───────────────────────────────────────────────
     #: The Claude model that reads a tender's documents and looks new items up
     #: on the web, through ANTHROPIC_API_KEY (the user's choice, 2026-10-06,

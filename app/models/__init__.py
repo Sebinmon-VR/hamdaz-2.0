@@ -78,6 +78,7 @@ from app.models.mailwatch import (
     MailWatchTestTask,
     WatchedMail,
 )
+from app.models.nova import NovaMessage, NovaPerson
 from app.models.enquiry import EnquiryAnalysis, EnquiryDocument, EnquiryLine
 from app.models.hr import (
     CLOSED_STAGES,
@@ -194,6 +195,8 @@ __all__ = [
     "MailWatchTeams",
     "MailWatchTestTask",
     "WatchedMail",
+    "NovaMessage",
+    "NovaPerson",
     "BcdCheckStatus",
     "TaskCalendarEvent",
     "EnquiryAnalysis",

@@ -1,0 +1,45 @@
+{
+  "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.17/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.17",
+  "version": "1.0.0",
+  "id": "{{NOVA_APP_ID}}",
+  "developer": {
+    "name": "Hamdaztech",
+    "websiteUrl": "https://www.hamdaz.com",
+    "privacyUrl": "https://www.hamdaz.com",
+    "termsOfUseUrl": "https://www.hamdaz.com"
+  },
+  "name": {
+    "short": "Nova",
+    "full": "Nova, the Hamdaz presales assistant"
+  },
+  "description": {
+    "short": "Ask Nova about tenders, your tasks and what's closing.",
+    "full": "Nova answers questions about presales work from the Hamdaz ERP: any tender or quote number, your open tasks, what's closing today or this week, and what's overdue. It only shows what your role lets you see, and it changes nothing."
+  },
+  "icons": {
+    "color": "color.png",
+    "outline": "outline.png"
+  },
+  "accentColor": "#7C3AED",
+  "bots": [
+    {
+      "botId": "{{NOVA_APP_ID}}",
+      "scopes": ["personal"],
+      "supportsFiles": false,
+      "isNotificationOnly": false,
+      "commandLists": [
+        {
+          "scopes": ["personal"],
+          "commands": [
+            { "title": "My tasks", "description": "What you have open" },
+            { "title": "What's closing this week?", "description": "Bids closing this week" },
+            { "title": "Anything overdue?", "description": "Open tasks past their closing date" }
+          ]
+        }
+      ]
+    }
+  ],
+  "permissions": ["identity", "messageTeamMembers"],
+  "validDomains": []
+}

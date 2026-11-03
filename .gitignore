@@ -33,3 +33,6 @@ var/
 
 # ── tests: kept on the laptop, never pushed (the user, 2026-10-14) ─────
 tests/
+
+# Nova's Teams package, built with teams-nova/make_package.py (carries the bot id)
+teams-nova/*.zip
