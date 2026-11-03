@@ -692,6 +692,11 @@ FILE_ROWS: Final = 6
 #: "See more".
 SHORT_MESSAGE: Final = 160
 
+#: Put on the banner's image addresses. Teams fetches card images through
+#: its own proxy, which keeps what it got — the site's page, for an image not
+#: yet deployed — so a changed or newly deployed image needs a new number.
+CARD_IMAGES_VERSION: Final = "2"
+
 #: Teams refuses a message over 28 KB; the card keeps under this, leaving
 #: room for the message around it.
 CARD_BYTES: Final = 26_000
@@ -1463,7 +1468,8 @@ def _congrats(name: str | None, customer: str, value: str, details: str) -> dict
     light = {"color": "Light"} if images else {}
 
     def popper(side: str, **extra: Any) -> dict[str, Any]:
-        url = f"{images}/popper-{side}.png" if images else settings.teams_card_popper_url
+        url = (f"{images}/popper-{side}.png?v={CARD_IMAGES_VERSION}" if images
+               else settings.teams_card_popper_url)
         return {
             "type": "Column", "width": "auto", "verticalContentAlignment": "Center", **extra,
             "items": [{"type": "Image", "url": url, "width": "72px", "altText": "Party popper"}],
@@ -1475,7 +1481,7 @@ def _congrats(name: str | None, customer: str, value: str, details: str) -> dict
     }
     if images:
         banner["backgroundImage"] = {
-            "url": f"{images}/banner.jpg", "fillMode": "cover",
+            "url": f"{images}/banner.jpg?v={CARD_IMAGES_VERSION}", "fillMode": "cover",
             "horizontalAlignment": "center", "verticalAlignment": "center",
         }
     return {
