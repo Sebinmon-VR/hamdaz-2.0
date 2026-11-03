@@ -1447,17 +1447,16 @@ def _won_in(task: dict[str, Any], order: Order, mail: WatchedMail) -> str | None
 
 def _congrats(name: str | None, customer: str, value: str, details: str) -> dict[str, Any]:
     """The top of a won order's card: congratulations to whoever's task it
-    was and the order's value, between two party poppers bursting confetti —
-    animated GIFs on the live frontend, which Teams plays (a phone may show
-    them still). The right one is left out on a narrow card."""
+    was and the order's value, between two animated party poppers
+    (``teams_card_popper_url``; a client that won't animate shows them
+    still). The right one is left out on a narrow card."""
     who = name.split()[0] if name and name.split() else None
-    images = get_settings().teams_card_images_url
+    url = get_settings().teams_card_popper_url
 
-    def popper(side: str, **extra: Any) -> dict[str, Any]:
+    def popper(**extra: Any) -> dict[str, Any]:
         return {
             "type": "Column", "width": "auto", "verticalContentAlignment": "Center", **extra,
-            "items": [{"type": "Image", "url": f"{images}/popper-{side}.gif", "width": "80px",
-                       "altText": "Party popper"}],
+            "items": [{"type": "Image", "url": url, "width": "72px", "altText": "Party popper"}],
         }
 
     return {
@@ -1465,7 +1464,7 @@ def _congrats(name: str | None, customer: str, value: str, details: str) -> dict
         "items": [{
             "type": "ColumnSet",
             "columns": [
-                popper("left"),
+                popper(),
                 {
                     "type": "Column", "width": "stretch", "verticalContentAlignment": "Center",
                     "items": [
@@ -1482,7 +1481,7 @@ def _congrats(name: str | None, customer: str, value: str, details: str) -> dict
                                  spacing="None"),
                     ],
                 },
-                popper("right", targetWidth=WIDE),
+                popper(targetWidth=WIDE),
             ],
         }],
     }

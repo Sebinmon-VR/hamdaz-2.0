@@ -490,9 +490,14 @@ class Settings(BaseSettings):
     teams_card_logo_url: str = (
         "https://calm-sky-08cea4100.6.azurestaticapps.net/hamdaz-logo.png"
     )
-    #: The cards' other images (a won order's animated party poppers): the
-    #: live frontend's teams/ folder, public for the same reason.
-    teams_card_images_url: str = "https://calm-sky-08cea4100.6.azurestaticapps.net/teams"
+    #: The party popper either side of a won order's congratulations: the
+    #: animated Fluent 🎉 Teams itself uses, transparent (an animated PNG — a
+    #: client that won't play it shows it still), from a public CDN, pinned to
+    #: one commit so it never changes.
+    teams_card_popper_url: str = (
+        "https://cdn.jsdelivr.net/gh/Tarikul-Islam-Anik/Animated-Fluent-Emojis"
+        "@55e1dceff489121c3f7c7a7ec4f4d401d2cbd53e/Emojis/Activities/Party%20Popper.png"
+    )
     #: Where the links in the overdue-task follow-up mails point. Its own
     #: setting, and production by default, because those mails reach real
     #: people from whichever backend sent them — a laptop included — and a
