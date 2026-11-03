@@ -485,6 +485,19 @@ class Settings(BaseSettings):
         "ba62d842-3d14-4a06-bdf5-ab56c9023b33"
     )
     mailwatch_task_list_id: str = "fb27f225-106f-4c8a-9925-d5b939511e05"
+    #: Run the mail watch's background loop on this server: read the CEO's
+    #: mail, create new tenders' tasks, post the Teams cards. Unset, it runs in
+    #: production only — a laptop shares the live database and the Teams
+    #: connection, so its loop would read, create tasks and post cards taking
+    #: turns with production's. Its buttons on the page still work anywhere.
+    mailwatch_worker_enabled: bool | None = None
+
+    @property
+    def mailwatch_worker_on(self) -> bool:
+        if self.mailwatch_worker_enabled is not None:
+            return self.mailwatch_worker_enabled
+        return self.environment == "production"
+
     #: The logo in the footer of the Teams cards. Teams fetches it itself, so it
     #: must be a public address — the live frontend's, not localhost.
     teams_card_logo_url: str = (

@@ -221,6 +221,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # on in its settings; read only. See app/mailwatch.
     # Negotiations from that mail, posted to the locked Teams channel as the
     # account a super admin connected. Off until switched on.
+    # The loop runs in production only (settings.mailwatch_worker_on): a
+    # laptop on the same database would read, assign and post as well.
     app.state.teams_poster = TeamsPoster(
         settings, http, app.state.mail_reader,
         sharepoint=app.state.sharepoint, drive=app.state.quote_drive,
@@ -233,7 +235,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         sharepoint=app.state.sharepoint,
         poster=app.state.teams_poster,
     )
-    app.state.mailwatch_worker.start()
+    if settings.mailwatch_worker_on:
+        app.state.mailwatch_worker.start()
+    else:
+        logger.info("mail watch loop off on this server (MAILWATCH_WORKER_ENABLED)")
     # The always-on agents: a task assigned to somebody starts their agent
     # (Nova, for presales), and runs a restart cut off are picked up. Off
     # unless AGENT_TRIGGERS_ENABLED is set — see app/agents/worker.py — and
