@@ -14,6 +14,7 @@ with a token Entra gives for the bot's own id and secret.
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from typing import Any, Final
 from urllib.parse import quote
 
@@ -39,6 +40,33 @@ class BotAuthError(Exception):
 
 class BotSendError(Exception):
     """A reply the bot service refused."""
+
+
+@dataclass(frozen=True, slots=True)
+class Address:
+    """Where a reply goes, and who it is from and to: the conversation a
+    message came in on, its two ends swapped. The bot service refuses an
+    activity that does not say who it is from."""
+
+    service_url: str
+    conversation_id: str
+    #: The bot's account in this conversation, and the person's: {id, name}.
+    bot: dict[str, str]
+    person: dict[str, str]
+
+    @classmethod
+    def of(cls, activity: dict[str, Any]) -> Address | None:
+        service_url = activity.get("serviceUrl")
+        conversation_id = (activity.get("conversation") or {}).get("id")
+        if not service_url or not conversation_id:
+            return None
+
+        def account(value: Any) -> dict[str, str]:
+            value = value or {}
+            return {k: str(value[k]) for k in ("id", "name") if value.get(k)}
+
+        return cls(service_url, conversation_id,
+                   account(activity.get("recipient")), account(activity.get("from")))
 
 
 class TeamsBot:
@@ -149,15 +177,21 @@ class TeamsBot:
         )
         return self._token[0]
 
-    async def send(self, service_url: str, conversation_id: str, activity: dict[str, Any]) -> str:
+    async def send(self, to: Address, activity: dict[str, Any]) -> str:
         """Post one activity — a message, or the typing dots — to a
-        conversation; its id."""
+        conversation, from the bot to the person; its id."""
         url = (
-            f"{service_url.rstrip('/')}/v3/conversations/"
-            f"{quote(conversation_id, safe='')}/activities"
+            f"{to.service_url.rstrip('/')}/v3/conversations/"
+            f"{quote(to.conversation_id, safe='')}/activities"
         )
+        body = {
+            **activity,
+            "from": to.bot,
+            "recipient": to.person,
+            "conversation": {"id": to.conversation_id},
+        }
         response = await self._http.post(
-            url, json=activity,
+            url, json=body,
             headers={"Authorization": f"Bearer {await self._connector_token()}"},
         )
         if response.status_code == 401:
@@ -171,11 +205,8 @@ class TeamsBot:
         except ValueError:
             return ""
 
-    async def say(self, service_url: str, conversation_id: str, text: str) -> str:
-        return await self.send(
-            service_url, conversation_id,
-            {"type": "message", "text": text, "textFormat": "markdown"},
-        )
+    async def say(self, to: Address, text: str) -> str:
+        return await self.send(to, {"type": "message", "text": text, "textFormat": "markdown"})
 
-    async def typing(self, service_url: str, conversation_id: str) -> None:
-        await self.send(service_url, conversation_id, {"type": "typing"})
+    async def typing(self, to: Address) -> None:
+        await self.send(to, {"type": "typing"})

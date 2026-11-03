@@ -28,7 +28,7 @@ from app.core.llm import TextModel
 from app.models.nova import NovaMessage, NovaPerson
 from app.models.user import User
 from app.nova import brain
-from app.nova.bot import BotSendError, TeamsBot
+from app.nova.bot import Address, BotSendError, TeamsBot
 
 logger = logging.getLogger("hamdaz.nova")
 
@@ -75,35 +75,34 @@ class NovaChat:
     # ── handlers ────────────────────────────────────────────────────────
 
     async def on_message(self, activity: dict[str, Any]) -> None:
-        service_url = activity.get("serviceUrl") or ""
-        conversation = activity.get("conversation") or {}
-        conversation_id = conversation.get("id") or ""
-        if not service_url or not conversation_id:
+        to = Address.of(activity)
+        if to is None:
             return
         received = datetime.now(UTC)
         started = time.monotonic()
-        typing = asyncio.create_task(self._keep_typing(service_url, conversation_id))
+        typing = asyncio.create_task(self._keep_typing(to))
         try:
-            if conversation.get("conversationType") not in (None, "personal"):
-                await self._say(
-                    service_url, conversation_id,
-                    "I only chat one to one for now. Message me directly and I'll help.",
+            kind = (activity.get("conversation") or {}).get("conversationType")
+            if kind not in (None, "personal"):
+                await self.bot.say(
+                    to, "I only chat one to one for now. Message me directly and I'll help."
                 )
                 return
             async with self._factory() as session:
                 user = await self._user(session, activity)
                 refusal = self._refusal(user)
                 if refusal:
-                    await self._say(service_url, conversation_id, refusal)
+                    await self.bot.say(to, refusal)
                     return
                 assert user is not None
                 message = brain.clean(activity.get("text") or "")
                 if not message:
-                    await self._say(service_url, conversation_id,
-                                    "I can't open files yet. Tell me in words what you're after.")
+                    await self.bot.say(
+                        to, "I can't open files yet. Tell me in words what you're after."
+                    )
                     return
                 async with self._locks.setdefault(user.id, asyncio.Lock()):
-                    person = await self._person(session, user, service_url, conversation_id)
+                    person = await self._person(session, user, to)
                     viewer = await brain.viewer_of(session, user)
                     past = await brain.history(
                         session, user.id, self.settings.nova_history_messages
@@ -115,7 +114,7 @@ class NovaChat:
                         now=now, seconds=self.settings.nova_reply_seconds,
                     )
                     typing.cancel()
-                    await self._say(service_url, conversation_id, text)
+                    await self.bot.say(to, text)
                     took = int((time.monotonic() - started) * 1000)
                     session.add_all([
                         NovaMessage(user_id=user.id, author="person", text=message[:4000],
@@ -134,8 +133,9 @@ class NovaChat:
         except Exception:  # noqa: BLE001 - a person must hear something
             logger.exception("nova: a message failed")
             try:
-                await self._say(service_url, conversation_id,
-                                "Sorry, something went wrong on my side. Try again in a moment.")
+                await self.bot.say(
+                    to, "Sorry, something went wrong on my side. Try again in a moment."
+                )
             except Exception:  # noqa: BLE001 - nothing more to do
                 pass
         finally:
@@ -144,22 +144,20 @@ class NovaChat:
     async def on_added(self, activity: dict[str, Any]) -> None:
         """Nova was installed for someone: say hello, and keep the address of
         their chat so Nova can write to them first, later."""
-        service_url = activity.get("serviceUrl") or ""
-        conversation_id = (activity.get("conversation") or {}).get("id") or ""
-        if not service_url or not conversation_id:
+        to = Address.of(activity)
+        if to is None:
             return
         try:
             async with self._factory() as session:
                 user = await self._user(session, activity)
                 refusal = self._refusal(user)
                 if refusal:
-                    await self._say(service_url, conversation_id, refusal)
+                    await self.bot.say(to, refusal)
                     return
                 assert user is not None
-                await self._person(session, user, service_url, conversation_id)
+                await self._person(session, user, to)
                 await session.commit()
-                await self._say(service_url, conversation_id,
-                                GREETING.format(name=user.display_name.split()[0]))
+                await self.bot.say(to, GREETING.format(name=user.display_name.split()[0]))
         except Exception:  # noqa: BLE001 - a greeting is not worth a crash
             logger.exception("nova: greeting failed")
 
@@ -180,24 +178,19 @@ class NovaChat:
                     "so I'm not open to you yet. I'll be around soon.")
         return None
 
-    async def _person(
-        self, session: AsyncSession, user: User, service_url: str, conversation_id: str
-    ) -> NovaPerson:
+    async def _person(self, session: AsyncSession, user: User, to: Address) -> NovaPerson:
         person = await session.get(NovaPerson, user.id)
         if person is None:
             person = NovaPerson(user_id=user.id)
             session.add(person)
-        person.service_url, person.conversation_id = service_url, conversation_id
+        person.service_url, person.conversation_id = to.service_url, to.conversation_id
         return person
 
-    async def _say(self, service_url: str, conversation_id: str, text: str) -> None:
-        await self.bot.say(service_url, conversation_id, text)
-
-    async def _keep_typing(self, service_url: str, conversation_id: str) -> None:
+    async def _keep_typing(self, to: Address) -> None:
         try:
             while True:
                 try:
-                    await self.bot.typing(service_url, conversation_id)
+                    await self.bot.typing(to)
                 except BotSendError as exc:
                     logger.info("nova: typing not shown: %s", exc)
                     return
