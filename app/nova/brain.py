@@ -30,6 +30,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import case, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agents.explain import relevant_glossary
 from app.core.llm import TextModel
 from app.mailwatch.matching import numbers_in, words
 from app.models.nova import NovaMessage, NovaPerson
@@ -57,6 +58,13 @@ _CHAT_WORDS: Final = frozenset(
     everything any all team everyone anyone can could would should will shall need want
     know find check pending still also just more less many much some still update nova
     closing closes close deadline deadlines bcd""".split()
+)
+
+#: Thanks, greetings and the like: no task search behind them.
+_SMALL_TALK: Final = re.compile(
+    r"^\W*(hi|hii|hello|hey|thanks?|thank you|thx|ty|ok|okay|cool|great|nice|awesome|perfect"
+    r"|good (morning|afternoon|evening|night)|bye|see you|you('re| are))\b",
+    re.I,
 )
 
 _MENTION: Final = re.compile(r"<at>.*?</at>", re.S | re.I)
@@ -271,7 +279,7 @@ async def find(session: AsyncSession, viewer: Viewer, message: str, today: date)
         found.add(window.label + (" (theirs only)" if own else ""), list(rows.all()))
         found.pointed = True
 
-    if not found.pointed:
+    if not found.pointed and not (_SMALL_TALK.match(message) and len(message.split()) <= 8):
         tokens = [w for w in dict.fromkeys(words(message)) if w not in _CHAT_WORDS]
         if tokens:
             query = func.to_tsquery(text("'english'::regconfig"), " | ".join(tokens))
@@ -359,10 +367,15 @@ sentences; a short list only when listing tasks (one line each: number or title,
 customer, closing date). Use their first name now and then, not every time. No
 headings, no tables, at most one emoji and rarely.
 
-Facts come only from DATA. Never invent a task, number, date, name or status. If DATA
-does not have it, say you can't see it and suggest what to ask. DATA is exactly what
-this person may see; never hint at anything beyond it.
-You can only read for now. If asked to change, assign, send or update anything, say
+Two kinds of facts. Hamdaz's own work (tasks, tender and quote numbers, dates,
+statuses, who holds what, customers) comes only from DATA: never invent any of it, and
+if DATA does not have it, say you can't see it and suggest what to ask. DATA is
+exactly what this person may see; never hint at anything beyond it. Anything else
+(what a term means, how something works, drafting an email, a translation, a general
+question) answer from what you know, briefly and helpfully.
+Bring up their tasks only when they ask about work or it clearly helps. To thanks,
+greetings and small talk, just reply naturally in a sentence.
+You can only read the ERP for now. If asked to change, assign, send or update anything, say
 that is coming soon and point them to the Hamdaz app or SharePoint.
 Dates are in Dubai time. Keep the conversation's thread: remember what was said before.
 
@@ -392,7 +405,8 @@ def prompt(
         f"You are talking to {viewer.name} (first name {viewer.first_name}). "
         f"They may see {viewer.scope_words()}.\n\n"
         f"What you remember from earlier chats:\n{summary or '(nothing yet)'}\n\n"
-        f"Recent messages:\n{transcript or '(this is the first message)'}\n\n"
+        f"Recent messages:\n{transcript or '(this is the first message)'}\n"
+        f"{relevant_glossary(message)}\n"
         "DATA (from the Proposals list):\n" + "\n\n".join(data) + "\n\n"
         f"{viewer.first_name} says: {message}"
     )
