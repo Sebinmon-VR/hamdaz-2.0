@@ -490,12 +490,21 @@ class Settings(BaseSettings):
     teams_card_logo_url: str = (
         "https://calm-sky-08cea4100.6.azurestaticapps.net/hamdaz-logo.png"
     )
-    #: The won-order banner's images, in the live frontend's teams/ folder
-    #: (public for the same reason): banner.jpg, its background, and
-    #: popper-left.png / popper-right.png, the animated Fluent 🎉 that Teams
-    #: itself uses, bursting outwards — animated PNGs, so a client that won't
-    #: play them shows them still.
-    teams_card_images_url: str = "https://calm-sky-08cea4100.6.azurestaticapps.net/teams"
+    #: The party popper either side of a won order's congratulations: the
+    #: animated Fluent 🎉 that Teams itself uses, transparent (an animated
+    #: PNG, so a client that won't play it shows it still), from a public
+    #: CDN, pinned to one commit so it never changes.
+    teams_card_popper_url: str = (
+        "https://cdn.jsdelivr.net/gh/Tarikul-Islam-Anik/Animated-Fluent-Emojis"
+        "@55e1dceff489121c3f7c7a7ec4f4d401d2cbd53e/Emojis/Activities/Party%20Popper.png"
+    )
+    #: The won-order banner's own images, once the frontend that has them is
+    #: deployed: its teams/ folder, e.g.
+    #: https://calm-sky-08cea4100.6.azurestaticapps.net/teams — banner.jpg
+    #: (the violet background) and popper-left.png / popper-right.png
+    #: (bursting outwards). Empty: the popper above on both sides, on a plain
+    #: banner. An address that isn't deployed yet gives broken images.
+    teams_card_images_url: str = ""
     #: Where the links in the overdue-task follow-up mails point. Its own
     #: setting, and production by default, because those mails reach real
     #: people from whichever backend sent them — a laptop included — and a

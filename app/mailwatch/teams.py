@@ -1451,26 +1451,35 @@ def _won_in(task: dict[str, Any], order: Order, mail: WatchedMail) -> str | None
 
 def _congrats(name: str | None, customer: str, value: str, details: str) -> dict[str, Any]:
     """The top of a won order's card: congratulations to whoever's task it
-    was and the order's value, on a violet banner, between two animated party
-    poppers bursting outwards (``teams_card_images_url``; a client that won't
-    animate shows them still). The banner is an image, the same in light and
-    dark Teams, so its text is white in both. The right popper is left out on
-    a narrow card."""
+    was and the order's value, between two animated party poppers (a client
+    that won't animate shows them still); the right one is left out on a
+    narrow card. With ``teams_card_images_url`` the banner is a violet image,
+    the same in light and dark Teams, so its text is white, and the poppers
+    burst outwards; without it, the CDN popper on both sides, on a plain
+    banner in the theme's own colours."""
     who = name.split()[0] if name and name.split() else None
-    images = get_settings().teams_card_images_url
+    settings = get_settings()
+    images = settings.teams_card_images_url.rstrip("/")
+    light = {"color": "Light"} if images else {}
 
     def popper(side: str, **extra: Any) -> dict[str, Any]:
+        url = f"{images}/popper-{side}.png" if images else settings.teams_card_popper_url
         return {
             "type": "Column", "width": "auto", "verticalContentAlignment": "Center", **extra,
-            "items": [{"type": "Image", "url": f"{images}/popper-{side}.png", "width": "72px",
-                       "altText": "Party popper"}],
+            "items": [{"type": "Image", "url": url, "width": "72px", "altText": "Party popper"}],
         }
 
-    return {
-        # "accent" only shows if the banner image can't be fetched.
+    banner: dict[str, Any] = {
+        # Under the image, "accent" only shows if it can't be fetched.
         "type": "Container", "style": "accent", "bleed": True, "spacing": "None",
-        "backgroundImage": {"url": f"{images}/banner.jpg", "fillMode": "cover",
-                            "horizontalAlignment": "center", "verticalAlignment": "center"},
+    }
+    if images:
+        banner["backgroundImage"] = {
+            "url": f"{images}/banner.jpg", "fillMode": "cover",
+            "horizontalAlignment": "center", "verticalAlignment": "center",
+        }
+    return {
+        **banner,
         "items": [{
             "type": "ColumnSet",
             "columns": [
@@ -1479,16 +1488,16 @@ def _congrats(name: str | None, customer: str, value: str, details: str) -> dict
                     "type": "Column", "width": "stretch", "verticalContentAlignment": "Center",
                     "items": [
                         _text(f"Congratulations, {who or 'team'}!", size="Large",
-                              weight="Bolder", color="Light", horizontalAlignment="Center"),
+                              weight="Bolder", horizontalAlignment="Center", **light),
                         _text(
                             (f"Your quote won an order from **{customer}**. Great work! 👏"
                              if who else f"We've won an order from **{customer}**! 👏"),
-                            color="Light", horizontalAlignment="Center", spacing="None",
+                            horizontalAlignment="Center", spacing="None", **light,
                         ),
-                        _text(value, size="Large", weight="Bolder", color="Light",
-                              horizontalAlignment="Center", spacing="Small"),
-                        _caption(details, size="Small", color="Light",
-                                 horizontalAlignment="Center", spacing="None"),
+                        _text(value, size="Large", weight="Bolder",
+                              horizontalAlignment="Center", spacing="Small", **light),
+                        _caption(details, size="Small", horizontalAlignment="Center",
+                                 spacing="None", **light),
                     ],
                 },
                 popper("right", targetWidth=WIDE),
