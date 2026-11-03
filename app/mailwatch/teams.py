@@ -688,6 +688,10 @@ REMARK_LINES: Final = 12
 #: Files listed per tab at most; the rest are a click away in the folder.
 FILE_ROWS: Final = 6
 
+#: A customer's message up to this long fits three lines; a longer one gets
+#: "See more".
+SHORT_MESSAGE: Final = 160
+
 #: Teams refuses a message over 28 KB; the card keeps under this, leaving
 #: room for the message around it.
 CARD_BYTES: Final = 26_000
@@ -1447,41 +1451,47 @@ def _won_in(task: dict[str, Any], order: Order, mail: WatchedMail) -> str | None
 
 def _congrats(name: str | None, customer: str, value: str, details: str) -> dict[str, Any]:
     """The top of a won order's card: congratulations to whoever's task it
-    was and the order's value, between two animated party poppers
-    (``teams_card_popper_url``; a client that won't animate shows them
-    still). The right one is left out on a narrow card."""
+    was and the order's value, on a violet banner, between two animated party
+    poppers bursting outwards (``teams_card_images_url``; a client that won't
+    animate shows them still). The banner is an image, the same in light and
+    dark Teams, so its text is white in both. The right popper is left out on
+    a narrow card."""
     who = name.split()[0] if name and name.split() else None
-    url = get_settings().teams_card_popper_url
+    images = get_settings().teams_card_images_url
 
-    def popper(**extra: Any) -> dict[str, Any]:
+    def popper(side: str, **extra: Any) -> dict[str, Any]:
         return {
             "type": "Column", "width": "auto", "verticalContentAlignment": "Center", **extra,
-            "items": [{"type": "Image", "url": url, "width": "72px", "altText": "Party popper"}],
+            "items": [{"type": "Image", "url": f"{images}/popper-{side}.png", "width": "72px",
+                       "altText": "Party popper"}],
         }
 
     return {
-        "type": "Container", "style": "good", "bleed": True, "spacing": "None",
+        # "accent" only shows if the banner image can't be fetched.
+        "type": "Container", "style": "accent", "bleed": True, "spacing": "None",
+        "backgroundImage": {"url": f"{images}/banner.jpg", "fillMode": "cover",
+                            "horizontalAlignment": "center", "verticalAlignment": "center"},
         "items": [{
             "type": "ColumnSet",
             "columns": [
-                popper(),
+                popper("left"),
                 {
                     "type": "Column", "width": "stretch", "verticalContentAlignment": "Center",
                     "items": [
                         _text(f"Congratulations, {who or 'team'}!", size="Large",
-                              weight="Bolder", horizontalAlignment="Center"),
+                              weight="Bolder", color="Light", horizontalAlignment="Center"),
                         _text(
                             (f"Your quote won an order from **{customer}**. Great work! 👏"
                              if who else f"We've won an order from **{customer}**! 👏"),
-                            horizontalAlignment="Center", spacing="None",
+                            color="Light", horizontalAlignment="Center", spacing="None",
                         ),
-                        _text(value, size="Large", weight="Bolder", color="Good",
+                        _text(value, size="Large", weight="Bolder", color="Light",
                               horizontalAlignment="Center", spacing="Small"),
-                        _caption(details, size="Small", horizontalAlignment="Center",
-                                 spacing="None"),
+                        _caption(details, size="Small", color="Light",
+                                 horizontalAlignment="Center", spacing="None"),
                     ],
                 },
-                popper(targetWidth=WIDE),
+                popper("right", targetWidth=WIDE),
             ],
         }],
     }
@@ -1559,7 +1569,7 @@ def _order_card(
         ("Payment terms", [_text(_v(order.payment_terms), weight="Bolder", spacing="None",
                                  maxLines=2)]),
         *([("Won in", [
-            _text(f"⏱️ {took}", weight="Bolder", spacing="None"),
+            _text(took, weight="Bolder", spacing="None"),
             _caption(f"{task.get('current_type') or 'Enquiry'} to order", size="Small",
                      spacing="None"),
         ])] if took else []),
@@ -1602,6 +1612,8 @@ def _order_card(
     said = order.message or ("" if on_network else ask)
     if said:
         when = mail.received_at.strftime("%d %b, %H:%M") if mail.received_at else ""
+        # "See more" only when three lines may not hold it.
+        long = len(said) > SHORT_MESSAGE
         body.append(
             {
                 "type": "ColumnSet", "separator": True, "spacing": "Medium",
@@ -1616,15 +1628,15 @@ def _order_card(
                                      spacing="None"),
                         ],
                     },
-                    {"type": "Column", "width": "auto", "verticalContentAlignment": "Center",
-                     "items": [_toggle(True), _toggle(False)]},
+                    *([{"type": "Column", "width": "auto", "verticalContentAlignment": "Center",
+                        "items": [_toggle(True), _toggle(False)]}] if long else []),
                 ],
             }
         )
         body += [
             _text(f"“{said}”", id="ask-short", maxLines=3),
             _text(f"“{said}”", id="ask-full", isVisible=False),
-        ]
+        ] if long else [_text(f"“{said}”")]
     if note:
         body.append(
             {
