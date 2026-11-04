@@ -173,3 +173,40 @@ async def approver_users(session: AsyncSession) -> list[User]:
         .where(Role.key.in_(APPROVE_ROLES), User.is_active.is_(True))
     )
     return list(dict.fromkeys(rows.all()))
+
+
+async def require_preparer_or_approver(access: Access) -> PayrollAccess:
+    """Creating an approved invoice in Zoho, and sending its report.
+
+    Either side may press it: the accountant who prepared the invoice, or the
+    super admin who has just approved it.
+    """
+    if not (access.can_process or access.can_approve):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only a payroll processor, a super admin or the CEO can do that.",
+        )
+    return access
+
+
+PreparerOrApprover = Annotated[PayrollAccess, Depends(require_preparer_or_approver)]
+
+
+async def users_with_roles(session: AsyncSession, keys: set[str]) -> list[User]:
+    """Active users holding any of these global roles."""
+    rows = await session.scalars(
+        select(User)
+        .join(UserRole, UserRole.user_id == User.id)
+        .join(Role, Role.id == UserRole.role_id)
+        .where(Role.key.in_(keys), User.is_active.is_(True))
+    )
+    return list(dict.fromkeys(rows.all()))
+
+
+async def accounts_users(session: AsyncSession) -> list[User]:
+    """Active members of the Accounts team."""
+    ids = await accounts_member_ids(session)
+    if not ids:
+        return []
+    rows = await session.scalars(select(User).where(User.id.in_(ids), User.is_active.is_(True)))
+    return list(rows.all())

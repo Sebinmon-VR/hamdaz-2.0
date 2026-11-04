@@ -446,6 +446,7 @@ def _event_out(event: PayrollEvent) -> EventOut:
         actor_name=event.actor.display_name if event.actor else None,
         run_id=event.run_id,
         employee_id=event.employee_id,
+        invoice_id=event.invoice_id,
         created_at=event.created_at,
     )
 

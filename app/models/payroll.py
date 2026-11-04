@@ -30,6 +30,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     Numeric,
     String,
     Text,
@@ -71,6 +72,15 @@ class RunStatus(StrEnum):
     APPROVED = "approved"
     #: The money has gone out.
     PAID = "paid"
+
+
+class InvoiceStatus(StrEnum):
+    #: Being prepared by the accountant.
+    DRAFT = "draft"
+    #: Sent to the super admins to check. Locked until they decide.
+    SUBMITTED = "submitted"
+    #: Approved. From here it goes to Zoho, and the report goes out.
+    APPROVED = "approved"
 
 
 class PayrollSettings(Base, Timestamped):
@@ -176,6 +186,29 @@ class PayrollSettings(Base, Timestamped):
     #: ``{"2025": {...}}``. See ``app/payroll/rules.TaxTable``.
     in_tax_tables: Mapped[dict] = mapped_column(
         JSONB, default=dict, server_default=text("'{}'::jsonb"), nullable=False
+    )
+
+    # ── invoicing ────────────────────────────────────────────────────
+    #: Our own invoice numbers: ``HZ-INV-2026-001``. Zoho gives its own as well.
+    invoice_prefix: Mapped[str] = mapped_column(
+        String(20), default="HZ-INV-", server_default=text("'HZ-INV-'"), nullable=False
+    )
+    #: Days to pay, the default on a new invoice.
+    invoice_payment_terms: Mapped[int] = mapped_column(
+        Integer, default=30, server_default=text("30"), nullable=False
+    )
+    #: Customer notes and terms printed on every new invoice, editable on each.
+    invoice_notes: Mapped[str | None] = mapped_column(Text)
+    invoice_terms: Mapped[str | None] = mapped_column(Text)
+    #: The Zoho contact a new invoice starts with — usually the one company
+    #: payroll is invoiced to. The accountant can change it on any invoice.
+    invoice_customer_zoho_id: Mapped[str | None] = mapped_column(String(40))
+    invoice_customer_name: Mapped[str | None] = mapped_column(String(200))
+    #: Mail the super admins when an invoice is sent for approval, and the
+    #: report (with the PDF) to the super admins, the CEO and Accounts once it
+    #: is in Zoho. Off by default: a trial invoice must not reach the CEO.
+    invoice_mail: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
     )
 
     updated_by_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -501,6 +534,9 @@ class PayrollEvent(Base, UUIDPrimaryKey, Timestamped):
     employee_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("payroll_employees.id", ondelete="SET NULL"), index=True
     )
+    invoice_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("payroll_invoices.id", ondelete="SET NULL"), index=True
+    )
     action: Mapped[str] = mapped_column(String(40), nullable=False)
     summary: Mapped[str] = mapped_column(Text, nullable=False)
     detail: Mapped[dict] = mapped_column(
@@ -508,3 +544,97 @@ class PayrollEvent(Base, UUIDPrimaryKey, Timestamped):
     )
 
     actor: Mapped[User | None] = relationship(foreign_keys=[actor_id], lazy="joined")
+
+
+class PayrollInvoice(Base, UUIDPrimaryKey, Timestamped):
+    """An invoice raised from payroll — the month's salaries, rent, anything else.
+
+    Prepared here, approved here, then created in Zoho Books. Its fields are
+    Zoho's invoice fields, so what is approved is exactly what Zoho receives:
+    ``zoho_payload`` keeps the body that was (or, in test mode, would have
+    been) sent.
+
+    Lines are JSON rather than a table, the same as a payroll line's extras:
+    ``{"item_id", "name", "description", "quantity", "rate", "tax_id",
+    "tax_name", "tax_percentage", "amount", "tax_amount", "run_id"}``, with
+    ``amount`` and ``tax_amount`` worked out by ``app/payroll/invoicing.py``.
+    """
+
+    __tablename__ = "payroll_invoices"
+
+    number: Mapped[str] = mapped_column(String(40), unique=True, nullable=False)
+    status: Mapped[InvoiceStatus] = mapped_column(
+        String(12), default=InvoiceStatus.DRAFT, nullable=False, index=True
+    )
+
+    # ── what Zoho needs ──────────────────────────────────────────────
+    #: The Zoho contact billed. Name kept beside it so the list reads without Zoho.
+    customer_zoho_id: Mapped[str | None] = mapped_column(String(40))
+    customer_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False)
+    #: Units of the organisation's base currency per unit of ``currency``,
+    #: when they differ. Zoho's own ``exchange_rate``.
+    exchange_rate: Mapped[Decimal | None] = mapped_column(Numeric(16, 6))
+    invoice_date: Mapped[date] = mapped_column(Date, nullable=False)
+    due_date: Mapped[date | None] = mapped_column(Date)
+    #: Days to pay; Zoho works the due date out from it when there is none.
+    payment_terms: Mapped[int | None] = mapped_column(Integer)
+    reference_number: Mapped[str | None] = mapped_column(String(100))
+    lines: Mapped[list] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb"), nullable=False
+    )
+    adjustment: Mapped[Decimal] = mapped_column(Money, default=Decimal("0"), nullable=False)
+    adjustment_description: Mapped[str | None] = mapped_column(String(100))
+    #: Printed on the invoice: a note to the customer, and the terms.
+    notes: Mapped[str | None] = mapped_column(Text)
+    terms: Mapped[str | None] = mapped_column(Text)
+
+    sub_total: Mapped[Decimal] = mapped_column(Money, default=Decimal("0"), nullable=False)
+    tax_total: Mapped[Decimal] = mapped_column(Money, default=Decimal("0"), nullable=False)
+    total: Mapped[Decimal] = mapped_column(Money, default=Decimal("0"), nullable=False)
+
+    #: The payroll month this bills, when a line came from one.
+    run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("payroll_runs.id", ondelete="SET NULL"), index=True
+    )
+
+    # ── the steps ────────────────────────────────────────────────────
+    created_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    submitted_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    approved_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    returned_note: Mapped[str | None] = mapped_column(Text)
+
+    #: ``test`` — checked against Zoho with reads, nothing written; ``live`` —
+    #: created in Zoho. Empty until "Create in Zoho" has been pressed.
+    zoho_mode: Mapped[str | None] = mapped_column(String(8))
+    zoho_payload: Mapped[dict | None] = mapped_column(JSONB)
+    zoho_invoice_id: Mapped[str | None] = mapped_column(String(40))
+    zoho_invoice_number: Mapped[str | None] = mapped_column(String(60))
+    zoho_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    zoho_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    #: What the reads found wrong, or what Zoho refused. Cleared on success.
+    zoho_error: Mapped[str | None] = mapped_column(Text)
+    #: Zoho's own PDF of a live invoice — what the report attaches.
+    zoho_pdf: Mapped[bytes | None] = mapped_column(LargeBinary)
+
+    report_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: Who the report went to — or, with mail off, would have gone to.
+    report_to: Mapped[list] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb"), nullable=False
+    )
+    report_error: Mapped[str | None] = mapped_column(Text)
+
+    created_by: Mapped[User | None] = relationship(foreign_keys=[created_by_id], lazy="joined")
+    submitted_by: Mapped[User | None] = relationship(foreign_keys=[submitted_by_id], lazy="joined")
+    approved_by: Mapped[User | None] = relationship(foreign_keys=[approved_by_id], lazy="joined")
+    zoho_by: Mapped[User | None] = relationship(foreign_keys=[zoho_by_id], lazy="joined")

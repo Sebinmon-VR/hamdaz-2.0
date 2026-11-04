@@ -64,6 +64,8 @@ from app.mailwatch.worker import MailWatchWorker
 from app.nova.bot import TeamsBot
 from app.nova.chat import NovaChat
 from app.nova.router import router as nova_router
+from app.payroll.invoice_router import router as payroll_invoice_router
+from app.payroll.mailer import PayrollMailer
 from app.payroll.router import router as payroll_router
 from app.labels.router import router as labels_router
 from app.leave.mailer import LeaveMailer
@@ -117,6 +119,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.team_tasks_cache = TeamTasksCache()
     # Sends as the requester. Disabled unless HR turns it on in leave settings.
     app.state.leave_mailer = LeaveMailer(settings, http)
+    app.state.payroll_mailer = PayrollMailer(settings, http)
     # Reads the signed-in person's own calendar, and only theirs — the
     # mailbox is never named by a request. See app/meetings/router.py.
     app.state.calendar = GraphCalendar(settings, http)
@@ -365,6 +368,7 @@ def create_app() -> FastAPI:
     # Teams posts to it with the bot service's signature, not a session.
     app.include_router(nova_router, prefix=settings.api_prefix)
     app.include_router(payroll_router, prefix=settings.api_prefix)
+    app.include_router(payroll_invoice_router, prefix=settings.api_prefix)
     app.include_router(reports_admin_router, prefix=settings.api_prefix)
     app.include_router(reports_router, prefix=settings.api_prefix)
     # Mounted at the root, NOT under the API prefix, and holding no

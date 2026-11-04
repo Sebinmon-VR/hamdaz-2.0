@@ -176,6 +176,13 @@ class Settings(BaseSettings):
     #: refresh response hands back as ``api_domain``, so the data centre does
     #: not have to be guessed twice.
     zoho_accounts_url: str = "https://accounts.zoho.com"
+    #: Payroll invoices: really create them in Zoho Books. **Off.** While off,
+    #: "Create in Zoho" checks the invoice against Zoho with reads only and
+    #: writes nothing — the user asked for exactly that while Zoho is the live
+    #: production books ("as of now we dont need the real zoho"). An env
+    #: setting, not a screen toggle, so it cannot be flipped by a click; the
+    #: user sets PAYROLL_ZOHO_INVOICE_WRITE themselves when they choose.
+    payroll_zoho_invoice_write: bool = False
 
     @property
     def zoho_app_base(self) -> str:

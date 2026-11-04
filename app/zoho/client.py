@@ -261,9 +261,9 @@ class ZohoBooks:
         """One authenticated POST. **The only way this client writes.**
 
         Kept apart from ``_request`` so that reading that method never gives
-        false comfort: everything above it is a read. The one caller is the
-        workflow step that creates an estimate, and that step sits behind a
-        switch that ships off.
+        false comfort: everything above it is a read. Two callers, each behind
+        a switch that ships off: the workflow step that creates an estimate,
+        and payroll's "Create in Zoho" (``PAYROLL_ZOHO_INVOICE_WRITE``).
         """
         try:
             token = await self._tokens.get()
@@ -310,6 +310,48 @@ class ZohoBooks:
         if not estimate:
             raise ZohoError(f"Zoho did not return the estimate: {str(payload)[:200]}")
         return estimate
+
+    async def create_invoice(self, body: dict[str, Any]) -> dict:
+        """Create an invoice. Needs ``ZohoBooks.invoices.CREATE``.
+
+        The second write this client has. Its one caller is payroll's "Create
+        in Zoho", and that only calls it when ``PAYROLL_ZOHO_INVOICE_WRITE`` is
+        on — off by default, and the user's to switch on (app/payroll/invoicing.py).
+        """
+        payload = await self._post("/invoices", body, scope="ZohoBooks.invoices.CREATE")
+        invoice = payload.get("invoice")
+        if not invoice:
+            raise ZohoError(f"Zoho did not return the invoice: {str(payload)[:200]}")
+        return invoice
+
+    async def invoice_pdf(self, invoice_id: str) -> bytes:
+        """The invoice as Zoho renders it — what payroll's report attaches."""
+        response = await self._request(
+            f"/invoices/{invoice_id}", {"accept": "pdf"}, scope="ZohoBooks.invoices.READ"
+        )
+        return response.content
+
+    async def search_contacts(self, text: str, *, contact_type: str = "customer") -> list[dict]:
+        """Active contacts whose name matches, for a picker."""
+        payload = await self._get(
+            "/contacts",
+            {"search_text": text or None, "contact_type": contact_type, "status": "active", "per_page": 50},
+            scope="ZohoBooks.contacts.READ",
+        )
+        return list(payload.get("contacts") or [])
+
+    async def search_items(self, text: str) -> list[dict]:
+        """Active items whose name matches, for an invoice line."""
+        payload = await self._get(
+            "/items",
+            {"search_text": text or None, "status": "active", "per_page": 50},
+            scope="ZohoBooks.items.READ",
+        )
+        return list(payload.get("items") or [])
+
+    async def taxes(self) -> list[dict]:
+        """The organisation's taxes (VAT rates), with their ids."""
+        return list((await self._get("/settings/taxes", scope="ZohoBooks.settings.READ")).get("taxes") or [])
 
     async def estimate_pdf(self, estimate_id: str) -> bytes:
         """The estimate as Zoho renders it — the commercial proposal."""

@@ -97,6 +97,14 @@ class SettingsOut(BaseModel):
     in_pt_slabs: dict[str, Any]
     in_tax_tables: dict[str, Any]
 
+    invoice_prefix: str
+    invoice_payment_terms: int
+    invoice_notes: str | None
+    invoice_terms: str | None
+    invoice_customer_zoho_id: str | None
+    invoice_customer_name: str | None
+    invoice_mail: bool
+
     updated_at: datetime
 
 
@@ -135,6 +143,14 @@ class SettingsIn(BaseModel):
     in_esi_ee_rate: Decimal | None = Rate
     in_esi_er_rate: Decimal | None = Rate
     in_pt_slabs: dict[str, list[dict[str, Any]]] | None = None
+
+    invoice_prefix: str | None = Field(default=None, min_length=1, max_length=20)
+    invoice_payment_terms: int | None = Field(default=None, ge=0, le=365)
+    invoice_notes: str | None = Field(default=None, max_length=2000)
+    invoice_terms: str | None = Field(default=None, max_length=4000)
+    invoice_customer_zoho_id: str | None = Field(default=None, max_length=40)
+    invoice_customer_name: str | None = Field(default=None, max_length=200)
+    invoice_mail: bool | None = None
 
 
 class TaxTableIn(BaseModel):
@@ -362,6 +378,7 @@ class EventOut(BaseModel):
     actor_name: str | None
     run_id: uuid.UUID | None
     employee_id: uuid.UUID | None
+    invoice_id: uuid.UUID | None = None
     created_at: datetime
 
 
@@ -384,3 +401,140 @@ class ReopenIn(BaseModel):
 
 class PaidIn(BaseModel):
     paid_on: date
+
+
+# ── invoices ──────────────────────────────────────────────────────────
+
+
+class InvoiceLineIn(BaseModel):
+    """One line, as Zoho takes it. Amounts are worked out by the server."""
+
+    item_id: str | None = Field(default=None, max_length=40)
+    name: str = Field(min_length=1, max_length=200)
+    description: str | None = Field(default=None, max_length=2000)
+    quantity: Decimal = Field(default=Decimal("1"), gt=0)
+    rate: Decimal = Field(ge=0)
+    tax_id: str | None = Field(default=None, max_length=40)
+    tax_name: str | None = Field(default=None, max_length=100)
+    tax_percentage: Decimal = Field(default=Decimal("0"), ge=0, le=100)
+    run_id: uuid.UUID | None = None
+
+
+class InvoiceIn(BaseModel):
+    customer_zoho_id: str | None = Field(default=None, max_length=40)
+    customer_name: str = Field(min_length=1, max_length=200)
+    currency: str = Field(min_length=3, max_length=3)
+    exchange_rate: Decimal | None = Field(default=None, gt=0)
+    invoice_date: date
+    due_date: date | None = None
+    payment_terms: int | None = Field(default=None, ge=0, le=365)
+    reference_number: str | None = Field(default=None, max_length=100)
+    lines: list[InvoiceLineIn] = Field(min_length=1)
+    adjustment: Decimal = Decimal("0")
+    adjustment_description: str | None = Field(default=None, max_length=100)
+    notes: str | None = Field(default=None, max_length=2000)
+    terms: str | None = Field(default=None, max_length=4000)
+    run_id: uuid.UUID | None = None
+
+
+class InvoiceLineOut(BaseModel):
+    item_id: str | None = None
+    name: str
+    description: str | None = None
+    quantity: Decimal
+    rate: Decimal
+    tax_id: str | None = None
+    tax_name: str | None = None
+    tax_percentage: Decimal
+    amount: Decimal
+    tax_amount: Decimal
+    run_id: uuid.UUID | None = None
+
+
+class InvoiceOut(BaseModel):
+    id: uuid.UUID
+    number: str
+    status: Literal["draft", "submitted", "approved"]
+    customer_zoho_id: str | None
+    customer_name: str
+    currency: str
+    exchange_rate: Decimal | None
+    invoice_date: date
+    due_date: date | None
+    payment_terms: int | None
+    reference_number: str | None
+    adjustment: Decimal
+    adjustment_description: str | None
+    notes: str | None
+    terms: str | None
+    sub_total: Decimal
+    tax_total: Decimal
+    total: Decimal
+    run_id: uuid.UUID | None
+    created_by_name: str | None
+    submitted_by_id: uuid.UUID | None
+    submitted_by_name: str | None
+    submitted_at: datetime | None
+    approved_by_name: str | None
+    approved_at: datetime | None
+    returned_note: str | None
+    zoho_mode: Literal["test", "live"] | None
+    zoho_invoice_id: str | None
+    zoho_invoice_number: str | None
+    zoho_at: datetime | None
+    zoho_by_name: str | None
+    zoho_error: str | None
+    report_sent_at: datetime | None
+    report_to: list[str]
+    report_error: str | None
+    created_at: datetime
+
+
+class InvoiceDetailOut(InvoiceOut):
+    lines: list[InvoiceLineOut]
+    zoho_payload: dict[str, Any] | None
+    events: list[EventOut]
+
+
+class ZohoContactOut(BaseModel):
+    contact_id: str
+    contact_name: str
+    company_name: str | None = None
+    currency_code: str | None = None
+    email: str | None = None
+    tax_treatment: str | None = None
+
+
+class ZohoItemOut(BaseModel):
+    item_id: str
+    name: str
+    description: str | None = None
+    rate: Decimal | None = None
+    tax_id: str | None = None
+
+
+class ZohoTaxOut(BaseModel):
+    tax_id: str
+    tax_name: str
+    tax_percentage: Decimal
+
+
+class InvoiceSetupOut(BaseModel):
+    """What the invoice form needs that is not an invoice."""
+
+    #: True only when ``PAYROLL_ZOHO_INVOICE_WRITE`` is on: "Create in Zoho" writes.
+    zoho_live: bool
+    zoho_organization: str | None
+    mail: bool
+    #: Why Zoho could not be read, when it could not; the form still works.
+    zoho_error: str | None
+    taxes: list[ZohoTaxOut]
+    currencies: list[str]
+    default_customer_zoho_id: str | None
+    default_customer_name: str | None
+    payment_terms: int
+    notes: str | None
+    terms: str | None
+    #: Who the approval mail goes to, and who gets the report.
+    approvers: list[str]
+    report_to: list[str]

@@ -81,6 +81,7 @@ async def log(
     *,
     run_id: uuid.UUID | None = None,
     employee_id: uuid.UUID | None = None,
+    invoice_id: uuid.UUID | None = None,
     detail: dict[str, Any] | None = None,
 ) -> None:
     session.add(
@@ -91,6 +92,7 @@ async def log(
             summary=summary[:2000],
             run_id=run_id,
             employee_id=employee_id,
+            invoice_id=invoice_id,
             detail=rules.to_json(detail or {}),
         )
     )
@@ -101,6 +103,7 @@ async def events(
     *,
     run_id: uuid.UUID | None = None,
     employee_id: uuid.UUID | None = None,
+    invoice_id: uuid.UUID | None = None,
     limit: int = 200,
 ) -> list[PayrollEvent]:
     query = select(PayrollEvent).order_by(PayrollEvent.created_at.desc()).limit(limit)
@@ -108,6 +111,8 @@ async def events(
         query = query.where(PayrollEvent.run_id == run_id)
     if employee_id is not None:
         query = query.where(PayrollEvent.employee_id == employee_id)
+    if invoice_id is not None:
+        query = query.where(PayrollEvent.invoice_id == invoice_id)
     return list((await session.scalars(query)).unique().all())
 
 
@@ -191,6 +196,7 @@ async def update_settings(
         if value is None and key not in {
             "ae_company_address", "in_company_address", "ae_employer_mol_id",
             "ae_employer_bank_routing", "ae_employer_reference", "in_pf_establishment",
+            "invoice_notes", "invoice_terms", "invoice_customer_zoho_id", "invoice_customer_name",
         }:
             continue
         if not hasattr(settings, key):
