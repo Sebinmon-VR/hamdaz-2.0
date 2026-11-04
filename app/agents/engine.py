@@ -69,7 +69,7 @@ from app.models.proposal_index import ProposalIndexItem
 from app.models.user import User
 from app.notifications.service import notify, send_to_teams
 from app.proposals.sharepoint import SharePointConsentError, SharePointError
-from app.quoting.storage import DriveError
+from app.quoting.storage import DriveError, safe_file_name
 
 logger = logging.getLogger("hamdaz.agents")
 
@@ -885,8 +885,12 @@ class Runner:
                 folder = await deps.drive.find_task_folder(ctx.task_title)
                 if folder.how != "created":
                     ctx.folder_url = ctx.folder_url or folder.web_url
+                    # An attachment's copy in the folder is the same file: read once.
+                    attached = {safe_file_name(f[0]).casefold() for f in found}
                     for f in await deps.drive.list_files(folder.name):
                         if reading.is_own_output(f["name"], f["path"], deps.settings.enquiry_report_folder):
+                            continue
+                        if "/" not in f["path"] and f["name"].casefold() in attached:
                             continue
                         found.append((f["name"], f"task folder: {f['path']}", f.get("web_url"), ("drive", f["id"])))
                 else:

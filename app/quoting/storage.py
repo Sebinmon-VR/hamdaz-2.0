@@ -75,6 +75,14 @@ class DriveError(Exception):
     """The drive refused, or could not be reached. Safe to show a user."""
 
 
+class DriveConflictError(DriveError):
+    """A file of that name was already there, and was left as it was."""
+
+
+class DriveGoneError(DriveError):
+    """The folder written to is no longer in the drive — deleted, most likely."""
+
+
 @dataclass(frozen=True, slots=True)
 class FiledDocument:
     """Where a document ended up."""
@@ -95,24 +103,48 @@ class FolderMatch:
     #: with the same event number; created — none found, named from the title.
     how: str
     web_url: str | None = None
+    #: The drive item id, when the folder exists. Survives a rename, which a
+    #: name does not.
+    item_id: str | None = None
 
 
-def safe_name(value: str, *, fallback: str = "document") -> str:
+def safe_name(value: str, *, fallback: str = "document", limit: int = 120) -> str:
     """A name OneDrive will accept, that still reads like the original."""
     cleaned = _ILLEGAL.sub("-", (value or "").strip()).strip(". ")
     # Collapse the runs of dashes the substitution leaves behind.
     cleaned = re.sub(r"-{2,}", "-", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned)
-    return cleaned[:120] or fallback
+    # Stripped again after the cut: OneDrive refuses a name ending in a space
+    # or a dot, and the cut can leave either.
+    return cleaned[:limit].rstrip(". ") or fallback
+
+
+def safe_file_name(value: str, *, fallback: str = "document") -> str:
+    """As :func:`safe_name`, but a long name is shortened before its extension,
+    so "…Credit Risk Centralization.docx" still opens as a Word file."""
+    name = (value or "").strip()
+    stem, dot, ext = name.rpartition(".")
+    if dot and stem.strip(". ") and re.fullmatch(r"[A-Za-z0-9]{1,10}", ext):
+        return f"{safe_name(stem, fallback=fallback, limit=120 - len(ext) - 1)}.{ext}"
+    return safe_name(name, fallback=fallback)
 
 
 def leading_number(title: str | None) -> str | None:
     """The event number a task title starts with, if it starts with one."""
     if not title:
         return None
-    head = title.strip()[:40]
-    match = _LEADING_NUMBER.search(head)
-    return match.group(1) if match else None
+    # Searched in the whole title and kept when it *starts* in the first 40
+    # characters. Cutting the title at 40 first cut numbers too: "…for
+    # CCO-363105000076" became 363105000, which then matched another task's
+    # "363105000066 …" folder.
+    match = _LEADING_NUMBER.search(title.strip())
+    return match.group(1) if match and match.start() < 40 else None
+
+
+def starts_with_number(name: str, number: str) -> bool:
+    """Whether a folder name begins with exactly this number — not a longer
+    one that happens to share its first digits."""
+    return re.match(rf"{re.escape(number)}(?!\d)", name.strip(), re.I) is not None
 
 
 def quote_folder_name(reference: str | None, request_id: Any) -> str:
@@ -126,7 +158,7 @@ def quote_folder_name(reference: str | None, request_id: Any) -> str:
 def document_file_name(kind_label: str, original: str) -> str:
     """"Supplier quote — router-switch 4471.pdf": the kind first, so a folder
     with a dozen files reads as a list of what they are."""
-    return safe_name(f"{kind_label} — {original}", fallback="document")
+    return safe_file_name(f"{kind_label} — {original}", fallback="document")
 
 
 class QuoteDrive:
@@ -233,7 +265,9 @@ class QuoteDrive:
         if response.status_code == 200:
             item = response.json()
             if "folder" in item:
-                return FolderMatch(item.get("name") or wanted, "exact", item.get("webUrl"))
+                return FolderMatch(
+                    item.get("name") or wanted, "exact", item.get("webUrl"), item.get("id")
+                )
         elif response.status_code not in (404,):
             raise DriveError(
                 f"could not look for the task folder ({response.status_code}): "
@@ -274,13 +308,13 @@ class QuoteDrive:
             ):
                 continue
             name = str(item.get("name", ""))
-            if leading_number(name) == number or name.casefold().startswith(number.casefold()):
+            if leading_number(name) == number or starts_with_number(name, number):
                 candidates.append(item)
         if not candidates:
             return None
         # The most recently changed one, when the team made two.
         best = max(candidates, key=lambda i: str(i.get("lastModifiedDateTime", "")))
-        return FolderMatch(str(best["name"]), "number", best.get("webUrl"))
+        return FolderMatch(str(best["name"]), "number", best.get("webUrl"), best.get("id"))
 
     async def ensure_folder(self, name: str) -> str | None:
         """Make ``<root>/<name>`` if it is not there yet; its link either way.
@@ -291,6 +325,24 @@ class QuoteDrive:
         """
         if not self.enabled:
             raise DriveError("No drive is configured for quote documents")
+        try:
+            item = await self.create_folder(name)
+        except DriveError as exc:
+            logger.info("could not make folder %s (%s)", name, exc)
+            return None
+        return item.get("webUrl") if item else None
+
+    async def create_folder(self, name: str) -> dict[str, Any] | None:
+        """Make ``<root>/<name>``; the folder as the drive has it — ``id``,
+        ``name``, ``webUrl``. Raises :class:`DriveError` with the drive's
+        reason when it is refused.
+
+        Never a second folder: the request asks the drive to refuse a name that
+        is already there, and that refusal is read as "it exists" — so a
+        colleague making the same folder a moment earlier costs nothing.
+        """
+        if not self.enabled:
+            raise DriveError("No drive is configured for quote documents")
         headers = await self._headers()
         response = await self._http.post(
             self._path_url(self.root, "/children"),
@@ -298,11 +350,12 @@ class QuoteDrive:
             json={"name": name, "folder": {}, "@microsoft.graph.conflictBehavior": "fail"},
         )
         if response.status_code in (200, 201):
-            return response.json().get("webUrl")
+            return response.json()
         if response.status_code == 409:
-            return await self.folder_url(f"{self.root}/{name}")
-        logger.info("could not make folder %s (%s)", name, response.status_code)
-        return None
+            return await self.folder_item(name)
+        raise DriveError(
+            f"the folder was not made ({response.status_code}): {response.text[:160]}"
+        )
 
     async def folder_url(self, path: str) -> str | None:
         """The link to a folder, once something has been put in it."""
@@ -310,6 +363,70 @@ class QuoteDrive:
         if response.status_code != 200:
             return None
         return response.json().get("webUrl")
+
+    # ── a task folder by its item id ───────────────────────────────────
+    # For copying into a folder the team also works in: by id, a folder they
+    # renamed is still the one written to, and one they deleted is not
+    # quietly made again by addressing its old path.
+
+    def _item_url(self, item_id: str, suffix: str = "") -> str:
+        return f"{GRAPH_BASE}/drives/{self._drive()}/items/{item_id}{suffix}"
+
+    async def folder_item(self, name: str) -> dict[str, Any] | None:
+        """``<root>/<name>`` as the drive has it — ``id``, ``name``, ``webUrl``
+        — or None when there is no folder of that name."""
+        if not self.enabled:
+            raise DriveError("No drive is configured for quote documents")
+        response = await self._http.get(
+            self._path_url(f"{self.root}/{name}"),
+            headers=await self._headers(),
+            params={"$select": "id,name,webUrl,folder"},
+        )
+        if response.status_code == 404:
+            return None
+        if response.status_code != 200:
+            raise DriveError(f"could not read the folder ({response.status_code})")
+        item = response.json()
+        return item if "folder" in item else None
+
+    async def names_in(self, folder_id: str) -> set[str]:
+        """Every name directly inside the folder, in lower case. Raises
+        :class:`DriveError` when the folder is gone."""
+        headers = await self._headers()
+        url: str | None = self._item_url(folder_id, "/children")
+        params: dict[str, str] | None = {"$select": "name", "$top": "999"}
+        names: set[str] = set()
+        while url:
+            response = await self._http.get(url, headers=headers, params=params)
+            if response.status_code == 404:
+                raise DriveGoneError("the task's folder is no longer there")
+            if response.status_code != 200:
+                raise DriveError(f"could not list the folder ({response.status_code})")
+            payload = response.json()
+            names.update(str(i.get("name") or "").casefold() for i in payload.get("value", []))
+            url, params = payload.get("@odata.nextLink"), None
+        return names
+
+    async def file_into(
+        self, folder_id: str, filename: str, content: bytes, content_type: str | None = None
+    ) -> FiledDocument:
+        """Put a file directly inside the folder with this id, never over a file
+        of the same name — that raises :class:`DriveConflictError`."""
+        if not self.enabled:
+            raise DriveError("No drive is configured for quote documents")
+        if len(content) > MAX_UPLOAD_BYTES:
+            raise DriveError(
+                f"{filename} is {len(content) // (1024 * 1024)} MB, over the "
+                f"{MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit"
+            )
+        name = safe_file_name(filename)
+        address = self._item_url(folder_id, f":/{urlquote(name)}:")
+        item = await self._put(address, name, content, content_type, await self._headers(), "fail")
+        filed = FiledDocument(
+            item_id=item["id"], web_url=item.get("webUrl", ""), path=item.get("name") or name
+        )
+        logger.info("copied %s into folder %s", name, folder_id)
+        return filed
 
     # ── putting a file there ───────────────────────────────────────────
 
@@ -320,6 +437,7 @@ class QuoteDrive:
         filename: str,
         content: bytes,
         content_type: str | None = None,
+        replace: bool = True,
     ) -> FiledDocument:
         """Put one file at ``<root>/<folder>/<filename>``.
 
@@ -329,6 +447,10 @@ class QuoteDrive:
 
         Small files go in one request. Larger ones go through an upload
         session, in chunks, which is how a forty-page scanned tender arrives.
+
+        ``replace=False`` leaves a file of the same name alone and raises
+        :class:`DriveConflictError` instead — for copying into a folder people
+        also work in, where that file may be the one they have been editing.
         """
         if not self.enabled:
             raise DriveError("No drive is configured for quote documents")
@@ -337,38 +459,60 @@ class QuoteDrive:
                 f"{filename} is {len(content) // (1024 * 1024)} MB, over the "
                 f"{MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit"
             )
-        path = f"{self.root}/{folder.strip('/')}/{safe_name(filename)}"
+        path = f"{self.root}/{folder.strip('/')}/{safe_file_name(filename)}"
         headers = await self._headers()
-        if len(content) <= SIMPLE_UPLOAD_LIMIT:
-            item = await self._put_small(path, content, content_type, headers)
-        else:
-            item = await self._put_large(path, content, headers)
+        conflict = "replace" if replace else "fail"
+        item = await self._put(
+            self._path_url(path), path.rsplit("/", 1)[-1], content, content_type, headers, conflict
+        )
         filed = FiledDocument(item_id=item["id"], web_url=item.get("webUrl", ""), path=path)
         logger.info("filed %s at %s", filename, filed.path)
         return filed
 
-    async def _put_small(self, path, content, content_type, headers) -> dict[str, Any]:
+    async def _put(
+        self, address: str, label: str, content: bytes, content_type: str | None,
+        headers: dict[str, str], conflict: str,
+    ) -> dict[str, Any]:
+        """One file to ``address`` — a drive path ending in ``:``, by root path
+        or by parent item id. Small in one request, large in chunks."""
+        if len(content) <= SIMPLE_UPLOAD_LIMIT:
+            return await self._put_small(address, label, content, content_type, headers, conflict)
+        return await self._put_large(address, label, content, headers, conflict)
+
+    async def _put_small(
+        self, address, label, content, content_type, headers, conflict: str = "replace"
+    ) -> dict[str, Any]:
         response = await self._http.put(
-            self._path_url(path, "/content"),
+            f"{address}/content",
             content=content,
             headers={**headers, "Content-Type": content_type or "application/octet-stream"},
+            # Replacing is what a PUT does unasked, so only "fail" is spelled out.
+            params=(
+                {"@microsoft.graph.conflictBehavior": conflict} if conflict != "replace" else None
+            ),
         )
+        if response.status_code == 409:
+            raise DriveConflictError(f"{label} is already in the folder")
         if response.status_code not in (200, 201):
             raise DriveError(
-                f"upload of {path.rsplit('/', 1)[-1]} refused ({response.status_code}): "
+                f"upload of {label} refused ({response.status_code}): "
                 f"{response.text[:160]}"
             )
         return response.json()
 
-    async def _put_large(self, path, content, headers) -> dict[str, Any]:
+    async def _put_large(
+        self, address, label, content, headers, conflict: str = "replace"
+    ) -> dict[str, Any]:
         opened = await self._http.post(
-            self._path_url(path, "/createUploadSession"),
+            f"{address}/createUploadSession",
             headers=headers,
-            json={"item": {"@microsoft.graph.conflictBehavior": "replace"}},
+            json={"item": {"@microsoft.graph.conflictBehavior": conflict}},
         )
+        if opened.status_code == 409:
+            raise DriveConflictError(f"{label} is already in the folder")
         if opened.status_code not in (200, 201):
             raise DriveError(
-                f"upload session for {path.rsplit('/', 1)[-1]} refused "
+                f"upload session for {label} refused "
                 f"({opened.status_code}): {opened.text[:160]}"
             )
         upload_url = opened.json()["uploadUrl"]
@@ -387,6 +531,9 @@ class QuoteDrive:
             )
             if response.status_code in (200, 201):
                 item = response.json()
+            elif response.status_code == 409:
+                # With "fail", a name taken meanwhile is refused at the last chunk.
+                raise DriveConflictError(f"{label} is already in the folder")
             elif response.status_code != 202:
                 raise DriveError(
                     f"chunk {start}-{end - 1} refused ({response.status_code}): "

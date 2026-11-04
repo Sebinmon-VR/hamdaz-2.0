@@ -35,9 +35,11 @@ from app.analytics import publisher as publishing
 from app.core.config import Settings
 from app.models.assignment import AssignmentPolicy
 from app.models.team import Team
+from app.proposals import folders as task_folders
 from app.proposals import mirror as mirror_service
 from app.proposals.mirror import MirrorSync
 from app.proposals.sharepoint import SharePointError, SharePointProposals
+from app.quoting.storage import QuoteDrive
 
 logger = logging.getLogger("hamdaz.intake.worker")
 
@@ -80,10 +82,15 @@ class Worker:
         factory: async_sessionmaker[AsyncSession],
         settings: Settings,
         sharepoint: SharePointProposals,
+        drive: QuoteDrive | None = None,
     ) -> None:
         self._factory = factory
         self._settings = settings
         self._sharepoint = sharepoint
+        #: For the task folders — see app/proposals/folders.py. None in tests.
+        self._drive = drive
+        self._folders_job: asyncio.Task | None = None
+        self._folders_failed: str | None = None
         self._mirror = MirrorSync()
         self._publisher = publishing.Publisher(settings, sharepoint)
         self._tasks: set[asyncio.Task] = set()
@@ -236,6 +243,50 @@ class Worker:
             logger.debug(
                 "mirror: read=%d changed=%d in %dms",
                 report.read, report.changed, report.duration_ms,
+            )
+        self._start_folders()
+
+    # ── task folders ───────────────────────────────────────────────────
+
+    def _start_folders(self) -> None:
+        """Folders for new tasks, and their attachments, after a sync.
+
+        In the background, so copying a tender's files never holds up the next
+        sync; one pass at a time per instance, and one instance at a time by
+        the pass's own lock. Never from a forced sync on a laptop — the same
+        flag that keeps the mirror loop off there keeps this off.
+        """
+        if self._drive is None or not self._drive.enabled:
+            return
+        if not self._settings.task_folders_enabled or not self._mirror_wanted():
+            return
+        if self._folders_job is not None and not self._folders_job.done():
+            return
+        job = asyncio.create_task(self._folders_once(), name="task-folders")
+        self._folders_job = job
+        self._tasks.add(job)
+        job.add_done_callback(self._tasks.discard)
+
+    async def _folders_once(self) -> None:
+        try:
+            report = await task_folders.run_pass(
+                self._factory, self._drive, self._sharepoint, self._settings
+            )
+        except Exception as exc:  # noqa: BLE001 - never into the event loop
+            # Once per kind of failure, not once a sync: before its migration
+            # runs, the table is missing on every pass.
+            said = f"{type(exc).__name__}: {exc}"[:300]
+            if said != self._folders_failed:
+                logger.exception("task folders pass failed")
+            self._folders_failed = said
+            return
+        self._folders_failed = None
+        if report is not None and report.anything:
+            logger.info(
+                "task folders: %d made, %d found, %d failed; files %d copied, "
+                "%d left as they were, %d failed",
+                report.folders_made, report.folders_found, report.folder_errors,
+                report.files_copied, report.files_skipped, report.file_errors,
             )
 
     async def _renew_subscription(self, session: AsyncSession) -> None:

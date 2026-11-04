@@ -6,6 +6,7 @@ so there is exactly one place to look when a deployment misbehaves.
 
 from __future__ import annotations
 
+from datetime import date
 from decimal import Decimal
 from functools import lru_cache
 from typing import Annotated, Literal
@@ -121,6 +122,19 @@ class Settings(BaseSettings):
     #: Where a quote raised with no task behind it files its documents —
     #: a folder beside the task folders, so nothing is invented as a task.
     quote_drive_unlinked_folder: str = "_Quotes without a task"
+    #: Make each new Proposals task its folder under the root above, named
+    #: after its title — what the Power Automate flow did until it was turned
+    #: off on 2026-10-23 (its last folder: 10:53 that day). Runs with the
+    #: mirror loop, so only where MIRROR_SYNC_ENABLED is on. A folder that is
+    #: already there, by title or by event number, is used rather than doubled.
+    task_folders_enabled: bool = True
+    #: Tasks created on or after this day (UTC) get a folder; older ones are
+    #: left alone. The day the flow stopped, so the tasks it missed are filled.
+    task_folders_since: date = date(2026, 10, 23)
+    #: Copy the files attached to those tasks in the list into their folders —
+    #: straight into the task folder, never over a file of the same name, and
+    #: ones attached later as they are attached.
+    task_files_enabled: bool = True
 
     @property
     def files_to_drive(self) -> bool:

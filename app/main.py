@@ -171,6 +171,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         factory=get_session_factory(),
         settings=settings,
         sharepoint=app.state.sharepoint,
+        # Each new task's folder in the Proposal Team Channel, and its list
+        # attachments copied in — see app/proposals/folders.py.
+        drive=app.state.quote_drive,
     )
     # Started always; the loop decides each tick whether to do anything.
     app.state.intake_worker.start()

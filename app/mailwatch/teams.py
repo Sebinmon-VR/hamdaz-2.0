@@ -75,7 +75,7 @@ from app.mailwatch.classify import (
 )
 from app.models.mailwatch import MailWatchTeams, MailWatchTestTask, WatchedMail
 from app.proposals.sharepoint import SharePointConsentError, SharePointError, SharePointProposals
-from app.quoting.storage import DriveError, QuoteDrive
+from app.quoting.storage import DriveError, QuoteDrive, safe_file_name
 
 logger = logging.getLogger("hamdaz.mailwatch.teams")
 
@@ -484,7 +484,15 @@ class TeamsPoster:
                     out.folder_url = folder.web_url
                     found = await self._drive.list_files(folder.name, limit=100)
                     found.sort(key=lambda f: f.get("modified") or "", reverse=True)
+                    # An attachment's copy in the folder (app/proposals/folders.py)
+                    # is the same file: listed once, as the attachment.
+                    attached_names = {
+                        safe_file_name(f.name).casefold()
+                        for f in out.files if f.where == "Attached to the task"
+                    }
                     for f in found:
+                        if "/" not in f["path"] and f["name"].casefold() in attached_names:
+                            continue
                         where = f["path"].rpartition("/")[0] or "Task folder"
                         out.files.append(
                             TaskFile(f["name"], f["web_url"], where, f.get("modified"))
