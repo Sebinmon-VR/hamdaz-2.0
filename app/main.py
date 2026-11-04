@@ -64,6 +64,7 @@ from app.mailwatch.worker import MailWatchWorker
 from app.nova.bot import TeamsBot
 from app.nova.chat import NovaChat
 from app.nova.router import router as nova_router
+from app.payroll.router import router as payroll_router
 from app.labels.router import router as labels_router
 from app.leave.mailer import LeaveMailer
 from app.leave.router import router as leave_router
@@ -363,6 +364,7 @@ def create_app() -> FastAPI:
     app.include_router(mailwatch_router, prefix=settings.api_prefix)
     # Teams posts to it with the bot service's signature, not a session.
     app.include_router(nova_router, prefix=settings.api_prefix)
+    app.include_router(payroll_router, prefix=settings.api_prefix)
     app.include_router(reports_admin_router, prefix=settings.api_prefix)
     app.include_router(reports_router, prefix=settings.api_prefix)
     # Mounted at the root, NOT under the API prefix, and holding no

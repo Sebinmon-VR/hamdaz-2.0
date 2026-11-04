@@ -80,6 +80,17 @@ from app.models.mailwatch import (
     WatchedMail,
 )
 from app.models.nova import NovaMessage, NovaPerson
+from app.models.payroll import (
+    AccessLevel,
+    PayrollEmployee,
+    PayrollEvent,
+    PayrollLine,
+    PayrollMember,
+    PayrollRun,
+    PayrollSalary,
+    PayrollSettings,
+    RunStatus,
+)
 from app.models.enquiry import EnquiryAnalysis, EnquiryDocument, EnquiryLine
 from app.models.hr import (
     CLOSED_STAGES,
@@ -198,6 +209,15 @@ __all__ = [
     "WatchedMail",
     "NovaMessage",
     "NovaPerson",
+    "AccessLevel",
+    "PayrollEmployee",
+    "PayrollEvent",
+    "PayrollLine",
+    "PayrollMember",
+    "PayrollRun",
+    "PayrollSalary",
+    "PayrollSettings",
+    "RunStatus",
     "BcdCheckStatus",
     "TaskCalendarEvent",
     "EnquiryAnalysis",

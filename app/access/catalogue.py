@@ -270,6 +270,29 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         ),
     ),
     ModuleSpec(
+        key="payroll",
+        name="Payroll",
+        description=(
+            "Monthly payroll for the UAE and India: employees, salary "
+            "structures, the month's run, payslips and bank files. Not granted "
+            "to teams — reading it is the Accounts team, super admins, the CEO "
+            "and people a super admin names on the payroll access list; "
+            "processing it is the processors on that list and the super "
+            "admins; approving a month is a super admin or the CEO. Super "
+            "admins may do anything in it. See app/payroll/access.py."
+        ),
+        admin_only=True,
+        pages=(
+            PageSpec("runs", "Payroll months", "/payroll"),
+            PageSpec("run", "Payroll month", "/payroll/runs/[id]"),
+            PageSpec("employees", "Employees on payroll", "/payroll/employees"),
+            PageSpec("employee", "Employee", "/payroll/employees/[id]"),
+            PageSpec("gratuity", "Gratuity", "/payroll/gratuity"),
+            PageSpec("settings", "Payroll settings", "/payroll/settings"),
+            PageSpec("access", "Payroll access", "/payroll/access"),
+        ),
+    ),
+    ModuleSpec(
         key="templates",
         name="Form Templates",
         description=(
