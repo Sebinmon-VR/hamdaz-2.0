@@ -31,7 +31,7 @@ from app.models.payroll import (
 from app.models.user import User
 from app.payroll import exports, service
 from app.payroll.access import Access, Admin, Approver, PayrollAccess, Processor, Viewer
-from app.payroll.deps import Mailer
+from app.payroll.deps import Mailer, Zoho
 from app.payroll.rules import COMPONENTS, Period
 from app.payroll.schemas import (
     AccessOverviewOut,
@@ -540,6 +540,7 @@ async def submit(
     user: CurrentUser,
     session: Session,
     mailer: Mailer,
+    zoho: Zoho,
     notify: bool = True,
 ) -> RunDetailOut:
     """Send the month — payroll and its invoice — for approval.
@@ -548,14 +549,17 @@ async def submit(
     the same click: the other super admins need not be asked.
     """
     from app.payroll import invoicing
-    from app.payroll.invoice_router import month_link
+    from app.payroll.invoice_router import month_link, zoho_rate
 
     run = await _run(session, run_id)
     try:
         await service.submit(session, run, user)
+        settings = await service.get_settings(session)
+        currency = settings.invoice_currency or "AED"
+        rate, _ = await zoho_rate(zoho, currency, run.currency, service.period_of(run).end)
         await invoicing.on_submit(
             session, run, user,
-            mailer=mailer, link=month_link(run), notify=notify,
+            mailer=mailer, link=month_link(run), notify=notify, rate=rate,
         )
     except PayrollError as exc:
         raise _translate(exc) from exc
@@ -630,9 +634,19 @@ async def payslips(
         lines = [ln for ln in lines if ln.id == line]
         if not lines:
             raise HTTPException(status.HTTP_404_NOT_FOUND, detail="No such line in this month.")
-        stem = f"Payslip {lines[0].employee_code} {run.year}-{run.month:02d}"
+        pdf = exports.payslips_pdf(run, lines, await service.get_settings(session))
+        return _file(pdf, exports.payslip_name(run, lines[0]), exports.PDF_TYPE)
     pdf = exports.payslips_pdf(run, lines, await service.get_settings(session))
-    return _file(pdf, f"{stem}.pdf", exports.PDF_TYPE)
+    return _file(pdf, f"{stem} payslips.pdf", exports.PDF_TYPE)
+
+
+@router.get("/runs/{run_id}/payslips.zip")
+async def payslips_zip(run_id: uuid.UUID, _: Viewer, session: Session) -> Response:
+    """One PDF per person, zipped: the payslips to hand out or mail one by one."""
+    run = await _run(session, run_id)
+    lines = sorted(run.lines, key=lambda ln: ln.employee_code)
+    data = exports.payslips_zip(run, lines, await service.get_settings(session))
+    return _file(data, f"{exports.file_stem(run)} payslips.zip", exports.ZIP_TYPE)
 
 
 @router.get("/runs/{run_id}/register.xlsx")

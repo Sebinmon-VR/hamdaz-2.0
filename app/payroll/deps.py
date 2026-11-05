@@ -14,7 +14,7 @@ from app.zoho.client import ZohoBooks
 
 
 def get_zoho(request: Request) -> ZohoBooks:
-    return request.app.state.zoho
+    return getattr(request.app.state, "zoho", None)
 
 
 def get_mailer(request: Request) -> Any:
@@ -23,5 +23,5 @@ def get_mailer(request: Request) -> Any:
     return getattr(request.app.state, "payroll_mailer", None)
 
 
-Zoho = Annotated[ZohoBooks, Depends(get_zoho)]
+Zoho = Annotated[ZohoBooks | None, Depends(get_zoho)]
 Mailer = Annotated[Any, Depends(get_mailer)]

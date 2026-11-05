@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import csv
 import io
+import zipfile
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -46,6 +47,7 @@ from app.models.payroll import Country, PayrollLine, PayrollRun, PayrollSettings
 from app.payroll.rules import Period, dec, r0
 
 PDF_TYPE: Final = "application/pdf"
+ZIP_TYPE: Final = "application/zip"
 XLSX_TYPE: Final = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 LOGO: Final = Path(__file__).resolve().parent.parent / "quoting" / "assets" / "logo_mark.png"
 
@@ -247,6 +249,28 @@ def payslips_pdf(run: PayrollRun, lines: list[PayrollLine], settings: PayrollSet
     if not story:
         story = [Paragraph("Nobody in this month.", s["base"])]
     doc.build(story)
+    return buffer.getvalue()
+
+
+def payslip_name(run: PayrollRun, line: PayrollLine) -> str:
+    """``Payslip HZ-IN-001 Anu Thomas 2026-11.pdf`` — safe as a file name anywhere."""
+    name = "".join(c for c in (line.employee_name or "") if c.isalnum() or c in " .-_").strip()
+    return " ".join(
+        part for part in ("Payslip", line.employee_code, name, f"{run.year}-{run.month:02d}") if part
+    ) + ".pdf"
+
+
+def payslips_zip(run: PayrollRun, lines: list[PayrollLine], settings: PayrollSettings) -> bytes:
+    """Each person's payslip as a PDF of its own, in one ZIP — to send one by one."""
+    buffer = io.BytesIO()
+    seen: set[str] = set()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for line in lines:
+            name = payslip_name(run, line)
+            if name in seen:  # two people with the same code and name: keep both
+                name = name[:-4] + f" {str(line.id)[:8]}.pdf"
+            seen.add(name)
+            archive.writestr(name, payslips_pdf(run, [line], settings))
     return buffer.getvalue()
 
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import time
 import uuid
+from datetime import date
 from types import SimpleNamespace
 from typing import Annotated, Any
 from urllib.parse import quote
@@ -51,6 +52,28 @@ Session = Annotated[AsyncSession, Depends(get_session)]
 
 
 
+_RATES: dict[tuple[str, str, str], tuple[float, Any]] = {}
+
+
+async def zoho_rate(zoho: Any, currency: str, run_currency: str, on: date) -> tuple[Any, str | None]:
+    """Zoho's rate for the invoice date (INR per invoice-currency unit), cached ten minutes.
+
+    Every invoice view needs it and Zoho allows 100 calls a minute; a rate set
+    in Zoho shows here within ten minutes.
+    """
+    if currency == run_currency:
+        return None, None
+    if zoho is None or not getattr(zoho, "configured", True):
+        return None, "Zoho Books is not connected, so there is no rate to read — type one."
+    key = (currency, run_currency, on.isoformat())
+    hit = _RATES.get(key)
+    if hit and time.monotonic() - hit[0] < 600:
+        return hit[1]
+    value = await invoicing.zoho_rate_on(zoho, currency=currency, run_currency=run_currency, on=on)
+    _RATES[key] = (time.monotonic(), value)
+    return value
+
+
 def month_link(run: PayrollRun) -> str:
     return f"{app_settings().frontend_url.rstrip('/')}/payroll?tab=run&run={run.id}"
 
@@ -65,9 +88,13 @@ def _virtual(run: PayrollRun, settings: Any) -> Any:
     )
 
 
-async def _out(session: AsyncSession, run: PayrollRun) -> RunInvoiceOut:
+async def _out(session: AsyncSession, run: PayrollRun, zoho: Any) -> RunInvoiceOut:
     settings = await service.get_settings(session)
-    inv: Any = await invoicing.get_for_run(session, run) or _virtual(run, settings)
+    saved = await invoicing.get_for_run(session, run)
+    inv: Any = saved or _virtual(run, settings)
+    rate, note = await zoho_rate(zoho, inv.currency, run.currency, inv.invoice_date)
+    if saved is None and rate:
+        inv.exchange_rate = rate  # what the invoice will be made with
     lines, missing = invoicing.all_lines(run, inv)
     sub, tax, total = invoicing.totals(lines, inv.adjustment)
     salaries = sum((dec(x["amount"]) for x in lines if x["source"] == "salary"), dec(0))
@@ -84,6 +111,9 @@ async def _out(session: AsyncSession, run: PayrollRun) -> RunInvoiceOut:
         run_currency=run.currency,
         exchange_rate=inv.exchange_rate,
         needs_rate=missing,
+        zoho_rate=rate,
+        zoho_rate_note=note,
+        rate_from_zoho=bool(rate and inv.exchange_rate and dec(inv.exchange_rate) == dec(rate)),
         invoice_date=inv.invoice_date,
         due_date=inv.due_date,
         payment_terms=inv.payment_terms,
@@ -116,20 +146,26 @@ async def _out(session: AsyncSession, run: PayrollRun) -> RunInvoiceOut:
 
 
 @router.get("/runs/{run_id}/invoice", response_model=RunInvoiceOut)
-async def get_invoice(run_id: uuid.UUID, _: Viewer, session: Session) -> RunInvoiceOut:
-    return await _out(session, await _run(session, run_id))
+async def get_invoice(run_id: uuid.UUID, _: Viewer, session: Session, zoho: Zoho) -> RunInvoiceOut:
+    return await _out(session, await _run(session, run_id), zoho)
 
 
 @router.put("/runs/{run_id}/invoice", response_model=RunInvoiceOut)
 async def save_invoice(
-    run_id: uuid.UUID, body: RunInvoiceIn, _: Processor, user: CurrentUser, session: Session
+    run_id: uuid.UUID, body: RunInvoiceIn, _: Processor, user: CurrentUser, session: Session, zoho: Zoho
 ) -> RunInvoiceOut:
     run = await _run(session, run_id)
+    data = body.model_dump(mode="python")
+    # No rate typed for a foreign-currency invoice: Zoho's, for its date.
+    if data["currency"].upper() != run.currency and not data.get("exchange_rate"):
+        data["exchange_rate"], _ = await zoho_rate(
+            zoho, data["currency"].upper(), run.currency, data["invoice_date"]
+        )
     try:
-        await invoicing.save(session, run, body.model_dump(mode="python"), user)
+        await invoicing.save(session, run, data, user)
     except PayrollError as exc:
         raise _translate(exc) from exc
-    return await _out(session, run)
+    return await _out(session, run, zoho)
 
 
 @router.post("/runs/{run_id}/invoice/zoho", response_model=RunInvoiceOut)
@@ -157,12 +193,17 @@ async def invoice_to_zoho(
         # fails, but "why" should still be on the invoice afterwards.
         await session.commit()
         raise _translate(exc) from exc
-    return await _out(session, run)
+    return await _out(session, run, zoho)
 
 
 @router.post("/runs/{run_id}/invoice/report", response_model=RunInvoiceOut)
 async def invoice_report(
-    run_id: uuid.UUID, _: PreparerOrApprover, user: CurrentUser, session: Session, mailer: Mailer
+    run_id: uuid.UUID,
+    _: PreparerOrApprover,
+    user: CurrentUser,
+    session: Session,
+    mailer: Mailer,
+    zoho: Zoho,
 ) -> RunInvoiceOut:
     run = await _run(session, run_id)
     invoice = await invoicing.get_for_run(session, run)
@@ -172,11 +213,11 @@ async def invoice_report(
         await invoicing.send_report(session, run, invoice, user, mailer=mailer, link=month_link(run))
     except PayrollError as exc:
         raise _translate(exc) from exc
-    return await _out(session, run)
+    return await _out(session, run, zoho)
 
 
 @router.get("/runs/{run_id}/invoice.pdf")
-async def invoice_file(run_id: uuid.UUID, _: Viewer, session: Session) -> Response:
+async def invoice_file(run_id: uuid.UUID, _: Viewer, session: Session, zoho: Zoho) -> Response:
     run = await _run(session, run_id)
     settings = await service.get_settings(session)
     saved: PayrollInvoice | None = await invoicing.get_for_run(session, run)
@@ -184,9 +225,10 @@ async def invoice_file(run_id: uuid.UUID, _: Viewer, session: Session) -> Respon
         content = saved.zoho_pdf
         name = f"{saved.zoho_invoice_number or saved.number}.pdf"
     else:
-        inv: Any = saved or SimpleNamespace(**vars(_virtual(run, settings)))
-        if inv.number is None:
+        inv: Any = saved or _virtual(run, settings)
+        if saved is None:
             inv.number = "Draft"
+            inv.exchange_rate, _ = await zoho_rate(zoho, inv.currency, run.currency, inv.invoice_date)
         lines, _ = invoicing.all_lines(run, inv)
         test = inv.zoho_mode != "live"
         content = invoice_pdf(run, inv, lines, settings, test=test)
@@ -222,7 +264,7 @@ async def invoice_setup(_: Viewer, session: Session, zoho: Zoho) -> InvoiceSetup
     currencies: list[str] = []
     org: str | None = None
     error: str | None = None
-    if not zoho.configured:
+    if zoho is None or not zoho.configured:
         error = "Zoho Books is not configured on this server."
     else:
         try:
@@ -246,7 +288,12 @@ async def invoice_setup(_: Viewer, session: Session, zoho: Zoho) -> InvoiceSetup
             error = str(exc)
     approvers = await users_with_roles(session, {"super_admin"})
     report = await invoicing.report_recipients(session)
+    currency = settings.invoice_currency or "AED"
+    default_rate, default_note = await zoho_rate(zoho, currency, "INR", date.today())
     return InvoiceSetupOut(
+        default_currency=currency,
+        default_rate=default_rate,
+        default_rate_note=default_note,
         zoho_live=app_settings().payroll_zoho_invoice_write,
         zoho_organization=org,
         mail=settings.mail_enabled,

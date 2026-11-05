@@ -32,8 +32,8 @@ from __future__ import annotations
 
 import html
 import re
-from datetime import UTC, datetime
-from decimal import Decimal
+from datetime import UTC, date, datetime
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Iterable
 
 from sqlalchemy import select
@@ -181,13 +181,16 @@ def totals(lines: list[dict[str, Any]], adjustment: Any = 0) -> tuple[Decimal, D
     return sub, tax, r2(sub + tax + dec(adjustment or 0))
 
 
-def zoho_payload(invoice: Any, lines: list[dict[str, Any]], *, run_currency: str) -> dict[str, Any]:
+def zoho_payload(
+    invoice: Any, lines: list[dict[str, Any]], *, exchange_rate: Any = None
+) -> dict[str, Any]:
     """The body for Zoho's ``POST /invoices`` — exactly what would be sent.
 
     Zoho numbers its invoices itself, so ours goes in as the reference when
-    there is no other. ``exchange_rate`` is only sent for a foreign-currency
-    invoice; it is units of the issuing company's base currency (INR, the
-    payroll's) per unit of the invoice's, which is what Zoho means by it.
+    there is no other. ``exchange_rate`` is what Zoho means by it — units of
+    the *organisation's base currency* per unit of the invoice's — so the
+    caller works it out against that base (``zoho_exchange_rate``): none for
+    an invoice in the base currency itself.
     """
 
     def num(value: Any) -> float:
@@ -203,8 +206,8 @@ def zoho_payload(invoice: Any, lines: list[dict[str, Any]], *, run_currency: str
         body["due_date"] = invoice.due_date.isoformat()
     elif invoice.payment_terms is not None:
         body["payment_terms"] = invoice.payment_terms
-    if invoice.currency != run_currency and invoice.exchange_rate:
-        body["exchange_rate"] = num(invoice.exchange_rate)
+    if exchange_rate:
+        body["exchange_rate"] = num(exchange_rate)
     for line in lines:
         item: dict[str, Any] = {
             "name": line["name"],
@@ -226,6 +229,94 @@ def zoho_payload(invoice: Any, lines: list[dict[str, Any]], *, run_currency: str
     return body
 
 
+# ── exchange rates, from Zoho ─────────────────────────────────────────
+
+
+def _as_date(raw: Any) -> date | None:
+    try:
+        return date.fromisoformat(str(raw)[:10]) if raw else None
+    except ValueError:
+        return None
+
+
+async def _zoho_table(zoho: Any) -> tuple[str | None, dict[str, dict[str, Any]]]:
+    rows = await zoho.currencies()
+    base = next((str(r["currency_code"]).upper() for r in rows if r.get("is_base_currency")), None)
+    return base, {str(r.get("currency_code", "")).upper(): r for r in rows}
+
+
+async def zoho_rate_on(
+    zoho: Any, *, currency: str, run_currency: str, on: date
+) -> tuple[Decimal | None, str]:
+    """Payroll-currency units per one invoice-currency unit (INR per AED), from Zoho.
+
+    Zoho keeps one rate per currency against the organisation's base, with a
+    dated history: the latest rate on or before ``on`` (the invoice date) is
+    used, else the currency's current rate. Converting at anything but Zoho's
+    rate is how two documents for the same money come to disagree — see
+    ``app/quoting/fx.py``. Returns the rate, or ``None`` and why there is none.
+    """
+    from app.zoho.client import ZohoError
+
+    if currency == run_currency:
+        return None, ""
+    try:
+        base, rows = await _zoho_table(zoho)
+    except ZohoError as exc:
+        return None, f"Zoho's currencies could not be read: {exc}"
+    if base is None:
+        return None, "Zoho Books did not say which currency is its base."
+
+    async def in_base(code: str) -> tuple[Decimal | None, date | None]:
+        if code == base:
+            return Decimal(1), None
+        row = rows.get(code)
+        if row is None:
+            return None, None
+        best: tuple[Decimal, date] | None = None
+        if row.get("currency_id"):
+            try:
+                history = await zoho._get(f"/settings/currencies/{row['currency_id']}/exchangerates")
+            except ZohoError:
+                history = {}
+            for item in history.get("exchange_rates") or []:
+                when, value = _as_date(item.get("effective_date")), dec(item.get("rate") or 0)
+                if when and value > 0 and when <= on and (best is None or when > best[1]):
+                    best = (value, when)
+        if best:
+            return best
+        value = dec(row.get("exchange_rate") or 0)
+        return (value, _as_date(row.get("effective_date"))) if value > 0 else (None, None)
+
+    ours, d1 = await in_base(currency)
+    theirs, d2 = await in_base(run_currency)
+    missing = [c for c, v in ((currency, ours), (run_currency, theirs)) if v is None]
+    if missing:
+        return None, (
+            f"Zoho Books has no exchange rate for {', '.join(missing)} — set one in Zoho Books "
+            "under Settings → Currencies, or type the rate on the invoice."
+        )
+    rate = (ours / theirs).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+    when = max((d for d in (d1, d2) if d), default=None)
+    note = f"Zoho: 1 {currency} = {rate.normalize():f} {run_currency}"
+    return rate, note + (f", rate of {when:%d %b %Y}" if when else "")
+
+
+async def zoho_exchange_rate(zoho: Any, invoice: Any, run_currency: str) -> Decimal | None:
+    """The ``exchange_rate`` Zoho's invoice body needs, against Zoho's own base.
+
+    None for an invoice in the base currency (an AED invoice in AED books). In
+    books whose base is the payroll's currency (INR), it is the invoice's own
+    rate. Otherwise none is sent and Zoho uses its own table.
+    """
+    base, _ = await _zoho_table(zoho)
+    if base is None or invoice.currency == base:
+        return None
+    if base == run_currency and invoice.exchange_rate:
+        return dec(invoice.exchange_rate)
+    return None
+
+
 # ── the invoice of a month ────────────────────────────────────────────
 
 
@@ -240,7 +331,8 @@ def defaults(run: PayrollRun, settings: PayrollSettings) -> dict[str, Any]:
         "customer_zoho_id": settings.invoice_customer_zoho_id,
         "customer_name": settings.ae_company_name,
         "customer_address": settings.ae_company_address,
-        "currency": settings.invoice_currency or run.currency,
+        # The India company bills the UAE company in AED unless settings say otherwise.
+        "currency": settings.invoice_currency or "AED",
         "exchange_rate": None,
         "invoice_date": period.end,
         "due_date": None,
@@ -275,12 +367,24 @@ def _refresh(invoice: PayrollInvoice, run: PayrollRun) -> list[dict[str, Any]]:
     return lines
 
 
-async def ensure(session: AsyncSession, run: PayrollRun, actor: User | None) -> PayrollInvoice:
-    """The month's invoice, made from the defaults the first time it is needed."""
+async def ensure(
+    session: AsyncSession, run: PayrollRun, actor: User | None, *, rate: Any = None
+) -> PayrollInvoice:
+    """The month's invoice, made from the defaults the first time it is needed.
+
+    ``rate`` is Zoho's (INR per invoice-currency unit), filled in when the
+    invoice is not in the payroll's currency and has no rate of its own yet.
+    """
     invoice = await get_for_run(session, run)
+    if invoice is not None:
+        if rate and invoice.currency != run.currency and not invoice.exchange_rate:
+            invoice.exchange_rate = rate
+            _refresh(invoice, run)
     if invoice is None:
         settings = await get_settings(session)
         values = defaults(run, settings)
+        if values["currency"] != run.currency:
+            values["exchange_rate"] = rate
         invoice = PayrollInvoice(
             run_id=run.id,
             number=await next_number(session, settings.invoice_prefix, values["invoice_date"].year),
@@ -344,14 +448,21 @@ async def save(
 
 
 async def on_submit(
-    session: AsyncSession, run: PayrollRun, actor: User, *, mailer: Any, link: str, notify: bool
+    session: AsyncSession,
+    run: PayrollRun,
+    actor: User,
+    *,
+    mailer: Any,
+    link: str,
+    notify: bool,
+    rate: Any = None,
 ) -> None:
     """After a month is sent for approval: its invoice is settled, the super admins told.
 
     ``notify`` is off when a super admin approves their own month in one step:
     asking the other super admins to approve something already approved is noise.
     """
-    invoice = await ensure(session, run, actor)
+    invoice = await ensure(session, run, actor, rate=rate)
     lines = _refresh(invoice, run)
     await session.flush()
     if not notify:
@@ -476,16 +587,27 @@ async def to_zoho(
         raise PayrollConflict(
             f"Invoice {invoice.number} is already in Zoho as {invoice.zoho_invoice_number}."
         )
+    note = ""
+    if invoice.currency != run.currency and not invoice.exchange_rate:
+        rate, note = await zoho_rate_on(
+            zoho, currency=invoice.currency, run_currency=run.currency, on=invoice.invoice_date
+        )
+        if rate:
+            invoice.exchange_rate = rate
     lines, missing = all_lines(run, invoice)
     invoice.sub_total, invoice.tax_total, invoice.total = totals(lines, invoice.adjustment)
-    payload = zoho_payload(invoice, lines, run_currency=run.currency)
+    try:
+        body_rate = await zoho_exchange_rate(zoho, invoice, run.currency)
+    except ZohoError:
+        body_rate = None
+    payload = zoho_payload(invoice, lines, exchange_rate=body_rate)
     invoice.zoho_payload = payload
     problems = await check_against_zoho(zoho, invoice, lines)
     if missing:
         problems.insert(
             0,
-            f"The invoice is in {invoice.currency} but the payroll is in {run.currency}: "
-            "give the exchange rate.",
+            f"The invoice is in {invoice.currency} but the payroll is in {run.currency}, and there "
+            f"is no rate to convert at. {note}".strip(),
         )
     if problems:
         invoice.zoho_error = " ".join(problems)

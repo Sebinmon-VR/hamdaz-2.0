@@ -465,9 +465,15 @@ class RunInvoiceOut(BaseModel):
     customer_address: str | None
     currency: str
     run_currency: str
+    #: Payroll-currency units per invoice-currency unit (INR per AED).
     exchange_rate: Decimal | None
     #: The invoice is in another currency and there is no rate to convert at.
     needs_rate: bool
+    #: Zoho's rate for the invoice date, and where it came from (or why there is none).
+    zoho_rate: Decimal | None
+    zoho_rate_note: str | None
+    #: The invoice's rate is Zoho's, not one typed in.
+    rate_from_zoho: bool
     invoice_date: date
     due_date: date | None
     payment_terms: int | None
@@ -529,6 +535,10 @@ class InvoiceSetupOut(BaseModel):
     zoho_error: str | None
     taxes: list[ZohoTaxOut]
     currencies: list[str]
+    #: A new invoice's currency, and Zoho's rate to it from the India payroll's (INR) today.
+    default_currency: str
+    default_rate: Decimal | None
+    default_rate_note: str | None
     #: Who the approval mail goes to, and who gets the report.
     approvers: list[str]
     report_to: list[str]
