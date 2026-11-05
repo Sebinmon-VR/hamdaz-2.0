@@ -1,12 +1,12 @@
-"""A payroll invoice as a PDF — what the report carries until Zoho's own exists.
+"""A month's invoice as a PDF — what the report carries until Zoho's own exists.
 
 Once an invoice is really in Zoho, the report attaches *Zoho's* PDF: that is
 the document of record. Until then (test mode, or Zoho's PDF failing to
 download) this one stands in, laid out like it and marked TEST so nobody
 files it as the real thing.
 
-The issuer is the India company in payroll settings — payroll is the side
-raising the invoice; the customer is the Zoho contact chosen on it.
+From the India company in payroll settings (Hamdaz Technologies LLP) to the
+invoice's customer (by default the UAE company, Hamdaztech Technologies LLC).
 """
 
 from __future__ import annotations
@@ -14,23 +14,33 @@ from __future__ import annotations
 import io
 from typing import Any
 
-from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
-from app.models.payroll import PayrollInvoice, PayrollSettings
-from app.payroll.exports import INK, LINE, LOGO, MUTED, NAVY, ROW, _styles
+from app.models.payroll import PayrollInvoice, PayrollRun, PayrollSettings
+from app.payroll.exports import LINE, LOGO, NAVY, ROW, _styles
 from app.payroll.rules import dec
 
-PINK = colors.HexColor("#d62d7d")
+TOP = [("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0)]
 
 
 def _money(value: Any) -> str:
     return f"{dec(value):,.2f}"
 
 
-def invoice_pdf(invoice: PayrollInvoice, settings: PayrollSettings, *, test: bool) -> bytes:
+def _pct(value: Any) -> str:
+    return f"{dec(value or 0).normalize():f} %"
+
+
+def invoice_pdf(
+    run: PayrollRun,
+    invoice: PayrollInvoice,
+    lines: list[dict[str, Any]],
+    settings: PayrollSettings,
+    *,
+    test: bool,
+) -> bytes:
     s = _styles()
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
@@ -57,39 +67,35 @@ def invoice_pdf(invoice: PayrollInvoice, settings: PayrollSettings, *, test: boo
     elif invoice.zoho_invoice_number:
         title.append(Paragraph(f"Zoho {invoice.zoho_invoice_number}", s["right"]))
     head = Table([[logo, issuer, title]], colWidths=[18 * mm, 100 * mm, 62 * mm])
-    head.setStyle(
-        TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0)])
-    )
+    head.setStyle(TableStyle(TOP))
     story += [head, Spacer(1, 6 * mm)]
 
     def kv(label: str, value: Any) -> list[Any]:
-        return [
-            Paragraph(label, s["muted"]),
-            Paragraph(str(value) if value not in (None, "") else "—", s["base"]),
-        ]
+        text = str(value) if value not in (None, "") else "—"
+        return [Paragraph(label, s["muted"]), Paragraph(text, s["base"])]
 
+    due = (
+        f"{invoice.due_date:%d %b %Y}"
+        if invoice.due_date
+        else (f"{invoice.payment_terms} days" if invoice.payment_terms is not None else None)
+    )
     facts = [
         kv("Invoice date", f"{invoice.invoice_date:%d %b %Y}"),
-        kv(
-            "Due date",
-            f"{invoice.due_date:%d %b %Y}"
-            if invoice.due_date
-            else (f"{invoice.payment_terms} days" if invoice.payment_terms is not None else None),
-        ),
+        kv("Due", due),
         kv("Reference", invoice.reference_number),
         kv("Currency", invoice.currency),
     ]
-    bill = [
+    bill: list[list[Any]] = [
         [Paragraph("Bill to", s["muted"])],
         [Paragraph(f"<b>{invoice.customer_name}</b>", s["base"])],
     ]
+    if invoice.customer_address:
+        bill.append([Paragraph(invoice.customer_address.replace("\n", "<br/>"), s["muted"])])
     top = Table(
         [[Table(bill, colWidths=[85 * mm]), Table(facts, colWidths=[25 * mm, 55 * mm])]],
         colWidths=[95 * mm, 85 * mm],
     )
-    top.setStyle(
-        TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0)])
-    )
+    top.setStyle(TableStyle(TOP))
     story += [top, Spacer(1, 6 * mm)]
 
     rows: list[list[Any]] = [
@@ -102,20 +108,17 @@ def invoice_pdf(invoice: PayrollInvoice, settings: PayrollSettings, *, test: boo
             Paragraph("<b>Amount</b>", s["right"]),
         ]
     ]
-    for i, line in enumerate(invoice.lines, start=1):
+    for i, line in enumerate(lines, start=1):
         text = f"<b>{line['name']}</b>"
         if line.get("description"):
             text += f"<br/><font color='#64727f'>{line['description']}</font>"
-        tax = (
-            f"{dec(line.get('tax_percentage') or 0).normalize():f} %" if line.get("tax_id") else "—"
-        )
         rows.append(
             [
                 Paragraph(str(i), s["base"]),
                 Paragraph(text, s["base"]),
                 Paragraph(f"{dec(line['quantity']).normalize():f}", s["right"]),
                 Paragraph(_money(line["rate"]), s["right"]),
-                Paragraph(tax, s["right"]),
+                Paragraph(_pct(line.get("tax_percentage")) if line.get("tax_id") else "—", s["right"]),
                 Paragraph(_money(line["amount"]), s["right"]),
             ]
         )
@@ -135,13 +138,14 @@ def invoice_pdf(invoice: PayrollInvoice, settings: PayrollSettings, *, test: boo
     )
     story += [table, Spacer(1, 4 * mm)]
 
+    sub = dec(sum((dec(line["amount"]) for line in lines), dec(0)))
     sums: list[list[Any]] = [
-        [Paragraph("Sub total", s["right"]), Paragraph(_money(invoice.sub_total), s["right"])]
+        [Paragraph("Sub total", s["right"]), Paragraph(_money(sub), s["right"])]
     ]
     taxes: dict[str, Any] = {}
-    for line in invoice.lines:
+    for line in lines:
         if line.get("tax_id"):
-            label = f"{line.get('tax_name') or 'Tax'} ({dec(line.get('tax_percentage') or 0).normalize():f} %)"
+            label = f"{line.get('tax_name') or 'Tax'} ({_pct(line.get('tax_percentage'))})"
             taxes[label] = dec(taxes.get(label, 0)) + dec(line.get("tax_amount") or 0)
     for label, value in taxes.items():
         sums.append([Paragraph(label, s["right"]), Paragraph(_money(value), s["right"])])
@@ -152,22 +156,18 @@ def invoice_pdf(invoice: PayrollInvoice, settings: PayrollSettings, *, test: boo
                 Paragraph(_money(invoice.adjustment), s["right"]),
             ]
         )
+    total = sub + sum((dec(v) for v in taxes.values()), dec(0)) + dec(invoice.adjustment or 0)
     sums.append(
         [
             Paragraph(f"<b>Total ({invoice.currency})</b>", s["bold_right"]),
-            Paragraph(f"<b>{_money(invoice.total)}</b>", s["bold_right"]),
+            Paragraph(f"<b>{_money(total)}</b>", s["bold_right"]),
         ]
     )
-    totals = Table(sums, colWidths=[40 * mm, 30 * mm], hAlign="RIGHT")
-    totals.setStyle(
-        TableStyle(
-            [
-                ("LINEABOVE", (0, -1), (-1, -1), 0.8, NAVY),
-                ("TOPPADDING", (0, 0), (-1, -1), 2),
-            ]
-        )
+    summary = Table(sums, colWidths=[40 * mm, 30 * mm], hAlign="RIGHT")
+    summary.setStyle(
+        TableStyle([("LINEABOVE", (0, -1), (-1, -1), 0.8, NAVY), ("TOPPADDING", (0, 0), (-1, -1), 2)])
     )
-    story += [totals, Spacer(1, 8 * mm)]
+    story += [summary, Spacer(1, 8 * mm)]
 
     for label, value in (("Notes", invoice.notes), ("Terms and conditions", invoice.terms)):
         if value:
@@ -178,14 +178,11 @@ def invoice_pdf(invoice: PayrollInvoice, settings: PayrollSettings, *, test: boo
             ]
 
     approved = (
-        f"Approved by {invoice.approved_by.display_name} on {invoice.approved_at:%d %b %Y}."
-        if invoice.approved_by and invoice.approved_at
+        f"Approved by {run.approved_by.display_name} on {run.approved_at:%d %b %Y}."
+        if run.approved_by and run.approved_at
         else "Not approved yet."
     )
     story += [Spacer(1, 4 * mm), Paragraph(f"Prepared in Hamdaz payroll. {approved}", s["muted"])]
 
     doc.build(story)
     return buffer.getvalue()
-
-
-__all__ = ["invoice_pdf", "INK", "MUTED", "PINK"]

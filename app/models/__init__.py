@@ -82,7 +82,6 @@ from app.models.mailwatch import (
 from app.models.nova import NovaMessage, NovaPerson
 from app.models.payroll import (
     AccessLevel,
-    InvoiceStatus,
     PayrollEmployee,
     PayrollEvent,
     PayrollInvoice,
@@ -212,7 +211,6 @@ __all__ = [
     "NovaMessage",
     "NovaPerson",
     "AccessLevel",
-    "InvoiceStatus",
     "PayrollEmployee",
     "PayrollEvent",
     "PayrollInvoice",

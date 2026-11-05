@@ -1,55 +1,55 @@
-"""Invoices raised from payroll, and their way into Zoho Books.
+"""The invoice a payroll month is billed on, and its way into Zoho Books.
 
-The order is the user's (2026-11-04):
+The India payroll is not only paid, it is invoiced: Hamdaz Technologies LLP
+(the India company in payroll settings) bills Hamdaztech Technologies LLC (the
+UAE company) for the month's salaries and the other charges it carried — rent,
+internet, anything (the user, 2026-11-05: "we need the payroll and the invoice
+together"). So each run has one invoice, prepared with it and **approved with
+it**:
 
-1. The accountant prepares the invoice here — the customer picked from Zoho,
-   lines for the month's payroll, rent, anything else.
-2. It is sent for approval, and the **super admins get a mail** to check it.
-3. A super admin approves it (or sends it back with a note).
-4. **"Create in Zoho"** — the invoice is created in Zoho Books and Zoho's own
-   PDF is fetched.
-5. **The report** — that PDF, mailed to the super admins, the CEO and the
-   Accounts team.
+1. The accountant prepares the month — the pay sheet, and under it the
+   invoice: the salary lines come off the payslips, the other charges are
+   typed in.
+2. Sending the month for approval **mails the super admins**.
+3. A super admin (or the CEO) approves the month — payroll and invoice.
+4. **"Create in Zoho"** creates the invoice in Zoho Books and fetches Zoho's PDF.
+5. **The report** — that PDF and the salary register, mailed to the super
+   admins, the CEO and the Accounts team.
+
+The salary lines are never stored: ``salary_lines`` reads them off the run
+each time, so the invoice cannot disagree with the payroll it bills.
 
 Step 4 is **test mode** unless ``PAYROLL_ZOHO_INVOICE_WRITE`` is on, and it
-ships off: Zoho is the live production books, and the user asked for a button
-that does not write ("as of now we dont need the real zoho"). In test mode the
-invoice is still checked against Zoho — the customer, every tax and every item
-are read back to make sure they exist — and the exact body Zoho would receive
-is kept on the invoice. Nothing is written. The report then carries this
-app's own PDF, marked TEST.
-
-Mail in steps 2 and 5 sits behind ``PayrollSettings.invoice_mail``, also off,
-so a trial invoice does not reach the CEO. With it off each step records who
-it would have mailed.
-
-The arithmetic (`clean_lines`, `totals`) and the Zoho body (`zoho_payload`)
-are pure functions, so they are tested without a database or a Zoho.
+ships off — Zoho is the live production books. In test mode the invoice is
+still checked against Zoho with reads (customer, currency, every tax, every
+item) and the exact body Zoho would receive is kept; nothing is written, and
+the report carries this app's own PDF, marked TEST. Mail in steps 2 and 5 sits
+behind ``PayrollSettings.mail_enabled``, also off; with it off each step
+records who it would have mailed.
 """
 
 from __future__ import annotations
 
 import html
 import re
-import uuid
-from collections.abc import Iterable
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Iterable
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.payroll import InvoiceStatus, PayrollInvoice, PayrollRun, PayrollSettings
+from app.models.payroll import PayrollInvoice, PayrollRun, PayrollSettings, RunStatus
 from app.models.user import User
 from app.payroll import access as payroll_access
 from app.payroll.rules import dec, r2, to_json
 from app.payroll.service import (
     PayrollConflict,
     PayrollError,
-    PayrollNotFound,
+    _country,
     get_settings,
     log,
+    period_of,
 )
 
 ZERO = Decimal("0")
@@ -57,10 +57,10 @@ ZERO = Decimal("0")
 # ── the arithmetic ────────────────────────────────────────────────────
 
 
-def clean_lines(raw: Iterable[dict[str, Any]] | None) -> list[dict[str, Any]]:
-    """Each line checked and its amount and tax worked out, the way Zoho does.
+def clean_charges(raw: Iterable[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Each charge checked and its amount and tax worked out, the way Zoho does.
 
-    ``amount`` is quantity × rate to the cent; ``tax_amount`` is that amount ×
+    ``amount`` is quantity × rate to the cent; ``tax_amount`` that amount ×
     the tax rate, to the cent, per line — Zoho rounds per line too, so the
     totals agree with the invoice Zoho shows.
     """
@@ -68,41 +68,110 @@ def clean_lines(raw: Iterable[dict[str, Any]] | None) -> list[dict[str, Any]]:
     for index, item in enumerate(raw or [], start=1):
         name = str(item.get("name") or "").strip()
         if not name:
-            raise PayrollError(f"Line {index} needs a name.")
+            raise PayrollError(f"Charge {index} needs a name.")
         try:
             quantity = dec(item.get("quantity") if item.get("quantity") not in (None, "") else 1)
             rate = dec(item.get("rate") if item.get("rate") not in (None, "") else 0)
             pct = dec(item.get("tax_percentage") or 0)
         except Exception as exc:  # noqa: BLE001
-            raise PayrollError(f"Line {index} ({name}): a number is not a number.") from exc
+            raise PayrollError(f"Charge {index} ({name}): a number is not a number.") from exc
         if quantity <= 0:
-            raise PayrollError(f"Line {index} ({name}): the quantity must be more than 0.")
+            raise PayrollError(f"Charge {index} ({name}): the quantity must be more than 0.")
         if rate < 0:
-            raise PayrollError(f"Line {index} ({name}): the rate cannot be negative.")
+            raise PayrollError(f"Charge {index} ({name}): the rate cannot be negative.")
         if pct < 0 or pct > 100:
-            raise PayrollError(f"Line {index} ({name}): the tax rate must be 0 to 100 %.")
-        amount = r2(quantity * rate)
+            raise PayrollError(f"Charge {index} ({name}): the tax rate must be 0 to 100 %.")
         tax_id = str(item.get("tax_id") or "").strip() or None
-        out.append(
-            {
-                "item_id": str(item.get("item_id") or "").strip() or None,
-                "name": name[:200],
-                "description": (str(item.get("description") or "").strip() or None),
-                "quantity": quantity.normalize()
-                if quantity == quantity.to_integral()
-                else quantity,
-                "rate": r2(rate),
-                "tax_id": tax_id,
-                "tax_name": (str(item.get("tax_name") or "").strip() or None) if tax_id else None,
-                "tax_percentage": pct if tax_id else ZERO,
-                "amount": amount,
-                "tax_amount": r2(amount * pct / 100) if tax_id else ZERO,
-                "run_id": str(item.get("run_id")) if item.get("run_id") else None,
-            }
-        )
-    if not out:
-        raise PayrollError("An invoice needs at least one line.")
+        out.append(_line("charge", item, name, quantity, rate, tax_id, pct if tax_id else ZERO))
     return to_json(out)
+
+
+def _line(
+    source: str,
+    item: dict[str, Any],
+    name: str,
+    quantity: Decimal,
+    rate: Decimal,
+    tax_id: str | None,
+    pct: Decimal,
+) -> dict[str, Any]:
+    amount = r2(quantity * rate)
+    return {
+        "source": source,
+        "item_id": str(item.get("item_id") or "").strip() or None,
+        "name": name[:200],
+        "description": str(item.get("description") or "").strip() or None,
+        "quantity": quantity.normalize() if quantity == quantity.to_integral() else quantity,
+        "rate": r2(rate),
+        "tax_id": tax_id,
+        "tax_name": (str(item.get("tax_name") or "").strip() or None) if tax_id else None,
+        "tax_percentage": pct,
+        "amount": amount,
+        "tax_amount": r2(amount * pct / 100) if tax_id else ZERO,
+    }
+
+
+def convert(amount: Any, *, run_currency: str, currency: str, rate: Any) -> Decimal | None:
+    """A payroll amount in the invoice's currency; ``None`` when there is no rate."""
+    if currency == run_currency:
+        return r2(amount)
+    if not rate or dec(rate) <= 0:
+        return None
+    return r2(dec(amount) / dec(rate))
+
+
+def salary_lines(run: PayrollRun, invoice: Any) -> tuple[list[dict[str, Any]], bool]:
+    """The salary lines, read off the payslips; and whether a rate is missing.
+
+    What is billed is each person's cost to the company — gross pay plus the
+    employer's contributions, which with no statutory deductions is the gross.
+    """
+    period = period_of(run)
+    missing = False
+
+    def money(value: Any) -> Decimal:
+        nonlocal missing
+        got = convert(value, run_currency=run.currency, currency=invoice.currency, rate=invoice.exchange_rate)
+        if got is None:
+            missing = True
+            return ZERO
+        return got
+
+    if not run.lines:
+        return [], False
+    if invoice.salary_lines == "per_employee":
+        out = []
+        for line in run.lines:
+            what = " · ".join(x for x in (line.employee_code, line.designation) if x)
+            out.append(
+                _line(
+                    "salary",
+                    {"description": f"{what} — salary, {period.label}"},
+                    line.employee_name,
+                    Decimal("1"),
+                    money(line.employer_cost),
+                    None,
+                    ZERO,
+                )
+            )
+        return to_json(out), missing
+    people = len(run.lines)
+    line = _line(
+        "salary",
+        {"description": f"{_country(run.country)} payroll, {period.label} — "
+                        f"{people} {'employee' if people == 1 else 'employees'}"},
+        "Salaries",
+        Decimal("1"),
+        money(run.employer_cost),
+        None,
+        ZERO,
+    )
+    return to_json([line]), missing
+
+
+def all_lines(run: PayrollRun, invoice: Any) -> tuple[list[dict[str, Any]], bool]:
+    salaries, missing = salary_lines(run, invoice)
+    return salaries + list(invoice.charges or []), missing
 
 
 def totals(lines: list[dict[str, Any]], adjustment: Any = 0) -> tuple[Decimal, Decimal, Decimal]:
@@ -112,12 +181,13 @@ def totals(lines: list[dict[str, Any]], adjustment: Any = 0) -> tuple[Decimal, D
     return sub, tax, r2(sub + tax + dec(adjustment or 0))
 
 
-def zoho_payload(invoice: PayrollInvoice) -> dict[str, Any]:
+def zoho_payload(invoice: Any, lines: list[dict[str, Any]], *, run_currency: str) -> dict[str, Any]:
     """The body for Zoho's ``POST /invoices`` — exactly what would be sent.
 
-    Zoho numbers its invoices itself, so our number goes in as the reference
-    when there is no other. Numbers go as JSON numbers, which is what Zoho's
-    API documents; every value here has at most two decimal places already.
+    Zoho numbers its invoices itself, so ours goes in as the reference when
+    there is no other. ``exchange_rate`` is only sent for a foreign-currency
+    invoice; it is units of the issuing company's base currency (INR, the
+    payroll's) per unit of the invoice's, which is what Zoho means by it.
     """
 
     def num(value: Any) -> float:
@@ -133,20 +203,17 @@ def zoho_payload(invoice: PayrollInvoice) -> dict[str, Any]:
         body["due_date"] = invoice.due_date.isoformat()
     elif invoice.payment_terms is not None:
         body["payment_terms"] = invoice.payment_terms
-    if invoice.exchange_rate:
+    if invoice.currency != run_currency and invoice.exchange_rate:
         body["exchange_rate"] = num(invoice.exchange_rate)
-    for line in invoice.lines:
+    for line in lines:
         item: dict[str, Any] = {
             "name": line["name"],
             "quantity": num(line["quantity"]),
             "rate": num(line["rate"]),
         }
-        if line.get("item_id"):
-            item["item_id"] = line["item_id"]
-        if line.get("description"):
-            item["description"] = line["description"]
-        if line.get("tax_id"):
-            item["tax_id"] = line["tax_id"]
+        for key in ("item_id", "description", "tax_id"):
+            if line.get(key):
+                item[key] = line[key]
         body["line_items"].append(item)
     if dec(invoice.adjustment or 0) != 0:
         body["adjustment"] = num(invoice.adjustment)
@@ -159,23 +226,33 @@ def zoho_payload(invoice: PayrollInvoice) -> dict[str, Any]:
     return body
 
 
-# ── reading ───────────────────────────────────────────────────────────
+# ── the invoice of a month ────────────────────────────────────────────
 
 
-async def list_invoices(session: AsyncSession) -> list[PayrollInvoice]:
-    rows = await session.scalars(
-        select(PayrollInvoice).order_by(
-            PayrollInvoice.invoice_date.desc(), PayrollInvoice.number.desc()
-        )
-    )
-    return list(rows.unique().all())
+async def get_for_run(session: AsyncSession, run: PayrollRun) -> PayrollInvoice | None:
+    return await session.scalar(select(PayrollInvoice).where(PayrollInvoice.run_id == run.id))
 
 
-async def get_invoice(session: AsyncSession, invoice_id: uuid.UUID) -> PayrollInvoice:
-    invoice = await session.get(PayrollInvoice, invoice_id)
-    if invoice is None:
-        raise PayrollNotFound("No such invoice.")
-    return invoice
+def defaults(run: PayrollRun, settings: PayrollSettings) -> dict[str, Any]:
+    """A new month's invoice: from the India company to the UAE company."""
+    period = period_of(run)
+    return {
+        "customer_zoho_id": settings.invoice_customer_zoho_id,
+        "customer_name": settings.ae_company_name,
+        "customer_address": settings.ae_company_address,
+        "currency": settings.invoice_currency or run.currency,
+        "exchange_rate": None,
+        "invoice_date": period.end,
+        "due_date": None,
+        "payment_terms": settings.invoice_payment_terms,
+        "reference_number": f"Payroll {period.label}",
+        "salary_lines": "single",
+        "charges": [],
+        "adjustment": ZERO,
+        "adjustment_description": None,
+        "notes": settings.invoice_notes,
+        "terms": settings.invoice_terms,
+    }
 
 
 async def next_number(session: AsyncSession, prefix: str, year: int) -> str:
@@ -192,31 +269,47 @@ async def next_number(session: AsyncSession, prefix: str, year: int) -> str:
     return f"{stem}{highest + 1:03d}"
 
 
-# ── preparing ─────────────────────────────────────────────────────────
+def _refresh(invoice: PayrollInvoice, run: PayrollRun) -> list[dict[str, Any]]:
+    lines, _ = all_lines(run, invoice)
+    invoice.sub_total, invoice.tax_total, invoice.total = totals(lines, invoice.adjustment)
+    return lines
+
+
+async def ensure(session: AsyncSession, run: PayrollRun, actor: User | None) -> PayrollInvoice:
+    """The month's invoice, made from the defaults the first time it is needed."""
+    invoice = await get_for_run(session, run)
+    if invoice is None:
+        settings = await get_settings(session)
+        values = defaults(run, settings)
+        invoice = PayrollInvoice(
+            run_id=run.id,
+            number=await next_number(session, settings.invoice_prefix, values["invoice_date"].year),
+            report_to=[],
+            updated_by_id=actor.id if actor else None,
+            **values,
+        )
+        _refresh(invoice, run)
+        session.add(invoice)
+        await session.flush()
+    return invoice
+
 
 _FIELDS = (
-    "customer_zoho_id",
-    "customer_name",
-    "currency",
-    "exchange_rate",
-    "invoice_date",
-    "due_date",
-    "payment_terms",
-    "reference_number",
-    "adjustment",
-    "adjustment_description",
-    "notes",
-    "terms",
-    "run_id",
+    "customer_zoho_id", "customer_name", "customer_address", "currency", "exchange_rate",
+    "invoice_date", "due_date", "payment_terms", "reference_number", "salary_lines",
+    "adjustment", "adjustment_description", "notes", "terms",
 )
 
 
-def _require(invoice: PayrollInvoice, *allowed: InvoiceStatus, doing: str) -> None:
-    if invoice.status not in allowed:
-        raise PayrollConflict(f"This invoice is {invoice.status} and cannot be {doing}.")
-
-
-async def _apply(session: AsyncSession, invoice: PayrollInvoice, data: dict[str, Any]) -> None:
+async def save(
+    session: AsyncSession, run: PayrollRun, data: dict[str, Any], actor: User
+) -> PayrollInvoice:
+    """The accountant's changes. Only while the month is a draft — it is approved with it."""
+    if run.status != RunStatus.DRAFT:
+        raise PayrollConflict(
+            f"The {period_of(run).label} payroll is {run.status}; its invoice is locked with it."
+        )
+    invoice = await ensure(session, run, actor)
     for key in _FIELDS:
         if key in data:
             value = data[key]
@@ -224,174 +317,81 @@ async def _apply(session: AsyncSession, invoice: PayrollInvoice, data: dict[str,
                 value = value.strip() or None
             setattr(invoice, key, value)
     if not invoice.customer_name:
-        raise PayrollError("Choose the customer.")
+        raise PayrollError("The invoice needs a customer.")
     invoice.currency = (invoice.currency or "").upper()
     if not re.fullmatch(r"[A-Z]{3}", invoice.currency):
-        raise PayrollError("The currency is a three-letter code, like AED or INR.")
+        raise PayrollError("The currency is a three-letter code, like INR or AED.")
     if invoice.due_date and invoice.due_date < invoice.invoice_date:
         raise PayrollError("The due date is before the invoice date.")
-    if invoice.run_id and await session.get(PayrollRun, invoice.run_id) is None:
-        raise PayrollError("That payroll month no longer exists.")
-    if "lines" in data:
-        invoice.lines = clean_lines(data["lines"])
+    if invoice.salary_lines not in ("single", "per_employee"):
+        raise PayrollError("Salaries are billed as one line or a line per employee.")
+    if "charges" in data:
+        invoice.charges = clean_charges(data["charges"])
     invoice.adjustment = r2(invoice.adjustment or 0)
-    invoice.sub_total, invoice.tax_total, invoice.total = totals(invoice.lines, invoice.adjustment)
-
-
-async def create_invoice(
-    session: AsyncSession, data: dict[str, Any], actor: User
-) -> PayrollInvoice:
-    settings = await get_settings(session)
-    day = data.get("invoice_date") or date.today()
-    invoice = PayrollInvoice(
-        number=await next_number(session, settings.invoice_prefix, day.year),
-        status=InvoiceStatus.DRAFT,
-        invoice_date=day,
-        currency=data.get("currency") or "",
-        customer_name=data.get("customer_name") or "",
-        created_by_id=actor.id,
-        created_by=actor,
-        lines=[],
-        report_to=[],
-        adjustment=ZERO,
-    )
-    await _apply(session, invoice, data)
-    session.add(invoice)
+    invoice.updated_by_id = actor.id
+    _refresh(invoice, run)
     await session.flush()
     await log(
-        session,
-        actor,
-        "invoice.created",
-        f"Prepared invoice {invoice.number} to {invoice.customer_name}: "
+        session, actor, "invoice.updated",
+        f"Changed the invoice for {period_of(run).label} ({invoice.number}): "
         f"{invoice.currency} {invoice.total}",
-        invoice_id=invoice.id,
-        run_id=invoice.run_id,
+        run_id=run.id,
     )
     return invoice
 
 
-async def update_invoice(
-    session: AsyncSession, invoice: PayrollInvoice, data: dict[str, Any], actor: User
-) -> PayrollInvoice:
-    _require(invoice, InvoiceStatus.DRAFT, doing="changed")
-    before = invoice.total
-    await _apply(session, invoice, data)
+# ── approval ──────────────────────────────────────────────────────────
+
+
+async def on_submit(
+    session: AsyncSession, run: PayrollRun, actor: User, *, mailer: Any, link: str, notify: bool
+) -> None:
+    """After a month is sent for approval: its invoice is settled, the super admins told.
+
+    ``notify`` is off when a super admin approves their own month in one step:
+    asking the other super admins to approve something already approved is noise.
+    """
+    invoice = await ensure(session, run, actor)
+    lines = _refresh(invoice, run)
     await session.flush()
-    await log(
-        session,
-        actor,
-        "invoice.updated",
-        f"Changed invoice {invoice.number}"
-        + (
-            f": total {invoice.currency} {before} → {invoice.total}"
-            if before != invoice.total
-            else ""
-        ),
-        invoice_id=invoice.id,
-    )
-    return invoice
-
-
-async def delete_invoice(session: AsyncSession, invoice: PayrollInvoice, actor: User) -> None:
-    _require(invoice, InvoiceStatus.DRAFT, doing="deleted")
-    await log(
-        session,
-        actor,
-        "invoice.deleted",
-        f"Deleted draft invoice {invoice.number} to {invoice.customer_name} "
-        f"({invoice.currency} {invoice.total})",
-    )
-    await session.delete(invoice)
-    await session.flush()
-
-
-# ── approving ─────────────────────────────────────────────────────────
-
-
-async def submit(
-    session: AsyncSession, invoice: PayrollInvoice, actor: User, *, mailer: Any, link: str
-) -> PayrollInvoice:
-    _require(invoice, InvoiceStatus.DRAFT, doing="sent for approval")
-    if not invoice.lines or invoice.total <= 0:
-        raise PayrollError("There is nothing to invoice: add a line with an amount.")
-    invoice.status = InvoiceStatus.SUBMITTED
-    invoice.submitted_by_id = actor.id
-    invoice.submitted_by = actor
-    invoice.submitted_at = datetime.now(UTC)
-    invoice.approved_by_id = None
-    invoice.approved_by = None
-    invoice.approved_at = None
-    invoice.returned_note = None
-    await session.flush()
-
-    # The super admins check it. Not the sender: telling yourself is noise.
+    if not notify:
+        return
     approvers = [
-        u
-        for u in await payroll_access.users_with_roles(session, {"super_admin"})
-        if u.id != actor.id
+        u for u in await payroll_access.users_with_roles(session, {"super_admin"}) if u.id != actor.id
     ]
+    to = [u.email for u in approvers]
     mailed = await _mail(
         session,
-        lambda to: mailer.invoice_for_approval(
-            invoice, sender=actor.entra_object_id, recipients=to, link=link
+        lambda recipients: mailer.month_for_approval(
+            run, invoice, lines, sender=actor.entra_object_id, recipients=recipients, link=link
         ),
-        [u.email for u in approvers],
+        to,
     )
     await log(
-        session,
-        actor,
-        "invoice.submitted",
-        f"Sent invoice {invoice.number} for approval: {invoice.currency} {invoice.total}. {mailed}",
-        invoice_id=invoice.id,
-        detail={"mail": mailed, "to": [u.email for u in approvers]},
+        session, actor, "run.approval_mail",
+        f"Approval request for {period_of(run).label}: {mailed}",
+        run_id=run.id, detail={"to": to, "mail": mailed},
     )
-    return invoice
 
 
-async def approve(
-    session: AsyncSession, invoice: PayrollInvoice, actor: User, *, own_allowed: bool
-) -> PayrollInvoice:
-    """``own_allowed``: a super admin may approve what they sent; nobody else may."""
-    _require(invoice, InvoiceStatus.SUBMITTED, doing="approved")
-    if invoice.submitted_by_id == actor.id and not own_allowed:
-        raise PayrollConflict("You sent this invoice, so a super admin has to approve it.")
-    invoice.status = InvoiceStatus.APPROVED
-    invoice.approved_by_id = actor.id
-    invoice.approved_by = actor
-    invoice.approved_at = datetime.now(UTC)
-    await session.flush()
-    await log(
-        session,
-        actor,
-        "invoice.approved",
-        f"Approved invoice {invoice.number}: {invoice.currency} {invoice.total}",
-        invoice_id=invoice.id,
-    )
-    return invoice
-
-
-async def return_invoice(
-    session: AsyncSession, invoice: PayrollInvoice, note: str, actor: User
-) -> PayrollInvoice:
-    _require(invoice, InvoiceStatus.SUBMITTED, doing="sent back")
-    invoice.status = InvoiceStatus.DRAFT
-    invoice.returned_note = note.strip()
-    await session.flush()
-    await log(
-        session,
-        actor,
-        "invoice.returned",
-        f"Sent invoice {invoice.number} back: {note.strip()}",
-        invoice_id=invoice.id,
-        detail={"note": note.strip()},
-    )
-    return invoice
+async def on_reopen(session: AsyncSession, run: PayrollRun) -> None:
+    """A reopened month's test result is stale; a live Zoho invoice stays on record."""
+    invoice = await get_for_run(session, run)
+    if invoice is not None and invoice.zoho_mode == "test":
+        invoice.zoho_mode = None
+        invoice.zoho_payload = None
+        invoice.zoho_at = None
+        invoice.zoho_error = None
+        invoice.report_sent_at = None
+        invoice.report_to = []
+        invoice.report_error = None
+        await session.flush()
 
 
 # ── Zoho, and the report ─────────────────────────────────────────────
 
 
-async def check_against_zoho(zoho: Any, invoice: PayrollInvoice) -> list[str]:
+async def check_against_zoho(zoho: Any, invoice: Any, lines: list[dict[str, Any]]) -> list[str]:
     """What Zoho would refuse, found with reads only.
 
     The customer must exist, be a customer, be active and be billed in this
@@ -403,7 +403,8 @@ async def check_against_zoho(zoho: Any, invoice: PayrollInvoice) -> list[str]:
     problems: list[str] = []
     if not invoice.customer_zoho_id:
         problems.append(
-            f"{invoice.customer_name} is not linked to a Zoho contact — choose the customer from Zoho."
+            f"{invoice.customer_name} is not linked to a Zoho contact — "
+            "link the customer in the invoice or in payroll settings."
         )
     else:
         try:
@@ -412,25 +413,24 @@ async def check_against_zoho(zoho: Any, invoice: PayrollInvoice) -> list[str]:
             contact = {}
             problems.append(f"Zoho could not find the customer {invoice.customer_name}: {exc}")
         if contact:
+            name = contact.get("contact_name")
             if contact.get("contact_type") and contact["contact_type"] != "customer":
-                problems.append(
-                    f"{contact.get('contact_name')} is a {contact['contact_type']} in Zoho, not a customer."
-                )
+                problems.append(f"{name} is a {contact['contact_type']} in Zoho, not a customer.")
             if contact.get("status") and contact["status"] != "active":
-                problems.append(f"{contact.get('contact_name')} is {contact['status']} in Zoho.")
+                problems.append(f"{name} is {contact['status']} in Zoho.")
             if contact.get("currency_code") and contact["currency_code"] != invoice.currency:
                 problems.append(
-                    f"Zoho bills {contact.get('contact_name')} in {contact['currency_code']}, "
+                    f"Zoho bills {name} in {contact['currency_code']}, "
                     f"but this invoice is in {invoice.currency}."
                 )
-    if any(line.get("tax_id") for line in invoice.lines):
+    if any(line.get("tax_id") for line in lines):
         try:
             taxes = {t.get("tax_id"): t for t in await zoho.taxes()}
         except ZohoError as exc:
             taxes = None
             problems.append(f"Zoho's taxes could not be read: {exc}")
         if taxes is not None:
-            for line in invoice.lines:
+            for line in lines:
                 tax_id = line.get("tax_id")
                 if not tax_id:
                     continue
@@ -439,10 +439,10 @@ async def check_against_zoho(zoho: Any, invoice: PayrollInvoice) -> list[str]:
                     problems.append(f"{line['name']}: the tax is not one of Zoho's.")
                 elif dec(tax.get("tax_percentage") or 0) != dec(line.get("tax_percentage") or 0):
                     problems.append(
-                        f"{line['name']}: Zoho's {tax.get('tax_name')} is {tax.get('tax_percentage')} %, "
-                        f"not {line.get('tax_percentage')} %."
+                        f"{line['name']}: Zoho's {tax.get('tax_name')} is "
+                        f"{tax.get('tax_percentage')} %, not {line.get('tax_percentage')} %."
                     )
-    for line in invoice.lines:
+    for line in lines:
         if line.get("item_id"):
             try:
                 await zoho.item(line["item_id"])
@@ -453,7 +453,7 @@ async def check_against_zoho(zoho: Any, invoice: PayrollInvoice) -> list[str]:
 
 async def to_zoho(
     session: AsyncSession,
-    invoice: PayrollInvoice,
+    run: PayrollRun,
     actor: User,
     *,
     zoho: Any,
@@ -461,7 +461,7 @@ async def to_zoho(
     mailer: Any,
     link: str,
 ) -> PayrollInvoice:
-    """Create the approved invoice in Zoho — or, in test mode, check it and stop.
+    """Create the approved month's invoice in Zoho — or, in test mode, check it and stop.
 
     Then send the report. A test run can be repeated (after fixing what the
     check found); a live one only once, because a second press would make a
@@ -469,24 +469,31 @@ async def to_zoho(
     """
     from app.zoho.client import ZohoError
 
-    _require(invoice, InvoiceStatus.APPROVED, doing="sent to Zoho")
+    if run.status not in (RunStatus.APPROVED, RunStatus.PAID):
+        raise PayrollConflict("The invoice goes to Zoho once the month is approved.")
+    invoice = await ensure(session, run, actor)
     if invoice.zoho_mode == "live":
         raise PayrollConflict(
             f"Invoice {invoice.number} is already in Zoho as {invoice.zoho_invoice_number}."
         )
-    payload = zoho_payload(invoice)
+    lines, missing = all_lines(run, invoice)
+    invoice.sub_total, invoice.tax_total, invoice.total = totals(lines, invoice.adjustment)
+    payload = zoho_payload(invoice, lines, run_currency=run.currency)
     invoice.zoho_payload = payload
-    problems = await check_against_zoho(zoho, invoice)
+    problems = await check_against_zoho(zoho, invoice, lines)
+    if missing:
+        problems.insert(
+            0,
+            f"The invoice is in {invoice.currency} but the payroll is in {run.currency}: "
+            "give the exchange rate.",
+        )
     if problems:
         invoice.zoho_error = " ".join(problems)
         await session.flush()
         await log(
-            session,
-            actor,
-            "invoice.zoho_refused",
+            session, actor, "invoice.zoho_refused",
             f"Invoice {invoice.number} is not ready for Zoho: {invoice.zoho_error}",
-            invoice_id=invoice.id,
-            detail={"problems": problems, "live": live},
+            run_id=run.id, detail={"problems": problems, "live": live},
         )
         raise PayrollError("Not ready for Zoho: " + " ".join(problems))
 
@@ -512,18 +519,15 @@ async def to_zoho(
     invoice.zoho_error = None
     await session.flush()
     await log(
-        session,
-        actor,
-        "invoice.zoho",
+        session, actor, "invoice.zoho",
         (
             f"Created invoice {invoice.number} in Zoho as {invoice.zoho_invoice_number}"
             if live
             else f"Checked invoice {invoice.number} against Zoho (test mode — nothing was written)"
         ),
-        invoice_id=invoice.id,
-        detail={"live": live, "payload": payload},
+        run_id=run.id, detail={"live": live, "payload": payload},
     )
-    await send_report(session, invoice, actor, mailer=mailer, link=link)
+    await send_report(session, run, invoice, actor, mailer=mailer, link=link)
     return invoice
 
 
@@ -539,21 +543,37 @@ async def report_recipients(session: AsyncSession) -> list[User]:
 
 
 async def send_report(
-    session: AsyncSession, invoice: PayrollInvoice, actor: User, *, mailer: Any, link: str
+    session: AsyncSession, run: PayrollRun, invoice: PayrollInvoice, actor: User, *, mailer: Any, link: str
 ) -> PayrollInvoice:
-    """The invoice PDF to the super admins, the CEO and Accounts."""
+    """The invoice PDF and the salary register to the super admins, the CEO and Accounts."""
+    from app.core.mail import Attachment
+    from app.payroll.exports import XLSX_TYPE, file_stem, register_xlsx
     from app.payroll.invoice_pdf import invoice_pdf
 
-    if invoice.status != InvoiceStatus.APPROVED or not invoice.zoho_mode:
+    if not invoice.zoho_mode:
         raise PayrollConflict("The report goes out once the invoice has been through Zoho.")
     settings = await get_settings(session)
-    people = await report_recipients(session)
-    to = [u.email for u in people]
-    pdf = invoice.zoho_pdf or invoice_pdf(invoice, settings, test=invoice.zoho_mode != "live")
+    lines, _ = all_lines(run, invoice)
+    to = [u.email for u in await report_recipients(session)]
+    test = invoice.zoho_mode != "live"
+    pdf = invoice.zoho_pdf or invoice_pdf(run, invoice, lines, settings, test=test)
+    files = [
+        Attachment(
+            name=f"{invoice.zoho_invoice_number or invoice.number}{' TEST' if test else ''}.pdf",
+            content=pdf,
+            content_type="application/pdf",
+        ),
+        Attachment(
+            name=f"{file_stem(run)} register.xlsx",
+            content=register_xlsx(run, settings),
+            content_type=XLSX_TYPE,
+        ),
+    ]
     mailed = await _mail(
         session,
-        lambda recipients: mailer.invoice_report(
-            invoice, sender=actor.entra_object_id, recipients=recipients, link=link, pdf=pdf
+        lambda recipients: mailer.month_report(
+            run, invoice, lines, sender=actor.entra_object_id, recipients=recipients,
+            link=link, attachments=files,
         ),
         to,
     )
@@ -565,12 +585,9 @@ async def send_report(
         invoice.report_error = mailed
     await session.flush()
     await log(
-        session,
-        actor,
-        "invoice.report",
-        f"Report for invoice {invoice.number}: {mailed}",
-        invoice_id=invoice.id,
-        detail={"to": to, "mail": mailed},
+        session, actor, "invoice.report",
+        f"Report for {period_of(run).label} ({invoice.number}): {mailed}",
+        run_id=run.id, detail={"to": to, "mail": mailed},
     )
     return invoice
 
@@ -579,10 +596,10 @@ async def _mail(session: AsyncSession, send: Any, to: list[str]) -> str:
     """Send, or say why not. Never raises: the step is done either way."""
     from app.core.mail import MailError
 
-    settings: PayrollSettings = await get_settings(session)
+    settings = await get_settings(session)
     if not to:
         return "Nobody to mail."
-    if not settings.invoice_mail:
+    if not settings.mail_enabled:
         return "Mail is off in payroll settings — would have mailed " + ", ".join(to) + "."
     try:
         await send(to)
@@ -593,44 +610,38 @@ async def _mail(session: AsyncSession, send: Any, to: list[str]) -> str:
     return "Mailed " + ", ".join(to) + "."
 
 
-def summary_html(invoice: PayrollInvoice) -> str:
-    """The invoice as a small HTML table, for the mails."""
+def summary_html(run: PayrollRun, invoice: PayrollInvoice, lines: list[dict[str, Any]]) -> str:
+    """The month and its invoice as small HTML tables, for the mails."""
     cell = "padding:4px 8px;border-bottom:1px solid #e2e9ef"
+    font = "font-family:Segoe UI,Arial,sans-serif;font-size:13px"
     rows = []
-    for line in invoice.lines:
+    for line in lines:
         name = html.escape(str(line["name"]))
         if line.get("description"):
-            name += (
-                "<br><span style='color:#64727f'>"
-                + html.escape(str(line["description"]))
-                + "</span>"
-            )
+            name += "<br><span style='color:#64727f'>" + html.escape(str(line["description"])) + "</span>"
         rows.append(
             f"<tr><td style='{cell}'>{name}</td>"
-            f"<td style='{cell};text-align:right'>{dec(line['quantity']).normalize():f}</td>"
-            f"<td style='{cell};text-align:right'>{dec(line['rate']):,.2f}</td>"
             f"<td style='{cell};text-align:right'>{dec(line['amount']):,.2f}</td></tr>"
         )
     facts = [
-        ("Invoice", f"<b>{html.escape(invoice.number)}</b>"),
-        ("Customer", html.escape(invoice.customer_name)),
-        ("Date", f"{invoice.invoice_date:%d %b %Y}"),
+        ("Payroll", f"{_country(run.country)} {period_of(run).label} — {run.headcount} people"),
+        ("Gross pay", f"{run.currency} {dec(run.gross):,.2f}"),
+        ("Net pay", f"{run.currency} {dec(run.net):,.2f}"),
+        ("Invoice", f"<b>{html.escape(invoice.number)}</b> to {html.escape(invoice.customer_name)}"),
     ]
-    if invoice.due_date:
-        facts.append(("Due", f"{invoice.due_date:%d %b %Y}"))
     if dec(invoice.tax_total) > 0:
         facts.append(("Tax", f"{invoice.currency} {dec(invoice.tax_total):,.2f}"))
-    facts.append(("Total", f"<b>{invoice.currency} {dec(invoice.total):,.2f}</b>"))
-    font = "font-family:Segoe UI,Arial,sans-serif;font-size:13px"
+    facts.append(("Invoice total", f"<b>{invoice.currency} {dec(invoice.total):,.2f}</b>"))
     head = "".join(
-        f"<tr><td style='padding:2px 8px;color:#64727f'>{k}</td><td style='padding:2px 8px'>{v}</td></tr>"
+        f"<tr><td style='padding:2px 8px;color:#64727f'>{k}</td>"
+        f"<td style='padding:2px 8px'>{v}</td></tr>"
         for k, v in facts
     )
     return (
         f"<table cellspacing='0' style='border-collapse:collapse;{font}'>{head}</table><br>"
-        f"<table cellspacing='0' style='border-collapse:collapse;{font};min-width:480px'>"
-        "<tr style='background:#f5f9fb'><th style='padding:4px 8px;text-align:left'>Item</th>"
-        "<th style='padding:4px 8px;text-align:right'>Qty</th>"
-        "<th style='padding:4px 8px;text-align:right'>Rate</th>"
-        "<th style='padding:4px 8px;text-align:right'>Amount</th></tr>" + "".join(rows) + "</table>"
+        f"<table cellspacing='0' style='border-collapse:collapse;{font};min-width:420px'>"
+        "<tr style='background:#f5f9fb'><th style='padding:4px 8px;text-align:left'>Invoice line</th>"
+        "<th style='padding:4px 8px;text-align:right'>Amount</th></tr>"
+        + "".join(rows)
+        + "</table>"
     )

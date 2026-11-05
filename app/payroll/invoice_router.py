@@ -1,8 +1,8 @@
-"""Payroll invoices' API, and the Zoho look-ups the invoice form needs.
+"""A payroll month's invoice, and the Zoho look-ups its form needs.
 
-The same access as the rest of payroll (``app/payroll/access.py``): readers see
-invoices, processors prepare them, super admins or the CEO approve, and either
-side presses "Create in Zoho" once one is approved. See
+The invoice belongs to its run (``/payroll/runs/{id}/invoice``): it is edited
+while the month is a draft, approved with the month, and only then created in
+Zoho. Access is the rest of payroll's (``app/payroll/access.py``). See
 ``app/payroll/invoicing.py`` for the steps and what test mode means.
 """
 
@@ -10,254 +10,187 @@ from __future__ import annotations
 
 import time
 import uuid
+from types import SimpleNamespace
 from typing import Annotated, Any
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.deps import CurrentUser
 from app.core.config import get_settings as app_settings
 from app.core.db import get_session
-from app.models.payroll import PayrollInvoice
+from app.models.payroll import PayrollInvoice, PayrollRun
 from app.payroll import invoicing, service
-from app.payroll.access import Approver, PreparerOrApprover, Processor, Viewer
+from app.payroll.access import PreparerOrApprover, Processor, Viewer, users_with_roles
+from app.payroll.deps import (  # noqa: F401 — re-exported for tests
+    Mailer,
+    Zoho,
+    get_mailer,
+    get_zoho,
+)
 from app.payroll.invoice_pdf import invoice_pdf
-from app.payroll.router import _event_out, _translate
+from app.payroll.router import _run, _translate
+from app.payroll.rules import dec
 from app.payroll.schemas import (
-    InvoiceDetailOut,
-    InvoiceIn,
+    ChargeIn,
     InvoiceLineOut,
-    InvoiceOut,
     InvoiceSetupOut,
-    ReturnIn,
+    RunInvoiceIn,
+    RunInvoiceOut,
     ZohoContactOut,
     ZohoItemOut,
     ZohoTaxOut,
 )
 from app.payroll.service import PayrollError
-from app.zoho.client import ZohoBooks, ZohoError
+from app.zoho.client import ZohoError
 
 router = APIRouter(prefix="/payroll", tags=["payroll"])
 
 Session = Annotated[AsyncSession, Depends(get_session)]
 
 
-def get_zoho(request: Request) -> ZohoBooks:
-    return request.app.state.zoho
+
+def month_link(run: PayrollRun) -> str:
+    return f"{app_settings().frontend_url.rstrip('/')}/payroll?tab=run&run={run.id}"
 
 
-def get_mailer(request: Request) -> Any:
-    return request.app.state.payroll_mailer
-
-
-Zoho = Annotated[ZohoBooks, Depends(get_zoho)]
-Mailer = Annotated[Any, Depends(get_mailer)]
-
-
-def _link(invoice: PayrollInvoice) -> str:
-    return f"{app_settings().frontend_url.rstrip('/')}/payroll?tab=invoices&invoice={invoice.id}"
-
-
-def _name(user: Any) -> str | None:
-    return user.display_name if user else None
-
-
-def _out(invoice: PayrollInvoice) -> InvoiceOut:
-    return InvoiceOut(
-        id=invoice.id,
-        number=invoice.number,
-        status=invoice.status,
-        customer_zoho_id=invoice.customer_zoho_id,
-        customer_name=invoice.customer_name,
-        currency=invoice.currency,
-        exchange_rate=invoice.exchange_rate,
-        invoice_date=invoice.invoice_date,
-        due_date=invoice.due_date,
-        payment_terms=invoice.payment_terms,
-        reference_number=invoice.reference_number,
-        adjustment=invoice.adjustment,
-        adjustment_description=invoice.adjustment_description,
-        notes=invoice.notes,
-        terms=invoice.terms,
-        sub_total=invoice.sub_total,
-        tax_total=invoice.tax_total,
-        total=invoice.total,
-        run_id=invoice.run_id,
-        created_by_name=_name(invoice.created_by),
-        submitted_by_id=invoice.submitted_by_id,
-        submitted_by_name=_name(invoice.submitted_by),
-        submitted_at=invoice.submitted_at,
-        approved_by_name=_name(invoice.approved_by),
-        approved_at=invoice.approved_at,
-        returned_note=invoice.returned_note,
-        zoho_mode=invoice.zoho_mode,
-        zoho_invoice_id=invoice.zoho_invoice_id,
-        zoho_invoice_number=invoice.zoho_invoice_number,
-        zoho_at=invoice.zoho_at,
-        zoho_by_name=_name(invoice.zoho_by),
-        zoho_error=invoice.zoho_error,
-        report_sent_at=invoice.report_sent_at,
-        report_to=list(invoice.report_to or []),
-        report_error=invoice.report_error,
-        created_at=invoice.created_at,
+def _virtual(run: PayrollRun, settings: Any) -> Any:
+    """The invoice a month will get, before anybody has saved it."""
+    return SimpleNamespace(
+        id=None, number=None, zoho_mode=None, zoho_payload=None, zoho_invoice_id=None,
+        zoho_invoice_number=None, zoho_at=None, zoho_by=None, zoho_error=None,
+        report_sent_at=None, report_to=[], report_error=None,
+        **invoicing.defaults(run, settings),
     )
 
 
-async def _detail(session: AsyncSession, invoice: PayrollInvoice) -> InvoiceDetailOut:
-    events = await service.events(session, invoice_id=invoice.id)
-    return InvoiceDetailOut(
-        **_out(invoice).model_dump(),
-        lines=[InvoiceLineOut.model_validate(line) for line in invoice.lines],
-        zoho_payload=invoice.zoho_payload,
-        events=[_event_out(e) for e in events],
+async def _out(session: AsyncSession, run: PayrollRun) -> RunInvoiceOut:
+    settings = await service.get_settings(session)
+    inv: Any = await invoicing.get_for_run(session, run) or _virtual(run, settings)
+    lines, missing = invoicing.all_lines(run, inv)
+    sub, tax, total = invoicing.totals(lines, inv.adjustment)
+    salaries = sum((dec(x["amount"]) for x in lines if x["source"] == "salary"), dec(0))
+    return RunInvoiceOut(
+        id=inv.id,
+        run_id=run.id,
+        number=inv.number,
+        issuer_name=settings.in_company_name,
+        issuer_address=settings.in_company_address,
+        customer_zoho_id=inv.customer_zoho_id,
+        customer_name=inv.customer_name,
+        customer_address=inv.customer_address,
+        currency=inv.currency,
+        run_currency=run.currency,
+        exchange_rate=inv.exchange_rate,
+        needs_rate=missing,
+        invoice_date=inv.invoice_date,
+        due_date=inv.due_date,
+        payment_terms=inv.payment_terms,
+        reference_number=inv.reference_number,
+        salary_lines=inv.salary_lines,
+        charges=[ChargeIn.model_validate(c) for c in inv.charges or []],
+        lines=[InvoiceLineOut.model_validate(x) for x in lines],
+        adjustment=inv.adjustment,
+        adjustment_description=inv.adjustment_description,
+        notes=inv.notes,
+        terms=inv.terms,
+        salaries=salaries,
+        sub_total=sub,
+        tax_total=tax,
+        total=total,
+        zoho_mode=inv.zoho_mode,
+        zoho_payload=inv.zoho_payload,
+        zoho_invoice_id=inv.zoho_invoice_id,
+        zoho_invoice_number=inv.zoho_invoice_number,
+        zoho_at=inv.zoho_at,
+        zoho_by_name=inv.zoho_by.display_name if inv.zoho_by else None,
+        zoho_error=inv.zoho_error,
+        report_sent_at=inv.report_sent_at,
+        report_to=list(inv.report_to or []),
+        report_error=inv.report_error,
     )
 
 
-async def _invoice(session: AsyncSession, invoice_id: uuid.UUID) -> PayrollInvoice:
+# ── the month's invoice ───────────────────────────────────────────────
+
+
+@router.get("/runs/{run_id}/invoice", response_model=RunInvoiceOut)
+async def get_invoice(run_id: uuid.UUID, _: Viewer, session: Session) -> RunInvoiceOut:
+    return await _out(session, await _run(session, run_id))
+
+
+@router.put("/runs/{run_id}/invoice", response_model=RunInvoiceOut)
+async def save_invoice(
+    run_id: uuid.UUID, body: RunInvoiceIn, _: Processor, user: CurrentUser, session: Session
+) -> RunInvoiceOut:
+    run = await _run(session, run_id)
     try:
-        return await invoicing.get_invoice(session, invoice_id)
+        await invoicing.save(session, run, body.model_dump(mode="python"), user)
     except PayrollError as exc:
         raise _translate(exc) from exc
+    return await _out(session, run)
 
 
-# ── invoices ──────────────────────────────────────────────────────────
-
-
-@router.get("/invoices", response_model=list[InvoiceOut])
-async def list_invoices(_: Viewer, session: Session) -> list[InvoiceOut]:
-    return [_out(i) for i in await invoicing.list_invoices(session)]
-
-
-@router.post("/invoices", response_model=InvoiceDetailOut, status_code=status.HTTP_201_CREATED)
-async def create_invoice(
-    body: InvoiceIn, _: Processor, user: CurrentUser, session: Session
-) -> InvoiceDetailOut:
-    try:
-        invoice = await invoicing.create_invoice(session, body.model_dump(mode="python"), user)
-    except PayrollError as exc:
-        raise _translate(exc) from exc
-    return await _detail(session, invoice)
-
-
-@router.get("/invoices/{invoice_id}", response_model=InvoiceDetailOut)
-async def get_invoice(invoice_id: uuid.UUID, _: Viewer, session: Session) -> InvoiceDetailOut:
-    return await _detail(session, await _invoice(session, invoice_id))
-
-
-@router.patch("/invoices/{invoice_id}", response_model=InvoiceDetailOut)
-async def update_invoice(
-    invoice_id: uuid.UUID, body: InvoiceIn, _: Processor, user: CurrentUser, session: Session
-) -> InvoiceDetailOut:
-    invoice = await _invoice(session, invoice_id)
-    try:
-        await invoicing.update_invoice(session, invoice, body.model_dump(mode="python"), user)
-    except PayrollError as exc:
-        raise _translate(exc) from exc
-    return await _detail(session, invoice)
-
-
-@router.delete("/invoices/{invoice_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_invoice(
-    invoice_id: uuid.UUID, _: Processor, user: CurrentUser, session: Session
-) -> None:
-    invoice = await _invoice(session, invoice_id)
-    try:
-        await invoicing.delete_invoice(session, invoice, user)
-    except PayrollError as exc:
-        raise _translate(exc) from exc
-
-
-@router.post("/invoices/{invoice_id}/submit", response_model=InvoiceDetailOut)
-async def submit_invoice(
-    invoice_id: uuid.UUID, _: Processor, user: CurrentUser, session: Session, mailer: Mailer
-) -> InvoiceDetailOut:
-    invoice = await _invoice(session, invoice_id)
-    try:
-        await invoicing.submit(session, invoice, user, mailer=mailer, link=_link(invoice))
-    except PayrollError as exc:
-        raise _translate(exc) from exc
-    return await _detail(session, invoice)
-
-
-@router.post("/invoices/{invoice_id}/approve", response_model=InvoiceDetailOut)
-async def approve_invoice(
-    invoice_id: uuid.UUID, access: Approver, user: CurrentUser, session: Session
-) -> InvoiceDetailOut:
-    invoice = await _invoice(session, invoice_id)
-    try:
-        await invoicing.approve(session, invoice, user, own_allowed=access.can_admin)
-    except PayrollError as exc:
-        raise _translate(exc) from exc
-    return await _detail(session, invoice)
-
-
-@router.post("/invoices/{invoice_id}/return", response_model=InvoiceDetailOut)
-async def return_invoice(
-    invoice_id: uuid.UUID, body: ReturnIn, _: Approver, user: CurrentUser, session: Session
-) -> InvoiceDetailOut:
-    invoice = await _invoice(session, invoice_id)
-    try:
-        await invoicing.return_invoice(session, invoice, body.note, user)
-    except PayrollError as exc:
-        raise _translate(exc) from exc
-    return await _detail(session, invoice)
-
-
-@router.post("/invoices/{invoice_id}/zoho", response_model=InvoiceDetailOut)
+@router.post("/runs/{run_id}/invoice/zoho", response_model=RunInvoiceOut)
 async def invoice_to_zoho(
-    invoice_id: uuid.UUID,
+    run_id: uuid.UUID,
     _: PreparerOrApprover,
     user: CurrentUser,
     session: Session,
     zoho: Zoho,
     mailer: Mailer,
-) -> InvoiceDetailOut:
-    invoice = await _invoice(session, invoice_id)
+) -> RunInvoiceOut:
+    run = await _run(session, run_id)
     try:
         await invoicing.to_zoho(
             session,
-            invoice,
+            run,
             user,
             zoho=zoho,
             live=app_settings().payroll_zoho_invoice_write,
             mailer=mailer,
-            link=_link(invoice),
+            link=month_link(run),
         )
     except PayrollError as exc:
         # Keep what the check found, and the log line saying so: the request
         # fails, but "why" should still be on the invoice afterwards.
         await session.commit()
         raise _translate(exc) from exc
-    return await _detail(session, invoice)
+    return await _out(session, run)
 
 
-@router.post("/invoices/{invoice_id}/report", response_model=InvoiceDetailOut)
+@router.post("/runs/{run_id}/invoice/report", response_model=RunInvoiceOut)
 async def invoice_report(
-    invoice_id: uuid.UUID,
-    _: PreparerOrApprover,
-    user: CurrentUser,
-    session: Session,
-    mailer: Mailer,
-) -> InvoiceDetailOut:
-    invoice = await _invoice(session, invoice_id)
+    run_id: uuid.UUID, _: PreparerOrApprover, user: CurrentUser, session: Session, mailer: Mailer
+) -> RunInvoiceOut:
+    run = await _run(session, run_id)
+    invoice = await invoicing.get_for_run(session, run)
+    if invoice is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="This month has no invoice yet.")
     try:
-        await invoicing.send_report(session, invoice, user, mailer=mailer, link=_link(invoice))
+        await invoicing.send_report(session, run, invoice, user, mailer=mailer, link=month_link(run))
     except PayrollError as exc:
         raise _translate(exc) from exc
-    return await _detail(session, invoice)
+    return await _out(session, run)
 
 
-@router.get("/invoices/{invoice_id}/pdf")
-async def invoice_file(invoice_id: uuid.UUID, _: Viewer, session: Session) -> Response:
-    invoice = await _invoice(session, invoice_id)
-    if invoice.zoho_pdf:
-        content, name = invoice.zoho_pdf, f"{invoice.zoho_invoice_number or invoice.number}.pdf"
+@router.get("/runs/{run_id}/invoice.pdf")
+async def invoice_file(run_id: uuid.UUID, _: Viewer, session: Session) -> Response:
+    run = await _run(session, run_id)
+    settings = await service.get_settings(session)
+    saved: PayrollInvoice | None = await invoicing.get_for_run(session, run)
+    if saved is not None and saved.zoho_pdf:
+        content = saved.zoho_pdf
+        name = f"{saved.zoho_invoice_number or saved.number}.pdf"
     else:
-        settings = await service.get_settings(session)
-        test = invoice.zoho_mode != "live"
-        content = invoice_pdf(invoice, settings, test=test)
-        name = f"{invoice.number}{' TEST' if test else ''}.pdf"
+        inv: Any = saved or SimpleNamespace(**vars(_virtual(run, settings)))
+        if inv.number is None:
+            inv.number = "Draft"
+        lines, _ = invoicing.all_lines(run, inv)
+        test = inv.zoho_mode != "live"
+        content = invoice_pdf(run, inv, lines, settings, test=test)
+        name = f"{inv.number}{' TEST' if test else ''}.pdf"
     return Response(
         content=content,
         media_type="application/pdf",
@@ -293,38 +226,33 @@ async def invoice_setup(_: Viewer, session: Session, zoho: Zoho) -> InvoiceSetup
         error = "Zoho Books is not configured on this server."
     else:
         try:
-            raw_taxes = await _cached("taxes", zoho.taxes)
-            taxes = [
-                ZohoTaxOut(
-                    tax_id=str(t["tax_id"]),
-                    tax_name=t.get("tax_name") or "Tax",
-                    tax_percentage=t.get("tax_percentage") or 0,
-                )
-                for t in raw_taxes
-                if t.get("tax_id")
+            for t in await _cached("taxes", zoho.taxes):
+                if t.get("tax_id"):
+                    taxes.append(
+                        ZohoTaxOut(
+                            tax_id=str(t["tax_id"]),
+                            tax_name=t.get("tax_name") or "Tax",
+                            tax_percentage=t.get("tax_percentage") or 0,
+                        )
+                    )
+            currencies = [
+                c["currency_code"] for c in await _cached("currencies", zoho.currencies) if c.get("currency_code")
             ]
-            raw_currencies = await _cached("currencies", zoho.currencies)
-            currencies = [c["currency_code"] for c in raw_currencies if c.get("currency_code")]
             orgs = await _cached("org", lambda: zoho._get("/organizations"))
             for o in orgs.get("organizations") or []:
                 if str(o.get("organization_id")) == str(zoho.organization_id):
                     org = f"{o.get('name')} ({o.get('currency_code')})"
         except ZohoError as exc:
             error = str(exc)
-    approvers = await invoicing.payroll_access.users_with_roles(session, {"super_admin"})
+    approvers = await users_with_roles(session, {"super_admin"})
     report = await invoicing.report_recipients(session)
     return InvoiceSetupOut(
         zoho_live=app_settings().payroll_zoho_invoice_write,
         zoho_organization=org,
-        mail=settings.invoice_mail,
+        mail=settings.mail_enabled,
         zoho_error=error,
         taxes=taxes,
         currencies=currencies,
-        default_customer_zoho_id=settings.invoice_customer_zoho_id,
-        default_customer_name=settings.invoice_customer_name,
-        payment_terms=settings.invoice_payment_terms,
-        notes=settings.invoice_notes,
-        terms=settings.invoice_terms,
         approvers=[u.email for u in approvers],
         report_to=[u.email for u in report],
     )

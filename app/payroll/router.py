@@ -31,6 +31,7 @@ from app.models.payroll import (
 from app.models.user import User
 from app.payroll import exports, service
 from app.payroll.access import Access, Admin, Approver, PayrollAccess, Processor, Viewer
+from app.payroll.deps import Mailer
 from app.payroll.rules import COMPONENTS, Period
 from app.payroll.schemas import (
     AccessOverviewOut,
@@ -446,7 +447,6 @@ def _event_out(event: PayrollEvent) -> EventOut:
         actor_name=event.actor.display_name if event.actor else None,
         run_id=event.run_id,
         employee_id=event.employee_id,
-        invoice_id=event.invoice_id,
         created_at=event.created_at,
     )
 
@@ -534,10 +534,29 @@ async def update_line(
 
 
 @router.post("/runs/{run_id}/submit", response_model=RunDetailOut)
-async def submit(run_id: uuid.UUID, _: Processor, user: CurrentUser, session: Session) -> RunDetailOut:
+async def submit(
+    run_id: uuid.UUID,
+    _: Processor,
+    user: CurrentUser,
+    session: Session,
+    mailer: Mailer,
+    notify: bool = True,
+) -> RunDetailOut:
+    """Send the month — payroll and its invoice — for approval.
+
+    ``notify=false`` when a super admin is about to approve it themselves in
+    the same click: the other super admins need not be asked.
+    """
+    from app.payroll import invoicing
+    from app.payroll.invoice_router import month_link
+
     run = await _run(session, run_id)
     try:
         await service.submit(session, run, user)
+        await invoicing.on_submit(
+            session, run, user,
+            mailer=mailer, link=month_link(run), notify=notify,
+        )
     except PayrollError as exc:
         raise _translate(exc) from exc
     return await _detail(session, run)
@@ -583,9 +602,12 @@ async def mark_paid(
 async def reopen(
     run_id: uuid.UUID, body: ReopenIn, _: Admin, user: CurrentUser, session: Session
 ) -> RunDetailOut:
+    from app.payroll import invoicing
+
     run = await _run(session, run_id)
     try:
         await service.reopen(session, run, body.reason, user)
+        await invoicing.on_reopen(session, run)
     except PayrollError as exc:
         raise _translate(exc) from exc
     return await _detail(session, run)
