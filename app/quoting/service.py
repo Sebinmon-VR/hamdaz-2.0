@@ -542,13 +542,14 @@ _RATE = Decimal("0.0001")
 _PRICE = Decimal("0.01")
 
 #: How a selling price is rounded *in the supplier's currency*, before it is
-#: converted. Zoho's item prices are set in the base currency, and the one
-#: this was checked against is a whole dirham: purchase 49, sale 59 — not
-#: 58.80. Converting that at 3.672501 is what gives Zoho's 16.07, and marking
-#: up the converted cost instead gave 16.01 for months. So a price is built
-#: where Zoho builds it, and rounded there the way Zoho's is: to the dirham in
-#: AED, to the cent anywhere else, where no such practice has been observed.
-_SELL_STEP: Final = {"AED": Decimal("1")}
+#: converted: to Zoho's ``price_precision`` for that currency, read from
+#: /settings/currencies on 5 Nov 2026 — 2 places for AED, USD and the rest,
+#: 0 for JPY. A price is built where Zoho builds it (in the supplier's
+#: currency, then converted), but it is not rounded any further than Zoho
+#: rounds it: a landed cost of 645 at a 20% margin is 806.25, which keeps
+#: exactly 20%. Rounding AED to the whole dirham (806, 19.98%) came from one
+#: Zoho item priced at 59 by hand, not from anything Zoho does.
+_SELL_STEP: Final = {"JPY": Decimal("1")}
 
 
 def sell_step(currency: str | None) -> Decimal:
@@ -903,11 +904,10 @@ def convert_figures(
     margin stays, because cost and price move together. A supplier's own figure
     in its own currency stays, because it was never in ours.
 
-    Zoho prices sales lines in the source currency first.  In particular, an
-    AED selling price is a whole dirham: AED 58.80 is the AED 59 price that
-    Zoho converts to USD 16.07, not USD 16.01.  Normalise only the selling
-    rate at that source-currency precision before converting it; costs,
-    discounts and every other amount remain ordinary money figures.
+    Zoho prices sales lines in the source currency first. Normalise only the
+    selling rate at that currency's Zoho precision (``sell_step``) before
+    converting it; costs, discounts and every other amount remain ordinary
+    money figures.
     """
 
     def money(value: Decimal | None) -> Decimal | None:
@@ -958,8 +958,7 @@ async def convert_currency(
     try:
         step = await rates(old, new)
         # Zoho first rounds an item price to the precision of the currency it
-        # was quoted in (whole dirhams for AED), then converts it.  Converting
-        # an unrounded AED price is how 58.80 incorrectly became USD 16.01.
+        # was quoted in (``sell_step``), then converts it.
         convert_figures(request, step.rate, source_currency=old)
         request.currency = new
         supplier = (request.supplier_currency or "").upper()
@@ -1207,9 +1206,9 @@ def _line_from(
     """One supplier line as a line of ours, in the request's own currency.
 
     Built in Zoho's order: the margin goes on in the supplier's currency and
-    the price is rounded there — to the dirham, for an AED supplier, as Zoho's
-    item prices are — and only then converted, to the cent. AED 49 at a 20%
-    margin is 61.25, is 61, is USD 16.61. The other order — convert the cost,
+    the price is rounded there to Zoho's precision for that currency — the fils,
+    for an AED supplier — and only then converted, to the cent. AED 49 at a 20%
+    margin is 61.25, is USD 16.68. The other order — convert the cost,
     then price — lands a cent a unit away, and a quote and its estimate that
     disagree by a cent a unit on every line.
     """
