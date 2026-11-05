@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.agents.model import AgentModel
 from app.core.config import Settings
 from app.intake.graph_mail import MailReader
-from app.mailwatch import assign, service, teams
+from app.mailwatch import assign, manual, service, teams
 from app.proposals.sharepoint import SharePointProposals
 
 logger = logging.getLogger("hamdaz.mailwatch.worker")
@@ -158,6 +158,11 @@ class MailWatchWorker:
                     # After the commit, so a post never names a mail that
                     # was then rolled back; rows are locked one by one.
                     await teams.post_pending(
+                        session, poster=self._poster, settings=self._settings
+                    )
+                    await session.commit()
+                    # Tasks added to the list by hand, not by the mail watch.
+                    await manual.post_pending(
                         session, poster=self._poster, settings=self._settings
                     )
                     await session.commit()
