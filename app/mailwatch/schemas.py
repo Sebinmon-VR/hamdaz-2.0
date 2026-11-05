@@ -215,6 +215,14 @@ class TeamsOut(BaseModel):
     post_orders: bool = False
     orders_from: datetime | None = None
     orders_test_only: bool = True
+    #: Cards for tasks added to the Proposals list by hand — to the test
+    #: channel while ``manual_test_only``, else where the other cards go.
+    post_manual_tasks: bool = False
+    manual_from: datetime | None = None
+    manual_test_only: bool = True
+    manual_posted: int = 0
+    #: The newest task added by hand, for the sample card: "1900 — title".
+    manual_latest: str | None = None
     #: Where new tenders' tasks are created: test / real / none.
     task_list: str = "test"
     #: The lists that choice can name, with their links: [{key, name, url}].
@@ -233,6 +241,9 @@ class TeamsIn(BaseModel):
     post_orders: bool | None = None
     #: False sends order cards where the other cards go.
     orders_test_only: bool | None = None
+    post_manual_tasks: bool | None = None
+    #: False sends hand-added tasks' cards where the other cards go.
+    manual_test_only: bool | None = None
     task_list: Literal["test", "real", "none"] | None = None
     #: Where cards are posted: a team and channel, or a group chat.
     team_id: str | None = None

@@ -241,6 +241,17 @@ class MailWatchTeams(Base, Timestamped):
         Boolean, nullable=False, default=True, server_default=text("true")
     )
 
+    #: Post a card for each task added to the Proposals list by hand — one the
+    #: mail watch did not create. Off until switched on; only tasks created
+    #: from ``manual_from``. To the test channel while ``manual_test_only``.
+    post_manual_tasks: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    manual_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    manual_test_only: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=text("true")
+    )
+
 
 class MailWatchTestTask(Base, UUIDPrimaryKey, Timestamped):
     """A task the mail watch would create on the Proposals list, kept here
@@ -301,3 +312,26 @@ class MailWatchTestTask(Base, UUIDPrimaryKey, Timestamped):
     list_item_id: Mapped[str | None] = mapped_column(String(20))
     list_item_url: Mapped[str | None] = mapped_column(Text)
     list_error: Mapped[str | None] = mapped_column(Text)
+
+
+class MailWatchManualTask(Base, Timestamped):
+    """A task somebody added to the Proposals list by hand, and its Teams card.
+
+    One row per list item, made when its card is first tried, so a task is
+    posted once whatever happens to it afterwards — reassigned, renamed or
+    edited, it is not posted again. See ``app/mailwatch/manual.py``.
+    """
+
+    __tablename__ = "mailwatch_manual_tasks"
+
+    item_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    title: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    assigned_email: Mapped[str | None] = mapped_column(String(320))
+    attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    posted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    message_id: Mapped[str | None] = mapped_column(String(200))
+    #: Where it went: "test" (the test channel) or "chosen" (where cards go).
+    posted_to: Mapped[str | None] = mapped_column(String(20))
+    error: Mapped[str | None] = mapped_column(Text)

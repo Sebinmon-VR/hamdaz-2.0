@@ -22,7 +22,7 @@ from app.auth.deps import CurrentUser
 from app.auth.router import LOGIN_STATE_AUDIENCE
 from app.core.config import Settings, get_settings
 from app.core.db import get_session
-from app.mailwatch import assign, matching, service, teams
+from app.mailwatch import assign, manual, matching, service, teams
 from app.mailwatch.classify import CATEGORIES, NEGOTIATION, NEW_TENDER, SURE, Reading
 from app.mailwatch.classify import references as refs_in
 from app.mailwatch.schemas import (
@@ -287,6 +287,9 @@ async def _teams_out(session: AsyncSession) -> TeamsOut:
         await session.scalar(select(func.count()).select_from(MailWatchTestTask)) or 0
     )
     config = get_settings()
+    body.manual_posted = await manual.counts(session)
+    newest = await manual.latest(session, config)
+    body.manual_latest = f"{newest.item_id} — {newest.title}" if newest else None
     body.task_lists = [
         {"key": key, "name": target.name, "url": target.list_url}
         for key in (assign.TEST_LIST, assign.REAL_LIST)
@@ -337,6 +340,15 @@ async def teams_switch(
         row.post_orders = body.post_orders
     if body.orders_test_only is not None:
         row.orders_test_only = body.orders_test_only
+    if body.post_manual_tasks is not None:
+        if body.post_manual_tasks and not teams.is_connected(row):
+            raise HTTPException(status_code=400, detail="Connect a Teams account first.")
+        if body.post_manual_tasks and not row.post_manual_tasks:
+            # From now on: switching on never posts the tasks already there.
+            row.manual_from = datetime.now(UTC)
+        row.post_manual_tasks = body.post_manual_tasks
+    if body.manual_test_only is not None:
+        row.manual_test_only = body.manual_test_only
     if body.task_list is not None:
         row.task_list = body.task_list
     if body.chat_id:
@@ -435,6 +447,25 @@ async def teams_sample_order(admin: SuperAdmin, session: Session, request: Reque
         await teams.post_sample_order(
             session, name=admin.display_name, email=admin.email, poster=_poster(request)
         )
+    except teams.TeamsError as exc:
+        await session.commit()
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    await session.commit()
+    return await _teams_out(session)
+
+
+@router.post(
+    "/teams/sample-manual",
+    response_model=TeamsOut,
+    summary="Post the newest hand-added task's card to the test channel",
+)
+async def teams_sample_manual(
+    admin: SuperAdmin, session: Session, request: Request, config: Config
+) -> TeamsOut:
+    """The card the newest task added to the Proposals list by hand gets, to
+    the test channel whatever is chosen for real cards. Nothing is recorded."""
+    try:
+        await manual.post_sample(session, poster=_poster(request), settings=config)
     except teams.TeamsError as exc:
         await session.commit()
         raise HTTPException(status_code=502, detail=str(exc)) from exc

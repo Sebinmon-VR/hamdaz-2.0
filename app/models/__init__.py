@@ -74,6 +74,7 @@ from app.models.bcd_check import BcdCheck, BcdCheckSettings, BcdCheckStatus
 from app.models.task_calendar import TaskCalendarEvent, TaskCalendarSettings
 from app.models.task_folder import TaskFolder
 from app.models.mailwatch import (
+    MailWatchManualTask,
     MailWatchSettings,
     MailWatchTeams,
     MailWatchTestTask,
@@ -204,6 +205,7 @@ __all__ = [
     "StatusReminderSettings",
     "BcdCheck",
     "BcdCheckSettings",
+    "MailWatchManualTask",
     "MailWatchSettings",
     "MailWatchTeams",
     "MailWatchTestTask",

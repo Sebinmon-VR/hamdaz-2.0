@@ -93,7 +93,7 @@ def steps(request: QuoteRequest, pack: BidPack) -> list[Step]:  # noqa: C901
             step = sell_step(theirs)
             rounded = raw.quantize(step, rounding=ROUND_HALF_UP)
             rounding = (
-                f" → {_n(rounded, 0)} (whole {theirs}, as Zoho prices items)"
+                f" → {_n(rounded, 0)} (whole {theirs}, Zoho's precision for it)"
                 if step == Decimal(1) and rounded != raw else ""
             )
             parts.append(
