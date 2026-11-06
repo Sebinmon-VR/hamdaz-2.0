@@ -612,42 +612,9 @@ class TeamsPoster:
         that Adaptive Card and ``content_html`` is ignored. ``test_only``
         posts to the test channel whatever is chosen, and leaves the choice
         as it is."""
-        to_chat = not test_only and row.target_kind == CHAT and bool(row.chat_id)
-        if to_chat and not can_chat(row):
-            raise TeamsError("Posting to a group chat needs the account connected again.")
-        if test_only:
-            if self._test_ids is None:
-                self._test_ids = await _test_channel(self._graph)
-            team_id, _, channel_id, _ = self._test_ids
-        else:
-            if not to_chat and (not row.channel_id or not row.team_id):
-                await _resolve_channel(row, self._graph)
-            team_id, channel_id = row.team_id, row.channel_id
-        if card is not None and not test_only and not is_test_channel(row):
-            # A real channel: no TESTING banner.
-            card = {**card, "body": [b for b in card.get("body", []) if b.get("id") != "testing"]}
+        url = await self._messages_url(row, test_only)
+        message = self._message(row, content_html, card, test_only)
         token = await self._token(row)
-        if card is not None:
-            attachment_id = uuid.uuid4().hex
-            message: dict[str, Any] = {
-                "body": {
-                    "contentType": "html",
-                    "content": f'<attachment id="{attachment_id}"></attachment>',
-                },
-                "attachments": [
-                    {
-                        "id": attachment_id,
-                        "contentType": "application/vnd.microsoft.card.adaptive",
-                        "content": json.dumps(card),
-                    }
-                ],
-            }
-        else:
-            message = {"body": {"contentType": "html", "content": content_html}}
-        url = (
-            f"{GRAPH_BASE}/chats/{row.chat_id}/messages" if to_chat
-            else f"{GRAPH_BASE}/teams/{team_id}/channels/{channel_id}/messages"
-        )
         response = await self._http.post(
             url, headers={"Authorization": f"Bearer {token}"}, json=message
         )
@@ -658,6 +625,74 @@ class TeamsPoster:
         row.last_used_at = datetime.now(UTC)
         row.last_error = None
         return str(response.json().get("id") or "")
+
+    async def edit(
+        self, row: MailWatchTeams, message_id: str, *, card: dict, test_only: bool = False
+    ) -> None:
+        """Replace a card this account posted with ``card`` — the same
+        message, edited in place, where cards go now. A chat message needs
+        Chat.ReadWrite; a channel one ChannelMessage.ReadWrite."""
+        url = f"{await self._messages_url(row, test_only)}/{message_id}"
+        message = self._message(row, "", card, test_only)
+        token = await self._token(row)
+        response = await self._http.patch(
+            url, headers={"Authorization": f"Bearer {token}"}, json=message
+        )
+        if response.status_code == 401:
+            self._cached = None
+        if response.status_code == 404:
+            raise TeamsError("That card is not where cards go now, so it can't be updated.")
+        if response.status_code == 403:
+            raise TeamsError(
+                "Microsoft won't let the connected account edit its cards here "
+                f"(403): {response.text[:200]}"
+            )
+        if response.status_code >= 400:
+            raise TeamsError(f"Teams refused the update ({response.status_code}): {response.text[:300]}")
+        row.last_used_at = datetime.now(UTC)
+        row.last_error = None
+
+    async def _messages_url(self, row: MailWatchTeams, test_only: bool) -> str:
+        """Where cards are posted: the chosen group chat or channel, or the
+        test channel for a test-only card."""
+        to_chat = not test_only and row.target_kind == CHAT and bool(row.chat_id)
+        if to_chat and not can_chat(row):
+            raise TeamsError("Posting to a group chat needs the account connected again.")
+        if to_chat:
+            return f"{GRAPH_BASE}/chats/{row.chat_id}/messages"
+        if test_only:
+            if self._test_ids is None:
+                self._test_ids = await _test_channel(self._graph)
+            team_id, _, channel_id, _ = self._test_ids
+        else:
+            if not row.channel_id or not row.team_id:
+                await _resolve_channel(row, self._graph)
+            team_id, channel_id = row.team_id, row.channel_id
+        return f"{GRAPH_BASE}/teams/{team_id}/channels/{channel_id}/messages"
+
+    @staticmethod
+    def _message(
+        row: MailWatchTeams, content_html: str, card: dict | None, test_only: bool
+    ) -> dict[str, Any]:
+        if card is None:
+            return {"body": {"contentType": "html", "content": content_html}}
+        if not test_only and not is_test_channel(row):
+            # A real channel: no TESTING banner.
+            card = {**card, "body": [b for b in card.get("body", []) if b.get("id") != "testing"]}
+        attachment_id = uuid.uuid4().hex
+        return {
+            "body": {
+                "contentType": "html",
+                "content": f'<attachment id="{attachment_id}"></attachment>',
+            },
+            "attachments": [
+                {
+                    "id": attachment_id,
+                    "contentType": "application/vnd.microsoft.card.adaptive",
+                    "content": json.dumps(card),
+                }
+            ],
+        }
 
 
 # ── what a negotiation post says ────────────────────────────────────
@@ -1971,25 +2006,8 @@ async def post_mail(
     elif mail.category != NEGOTIATION:
         raise TeamsError("Only negotiations, orders and assigned new tenders are posted to Teams.")
     mail.teams_attempts = (mail.teams_attempts or 0) + 1
-    test_only = False
     try:
-        if test_task is not None:
-            files = (
-                await poster.task_files(mail.task)
-                if mail.task and test_task.action == "stage_change" else None
-            )
-            people = await poster.people([test_task.assigned_to_email or ""])
-            card = new_tender_card(mail, test_task, files, people)
-        elif mail.category == ORDER:
-            task = next((m.task for m in group if m.task), None)
-            files = await poster.task_files(task) if task else None
-            people = await poster.people([(task or {}).get("assignee_email") or ""])
-            card = order_card(group[0], merged_order(group), task, files, people)
-            test_only = row.orders_test_only
-        else:
-            files = await poster.task_files(mail.task) if mail.task else None
-            people = await poster.people([(mail.task or {}).get("assignee_email") or ""])
-            card = negotiation_card(mail, files, people)
+        card, test_only = await _card_of(mail, group, test_task, row=row, poster=poster)
         message_id = await poster.post(row, "", card=card, test_only=test_only)
     except TeamsError as exc:
         mail.teams_error = str(exc)[:500]
@@ -2000,6 +2018,58 @@ async def post_mail(
         if each is mail or each.teams_posted_at is None:
             each.teams_posted_at, each.teams_message_id, each.teams_error = now, message_id, None
     return message_id
+
+
+async def _card_of(
+    mail: WatchedMail,
+    group: list[WatchedMail],
+    test_task: MailWatchTestTask | None,
+    *,
+    row: MailWatchTeams,
+    poster: TeamsPoster,
+) -> tuple[dict[str, Any], bool]:
+    """The mail's card as it would be posted now, and whether it goes to the
+    test channel only (an order, until that is switched off)."""
+    if test_task is not None:
+        files = (
+            await poster.task_files(mail.task)
+            if mail.task and test_task.action == "stage_change" else None
+        )
+        people = await poster.people([test_task.assigned_to_email or ""])
+        return new_tender_card(mail, test_task, files, people), False
+    if mail.category == ORDER:
+        task = next((m.task for m in group if m.task), None)
+        files = await poster.task_files(task) if task else None
+        people = await poster.people([(task or {}).get("assignee_email") or ""])
+        return order_card(group[0], merged_order(group), task, files, people), row.orders_test_only
+    files = await poster.task_files(mail.task) if mail.task else None
+    people = await poster.people([(mail.task or {}).get("assignee_email") or ""])
+    return negotiation_card(mail, files, people), False
+
+
+async def update_mail(
+    session: AsyncSession, mail: WatchedMail, *, poster: TeamsPoster
+) -> str:
+    """Make this mail's card again from what is known now and put it in place
+    of the one already posted — the same message, edited, not a new post.
+    Only where cards go now: a card posted before the destination changed
+    is not found there."""
+    if not mail.teams_message_id:
+        raise TeamsError("This mail has no card in Teams to update.")
+    row = await get_connection(session)
+    if not is_connected(row):
+        raise TeamsError("No Teams account is connected.")
+    test_task = None
+    group: list[WatchedMail] = [mail]
+    if mail.category == NEW_TENDER:
+        test_task = await assign.test_task_of(session, mail)
+        if test_task is None:
+            raise TeamsError("This new tender has no task assigned any more.")
+    elif mail.category == ORDER:
+        group = await order_group(session, mail)
+    card, test_only = await _card_of(mail, group, test_task, row=row, poster=poster)
+    await poster.edit(row, mail.teams_message_id, card=card, test_only=test_only)
+    return mail.teams_message_id
 
 
 async def post_sample_order(

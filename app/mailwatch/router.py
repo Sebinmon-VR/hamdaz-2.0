@@ -494,6 +494,27 @@ async def post_mail_to_teams(
     return WatchedMailDetailOut.model_validate(mail)
 
 
+@router.post(
+    "/mails/{mail_id}/teams/update",
+    response_model=WatchedMailDetailOut,
+    summary="Make this mail's card again and edit the posted one in place (no new post)",
+)
+async def update_mail_in_teams(
+    mail_id: uuid.UUID, admin: SuperAdmin, session: Session, request: Request
+) -> WatchedMailDetailOut:
+    mail = await session.get(WatchedMail, mail_id)
+    if mail is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such mail.")
+    try:
+        await teams.update_mail(session, mail, poster=_poster(request))
+    except teams.TeamsError as exc:
+        await session.commit()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await session.commit()
+    await session.refresh(mail)
+    return WatchedMailDetailOut.model_validate(mail)
+
+
 def _test_task_out(task: MailWatchTestTask, mail: WatchedMail | None) -> TestTaskOut:
     out = TestTaskOut.model_validate(task)
     if mail is not None:

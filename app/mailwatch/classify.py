@@ -295,8 +295,24 @@ def read_order(subject: str | None, body: str | None) -> Order:
             if i + 2 < len(lines) and (m := _ORDER_NO.fullmatch(lines[i + 2])):
                 order.number = order.number or m.group(1)
             break
+    # A light account's purchase order sets the details as a table, headings
+    # first: "Order number" / "Amount" / "45…" / "15,000.00 AED". The line
+    # after "Amount" there is the order number, never the value.
+    for i, line in enumerate(lines[:-3]):
+        if line.lower() == "order number" and lines[i + 1].rstrip(":").lower() == "amount":
+            if m := _ORDER_NO.fullmatch(lines[i + 2]):
+                order.number = order.number or m.group(1)
+            if m := re.fullmatch(r"([\d,]+(?:\.\d+)?)\s*([A-Z]{3})?", lines[i + 3]):
+                order.amount, order.currency = m.group(1), m.group(2) or order.currency
+            break
     for i, line in enumerate(lines[:-1]):
-        if line.rstrip(":").lower() == "amount" and re.fullmatch(r"[\d,]+(?:\.\d+)?", lines[i + 1]):
+        if order.amount and i and lines[i - 1].lower() == "order number":
+            break  # the table above, already read
+        if (
+            line.rstrip(":").lower() == "amount"
+            and re.fullmatch(r"[\d,]+(?:\.\d+)?", lines[i + 1])
+            and not _ORDER_NO.fullmatch(lines[i + 1])  # an order number is never its value
+        ):
             order.amount = lines[i + 1]
             if i + 2 < len(lines) and re.fullmatch(r"[A-Z]{3}", lines[i + 2]):
                 order.currency = lines[i + 2]
