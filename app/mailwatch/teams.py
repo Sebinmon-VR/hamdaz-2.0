@@ -61,6 +61,7 @@ from app.core.config import Settings, get_settings
 from app.core.mail import GRAPH_BASE, GraphMailer
 from app.core.security import sign
 from app.mailwatch import assign
+from app.mailwatch.availability import away_reason
 from app.mailwatch.classify import (
     NEGOTIATION,
     NEW_TENDER,
@@ -96,6 +97,15 @@ BUSINESS_NETWORK: Final = "https://supplier.ariba.com"
 
 #: Where cards go (MailWatchTeams.target_kind): a team channel or a group chat.
 CHANNEL, CHAT = "channel", "chat"
+
+
+@dataclass(frozen=True, slots=True)
+class Mention:
+    """Who a card's post @mentions: a person (``user_id``, their directory
+    id) or, with no id, the whole team the channel belongs to."""
+
+    name: str
+    user_id: str | None = None
 
 
 def _granted(tokens: dict[str, Any]) -> str:
@@ -609,7 +619,7 @@ class TeamsPoster:
 
     async def post(
         self, row: MailWatchTeams, content_html: str, *, card: dict | None = None,
-        test_only: bool = False,
+        test_only: bool = False, mention: Mention | None = None,
     ) -> str:
         """Post to the chosen channel or group chat (the test channel until
         one is chosen); the new message's id. With ``card``, the message is
@@ -619,9 +629,17 @@ class TeamsPoster:
         url = await self._messages_url(row, test_only)
         message = self._message(row, content_html, card, test_only)
         token = await self._token(row)
+        mentioned = self._with_mention(message, row, mention, test_only)
         response = await self._http.post(
-            url, headers={"Authorization": f"Bearer {token}"}, json=message
+            url, headers={"Authorization": f"Bearer {token}"}, json=mentioned
         )
+        if response.status_code == 400 and mentioned is not message:
+            # A mention Teams won't take (somebody outside the team, say)
+            # must not cost the card: posted again without it.
+            logger.warning("Teams refused the mention, posting without it: %s", response.text[:200])
+            response = await self._http.post(
+                url, headers={"Authorization": f"Bearer {token}"}, json=message
+            )
         if response.status_code == 401:
             self._cached = None
         if response.status_code >= 400:
@@ -631,7 +649,8 @@ class TeamsPoster:
         return str(response.json().get("id") or "")
 
     async def edit(
-        self, row: MailWatchTeams, message_id: str, *, card: dict, test_only: bool = False
+        self, row: MailWatchTeams, message_id: str, *, card: dict, test_only: bool = False,
+        mention: Mention | None = None,
     ) -> None:
         """Replace a card this account posted with ``card`` — the same
         message, edited in place, where cards go now. A chat message needs
@@ -639,9 +658,14 @@ class TeamsPoster:
         url = f"{await self._messages_url(row, test_only)}/{message_id}"
         message = self._message(row, "", card, test_only)
         token = await self._token(row)
+        mentioned = self._with_mention(message, row, mention, test_only)
         response = await self._http.patch(
-            url, headers={"Authorization": f"Bearer {token}"}, json=message
+            url, headers={"Authorization": f"Bearer {token}"}, json=mentioned
         )
+        if response.status_code == 400 and mentioned is not message:
+            response = await self._http.patch(
+                url, headers={"Authorization": f"Bearer {token}"}, json=message
+            )
         if response.status_code == 401:
             self._cached = None
         if response.status_code == 404:
@@ -673,6 +697,44 @@ class TeamsPoster:
                 await _resolve_channel(row, self._graph)
             team_id, channel_id = row.team_id, row.channel_id
         return f"{GRAPH_BASE}/teams/{team_id}/channels/{channel_id}/messages"
+
+    def _with_mention(
+        self, message: dict[str, Any], row: MailWatchTeams, mention: Mention | None,
+        test_only: bool,
+    ) -> dict[str, Any]:
+        """The message with an @mention on the line above the card: a person
+        by their directory id, or everybody — the whole team the channel
+        belongs to, or, in a group chat (Quote Alerts), everyone in the chat.
+        The message itself is returned untouched when there is nothing to add."""
+        if mention is None:
+            return message
+        if mention.user_id:
+            name = mention.name
+            mentioned: dict[str, Any] = {"user": {
+                "id": mention.user_id, "displayName": name, "userIdentityType": "aadUser",
+            }}
+        elif not test_only and row.target_kind == CHAT and row.chat_id:
+            name = "Everyone"
+            mentioned = {"conversation": {
+                "id": row.chat_id, "displayName": name, "conversationIdentityType": "chat",
+            }}
+        else:
+            if test_only and self._test_ids is not None:
+                team_id, team_name = self._test_ids[0], self._test_ids[1]
+            else:
+                team_id, team_name = row.team_id, row.team_name
+            if not team_id:
+                return message
+            name = team_name or "team"
+            mentioned = {"conversation": {
+                "id": team_id, "displayName": name, "conversationIdentityType": "team",
+            }}
+        body = message["body"]["content"]
+        return {
+            **message,
+            "body": {"contentType": "html", "content": f'<at id="0">{_e(name)}</at> {body}'},
+            "mentions": [{"id": 0, "mentionText": name, "mentioned": mentioned}],
+        }
 
     @staticmethod
     def _message(
@@ -1053,12 +1115,33 @@ def _tabs(tabs: list[tuple[str, str, str, list[dict[str, Any]]]]) -> list[dict[s
     return out
 
 
+def _away_notice(holder: str | None, away: str) -> dict[str, Any]:
+    """The task's holder can't take this: said on the card, with why, and that
+    the whole team is mentioned so somebody picks it up."""
+    who = holder or "The task's holder"
+    return {
+        "type": "Container", "style": "attention", "spacing": "Medium",
+        "items": [
+            _with_icon(
+                _icon("Warning", color="Attention"),
+                _text(f"{who} can't take this: {away}.", weight="Bolder"),
+            ),
+            _caption(
+                f"{who} worked on this tender (details below). The whole team is "
+                "mentioned so somebody picks it up.",
+                size="Small",
+            ),
+        ],
+    }
+
+
 def negotiation_card(
     mail: WatchedMail,
     files: TaskFiles | None = None,
     people: dict[str, dict[str, str]] | None = None,
     *,
     existing: bool = False,
+    away: str | None = None,
 ) -> dict[str, Any]:
     """The card, with as many files as fit under Teams' size limit.
 
@@ -1066,7 +1149,7 @@ def negotiation_card(
     on the list — no task is made, and the card says the match was found."""
     shown = FILE_ROWS
     while True:
-        card = _negotiation_card(mail, files, people, shown, existing=existing)
+        card = _negotiation_card(mail, files, people, shown, existing=existing, away=away)
         if shown == 0 or len(json.dumps(card, ensure_ascii=False)) <= CARD_BYTES:
             return card
         shown -= 1
@@ -1079,6 +1162,7 @@ def _negotiation_card(
     shown: int,
     *,
     existing: bool = False,
+    away: str | None = None,
 ) -> dict[str, Any]:
     """The Teams post for a negotiation. On top the customer, a badge, and the
     facts that matter (who has it, quote, status, BCD); then how far the
@@ -1155,6 +1239,8 @@ def _negotiation_card(
             )]),
             ("BCD", bcd),
         ])
+        if away:
+            body.append(_away_notice(task.get("assignee"), away))
         body += [{"type": "Container", "separator": True, "spacing": "Medium",
                   "items": _tracker(task)}]
     else:
@@ -1363,10 +1449,19 @@ def _new_tender_card(
     ) if staged else (
         "Priority 1 in Presale"
     )
+    if task.previous_owner:
+        # The earlier holder couldn't take it: picked by the rotation instead.
+        why = "Priority 1 in Presale"
     why_items = [_with_icon(
-        _icon("History" if staged else "Trophy", color="Accent"),
+        _icon("History" if staged and not task.previous_owner else "Trophy", color="Accent"),
         _text(why, weight="Bolder"), spacing="None",
     )]
+    if task.previous_owner:
+        why_items.append(_caption(
+            f"{task.previous_owner} worked on {task.previous_title or 'the earlier task'} "
+            f"({(task.previous_stage or 'earlier stage').upper()}) but can't take it",
+            size="Small", spacing="None",
+        ))
     if task.action == "unsure":
         closest = assign.closest_task(mail)
         why_items.append(_caption(
@@ -1435,6 +1530,8 @@ def _new_tender_card(
                                                     task.start_date.strftime("%d %b %Y"))},
                 {"title": "BCD UAE Time", "value": _v(task.bcd and task.bcd.astimezone(
                     ZoneInfo("Asia/Dubai")).strftime("%d %b %Y %H:%M"))},
+                *([{"title": "Previous Owner", "value": task.previous_owner}]
+                  if task.previous_owner else []),
                 {"title": "Remarks", "value": _v(task.remarks)},
             ],
         },
@@ -1502,11 +1599,13 @@ def order_card(
     task: dict[str, Any] | None,
     files: TaskFiles | None = None,
     people: dict[str, dict[str, str]] | None = None,
+    *,
+    away: str | None = None,
 ) -> dict[str, Any]:
     """The card, with as many of the task's files as fit."""
     shown = FILE_ROWS
     while True:
-        card = _order_card(mail, order, task, files, people, shown)
+        card = _order_card(mail, order, task, files, people, shown, away=away)
         if shown == 0 or len(json.dumps(card, ensure_ascii=False)) <= CARD_BYTES:
             return card
         shown -= 1
@@ -1605,6 +1704,8 @@ def _order_card(
     files: TaskFiles | None,
     people: dict[str, dict[str, str]] | None,
     shown: int,
+    *,
+    away: str | None = None,
 ) -> dict[str, Any]:
     """The Teams post for a customer's order. A new order opens with
     congratulations to whoever's task won it — party poppers, confetti, the
@@ -1676,6 +1777,8 @@ def _order_card(
         ])] if took else []),
         ("Won by" if won and task else "Task owner", owner),
     ])
+    if away and task:
+        body.append(_away_notice(task.get("assignee"), away))
 
     if task:
         body.append({"type": "Container", "separator": True, "spacing": "Medium",
@@ -2050,8 +2153,11 @@ async def post_mail(
         raise TeamsError("Only negotiations, orders and assigned new tenders are posted to Teams.")
     mail.teams_attempts = (mail.teams_attempts or 0) + 1
     try:
-        card, test_only = await _card_of(mail, group, test_task, row=row, poster=poster)
-        message_id = await poster.post(row, "", card=card, test_only=test_only)
+        away = await _holder_away(session, mail, group, test_task)
+        card, test_only, mention = await _card_of(
+            mail, group, test_task, row=row, poster=poster, away=away
+        )
+        message_id = await poster.post(row, "", card=card, test_only=test_only, mention=mention)
     except TeamsError as exc:
         mail.teams_error = str(exc)[:500]
         row.last_error = str(exc)[:500]
@@ -2063,6 +2169,43 @@ async def post_mail(
     return message_id
 
 
+def _holder_task(mail: WatchedMail, group: list[WatchedMail]) -> dict[str, Any] | None:
+    """The earlier task a negotiation or order card is about."""
+    if mail.category == ORDER:
+        return next((m.task for m in group if m.task), None)
+    return mail.task
+
+
+async def _holder_away(
+    session: AsyncSession,
+    mail: WatchedMail,
+    group: list[WatchedMail],
+    test_task: MailWatchTestTask | None,
+) -> str | None:
+    """Why the earlier task's holder can't take this card's work, or None.
+    A new task already went to somebody who can (``assign.plan``)."""
+    if test_task is not None:
+        return None
+    task = _holder_task(mail, group)
+    return await away_reason(session, (task or {}).get("assignee_email")) if task else None
+
+
+def _mention_of(
+    task: dict[str, Any] | None, people: dict[str, dict[str, str]], away: str | None
+) -> Mention | None:
+    """The holder, when they can take it; the whole team when they can't."""
+    if not task:
+        return None
+    if away:
+        return Mention(name="team")
+    person = people.get((task.get("assignee_email") or "").lower())
+    if person and person.get("id"):
+        return Mention(
+            name=person.get("displayName") or task.get("assignee") or "", user_id=person["id"]
+        )
+    return None
+
+
 async def _card_of(
     mail: WatchedMail,
     group: list[WatchedMail],
@@ -2070,25 +2213,28 @@ async def _card_of(
     *,
     row: MailWatchTeams,
     poster: TeamsPoster,
-) -> tuple[dict[str, Any], bool]:
-    """The mail's card as it would be posted now, and whether it goes to the
-    test channel only (an order, until that is switched off)."""
+    away: str | None = None,
+) -> tuple[dict[str, Any], bool, Mention | None]:
+    """The mail's card as it would be posted now, whether it goes to the test
+    channel only (an order, until that is switched off), and who its post
+    @mentions: a negotiation's or order's holder, or the team when they can't
+    take it (``away``)."""
     if test_task is not None:
         files = (
             await poster.task_files(mail.task)
             if mail.task and test_task.action in ("stage_change", "match_found") else None
         )
         people = await poster.people([test_task.assigned_to_email or ""])
-        return new_tender_card(mail, test_task, files, people), False
+        return new_tender_card(mail, test_task, files, people), False, None
+    task = _holder_task(mail, group)
+    files = await poster.task_files(task) if task else None
+    people = await poster.people([(task or {}).get("assignee_email") or ""])
+    mention = _mention_of(task, people, away)
     if mail.category == ORDER:
-        task = next((m.task for m in group if m.task), None)
-        files = await poster.task_files(task) if task else None
-        people = await poster.people([(task or {}).get("assignee_email") or ""])
-        return order_card(group[0], merged_order(group), task, files, people), row.orders_test_only
-    files = await poster.task_files(mail.task) if mail.task else None
-    people = await poster.people([(mail.task or {}).get("assignee_email") or ""])
+        card = order_card(group[0], merged_order(group), task, files, people, away=away)
+        return card, row.orders_test_only, mention
     existing = mail.category == NEW_TENDER
-    return negotiation_card(mail, files, people, existing=existing), False
+    return negotiation_card(mail, files, people, existing=existing, away=away), False, mention
 
 
 def is_existing_tender(mail: WatchedMail) -> bool:
@@ -2123,8 +2269,13 @@ async def update_mail(
             raise TeamsError("This new tender has no task assigned any more.")
     elif mail.category == ORDER:
         group = await order_group(session, mail)
-    card, test_only = await _card_of(mail, group, test_task, row=row, poster=poster)
-    await poster.edit(row, mail.teams_message_id, card=card, test_only=test_only)
+    away = await _holder_away(session, mail, group, test_task)
+    card, test_only, mention = await _card_of(
+        mail, group, test_task, row=row, poster=poster, away=away
+    )
+    await poster.edit(
+        row, mail.teams_message_id, card=card, test_only=test_only, mention=mention
+    )
     return mail.teams_message_id
 
 

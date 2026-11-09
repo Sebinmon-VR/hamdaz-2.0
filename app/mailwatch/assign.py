@@ -34,6 +34,7 @@ from app.analytics import publisher as publishing
 from app.ariba.bcd import expected_bcd
 from app.core.config import Settings
 from app.intake.worker import MIRROR_LOCK
+from app.mailwatch.availability import away_reason
 from app.mailwatch.classify import NEW_TENDER
 from app.mailwatch.matching import MATCH_FOUND, NEW, STAGE_CHANGE, UNSURE
 from app.models.mailwatch import MailWatchTeams, MailWatchTestTask, WatchedMail
@@ -359,7 +360,45 @@ async def plan(
     if choice != REAL_LIST:
         task.remarks = "TESTING — " + task.remarks
 
-    if mail.verdict in FOLLOWS_EARLIER:
+    # Whoever had the tender gets it back — unless they can't take it today
+    # (resigned, switched off, on leave): then it goes to the rotation, and
+    # the task says who worked on it before.
+    away = (
+        await away_reason(session, earlier.get("assignee_email"))
+        if mail.verdict in FOLLOWS_EARLIER else None
+    )
+    if mail.verdict in FOLLOWS_EARLIER and away is not None:
+        if not standing:
+            raise AssignError(
+                f"{earlier.get('assignee') or 'The earlier holder'} can't take it ({away}) "
+                f"and nobody in {team.name} is eligible right now."
+            )
+        first = standing[0]
+        old = earlier.get("assignee") or earlier.get("assignee_email") or "the earlier holder"
+        task.assigned_to_name = first["name"]
+        task.assigned_to_email = first["email"]
+        task.assigned_to_lookup_id = first["lookup_id"]
+        task.previous_owner = old
+        task.previous_item_id = mail.matched_item_id
+        task.previous_title = earlier.get("title")
+        task.previous_stage = earlier.get("stage")
+        before = (task.previous_stage or "earlier stage").upper()
+        what = (
+            f"Match found on the list: {task.previous_title or 'an earlier task'} "
+            f"({mail.match_reason or 'same reference'})"
+            if mail.verdict == MATCH_FOUND
+            else f"Follows the {before} of this tender ({task.previous_title or 'its task'})"
+        )
+        task.assign_reason = (
+            f"{what}. {old} worked on it but can't take it ({away}), so it goes to "
+            f"priority 1 in {team.name} by workload ({first['active']} active task"
+            f"{'' if first['active'] == 1 else 's'})."
+        )
+        task.remarks += (
+            f" Previously worked by {old} on {task.previous_title or 'the earlier task'} "
+            f"({before}); reassigned: {away}."
+        )
+    elif mail.verdict in FOLLOWS_EARLIER:
         if not (earlier.get("assignee") or earlier.get("assignee_email")):
             raise AssignError("The earlier task has nobody assigned to hand this to.")
         task.assigned_to_name = earlier.get("assignee")
