@@ -245,6 +245,13 @@ def build(
     sale = _money(request.total_excl_tax)
     total_incl_tax = _money(request.total)
     tax_total = _money(request.tax_total)
+    # The landed cost in AED is converted from the unrounded total, and every
+    # cost-side AED figure (margin, walk-away, ladder) is worked from it, so
+    # each column adds up in its own currency — as Zoho's AED figures do.
+    # Converting a figure rounded to the cent in USD drifted by fils: AED
+    # 3,244.18 for a landed cost that is 3,244.50 (QT-001862).
+    exact = pack.landed.total_exact if pack.landed.total_exact is not None else landed_total
+    landed_fig = Figure(_money(landed_total), _money(exact * rate) if rate else None)
 
     margin = sale - landed_total
     margin_pct = (margin / sale * Decimal(100)) if sale > 0 else None
@@ -263,17 +270,17 @@ def build(
         comfortable = walk_away
 
     lines, total_qty, total_supplier, supplier_currency = _lines(
-        request, pack.landed, fig, rate
+        request, pack.landed, fig, landed_fig.base
     )
     cost_rows = _cost_rows(pack, fig)
-    ladder = _walk_away_ladder(landed_total, sale, walk_away, fig)
-    steps = _negotiation(sale, total_incl_tax, landed_total, walk_away, comfortable, fig)
-    walk_away_price = _price_at_margin(landed_total, walk_away)
+    ladder = _walk_away_ladder(landed_fig, sale, walk_away)
+    steps = _negotiation(sale, total_incl_tax, landed_fig, walk_away, comfortable, fig)
+    walk_away_price = _at_margin(landed_fig, walk_away)
 
     supplier = _supplier(request, supplier_currency)
     suppliers = _suppliers(request, supplier, supplier_currency)
     recommendation = (request.recommendation or "").strip() or _recommend(
-        steps, fig(walk_away_price), currency, comfortable, walk_away
+        steps, walk_away_price, currency, comfortable, walk_away
     )
     notes, warnings = _notes(request, pack, cost_rows, lines, supplier, rate, currency)
 
@@ -299,12 +306,12 @@ def build(
         ),
         supplier=supplier,
         quoted_price=fig(sale),
-        landed_total=fig(landed_total),
-        gross_margin=fig(margin),
+        landed_total=landed_fig,
+        gross_margin=_less(fig(sale), landed_fig),
         gross_margin_percent=_pct(margin_pct),
         walk_away_margin_percent=_pct(walk_away),
         comfortable_margin_percent=_pct(comfortable),
-        walk_away_price=fig(walk_away_price),
+        walk_away_price=walk_away_price,
         lines=lines,
         total_quantity=total_qty,
         total_supplier_amount=total_supplier,
@@ -358,7 +365,28 @@ def _price_at_margin(landed: Decimal, margin_percent: Decimal) -> Decimal:
     return landed / keep
 
 
-def _lines(request, landed, fig, rate):
+def _at_margin(landed: Figure, margin_percent: Decimal) -> Figure:
+    """``_price_at_margin`` on each side: the AED price from the AED landed
+    cost, so a walk-away reads landed ÷ (1 − m) in both columns."""
+    keep = Decimal(1) - margin_percent / Decimal(100)
+    if keep <= 0:
+        return landed
+    return Figure(
+        _money(landed.amount / keep),
+        _money(landed.base / keep) if landed.base is not None else None,
+    )
+
+
+def _less(a: Figure, b: Figure) -> Figure:
+    """a − b on each side, so a margin is the difference of the two figures
+    printed beside it, in both currencies."""
+    return Figure(
+        a.amount - b.amount,
+        a.base - b.base if a.base is not None and b.base is not None else None,
+    )
+
+
+def _lines(request, landed, fig, landed_base):
     """The per-line table, each line at its own landed cost.
 
     A line carries its own charges and its share of the bid's — see
@@ -376,7 +404,6 @@ def _lines(request, landed, fig, rate):
         if i.cost_rate is not None and (i.cost_rate or _ZERO) > 0
     }
     goods = sum(costs.values(), _ZERO)
-    landed_base = _money(landed_total * rate) if rate else None
 
     # Each line's own landed total, converted line by line.
     per_line = {id(i): line for i, line in zip(items, landed.lines, strict=False)}
@@ -502,7 +529,10 @@ def _cost_rows(pack, fig) -> list[CostRow]:
                 label=(
                     f"{element.label} ({_trim(element.percent)}%)" if rated else element.label
                 ),
-                amount=fig(element.amount_base),
+                amount=fig(
+                    element.amount_exact if element.amount_exact is not None
+                    else element.amount_base
+                ),
                 is_estimate=not element.is_firm and not element.computed and not rated,
                 computed=element.computed or rated,
             )
@@ -517,17 +547,17 @@ def _trim(value: Decimal | None) -> str:
     return text.rstrip("0").rstrip(".") if "." in text else text
 
 
-def _walk_away_ladder(landed, sale, walk_away, fig) -> list[WalkAwayRung]:
+def _walk_away_ladder(landed: Figure, sale, walk_away) -> list[WalkAwayRung]:
     """Three rungs around the walk-away: five points either side of it."""
     rungs: list[WalkAwayRung] = []
     for margin in (walk_away + 5, walk_away, walk_away - 5):
         if margin < 0:
             continue
-        price = _price_at_margin(landed, margin)
+        price = _price_at_margin(landed.amount, margin)
         discount = (
             _pct((Decimal(1) - price / sale) * Decimal(100)) if sale > 0 else None
         )
-        rungs.append(WalkAwayRung(_pct(margin), fig(price), discount))
+        rungs.append(WalkAwayRung(_pct(margin), _at_margin(landed, margin), discount))
     return rungs
 
 
@@ -557,14 +587,14 @@ def _negotiation(
         keep = Decimal(1) - discount / Decimal(100)
         sale_d = _money(sale * keep)
         total_d = _money(total_incl_tax * keep)
-        margin = sale_d - landed
+        margin = sale_d - landed.amount
         pct = (margin / sale_d * Decimal(100)) if sale_d > 0 else None
         steps.append(
             NegotiationStep(
                 discount_percent=_pct(discount),
                 total_incl_tax=fig(total_d),
                 selling=fig(sale_d),
-                margin=fig(margin),
+                margin=_less(fig(sale_d), landed),
                 margin_percent=_pct(pct),
                 status=_status(pct, walk_away, comfortable),
             )

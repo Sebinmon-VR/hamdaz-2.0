@@ -592,6 +592,16 @@ _RATE = Decimal("0.0001")
 #: A selling price is quoted to the cent — the number a customer sees, and
 #: the number Zoho multiplies.
 _PRICE = Decimal("0.01")
+#: A cost converted from the supplier's currency keeps the column's four
+#: places. Rounded to the cent per unit, AED 150 became USD 40.84, and the
+#: report's AED column, converted back from that, showed AED 3,149.68 for a
+#: supplier who quoted 3,150.00 (QT-001862). A cost is never typed into Zoho,
+#: so nothing requires the cent; four places convert back to the fils.
+_COST = Decimal("0.0001")
+
+
+def _cost(value: Decimal) -> Decimal:
+    return value.quantize(_COST, rounding=ROUND_HALF_UP)
 
 #: How a selling price is rounded *in the supplier's currency*, before it is
 #: converted: to Zoho's ``price_precision`` for that currency, read from
@@ -618,10 +628,25 @@ def supplier_prices(request: QuoteRequest) -> dict[str, tuple[Decimal, str]]:
     priced from one supplier always has. A line added by hand has no supplier
     price and is left out.
     """
+    by_line = _supplier_prices_by_line(request)
+    return {
+        str(item.id): by_line[id(item)][:2] for item in request.items if id(item) in by_line
+    }
+
+
+#: (their unit price, their currency, the offer's rate: one of theirs in ours).
+_Source = tuple[Decimal, str, Decimal | None]
+
+
+def _supplier_prices_by_line(request: QuoteRequest) -> dict[int, _Source]:
+    """``supplier_prices`` keyed by the line object — a line not yet flushed
+    has no id, and every such line would share one key — with the offer's
+    rate, which the comparison holds even when the quote has lost its own."""
     if request.comparison is None:
         return {}
     quotes = {str(q.id): q for q in request.comparison.quotes}
-    out: dict[str, tuple[Decimal, str]] = {}
+    in_ours = (request.comparison.currency or "").upper() == (request.currency or "").upper()
+    out: dict[int, _Source] = {}
     by_source: dict[str, list[QuoteRequestItem]] = {}
     for item in sorted(request.items, key=lambda i: i.position or 0):
         if item.source_supplier_quote_id is not None:
@@ -637,10 +662,110 @@ def supplier_prices(request: QuoteRequest) -> dict[str, tuple[Decimal, str]]:
             # Priced line by line from several suppliers: only some of this
             # one's rows are on the quote, so each is found by what it is.
             pairs = [(mine, row) for mine in ours if (row := _row_for(mine, theirs)) is not None]
+        offer_rate = quote.fx_rate if in_ours and quote.fx_rate and quote.fx_rate > 0 else None
         for mine, row in pairs:
             if row.unit_price is not None:
-                out[str(mine.id)] = (row.unit_price, quote.currency.upper())
+                out[id(mine)] = (row.unit_price, quote.currency.upper(), offer_rate)
     return out
+
+
+#: Zoho Books' base currency. An item's price in Zoho is in this currency, and
+#: an estimate in any other converts it at Zoho's rate for that currency.
+ZOHO_BASE: Final = "AED"
+#: Zoho states a rate to six places at most ("1 USD = 3.672501 AED").
+_ZOHO_RATE_PLACES = Decimal("0.000001")
+
+
+@dataclass(frozen=True)
+class ZohoPrice:
+    """A selling price built the way Zoho builds it, with its working.
+
+    In Zoho an item is priced in AED, to the fils, and an estimate in USD
+    converts that price at Zoho's rate and rounds it to the cent. So a line
+    bought from an AED supplier on a USD quote is priced in AED: the landed
+    cost there (their price, plus the line's charges converted back at the
+    same rate), the margin on it, rounded to the fils, then converted. Marking
+    up the converted USD cost instead lands a cent a unit away on about a
+    third of prices.
+    """
+
+    unit: Decimal  # the supplier's price, AED
+    currency: str  # theirs: AED
+    fx: Decimal  # 1 of ours in AED, Zoho's rate
+    charges: Decimal  # the line's landing costs per unit, AED
+    landed: Decimal  # unit + charges
+    raw: Decimal  # landed ÷ (1 − margin)
+    sell: Decimal  # raw, to the fils
+    rate: Decimal  # sell ÷ fx, to the cent
+
+
+def _zoho_fx(request: QuoteRequest, theirs: str, offer_rate: Decimal | None) -> Decimal | None:
+    """Zoho's rate for the quote's currency, in AED: the quote's own when it
+    holds one for AED, else the line's offer's ("1 AED = 0.272294 USD", read
+    from Zoho when the offer was added) turned back into Zoho's six places."""
+    own = (request.supplier_currency or "").upper() == theirs
+    if own and request.fx_rate and request.fx_rate > 0:
+        return request.fx_rate
+    if offer_rate and offer_rate > 0 and offer_rate != 1:
+        return (Decimal(1) / offer_rate).quantize(_ZOHO_RATE_PLACES, rounding=ROUND_HALF_UP)
+    return None
+
+
+def zoho_fx_for(request: QuoteRequest) -> dict[str, Decimal]:
+    """By line id, the rate a line is priced at in Zoho's order — for the
+    editor, which prices the same way as a margin is typed."""
+    sources = _supplier_prices_by_line(request)
+    ours = (request.currency or "").upper()
+    out: dict[str, Decimal] = {}
+    for item in request.items:
+        found = sources.get(id(item))
+        if found is None or found[1] != ZOHO_BASE or ours == ZOHO_BASE:
+            continue
+        fx = _zoho_fx(request, found[1], found[2])
+        if fx is not None:
+            out[str(item.id)] = fx
+    return out
+
+
+def zoho_price(
+    request: QuoteRequest,
+    item: QuoteRequestItem,
+    landed_each: Decimal | None,
+    margin_percent: Decimal,
+    *,
+    sources: dict[int, _Source] | None = None,
+) -> ZohoPrice | None:
+    """The line's price in Zoho's order, or ``None`` when the line is priced
+    on its cost in the quote's currency instead.
+
+    Only for a line bought in AED on a quote in another currency, still at its
+    supplier's price: a cost changed by hand since is the figure the person
+    meant, and the price is built on it. A line from a supplier in any other
+    currency has no Zoho item price to convert, and is priced on its cost.
+    """
+    if margin_percent >= Decimal(100) or item.cost_rate is None or item.cost_rate <= 0:
+        return None
+    found = (sources if sources is not None else _supplier_prices_by_line(request)).get(id(item))
+    if found is None:
+        return None
+    unit, theirs, offer_rate = found
+    ours = (request.currency or "").upper()
+    if theirs != ZOHO_BASE or ours == ZOHO_BASE:
+        return None
+    fx = _zoho_fx(request, theirs, offer_rate)
+    # Still the supplier's price, converted: to four places now, to the cent
+    # on a quote costed before that changed.
+    if fx is None or item.cost_rate not in (
+        _cost(unit / fx),
+        (unit / fx).quantize(_PRICE, rounding=ROUND_HALF_UP),
+    ):
+        return None
+    charges = ((landed_each or item.cost_rate) - item.cost_rate) * fx
+    landed = unit + charges
+    raw = sell_at(landed, margin_percent)
+    sell = raw.quantize(sell_step(theirs), rounding=ROUND_HALF_UP)
+    rate = (sell / fx).quantize(sell_step(ours), rounding=ROUND_HALF_UP)
+    return ZohoPrice(unit, theirs, fx, charges, landed, raw, sell, rate)
 
 
 def _row_for(item: QuoteRequestItem, rows: list[SupplierQuoteItem]) -> SupplierQuoteItem | None:
@@ -973,7 +1098,7 @@ def convert_figures(
         if source_sell_step != _CENT:
             source_rate = source_rate.quantize(source_sell_step, rounding=ROUND_HALF_UP)
         item.rate = money(source_rate) or Decimal(0)
-        item.cost_rate = money(item.cost_rate)
+        item.cost_rate = _cost(item.cost_rate * factor) if item.cost_rate is not None else None
         item.discount = money(item.discount) or Decimal(0)
     request.discount = money(request.discount) or Decimal(0)
     request.shipping_charge = money(request.shipping_charge) or Decimal(0)
@@ -1157,7 +1282,10 @@ def restate_at_offer_rate(
     )
     if first is not None:
         line, item = first
-        if (item.unit_price * now).quantize(_PRICE, rounding=ROUND_HALF_UP) == line.cost_rate:
+        if line.cost_rate in (
+            _cost(item.unit_price * now),
+            (item.unit_price * now).quantize(_PRICE, rounding=ROUND_HALF_UP),
+        ):
             return False
         was = line.cost_rate / item.unit_price
     elif not was or was <= 0 or was == now:
@@ -1169,7 +1297,7 @@ def restate_at_offer_rate(
         # Their own price times the rate where the lines still pair up; the
         # old cost rescaled where they do not.
         cost = unit * now if unit is not None else item.cost_rate * now / was
-        item.cost_rate = cost.quantize(_PRICE, rounding=ROUND_HALF_UP)
+        item.cost_rate = _cost(cost)
     suffix = f"– {quote.supplier_name}"
     for row in request.cost_lines:
         if row.basis != "Supplier quotation" or not (row.label or "").endswith(suffix):
@@ -1203,9 +1331,11 @@ def reprice_at_margin(request: QuoteRequest, margin_percent: Decimal) -> int:
 
         selling price = landed cost ÷ (1 − margin)
 
-    rounded the way Zoho rounds an item price in the quote's currency. Costs
-    are untouched; only selling rates move, and a line with no cost keeps the
-    price somebody typed. Returns how many lines were priced.
+    rounded the way Zoho rounds an item price in the quote's currency. A line
+    still at its foreign supplier's price is priced in Zoho's order instead —
+    see ``zoho_price``. Costs are untouched; only selling rates move, and a
+    line with no cost keeps the price somebody typed. Returns how many lines
+    were priced.
     """
     # Built on the models, not on this module, so the import is safe; local
     # because bidpack is the heavier half and most callers never need it.
@@ -1223,12 +1353,20 @@ def reprice_at_margin(request: QuoteRequest, margin_percent: Decimal) -> int:
     # is per unit of it, prices that line and no other.
     landed = bidpack.landed_cost(request)
     step = sell_step(request.currency)
+    sources = _supplier_prices_by_line(request)
     priced = 0
     for index, item in enumerate(sorted(request.items, key=lambda i: i.position or 0)):
         if item.cost_rate is None or item.cost_rate <= 0:
             continue
         each = landed.lines[index].each or item.cost_rate * landed.uplift
-        item.rate = sell_at(each, margin_percent).quantize(step, rounding=ROUND_HALF_UP)
+        # Zoho's order where the line is still at its supplier's price: the
+        # margin in their currency, rounded there, then converted.
+        zoho = zoho_price(request, item, each, margin_percent, sources=sources)
+        item.rate = (
+            zoho.rate
+            if zoho is not None
+            else sell_at(each, margin_percent).quantize(step, rounding=ROUND_HALF_UP)
+        )
         priced += 1
     return priced
 
@@ -1268,7 +1406,7 @@ def _line_from(
     sell_theirs = sell_at(unit, margin_percent).quantize(
         sell_step(quote.currency), rounding=ROUND_HALF_UP
     )
-    cost = (unit / fx).quantize(_PRICE, rounding=ROUND_HALF_UP)
+    cost = _cost(unit / fx)
     name = (item.description or "").strip() or "Unnamed line"
     return {
         "name": name[:_NAME_LIMIT],

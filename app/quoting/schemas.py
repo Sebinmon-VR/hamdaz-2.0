@@ -291,6 +291,10 @@ class ItemOut(ItemIn):
     #: line typed by hand. Set by the router, not read off the row.
     supplier_unit_price: Decimal | None = None
     supplier_currency: str | None = None
+    #: Zoho's rate for the quote's currency in AED ("3.672501") when this line
+    #: is priced in Zoho's order — bought in AED on a quote in another
+    #: currency; null otherwise. See ``service.zoho_price``.
+    zoho_fx: Decimal | None = None
 
 
 class ReviewOut(BaseModel):

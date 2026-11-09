@@ -16,7 +16,7 @@ from decimal import ROUND_HALF_UP, Decimal
 
 from app.models.quoting import QuoteRequest
 from app.quoting.bidpack import BidPack
-from app.quoting.service import sell_at, sell_step, supplier_prices
+from app.quoting.service import sell_step, zoho_price
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,35 +70,33 @@ def steps(request: QuoteRequest, pack: BidPack) -> list[Step]:  # noqa: C901
         ))
 
     # ── the lines ───────────────────────────────────────────────────
-    sources = supplier_prices(request)
     ordered = sorted(request.items, key=lambda i: i.position or 0)
     lines = {id(i): line for i, line in zip(ordered, pack.landed.lines, strict=False)}
+    margin = request.target_markup_percent
     for item in request.items:
         qty = item.quantity or Decimal(0)
         rate = item.rate or Decimal(0)
         parts: list[str] = []
-        source = sources.get(str(item.id))
-        margin = request.target_markup_percent
-        if (
-            source is not None
-            and margin is not None
-            and margin < Decimal(100)
-            and source[1] != cur
-        ):
-            # Zoho's order, spelled out: price in their currency — cost ÷
-            # (1 − margin) — round there the way Zoho's item price is rounded,
-            # then convert.
-            unit, theirs = source
-            raw = sell_at(unit, margin)
-            step = sell_step(theirs)
-            rounded = raw.quantize(step, rounding=ROUND_HALF_UP)
-            rounding = (
-                f" → {_n(rounded, 0)} (whole {theirs}, Zoho's precision for it)"
-                if step == Decimal(1) and rounded != raw else ""
+        line = lines.get(id(item))
+        zoho = (
+            zoho_price(request, item, line.each if line else None, margin)
+            if margin is not None
+            else None
+        )
+        if zoho is not None and zoho.rate == rate:
+            # Zoho's order, spelled out: the landed cost in their currency,
+            # the margin on it there, rounded to Zoho's precision for their
+            # currency, then converted and rounded to the cent.
+            landed = (
+                f"{zoho.currency} {_n(zoho.unit)} + {_n(zoho.charges)} charges each "
+                f"= {_n(zoho.landed)} landed "
+                if zoho.charges
+                else f"{zoho.currency} {_n(zoho.unit)} "
             )
             parts.append(
-                f"{theirs} {_n(unit)} ÷ (1 − {_n(margin)}% margin) = {_n(raw)}{rounding}"
-                f" ÷ {fx if fx else '?'} = {_price(rate)} each"
+                f"{landed}÷ (1 − {_n(margin)}% margin) = {_n(zoho.raw, 4)} → "
+                f"{_n(zoho.sell, 0 if sell_step(zoho.currency) == 1 else 2)} {zoho.currency}, "
+                f"÷ {zoho.fx} = {_price(rate)} each, as Zoho converts it"
             )
         elif item.cost_rate is not None and item.cost_rate > 0:
             # The stored cost, not a source figure worked backwards from it:
@@ -111,7 +109,6 @@ def steps(request: QuoteRequest, pack: BidPack) -> list[Step]:  # noqa: C901
             # bid's in proportion to what it cost. The price is built on this,
             # so the margin typed is the gross margin.
             landed_each = item.cost_rate
-            line = lines.get(id(item))
             if line is not None and line.each is not None and line.each != item.cost_rate:
                 landed_each = line.each
                 if any(part.own for part in line.parts) or line.uplift is None:
@@ -133,8 +130,8 @@ def steps(request: QuoteRequest, pack: BidPack) -> list[Step]:  # noqa: C901
                     f"each, to the cent"
                 )
             elif rate > 0:
-                margin = (rate - landed_each) / rate * Decimal(100)
-                parts.append(f"÷ (1 − {_n(margin)}% margin) = {_price(rate)} each")
+                implied = (rate - landed_each) / rate * Decimal(100)
+                parts.append(f"÷ (1 − {_n(implied)}% margin) = {_price(rate)} each")
             else:
                 parts.append(f"= {_price(rate)} each")
         else:

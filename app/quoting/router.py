@@ -241,10 +241,12 @@ async def _out(
     # way it was built — in the supplier's currency first — when the margin is
     # retyped, rather than marking up a converted cost and drifting a cent.
     sources = service.supplier_prices(request)
+    zoho_fx = service.zoho_fx_for(request)
     for out in body.items:
         found = sources.get(str(out.id))
         if found is not None:
             out.supplier_unit_price, out.supplier_currency = found
+        out.zoho_fx = zoho_fx.get(str(out.id))
 
     # The automatic reading of import / export beside what the person said,
     # so the form can show "we read this as an import, because…" next to the

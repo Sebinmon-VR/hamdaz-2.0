@@ -147,6 +147,10 @@ class CostElement:
     #: The line a stored row is charged to, by position; null when it is the
     #: whole bid's and is shared across the lines by value.
     line_position: int | None = None
+    #: ``amount_base`` before it was rounded to the cent. The report converts
+    #: this, not the rounded figure, so the AED column lands on the supplier's
+    #: own fils (AED 3,150.00, not 3,149.68 or 3,150.01).
+    amount_exact: Decimal | None = None
     #: Stated per unit of that line. ``amount_base`` and ``amount_source`` are
     #: then the line's total — the figure × ``quantity``.
     per_unit: bool = False
@@ -234,6 +238,8 @@ class LandedCost:
     #: lines are priced on: they add up to ``total`` whenever there are goods
     #: to share the bid's own charges over.
     lines: list[LineLanded] = field(default_factory=list)
+    #: ``total`` before it was rounded — what the report converts to AED.
+    total_exact: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -408,6 +414,7 @@ def landed_cost(request: QuoteRequest) -> LandedCost:
             amount_source=(goods * fx).quantize(Decimal("0.01")) if fx else None,
             source_currency=request.supplier_currency if fx else None,
             amount_base=_money(goods),
+            amount_exact=goods,
             is_principal=True,
             is_firm=request.selected_supplier_quote_id is not None,
             computed=True,
@@ -462,6 +469,7 @@ def landed_cost(request: QuoteRequest) -> LandedCost:
                 ),
                 source_currency=None if rated else row.source_currency,
                 amount_base=_money(origin_amounts[id(row)]),
+                amount_exact=origin_amounts[id(row)],
                 # Coerced rather than passed through. A column default is
                 # applied by the database at insert, so a row added in this
                 # session and not yet flushed reads ``None`` here — and the
@@ -496,6 +504,7 @@ def landed_cost(request: QuoteRequest) -> LandedCost:
                     and request.freight_currency.upper() != currency.upper() else None
                 ),
                 amount_base=_money(manual_freight),
+                amount_exact=manual_freight,
                 is_principal=False,
                 is_firm=True,
                 computed=False,
@@ -539,6 +548,7 @@ def landed_cost(request: QuoteRequest) -> LandedCost:
                 amount_source=request.duty_charges if foreign else None,
                 source_currency=request.freight_currency.upper() if foreign else None,
                 amount_base=_money(duty),
+                amount_exact=duty,
                 is_principal=False,
                 is_firm=entered,
                 computed=not entered,
@@ -564,6 +574,7 @@ def landed_cost(request: QuoteRequest) -> LandedCost:
                 amount_source=request.documentation_charges if foreign else None,
                 source_currency=request.freight_currency.upper() if foreign else None,
                 amount_base=_money(documentation),
+                amount_exact=documentation,
                 is_principal=False,
                 is_firm=True,
                 computed=False,
@@ -597,6 +608,7 @@ def landed_cost(request: QuoteRequest) -> LandedCost:
                 amount_source=None,
                 source_currency=None,
                 amount_base=_money(financing),
+                amount_exact=financing,
                 is_principal=False,
                 is_firm=False,
                 computed=True,
@@ -638,6 +650,7 @@ def landed_cost(request: QuoteRequest) -> LandedCost:
                 ),
                 source_currency=None if rated else row.source_currency,
                 amount_base=_money(destination_amounts[id(row)]),
+                amount_exact=destination_amounts[id(row)],
                 is_principal=bool(row.is_principal),
                 is_firm=bool(row.is_firm),
                 computed=False,
@@ -677,6 +690,7 @@ def landed_cost(request: QuoteRequest) -> LandedCost:
         financing_cost=_money(financing),
         destination_subtotal=_money(destination_total),
         total=_money(total),
+        total_exact=total,
         quantity=quantity,
         per_unit=per_unit,
         per_unit_note=note,
