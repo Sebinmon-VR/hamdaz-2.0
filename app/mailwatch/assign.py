@@ -35,7 +35,7 @@ from app.ariba.bcd import expected_bcd
 from app.core.config import Settings
 from app.intake.worker import MIRROR_LOCK
 from app.mailwatch.classify import NEW_TENDER
-from app.mailwatch.matching import NEW, STAGE_CHANGE, UNSURE
+from app.mailwatch.matching import MATCH_FOUND, NEW, STAGE_CHANGE, UNSURE
 from app.models.mailwatch import MailWatchTeams, MailWatchTestTask, WatchedMail
 from app.models.proposal_index import ProposalIndexItem
 from app.models.team import Team
@@ -116,13 +116,17 @@ def wanted(mail: WatchedMail) -> bool:
         return False
     if mail.verdict == UNSURE:
         return mail.match_method == UNSURE_METHOD and mail.duplicate_of_id is None
-    return mail.verdict in (NEW, STAGE_CHANGE)
+    return mail.verdict in (NEW, STAGE_CHANGE, MATCH_FOUND)
+
+
+#: Verdicts handed to whoever had the matched task, as they know it.
+FOLLOWS_EARLIER: Final = (STAGE_CHANGE, MATCH_FOUND)
 
 
 def _wanted_clause():
     """:func:`wanted` as a query condition (the category aside)."""
     return or_(
-        WatchedMail.verdict.in_((NEW, STAGE_CHANGE)),
+        WatchedMail.verdict.in_((NEW, STAGE_CHANGE, MATCH_FOUND)),
         and_(
             WatchedMail.verdict == UNSURE,
             WatchedMail.match_method == UNSURE_METHOD,
@@ -355,7 +359,7 @@ async def plan(
     if choice != REAL_LIST:
         task.remarks = "TESTING — " + task.remarks
 
-    if mail.verdict == STAGE_CHANGE:
+    if mail.verdict in FOLLOWS_EARLIER:
         if not (earlier.get("assignee") or earlier.get("assignee_email")):
             raise AssignError("The earlier task has nobody assigned to hand this to.")
         task.assigned_to_name = earlier.get("assignee")
@@ -367,11 +371,18 @@ async def plan(
         task.previous_title = earlier.get("title")
         task.previous_stage = earlier.get("stage")
         before = (task.previous_stage or "earlier stage").upper()
-        task.assign_reason = (
-            f"Worked on the {before} of this tender ({task.previous_title or 'its task'}), "
-            f"now at {(mail.stage or '').upper() or 'a later stage'}."
-        )
-        task.remarks += f" Follows {task.previous_title or 'the earlier task'} ({before})."
+        if mail.verdict == MATCH_FOUND:
+            task.assign_reason = (
+                f"Match found on the list: {task.previous_title or 'an earlier task'} "
+                f"({mail.match_reason or 'same reference'}). Assigned to whoever had it."
+            )
+            task.remarks += f" Match found: {task.previous_title or 'an earlier task'}."
+        else:
+            task.assign_reason = (
+                f"Worked on the {before} of this tender ({task.previous_title or 'its task'}), "
+                f"now at {(mail.stage or '').upper() or 'a later stage'}."
+            )
+            task.remarks += f" Follows {task.previous_title or 'the earlier task'} ({before})."
     else:
         if not standing:
             raise AssignError(f"Nobody in {team.name} is eligible for a new task right now.")

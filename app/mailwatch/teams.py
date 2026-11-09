@@ -73,6 +73,7 @@ from app.mailwatch.classify import (
     Order,
     read_order,
 )
+from app.mailwatch.matching import EXISTING
 from app.models.mailwatch import MailWatchTeams, MailWatchTestTask, WatchedMail
 from app.proposals.sharepoint import SharePointConsentError, SharePointError, SharePointProposals
 from app.quoting.storage import DriveError, QuoteDrive, safe_file_name
@@ -122,6 +123,9 @@ PURPOSE: Final = "teams"
 
 #: A mail that failed this many times is left alone; the page shows why.
 MAX_ATTEMPTS: Final = 3
+#: "Already on the list" cards start here. Without it, switching them on would
+#: post every existing-match tender since assigning was switched on.
+EXISTING_CARDS_FROM: Final = datetime(2026, 11, 9, 7, 0, tzinfo=UTC)
 
 #: An unused connection is renewed after this; Microsoft's limit is 90 days.
 KEEP_ALIVE_AFTER: Final = timedelta(days=7)
@@ -1053,11 +1057,16 @@ def negotiation_card(
     mail: WatchedMail,
     files: TaskFiles | None = None,
     people: dict[str, dict[str, str]] | None = None,
+    *,
+    existing: bool = False,
 ) -> dict[str, Any]:
-    """The card, with as many files as fit under Teams' size limit."""
+    """The card, with as many files as fit under Teams' size limit.
+
+    ``existing``: the same card for a new-tender mail whose tender is already
+    on the list — no task is made, and the card says the match was found."""
     shown = FILE_ROWS
     while True:
-        card = _negotiation_card(mail, files, people, shown)
+        card = _negotiation_card(mail, files, people, shown, existing=existing)
         if shown == 0 or len(json.dumps(card, ensure_ascii=False)) <= CARD_BYTES:
             return card
         shown -= 1
@@ -1068,6 +1077,8 @@ def _negotiation_card(
     files: TaskFiles | None,
     people: dict[str, dict[str, str]] | None,
     shown: int,
+    *,
+    existing: bool = False,
 ) -> dict[str, Any]:
     """The Teams post for a negotiation. On top the customer, a badge, and the
     facts that matter (who has it, quote, status, BCD); then how far the
@@ -1079,6 +1090,13 @@ def _negotiation_card(
     note, ask, amounts = ask_of(mail.body)
     refs = " · ".join(mail.reference_numbers) or "no reference"
     customer = _v(mail.customer or task.get("customer"))
+    if existing:
+        stage = (mail.stage or "").upper() or "Tender"
+        kind_line = f"{stage} came again · {refs}"
+        badge = _badge("Already on the list", icon="History", style="Warning")
+    else:
+        kind_line = f"Negotiation · {refs}"
+        badge = _badge("Negotiation", icon="ArrowSwap", style="Accent")
 
     body: list[dict[str, Any]] = [
         *_testing_note("Posted to the test channel only; nothing is written anywhere."),
@@ -1089,17 +1107,29 @@ def _negotiation_card(
                     "type": "Column", "width": "stretch",
                     "items": [
                         _text(customer, size="Large", weight="Bolder"),
-                        _caption(f"Negotiation · {refs}", spacing="None"),
+                        _caption(kind_line, spacing="None"),
                     ],
                 },
                 {
                     "type": "Column", "width": "auto", "targetWidth": WIDE,
-                    "items": [_badge("Negotiation", icon="ArrowSwap", style="Accent")],
+                    "items": [badge],
                 },
             ],
         },
-        {**_badge("Negotiation", icon="ArrowSwap", style="Accent"), "targetWidth": NARROW},
+        {**badge, "targetWidth": NARROW},
     ]
+    if existing:
+        body.append({
+            "type": "Container", "style": "good", "spacing": "Medium",
+            "items": [
+                _with_icon(
+                    _icon("CheckmarkCircle", color="Good"),
+                    _text("Existing match found: this tender is already on the Proposals "
+                          "list. No new task was created.", weight="Bolder"),
+                ),
+                _caption(f"Matched by {mail.match_reason or 'reference'}.", size="Small"),
+            ],
+        })
 
     if task:
         submitted = "submit" in (task.get("submission_status") or "").lower()
@@ -1133,8 +1163,9 @@ def _negotiation_card(
                 "type": "Container", "style": "attention", "spacing": "Medium",
                 "items": [_with_icon(
                     _icon("Warning", color="Attention"),
-                    _text("No task found on the Proposals list for this negotiation — please "
-                          "check which task it belongs to.", weight="Bolder"),
+                    _text("No task found on the Proposals list for this "
+                          + ("tender" if existing else "negotiation")
+                          + " — please check which task it belongs to.", weight="Bolder"),
                 )],
             }
         )
@@ -1150,7 +1181,8 @@ def _negotiation_card(
                     "type": "Column", "width": "stretch", "spacing": "Small",
                     "items": [
                         _text(customer, weight="Bolder"),
-                        _caption(f"Customer message · {when} UTC", size="Small", spacing="None"),
+                        _caption(f"{'Tender mail' if existing else 'Customer message'} · "
+                                 f"{when} UTC", size="Small", spacing="None"),
                     ],
                 },
                 {"type": "Column", "width": "auto", "verticalContentAlignment": "Center",
@@ -1158,7 +1190,12 @@ def _negotiation_card(
             ],
         }
     )
-    message = f"“{ask}”" if ask else "The mail had no message text."
+    if existing:
+        # An Ariba invitation's body is boilerplate; the tender is its title.
+        ask, amounts = None, []
+        message = _v(mail.title or mail.subject)
+    else:
+        message = f"“{ask}”" if ask else "The mail had no message text."
     body += [
         _text(message, id="ask-short", maxLines=3, isSubtle=not ask),
         _text(message, id="ask-full", isVisible=False, isSubtle=not ask),
@@ -1273,14 +1310,18 @@ def _new_tender_card(
     files = files or TaskFiles()
     people = people or {}
     earlier = mail.task or {}
-    staged = task.action == "stage_change"
+    found = task.action == "match_found"
+    # A match found is shown as a stage change is: the earlier task and its files.
+    staged = task.action == "stage_change" or found
     customer = _v(mail.customer or task.end_user)
     refs = " · ".join([*mail.reference_numbers, *([mail.ariba_doc] if mail.ariba_doc else [])])
     stage = (mail.stage or "").upper() or "Tender"
     badge = (
         _badge(f"{(task.previous_stage or '?').upper()} → {stage}", icon="ArrowUp",
                style="Warning")
-        if staged else _badge("New task", icon="AddCircle", style="Good")
+        if staged and not found else
+        _badge("New task · match found", icon="AddCircle", style="Good")
+        if found else _badge("New task", icon="AddCircle", style="Good")
     )
 
     body: list[dict[str, Any]] = [
@@ -1317,7 +1358,9 @@ def _new_tender_card(
          )]
         if countdown and task.bcd else [_text("Not given", isSubtle=True, spacing="None")]
     )
-    why = f"Had the {(task.previous_stage or 'earlier stage').upper()}" if staged else (
+    why = "Had the matched task" if found else (
+        f"Had the {(task.previous_stage or 'earlier stage').upper()}"
+    ) if staged else (
         "Priority 1 in Presale"
     )
     why_items = [_with_icon(
@@ -1997,7 +2040,7 @@ async def post_mail(
     group: list[WatchedMail] = [mail]
     if mail.category == NEW_TENDER:
         test_task = await assign.test_task_of(session, mail)
-        if test_task is None:
+        if test_task is None and not is_existing_tender(mail):
             raise TeamsError("This new tender has no task assigned yet.")
     elif mail.category == ORDER:
         if mail.kind not in ORDER_KINDS:
@@ -2033,7 +2076,7 @@ async def _card_of(
     if test_task is not None:
         files = (
             await poster.task_files(mail.task)
-            if mail.task and test_task.action == "stage_change" else None
+            if mail.task and test_task.action in ("stage_change", "match_found") else None
         )
         people = await poster.people([test_task.assigned_to_email or ""])
         return new_tender_card(mail, test_task, files, people), False
@@ -2044,7 +2087,20 @@ async def _card_of(
         return order_card(group[0], merged_order(group), task, files, people), row.orders_test_only
     files = await poster.task_files(mail.task) if mail.task else None
     people = await poster.people([(mail.task or {}).get("assignee_email") or ""])
-    return negotiation_card(mail, files, people), False
+    existing = mail.category == NEW_TENDER
+    return negotiation_card(mail, files, people, existing=existing), False
+
+
+def is_existing_tender(mail: WatchedMail) -> bool:
+    """A new-tender mail whose tender is already on the list, and the first
+    mail about it — reminders and updates for the same event are not posted
+    again (``duplicate_of_id`` names the earlier mail)."""
+    return (
+        mail.category == NEW_TENDER
+        and mail.verdict == EXISTING
+        and bool(mail.matched_item_id)
+        and mail.duplicate_of_id is None
+    )
 
 
 async def update_mail(
@@ -2063,7 +2119,7 @@ async def update_mail(
     group: list[WatchedMail] = [mail]
     if mail.category == NEW_TENDER:
         test_task = await assign.test_task_of(session, mail)
-        if test_task is None:
+        if test_task is None and not is_existing_tender(mail):
             raise TeamsError("This new tender has no task assigned any more.")
     elif mail.category == ORDER:
         group = await order_group(session, mail)
@@ -2103,6 +2159,15 @@ async def post_pending(session: AsyncSession, *, poster: TeamsPoster, settings: 
             WatchedMail.category == NEW_TENDER,
             WatchedMail.received_at >= row.assign_from,
             WatchedMail.id.in_(select(MailWatchTestTask.mail_id)),
+        ))
+        # Already on the list: a card saying the match was found, no task.
+        due.append(and_(
+            WatchedMail.category == NEW_TENDER,
+            WatchedMail.received_at >= row.assign_from,
+            WatchedMail.received_at >= EXISTING_CARDS_FROM,
+            WatchedMail.verdict == EXISTING,
+            WatchedMail.matched_item_id.is_not(None),
+            WatchedMail.duplicate_of_id.is_(None),
         ))
     if row.post_orders and row.orders_from is not None:
         due.append(and_(

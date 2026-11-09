@@ -59,6 +59,11 @@ STAGE_CHANGE: Final = "stage_change"
 DUPLICATE_MAIL: Final = "duplicate_mail"
 NOT_FOUND: Final = "not_found"
 UNSURE: Final = "unsure"
+#: Match found, but maybe a new tender: the mail names a tender number no task
+#: carries, yet a task matched by its PR number or title (a re-issued event on
+#: the same PR, say). Handled like a stage change — a new task, to whoever had
+#: the matched one — and the card says the match was found.
+MATCH_FOUND: Final = "match_found"
 
 #: Title scores: at or above SURE it is the task; below LIKELY it is not.
 SURE: Final = 0.85
@@ -444,6 +449,7 @@ async def match(
         tender_numbers=tender_numbers, exclude_id=mail_id, before=received_at,
     )
     found: Match | None = None
+    by_tender_number = False
     if earlier is not None and earlier.matched_item_id:
         found = Match(
             verdict=EXISTING, method="earlier_mail", item_id=earlier.matched_item_id, score=1.0,
@@ -458,6 +464,7 @@ async def match(
         if not rows:
             which, rows = "order number", await by_number(session, po_numbers, as_of=as_of)
         if rows:
+            by_tender_number = which == "tender number"
             candidates = [_candidate(r, 1.0, f"same {which}") for r in rows[:5]]
             found = Match(
                 verdict=EXISTING, method="reference", item_id=rows[0].item_id, score=1.0,
@@ -536,8 +543,18 @@ async def match(
         if stage and theirs and STAGE_RANK.get(stage, -1) > STAGE_RANK.get(theirs, 99):
             found.verdict = STAGE_CHANGE
             found.reason += f"; the task is at {theirs.upper()}, this mail is {stage.upper()}"
+    # The mail's own tender number is on no task, yet one matched another way:
+    # possibly a new tender, so a task is made for whoever had the match.
+    if (
+        found.verdict == EXISTING
+        and tender_numbers
+        and not by_tender_number
+        and found.method != "earlier_mail"
+    ):
+        found.verdict = MATCH_FOUND
+        found.reason += "; this mail's tender number is on no task, so it may be a new tender"
     # Unsure too: the first mail's tender was assigned as new, so this is its repeat.
-    if found.verdict in (NEW, UNSURE) and earlier is not None:
+    if found.verdict in (NEW, UNSURE, MATCH_FOUND) and earlier is not None:
         found.verdict = DUPLICATE_MAIL
         found.duplicate_of_id = earlier.id
         found.reason = "no task yet, but an earlier mail brought the same tender"
