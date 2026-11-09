@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.access.catalogue import ACCESS_ADMINS, MODULES
-from app.roles.catalogue import ADMIN_ROLES
+from app.roles.catalogue import ADMIN_ROLES, ROLE_MODULES
 from app.models.access import Module, ModulePage, TeamModuleAccess, TeamPageAccess
 from app.models.role import Role
 from app.models.team import Team, TeamMembership
@@ -295,7 +295,17 @@ async def effective_access(
             )
         ).all()
     )
-    if not team_ids:
+    # Pages a global role opens on its own (see ROLE_MODULES), merged with the
+    # team grants below; the wider of the two wins, as between two teams.
+    by_role: dict[str, set[str] | None] = {}
+    for role_key in roles:
+        for module_key, pages in ROLE_MODULES.get(role_key, {}).items():
+            if pages is None or by_role.get(module_key, set()) is None:
+                by_role[module_key] = None
+            else:
+                by_role.setdefault(module_key, set()).update(pages)
+
+    if not team_ids and not by_role:
         return {"source": "teams", "modules": [], "via_teams": []}
 
     grants = list(
@@ -369,6 +379,15 @@ async def effective_access(
         current = by_module[module.key]
         if current is not None:
             current |= chosen
+
+    for module_key, pages in by_role.items():
+        if pages is None or by_module.get(module_key, "missing") is None:
+            by_module[module_key] = None
+        else:
+            by_module.setdefault(module_key, set())
+            current = by_module[module_key]
+            if current is not None:
+                current |= pages
 
     catalogue = {m.key: m for m in modules}
     out = []

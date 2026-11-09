@@ -103,6 +103,7 @@ from app.quoting.schemas import (
     ItemOut,
     LineChoiceIn,
     MailboxMessageOut,
+    NamedApproverOut,
     NegotiationIn,
     QuotableTaskOut,
     QuotableTasksOut,
@@ -453,7 +454,12 @@ async def _approval_settings_out(session: AsyncSession, row) -> ApprovalSettings
             )
         )
     updated_by = await session.get(User, row.updated_by_id) if row.updated_by_id else None
+    named = await service.named_approvers(session)
     return ApprovalSettingsOut(
+        named_approver_ids=[u.id for u in named],
+        named_approvers=[
+            NamedApproverOut(user_id=u.id, name=u.display_name, email=u.email) for u in named
+        ],
         notify_team_approvers=row.notify_team_approvers,
         notify_team_managers=row.notify_team_managers,
         notify_managers=row.notify_managers,
@@ -500,6 +506,11 @@ async def update_approval_settings(
     row.notify_super_admins = payload.notify_super_admins
     row.extra_emails = emails
     row.updated_by_id = user.id
+    if payload.named_approver_ids is not None:
+        try:
+            await service.set_named_approvers(session, payload.named_approver_ids, actor=user)
+        except QuoteError as exc:
+            raise _translate(exc) from exc
     await session.flush()
     logger.info("approval mail settings changed by %s", user.email)
     return await _approval_settings_out(session, row)

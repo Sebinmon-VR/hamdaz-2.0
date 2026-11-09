@@ -532,6 +532,16 @@ class ApprovalSettingsIn(BaseModel):
     notify_ceo: bool = False
     notify_super_admins: bool = False
     extra_emails: list[str] = Field(default_factory=list, max_length=20)
+    #: The named approvers, as the whole list. Omitted (None) leaves them as
+    #: they are, so a save from a screen that does not know about them cannot
+    #: quietly remove everybody.
+    named_approver_ids: list[uuid.UUID] | None = Field(default=None, max_length=50)
+
+
+class NamedApproverOut(BaseModel):
+    user_id: uuid.UUID
+    name: str
+    email: str
 
 
 class ApprovalRecipientsOut(BaseModel):
@@ -547,6 +557,8 @@ class ApprovalSettingsOut(ApprovalSettingsIn):
     updated_by_name: str | None = None
     #: Per team, because the team's own approvers and managers differ.
     preview: list[ApprovalRecipientsOut] = Field(default_factory=list)
+    #: Specific people who may open and decide any team's quote.
+    named_approvers: list[NamedApproverOut] = Field(default_factory=list)
 
 
 class SupplierDetailsOut(BaseModel):

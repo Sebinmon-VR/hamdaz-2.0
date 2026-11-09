@@ -68,7 +68,7 @@ from app.models.team import Team, TeamMembership
 from app.models.user import User
 from app.quoting import bidpack, costing
 from app.quoting.fx import FxQuote, FxUnavailableError
-from app.roles.catalogue import SUPER_ADMIN
+from app.roles.catalogue import QUOTE_APPROVER, SUPER_ADMIN
 
 logger = logging.getLogger("hamdaz.quoting")
 
@@ -82,6 +82,10 @@ GLOBAL_APPROVERS = frozenset({"super_admin", "ceo", "manager"})
 #: is given deliberately — ``approver`` is the role that exists to say so — or
 #: it comes with managing the team. A plain ``member`` never had it.
 TEAM_APPROVERS = frozenset({"approver", "team_manager"})
+#: Named approvers: specific people, in any team, picked in the approval
+#: settings. They decide any team's quote and see what is waiting — but are not
+#: auditors of every draft, so they are deliberately not in GLOBAL_APPROVERS.
+NAMED_APPROVER = QUOTE_APPROVER
 
 
 class QuoteError(Exception):
@@ -120,11 +124,14 @@ async def may_approve(
         return False, "You cannot approve a quote you raised yourself."
     if roles & GLOBAL_APPROVERS:
         return True, "Approves anywhere."
+    if NAMED_APPROVER in roles:
+        return True, "A named quote approver."
     held = await team_role_keys(session, team_id=request.team_id, user_id=user.id)
     if held & TEAM_APPROVERS:
         return True, f"Holds {sorted(held & TEAM_APPROVERS)[0]!r} in this team."
     return False, (
-        "Only an approver, team lead or manager of this team may decide a quote."
+        "Only an approver or manager of this team, or a named quote approver, "
+        "may decide a quote."
     )
 
 
@@ -132,7 +139,7 @@ async def approvers_for(
     session: AsyncSession,
     team_id: uuid.UUID,
     *,
-    global_roles: frozenset[str] = GLOBAL_APPROVERS,
+    global_roles: frozenset[str] = GLOBAL_APPROVERS | {NAMED_APPROVER},
 ) -> list[User]:
     """Everyone who could decide this team's quotes."""
     rows = await session.scalars(
@@ -168,6 +175,48 @@ async def approval_settings(session: AsyncSession) -> QuoteApprovalSettings:
         # rather than lazily later, which in async is a MissingGreenlet.
         await session.refresh(row)
     return row
+
+
+async def named_approvers(session: AsyncSession) -> list[User]:
+    """Holders of the named-approver role, by name."""
+    return list(
+        (
+            await session.scalars(
+                select(User)
+                .join(UserRole, UserRole.user_id == User.id)
+                .join(Role, Role.id == UserRole.role_id)
+                .where(Role.key == NAMED_APPROVER)
+                .order_by(User.display_name)
+            )
+        ).all()
+    )
+
+
+async def set_named_approvers(
+    session: AsyncSession, user_ids: list[uuid.UUID], *, actor: User
+) -> None:
+    """Make the named approvers exactly ``user_ids``: grant the new, revoke the gone.
+
+    Through the role, not a list on the settings row, so it shows on the
+    person's roles like any other grant and needs no table of its own.
+    """
+    from app.roles import service as roles_service  # roles imports nothing of ours
+
+    if await session.scalar(select(Role.id).where(Role.key == NAMED_APPROVER)) is None:
+        # Roles are seeded by hand; this one must exist the first time it is used.
+        await roles_service.seed_system_roles(session)
+
+    wanted = set(user_ids)
+    current = {u.id for u in await named_approvers(session)}
+    for user_id in wanted - current:
+        user = await session.get(User, user_id)
+        if user is None or not user.is_active:
+            raise QuoteError("One of the people picked is not an active user.")
+        await roles_service.assign_role(
+            session, user_id=user_id, role_key=NAMED_APPROVER, granted_by_id=actor.id
+        )
+    for user_id in current - wanted:
+        await roles_service.revoke_role(session, user_id=user_id, role_key=NAMED_APPROVER)
 
 
 def clean_emails(values: list[str] | None) -> list[str]:
@@ -221,6 +270,9 @@ async def approvers_to_notify(
         )
         if on
     }
+    # Named approvers are always told: being picked to approve is the reason
+    # they are on the list, and one who never hears about a quote is not one.
+    global_roles.add(NAMED_APPROVER)
     people: dict[uuid.UUID, User] = {}
     if team_roles:
         rows = await session.scalars(
@@ -2162,6 +2214,9 @@ async def listing(
             QuoteRequest.assigned_to_id == viewer.id,
         ]
         decides = await approver_team_ids(session, viewer.id)
+        if NAMED_APPROVER in set(viewer_roles):
+            # A named approver's queue is every team's, for the same reason.
+            visible.append(QuoteRequest.status == QuoteStatus.PENDING_APPROVAL)
         if decides:
             # Waiting on them, rather than everything their team has ever
             # written. An approver needs the queue; the archive is a different

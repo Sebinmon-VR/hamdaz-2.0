@@ -53,6 +53,17 @@ SYSTEM_ROLES: Final[tuple[SystemRole, ...]] = (
         ),
     ),
     SystemRole(
+        key="quote_approver",
+        name="Quote Approver",
+        scope=RoleScope.GLOBAL,
+        description=(
+            "A named approver for customer quotes, whatever team they are in: "
+            "sees every quote waiting for approval, decides it, and is emailed "
+            "when one is sent. Opens the Quote Requests list and quotes only — "
+            "not drafts or the archive. Given from the quote approval settings."
+        ),
+    ),
+    SystemRole(
         key="team_manager",
         name="Team Manager",
         scope=RoleScope.TEAM,
@@ -85,6 +96,17 @@ SYSTEM_ROLES: Final[tuple[SystemRole, ...]] = (
 
 SUPER_ADMIN: Final = "super_admin"
 TEAM_LEAD: Final = "team_lead"
+QUOTE_APPROVER: Final = "quote_approver"
+
+#: Modules a global role opens by itself, without the holder's team having
+#: been granted them, and which pages. ``None`` would mean every page.
+#:
+#: Narrow on purpose. A named quote approver is somebody outside the teams
+#: that quote (Accounts, say) asked to sign off prices; they need the queue and
+#: the quote, not the screen for raising one or the Zoho queue.
+ROLE_MODULES: Final[dict[str, dict[str, tuple[str, ...] | None]]] = {
+    QUOTE_APPROVER: {"quote_requests": ("list", "detail")},
+}
 
 #: What someone gets when added to a team without a role being named.
 DEFAULT_TEAM_ROLE: Final = "member"
