@@ -17,6 +17,7 @@ from typing import Final
 
 from app.models.labels import (
     LABEL_EXCLUDED,
+    LABEL_LEAVING,
     LABEL_NEW_JOINER,
     LABEL_ON_LEAVE,
     LabelKind,
@@ -118,6 +119,18 @@ LABELS: Final[tuple[LabelSpec, ...]] = (
         color="#b42318",
         capacity=0.0,
     ),
+    LabelSpec(
+        key=LABEL_LEAVING,
+        name="Serving Notice",
+        kind=LabelKind.STATUS,
+        description=(
+            "Resigned or leaving, from HR's staff list. Takes no new work from the "
+            "day it is recorded, whatever the team's policy says."
+        ),
+        color="#7a271a",
+        capacity=0.0,
+        derived=True,
+    ),
     # ── skill: which work ──────────────────────────────────────────────
     # Deliberately none shipped. Competencies are specific to what a business
     # actually sells, and a guessed list would be wrong everywhere and still get
@@ -128,7 +141,7 @@ BY_KEY: Final[dict[str, LabelSpec]] = {spec.key: spec for spec in LABELS}
 
 #: Keys the assignment policy refers to by name and may not lose.
 SYSTEM_KEYS: Final[frozenset[str]] = frozenset(
-    {LABEL_NEW_JOINER, LABEL_ON_LEAVE, LABEL_EXCLUDED}
+    {LABEL_NEW_JOINER, LABEL_ON_LEAVE, LABEL_EXCLUDED, LABEL_LEAVING}
 )
 
 #: Seeds a fresh policy's capacity map.
@@ -137,4 +150,4 @@ DEFAULT_CAPACITY_BY_LABEL: Final[dict[str, float]] = {
 }
 
 #: Seeds a fresh policy's exclusions: nobody who is away or off rotation.
-DEFAULT_EXCLUDED: Final[tuple[str, ...]] = (LABEL_ON_LEAVE, LABEL_EXCLUDED)
+DEFAULT_EXCLUDED: Final[tuple[str, ...]] = (LABEL_ON_LEAVE, LABEL_EXCLUDED, LABEL_LEAVING)

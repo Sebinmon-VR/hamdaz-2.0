@@ -34,6 +34,7 @@ from app.assignment import service as policy_service
 from app.labels import service as labels_service
 from app.models.analytics import AnalyticsRun, UserAnalytics
 from app.models.assignment import AssignmentPolicy
+from app.models.labels import LABEL_LEAVING
 from app.models.role import Role, UserRole
 from app.models.team import Team, TeamMembership
 from app.models.user import User
@@ -117,10 +118,14 @@ async def gather(
 
     # People this app knows, keyed by email — the only identifier both systems
     # agree on. Display names collide and change; lookup ids are site-local.
-    users = list(
-        (await session.scalars(select(User).where(User.is_active.is_(True)))).all()
-    )
-    by_email = {u.email.casefold(): u for u in users if u.email}
+    #
+    # Switched-off accounts are loaded too, and excluded below with a reason.
+    # Left out of this map, a leaver who still owns rows on the list stopped
+    # being recognised as a person this app knows and was ranked as an
+    # unmatched name in the company-wide list.
+    everyone = list((await session.scalars(select(User))).all())
+    users = [u for u in everyone if u.is_active]
+    by_email = {u.email.casefold(): u for u in everyone if u.email}
 
     members: set[uuid.UUID] | None = None
     if team is not None:
@@ -179,7 +184,16 @@ async def gather(
         keys = {label.key for label in held.get(user.id, [])} if user else set()
         capacity = policy_service.capacity_for(policy, keys)
         reason = policy_service.is_excluded(policy, keys)
-        if "on-leave" in keys:
+        if LABEL_LEAVING in keys:
+            # The derived label carries the last working day; that is the line
+            # worth reading, not the generic one.
+            reason = next(
+                (label.reason for label in held.get(user.id, []) if label.key == LABEL_LEAVING),
+                None,
+            ) or reason
+        elif user is not None and not user.is_active:
+            reason = "Account switched off"
+        if "on-leave" in keys and LABEL_LEAVING not in keys and (user is None or user.is_active):
             # The derived label carries the return date. Whether the policy
             # caught them through ``exclude_on_leave`` or by listing the label,
             # "on approved leave until the 30th" is the reason worth showing —

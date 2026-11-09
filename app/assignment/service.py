@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.labels.catalogue import DEFAULT_CAPACITY_BY_LABEL, DEFAULT_EXCLUDED
 from app.models.assignment import MIN_CAPACITY, AssignmentPolicy
+from app.models.labels import LABEL_LEAVING
 from app.models.team import Team, TeamMembership
 from app.models.user import User
 
@@ -373,7 +374,13 @@ def is_excluded(policy: AssignmentPolicy, label_keys: set[str]) -> str | None:
     Capacity 0 counts as exclusion as well as a listed label — a policy that
     gives someone no capacity has already said they take no work, and making the
     admin say it twice invites the two settings to disagree.
+
+    Leaving comes first and is not the policy's to decide. A team that edited
+    its exclusions before the label existed, or took it off the list, must
+    still never hand a tender to somebody who has resigned.
     """
+    if LABEL_LEAVING in label_keys:
+        return "Resigned: takes no new work"
     for key in policy.excluded_labels or []:
         if key in label_keys:
             return f"Excluded by the {key!r} label"

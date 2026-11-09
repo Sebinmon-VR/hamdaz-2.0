@@ -70,9 +70,12 @@ class LabelSource(StrEnum):
 LABEL_NEW_JOINER = "new-joiner"
 LABEL_ON_LEAVE = "on-leave"
 LABEL_EXCLUDED = "excluded-from-rotation"
+#: Resigned or otherwise leaving, from the HR exit record. Unlike the others it
+#: excludes whatever the policy says — see ``assignment.service.is_excluded``.
+LABEL_LEAVING = "leaving"
 
 #: Never stored on a ``label_assignments`` row; always computed.
-DERIVED_KEYS = frozenset({LABEL_NEW_JOINER, LABEL_ON_LEAVE})
+DERIVED_KEYS = frozenset({LABEL_NEW_JOINER, LABEL_ON_LEAVE, LABEL_LEAVING})
 
 
 class Label(Base, UUIDPrimaryKey, Timestamped):

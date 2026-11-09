@@ -53,6 +53,8 @@ from app.taskcalendar.worker import TaskCalendarWorker
 from app.forms.router import router as templates_router
 from app.hr.public import router as careers_router
 from app.hr.router import router as hr_router
+from app.hr.staff_router import router as hr_staff_router
+from app.hr.staff_worker import StaffWorker
 from app.intake.graph_mail import MailReader
 from app.intake.router import router as intake_router
 from app.intake.router import webhook_router as intake_webhook_router
@@ -211,6 +213,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         mailer=BcdMailer(settings, http),
     )
     app.state.bcd_worker.start()
+    # Switches off sign-in for leavers once their last working day has passed;
+    # exclusion from assignment needs no loop - see app/hr/staff.py.
+    app.state.staff_worker = StaffWorker(factory=get_session_factory())
+    app.state.staff_worker.start()
     # Each open task's BCD as an event in its holder's Outlook calendar. Off
     # until a super admin turns it on - see app/taskcalendar.
     app.state.task_calendar = TaskCalendar(settings, http)
@@ -277,6 +283,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await app.state.followup_worker.stop()
         await app.state.reminder_worker.stop()
         await app.state.bcd_worker.stop()
+        await app.state.staff_worker.stop()
         await app.state.task_calendar_worker.stop()
         await app.state.ariba_worker.stop()
         await app.state.mailwatch_worker.stop()
@@ -348,6 +355,7 @@ def create_app() -> FastAPI:
     if AGENTS_ENABLED:  # paused: see app/agents/__init__.py
         app.include_router(agents_router, prefix=settings.api_prefix)
     app.include_router(templates_router, prefix=settings.api_prefix)
+    app.include_router(hr_staff_router, prefix=settings.api_prefix)
     app.include_router(hr_router, prefix=settings.api_prefix)
     app.include_router(finance_router, prefix=settings.api_prefix)
     # Admin first: /reports/admin/... must be matched before /reports/{id},

@@ -93,6 +93,7 @@ from app.models.payroll import (
     PayrollSettings,
     RunStatus,
 )
+from app.models.employment import EmployeeExit, EmploymentEvent, ExitKind
 from app.models.enquiry import EnquiryAnalysis, EnquiryDocument, EnquiryLine
 from app.models.hr import (
     CLOSED_STAGES,
@@ -130,6 +131,9 @@ from app.models.user import User
 from app.models.zoho import ZohoToken
 
 __all__ = [
+    "EmployeeExit",
+    "EmploymentEvent",
+    "ExitKind",
     "AribaBcdFix",
     "AribaEvent",
     "AribaState",

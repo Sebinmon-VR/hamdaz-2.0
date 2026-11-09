@@ -25,8 +25,10 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.labels.catalogue import LABELS, SYSTEM_KEYS
+from app.models.employment import EmployeeExit
 from app.models.labels import (
     DERIVED_KEYS,
+    LABEL_LEAVING,
     LABEL_NEW_JOINER,
     LABEL_ON_LEAVE,
     Label,
@@ -284,6 +286,31 @@ async def on_leave_today(
     }
 
 
+async def leaving_reasons(
+    session: AsyncSession, user_ids: list[uuid.UUID], *, on: date | None = None
+) -> dict[uuid.UUID, str]:
+    """Who has an exit recorded, and the line that explains it.
+
+    From the day it is recorded, not from the last working day: somebody
+    serving notice should be finishing what they hold, not picking up bids
+    that will outlast them. Kept after the last day too, so a leaver who still
+    owns rows on the Proposals list is shown as left rather than ranked.
+    """
+    if not user_ids:
+        return {}
+    day = on or date.today()
+    rows = await session.scalars(select(EmployeeExit).where(EmployeeExit.user_id.in_(user_ids)))
+    out: dict[uuid.UUID, str] = {}
+    for row in rows.all():
+        last = row.last_working_day.strftime("%d %b %Y")
+        out[row.user_id] = (
+            f"Serving notice, last working day {last}"
+            if row.status(day) == "notice"
+            else f"Left on {last}"
+        )
+    return out
+
+
 def is_new_joiner(
     user: User,
     *,
@@ -364,9 +391,12 @@ async def effective_labels(
         )
 
     away = await on_leave_today(session, ids, on=on)
+    leaving = await leaving_reasons(session, ids, on=on)
     catalogue = {label.key: label for label in await all_labels(session, team_id=team_id)}
 
     for user in users:
+        if reason := leaving.get(user.id):
+            held[user.id].append(_derived(catalogue, LABEL_LEAVING, "Serving Notice", reason))
         if reason := away.get(user.id):
             held[user.id].append(_derived(catalogue, LABEL_ON_LEAVE, "On Leave", reason))
         if reason := is_new_joiner(
