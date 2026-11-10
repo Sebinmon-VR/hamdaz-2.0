@@ -308,6 +308,10 @@ class LineIn(BaseModel):
     tds_override: Decimal | None = Field(default=None, ge=0)
     on_hold: bool | None = None
     note: str | None = Field(default=None, max_length=2000)
+    #: The employee's joining date, changed from the pay sheet for someone who
+    #: started part-way through the month. It is the employee's record that
+    #: changes, so every draft month it moves through is reworked.
+    joined_on: date | None = None
 
 
 class LineOut(BaseModel):

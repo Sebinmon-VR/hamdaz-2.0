@@ -470,6 +470,10 @@ async def update_employee(
             user_id=values.get("user_id"),
             exclude=employee.id,
         )
+    old_joined = employee.joined_on
+    new_joined = values.get("joined_on")
+    if new_joined is not None and new_joined != old_joined:
+        await _check_joining_move(session, employee, old_joined, new_joined)
     changed: dict[str, Any] = {}
     for key, value in values.items():
         if value is None and key not in _CLEARABLE:
@@ -484,6 +488,10 @@ async def update_employee(
     joined, left = employee.joined_on, employee.left_on
     if left and left < joined:
         raise PayrollError("The leaving date is before the joining date.")
+    if "joined_on" in changed:
+        moved = _salary_follows_joining(employee, old_joined, joined)
+        if moved:
+            changed["first_salary_from"] = {"from": moved, "to": joined}
     if changed:
         employee.updated_by_id = actor.id
         await log(
@@ -492,7 +500,90 @@ async def update_employee(
             employee_id=employee.id, detail=changed,
         )
     await session.flush()
+    if "joined_on" in changed:
+        await _recalculate_drafts(session, employee.country, old_joined, joined)
     return employee
+
+
+def _months(a: date, b: date) -> tuple[int, int]:
+    """The months from the earlier date to the later, as ``year * 12 + month``."""
+    lo, hi = min(a, b), max(a, b)
+    return lo.year * 12 + lo.month, hi.year * 12 + hi.month
+
+
+async def _runs_between(
+    session: AsyncSession, country: Country | str, a: date, b: date
+) -> list[PayrollRun]:
+    lo, hi = _months(a, b)
+    key = PayrollRun.year * 12 + PayrollRun.month
+    return list(
+        (
+            await session.scalars(
+                select(PayrollRun).where(
+                    PayrollRun.country == country, key >= lo, key <= hi
+                )
+            )
+        ).all()
+    )
+
+
+async def _check_joining_move(
+    session: AsyncSession, employee: PayrollEmployee, old: date, new: date
+) -> None:
+    """A joining date changes the pay of every month between the old and new date.
+
+    Those months must still be drafts: a submitted, approved or paid month is
+    final, and moving the date under it would leave its payslip wrong.
+    """
+    locked = [
+        r for r in await _runs_between(session, employee.country, old, new)
+        if r.status != RunStatus.DRAFT
+    ]
+    if locked:
+        locked.sort(key=lambda r: (r.year, r.month))
+        months = ", ".join(f"{period_of(r).label} ({r.status})" for r in locked)
+        raise PayrollConflict(
+            f"Moving the joining date from {old:%d %b %Y} to {new:%d %b %Y} changes "
+            f"{months}, which is no longer a draft. Reopen it first."
+        )
+    later = sorted(employee.salaries, key=lambda s: s.effective_from)[1:]
+    clash = [s for s in later if s.effective_from <= new]
+    if clash:
+        raise PayrollError(
+            f"There is a salary revision from {clash[0].effective_from:%d %b %Y}, on or before "
+            f"the new joining date. Delete that revision first."
+        )
+
+
+def _salary_follows_joining(employee: PayrollEmployee, old: date, new: date) -> date | None:
+    """Move the first salary with the joining date; return where it started.
+
+    The first salary normally starts on the joining date ("Salary on joining").
+    Left behind, a later joining date would put the salary before the person
+    started, and an earlier one would leave the first weeks with no salary —
+    the person would drop out of that month's payroll. A first salary that
+    deliberately starts later than the joining date stays where it is.
+    """
+    salaries = sorted(employee.salaries, key=lambda s: s.effective_from)
+    if not salaries:
+        return None
+    first = salaries[0]
+    if first.effective_from == old or first.effective_from < new:
+        was = first.effective_from
+        if was != new:
+            first.effective_from = new
+            return was
+    return None
+
+
+async def _recalculate_drafts(
+    session: AsyncSession, country: Country | str, old: date, new: date
+) -> None:
+    """Rework the draft months the joining date moved through."""
+    for run in await _runs_between(session, country, old, new):
+        if run.status == RunStatus.DRAFT:
+            await _calculate(session, run)
+    await session.flush()
 
 
 async def delete_employee(session: AsyncSession, employee: PayrollEmployee, actor: User) -> None:
@@ -718,6 +809,16 @@ async def update_line(
     line = next((ln for ln in run.lines if ln.id == line_id), None)
     if line is None:
         raise PayrollNotFound("No such line in this month.")
+    joined_on = changes.pop("joined_on", None)
+    if joined_on is not None:
+        # Joined part-way through the month: the joining date is the
+        # employee's, so it is changed there — which reworks this draft and
+        # any other the date moves through.
+        employee = await get_employee(session, line.employee_id)
+        if joined_on != employee.joined_on:
+            await update_employee(session, employee, {"joined_on": joined_on}, actor)
+        if line not in run.lines:
+            return line
     if "extras" in changes:
         try:
             changes["extras"] = rules.clean_extras(changes["extras"])
