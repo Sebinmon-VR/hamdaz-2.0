@@ -207,14 +207,14 @@ class QuoteExtractor:
     async def _read(self, readable: Readable) -> ExtractedQuote | ExtractionError:
         if readable.kind == "text":
             if (parsed := parse_locally(readable)) is not None:
-                return with_charges(parsed, readable.text)
+                return with_charges(parsed, readable.text, readable.file_name)
             if (modelled := await self._read_with_model(readable)) is not None:
-                return with_charges(modelled, readable.text)
+                return with_charges(modelled, readable.text, readable.file_name)
         # Last: the page itself, for a scan and for a PDF whose table is a
         # picture — a web page printed to PDF, a quote pasted in as a screenshot.
         seen, priceless = await self._read_by_looking(readable)
         if seen is not None:
-            return with_charges(seen, readable.text)
+            return with_charges(seen, readable.text, readable.file_name)
         if priceless:
             return NoPricesError(
                 f"No prices could be found in {readable.file_name!r}: it reads as a "
@@ -279,12 +279,25 @@ class QuoteExtractor:
         return [await self._read(r) for r in readables]
 
 
-def with_charges(quote: ExtractedQuote, text: str | None) -> ExtractedQuote:
+def with_charges(
+    quote: ExtractedQuote, text: str | None, file_name: str | None = None
+) -> ExtractedQuote:
     """The charges the document states on top of its lines, however it was read.
 
     A charge sharing a figure with the freight ("Freight & handling USD 300")
     is the freight, already counted, and is not counted again.
+
+    The supplier's name is checked here too, after any reader: a model shown
+    a quote addressed to us has named us as the supplier (Topnet's, whose own
+    name is only in its logo and its footer).
     """
+    from app.comparison.parsing import settle_supplier
+
+    if (name := settle_supplier(quote.supplier_name, text, file_name)) != quote.supplier_name:
+        logger.info(
+            "%s: supplier read as %r, settled as %r", file_name, quote.supplier_name, name
+        )
+        quote.supplier_name = name or quote.supplier_name
     charges = find_charges(text or "", [i.description for i in quote.items])
     for charge in charges:
         same = charge.amount is not None and abs(charge.amount - (quote.freight or 0)) < 0.005
@@ -292,7 +305,7 @@ def with_charges(quote: ExtractedQuote, text: str | None) -> ExtractedQuote:
             charge.amount = None
             charge.included = True
     quote.charges = charges
-    quote.details = suggest_details(text, exclude=OWN_COMPANY)
+    quote.details = suggest_details(text, exclude=OWN_COMPANY, name=quote.supplier_name)
     if quote.contact and "contact_person" not in quote.details and "@" not in quote.contact:
         quote.details["contact_person"] = quote.contact
     if said := [c for c in charges if not c.included]:
@@ -347,7 +360,12 @@ def settle_model_reading(quote: ExtractedQuote, text: str | None) -> list[str]:
 def _transcribe(file_name: str) -> str:
     """What a model is asked to do with a supplier quotation, text or page."""
     return (
-        f"Transcribe this supplier quotation ({file_name}). One entry "
+        f"Transcribe this supplier quotation ({file_name}). We are Hamdaz "
+        f"(Hamdaztech Technology Services); the quotation is addressed TO us, so our "
+        f"name and address appear on it as the customer. `supplier_name` is the "
+        f"company that ISSUED it — from the letterhead, the logo, the footer or the "
+        f"sender's email domain — never Hamdaz and never a heading like "
+        f"\"Quotation\". One entry "
         f"in `items` per priced line; do not include subtotal, VAT or total rows "
         f"as items — those go in the header fields. Copy prices digit for digit. "
         f"`quantity` is the quantity as printed, and 1 when the quote prints none "

@@ -77,6 +77,14 @@ LABELS: Final[dict[str, str]] = {key: label for _, fields in GROUPS for key, lab
 #: address, email or TRN is never the supplier's.
 OWN_COMPANY: Final = ("hamdaz",)
 
+#: Our own address and phone as a supplier prints them in the "to" block,
+#: often split over lines that do not carry our name ("Centre, Hamdan Street,
+#: Abu Dhabi, UAE."). A line with one of these is ours, never the supplier's.
+OUR_ADDRESS: Final = (
+    "millenium tower", "millennium tower", "hamdan centre", "hamdan street",
+    "opp. hamdan", "508294540",
+)
+
 #: Our own quotation, as Zoho prints it: the heading or the estimate number.
 _OUR_QUOTATION: Final = re.compile(r"\bcommercial\s+proposal\b|#\s*QT-\d+", re.I)
 
@@ -196,8 +204,10 @@ _ADDRESS: Final = re.compile(
 _PO_BOX: Final = re.compile(r"(P\.?\s?O\.?\s*Box\s*[:.]?\s*\d+[^\n|]{0,120})", re.I)
 _CONTACT: Final = re.compile(
     # The label in any case; the name itself must start with a capital.
-    r"\b(?i:contact(?:\s+person)?|attn|sales\s+(?:person|executive|manager)|prepared\s+by|"
-    r"quoted\s+by)\s*[:.]\s*([A-Z][A-Za-z.'\- ]{2,60})",
+    # Not "Attn": that is who the quote is addressed to, which is us.
+    r"\b(?:(?i:contact(?:\s+person)?|prepared\s+by|quoted\s+by)\s*[:.]|"
+    r"(?i:sales\s+(?:person|executive|manager))\s*[:.]?)"
+    r"\s*([A-Z][A-Za-z.'\-]+(?: [A-Z][A-Za-z.'\-]+){0,4})",
 )
 _TYPE: Final = (
     (
@@ -206,6 +216,12 @@ _TYPE: Final = (
     ),
     (re.compile(r"\bmanufacturer\b|\bOEM\b", re.I), "OEM / manufacturer"),
     (re.compile(r"\breseller\b", re.I), "Reseller"),
+)
+
+#: "from the manufacturer", "by the OEM": a term about somebody else, not
+#: what the supplier is.
+_ABOUT_SOMEBODY_ELSE: Final = re.compile(
+    r"\b(?:from|by|of|with|to)\s+(?:the\s+)?(?:manufacturer|oem|distributor)s?\b", re.I
 )
 
 #: Countries a supplier letterhead names, and how to spell them back.
@@ -244,16 +260,23 @@ def _first(pattern: re.Pattern[str], text: str) -> str | None:
     return re.sub(r"\s+", " ", match.group(1)).strip(" ,;:-") if match else None
 
 
-def suggest(text: str | None, *, exclude: tuple[str, ...] = ()) -> dict[str, Any]:
+def suggest(
+    text: str | None, *, exclude: tuple[str, ...] = (), name: str | None = None
+) -> dict[str, Any]:
     """What a document says about who sent it, field by field.
 
     ``exclude`` are words of our own company ("hamdaz"): a quotation names the
     customer too, and our own address or email is not the supplier's. A line
-    carrying one of them is not read.
+    carrying one of them is not read, nor is a line of our own address.
+
+    ``name`` is the supplier as read: their address is the line under their
+    name, wherever that is — the footer, when our block fills the top.
     """
     if not text:
         return {}
     words = tuple(w.lower() for w in exclude if w)
+    if words:
+        words += OUR_ADDRESS
     lines = [line for line in text.splitlines() if not any(w in line.lower() for w in words)]
     body = "\n".join(lines)
     found: dict[str, Any] = {}
@@ -286,6 +309,19 @@ def suggest(text: str | None, *, exclude: tuple[str, ...] = ()) -> dict[str, Any
     ):
         if value := _first(pattern, body):
             found[key] = value
+    if "address" not in found and name and len(name.strip()) > 3:
+        # Under the supplier's own name: "Topnet Distribution LLC" in the
+        # footer, then "Office# B205, Auto Centre B-Block, ..., Deira, UAE".
+        key = name.strip().casefold()
+        for at, line in enumerate(lines):
+            if line.strip().casefold() != key:
+                continue
+            for below in lines[at + 1 : at + 3]:
+                clean = re.sub(r"\s+", " ", below).strip(" ,")
+                if "," in clean and not _EMAIL.search(clean) and not _PHONE.search(clean):
+                    found["address"] = re.sub(r"\s+,", ",", clean)[:300]
+                    break
+            break
     if "address" not in found:
         # A letterhead rarely labels its address: the line near the top that
         # names a place, with a comma in it, is the address.
@@ -300,13 +336,21 @@ def suggest(text: str | None, *, exclude: tuple[str, ...] = ()) -> dict[str, Any
         found["iban"] = found["iban"].replace(" ", "").upper()
     # The country from the address when there is one; otherwise from the
     # letterhead, which is the top of the document, not the customer block.
-    where = "\n".join(filter(None, [found.get("address"), *lines[:8]]))
-    if country := _country_in(where):
+    # The address alone first: searched together, our "United Arab Emirates"
+    # at the top outranked a German supplier's "Germany" in its address.
+    if country := _country_in(found.get("address") or "") or _country_in("\n".join(lines[:8])):
         found["country"] = country
+    # Their own name says it best ("Topnet Distribution LLC"); the terms say
+    # "subject to availability from manufacturer" of somebody else.
     for pattern, kind in _TYPE:
-        if pattern.search(body):
+        if name and pattern.search(name.replace("Distribution", "Distributor")):
             found["supplier_type"] = kind
             break
+    else:
+        for pattern, kind in _TYPE:
+            if pattern.search(_ABOUT_SOMEBODY_ELSE.sub(" ", body)):
+                found["supplier_type"] = kind
+                break
     return found
 
 

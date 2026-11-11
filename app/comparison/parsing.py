@@ -36,7 +36,7 @@ from typing import Final
 
 from app.comparison.documents import Readable
 from app.comparison.extraction import ExtractedItem, ExtractedQuote
-from app.comparison.supplier_details import is_own_company
+from app.comparison.supplier_details import is_our_quotation, is_own_company
 
 logger = logging.getLogger("hamdaz.comparison")
 
@@ -77,6 +77,13 @@ _NOT_AN_ITEM: Final = re.compile(
     r"customs|(?:import\s+)?dut(?:y|ies)|clearance|insurance|bank\s+charges?|"
     r"documentation\s+charges?|legali[sz]ation|attestation|"
     r"s\.?\s*no\.?|sr\.?\s*no\.?)\b",
+    re.I,
+)
+
+#: A total spelt out: "One Thousand ... Dirham and Fifty Fils", "... Only".
+_IN_WORDS: Final = re.compile(
+    r"^[^\d]*\b(?:dirhams?|fils|dollars?|cents?|euros?|pounds?|pence|rupees?|paise|"
+    r"riyals?|halalas?|only)\b[^\d]*$",
     re.I,
 )
 
@@ -156,7 +163,7 @@ _DOMAIN_LINE: Final = re.compile(
 
 #: Words that mean a line is a heading or a label, not a name.
 _NOT_A_NAME: Final = re.compile(
-    r"\b(quot|invoice|proforma|date|tel|phone|fax|e-?mail|page|to:|attn|dear|"
+    r"\b(quot\w*|invoice|proforma|date|tel|phone|fax|e-?mail|page|to:|attn|dear|offer|"
     r"description|item|qty|price|amount|total|ref|po box|www)\b|[:|]",
     re.I,
 )
@@ -350,10 +357,28 @@ def _items_from_table(table: list[list[str]]) -> list[ExtractedItem]:
             return None
         return (row[index] or "").strip() or None
 
+    # A per-line VAT amount column ("VAT", not "VAT(%)"): then "Net Amount"
+    # beside it can include the VAT, which the quote's tax already counts.
+    vat_at = next(
+        (
+            at
+            for at, head in enumerate(table[header_at])
+            if re.fullmatch(r"(?i)\s*(?:vat|tax|gst)(?:\s*(?:amount|amt|value))?\s*", head or "")
+        ),
+        None,
+    )
+
     items: list[ExtractedItem] = []
     considered = 0
     for row in table[header_at + 1 :]:
         if not any((c or "").strip() for c in row):
+            continue
+        # The rows under the items — Total, Tax, Grand Total, the amount in
+        # words — are not items the mapping failed on. Counted, one item over
+        # four summary rows read as a bad mapping and a plain one-line quote
+        # (Topnet's, from Odoo) went to a model instead.
+        first = next((c.strip() for c in row if (c or "").strip()), "")
+        if _NOT_AN_ITEM.match(first) or _IN_WORDS.search(first):
             continue
         considered += 1
 
@@ -370,6 +395,11 @@ def _items_from_table(table: list[list[str]]) -> list[ExtractedItem]:
             continue
         if unit_price is None and quantity:
             unit_price = line_total / quantity if quantity else line_total
+        if vat_at is not None and vat_at < len(row) and unit_price is not None and line_total:
+            vat = to_number(row[vat_at])
+            before = unit_price * quantity
+            if vat and abs(before + vat - line_total) <= Decimal("0.05"):
+                line_total = before
 
         items.append(
             ExtractedItem(
@@ -586,7 +616,90 @@ def _supplier_name(text: str) -> str | None:
         letters = sum(c.isalpha() for c in line)
         if 3 < len(line) < 60 and letters >= len(line) * 0.6 and not _NOT_A_NAME.search(line):
             return line
+    return _supplier_further_down(text)
+
+
+#: Mail and web hosts that say nothing about who the company is.
+_PUBLIC_HOSTS: Final = frozenset(
+    {"gmail", "yahoo", "hotmail", "outlook", "live", "icloud", "aol", "proton", "protonmail",
+     "zoho", "msn", "rediffmail", "emirates", "eim"}
+)
+_HOST: Final = re.compile(
+    r"[\w.+-]+@([\w-]+)(?:\.[\w-]+)+|\b(?:https?://)?(?:www\.)?([\w-]{3,})\.(?:com|net|org|ae|"
+    r"co|io|in|de|uk|sa|qa|om|kw|bh|cn|hk|sg|biz|info)\b",
+    re.I,
+)
+
+
+def _their_hosts(text: str) -> list[str]:
+    """The supplier's own domains, from the emails and websites on the page:
+    "info@topnet.ae", "www.topnetdistribution.com". Ours and public mail are
+    left out."""
+    hosts: list[str] = []
+    for match in _HOST.finditer(text):
+        host = (match.group(1) or match.group(2) or "").casefold()
+        if host and host not in _PUBLIC_HOSTS and not is_own_company(host) and host not in hosts:
+            hosts.append(host)
+    return hosts
+
+
+def _supplier_further_down(text: str) -> str | None:
+    """The supplier when the top of the page is only us.
+
+    A quotation addressed to us puts our name and address at the top, and
+    the supplier's own name in a logo (no text) and in the footer. So: a
+    company line anywhere in the document, the one matching the supplier's
+    email or website first ("Topnet Distribution LLC" beside info@topnet.ae),
+    else the last one, which is the footer. Failing all of that, the name in
+    their domain.
+    """
+    hosts = _their_hosts(text)
+    candidates = [
+        line
+        for raw in text.splitlines()
+        if (line := raw.strip())
+        and 3 < len(line) < 80
+        and len(line.split()) <= 7
+        and _COMPANY_SUFFIX.search(line)
+        and not is_own_company(line)
+        and not _NOT_A_NAME.search(line)
+        and line[0].isupper()
+    ]
+    for line in candidates:
+        squashed = re.sub(r"[^a-z0-9]", "", line.casefold())
+        first = re.sub(r"[^a-z0-9]", "", line.split()[0].casefold())
+        if any(host.startswith(first) or host in squashed for host in hosts if len(first) >= 3):
+            return line
+    if candidates:
+        return candidates[-1]
+    if hosts:
+        return hosts[0].replace("-", " ").title()
     return None
+
+
+def is_heading(name: str | None) -> bool:
+    """Whether a "supplier name" is really the page heading or nothing at all."""
+    clean = (name or "").strip()
+    return not clean or bool(re.fullmatch(r"(?i)(?:sales\s+|price\s+)?(?:quot\w*|offer|"
+                                          r"proforma(?:\s+invoice)?|invoice|estimate|rfq)", clean))
+
+
+def settle_supplier(name: str | None, text: str | None, file_name: str | None = None) -> str | None:
+    """The supplier's name, corrected where a reader got it wrong.
+
+    Whichever reader read the quote — the parser or a model — our own name
+    is never the supplier's, nor is the page heading or the file's name. Then
+    the document is searched again, top to footer, for the company that sent
+    it. ``None`` when the document names nobody else either."""
+    stem = (file_name or "").rsplit(".", 1)[0].strip()
+    wrong = is_own_company(name) or is_heading(name) or (stem and (name or "").strip() == stem)
+    if not wrong or not text:
+        return name if not wrong else None
+    if is_our_quotation(text):
+        # Our own quotation dropped in by mistake: the other company on it is
+        # the customer, not a supplier. Left as ours, so it is refused.
+        return name
+    return _supplier_name(text)
 
 
 def _currency(text: str) -> str | None:
