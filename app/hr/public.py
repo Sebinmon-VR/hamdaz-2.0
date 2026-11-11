@@ -29,8 +29,6 @@ The one thing a token holder can do is read a posted opening and apply to it.
 from __future__ import annotations
 
 import logging
-import time
-from collections import deque
 from typing import Annotated, Any, Final
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -46,6 +44,7 @@ from starlette.datastructures import UploadFile
 
 from app.core.config import Settings, get_settings
 from app.core.db import get_session
+from app.core.public import client_address, harden, rate_limited
 from app.hr import render, service
 from app.hr.documents import MAX_FILE_BYTES, UploadError, accept
 from app.hr.schemas import (
@@ -67,66 +66,13 @@ Config = Annotated[Settings, Depends(get_settings)]
 #: At most this many files on one application, whatever the form asks for.
 MAX_UPLOADS: Final[int] = 5
 
-#: Headers on everything this router serves. The CSP is the important one: the
-#: hosted page is entirely self-contained, so anything it could be made to load
-#: from elsewhere is an injection rather than a feature.
-_SECURITY_HEADERS: Final[dict[str, str]] = {
-    "Access-Control-Allow-Origin": "*",
-    "Referrer-Policy": "no-referrer",
-    "X-Content-Type-Options": "nosniff",
-    "X-Frame-Options": "DENY",
-    "Cache-Control": "no-store",
-    "Content-Security-Policy": (
-        "default-src 'none'; style-src 'unsafe-inline'; img-src data:; "
-        "script-src 'unsafe-inline'; form-action 'self'; connect-src 'self'; "
-        "base-uri 'none'; frame-ancestors 'none'"
-    ),
-}
-
-
-def _harden(response: Response) -> None:
-    """Apply the headers above without stamping on the CORS middleware.
-
-    Where the request came from an allowlisted ERP origin the middleware sets
-    its own, more specific ``Access-Control-Allow-Origin`` after this runs, and
-    a plain assignment there replaces rather than appends.
-    """
-    for name, value in _SECURITY_HEADERS.items():
-        response.headers[name] = value
-
-
 router = APIRouter(tags=["careers (public)"], include_in_schema=True)
 
 
-# ── a brake on repeat submissions ──────────────────────────────────────
-#
-# In-process and best effort, and said so out loud in the setting's comment. It
-# stops the same person submitting the same form fifty times; it is not a
-# defence against anything distributed, and it forgets everything on restart.
-
-_recent: dict[str, deque[float]] = {}
-
-
-def _rate_limited(key: str, *, limit: int, window: float = 3600.0) -> bool:
-    now = time.monotonic()
-    seen = _recent.setdefault(key, deque())
-    while seen and now - seen[0] > window:
-        seen.popleft()
-    if len(seen) >= limit:
-        return True
-    seen.append(now)
-    if len(_recent) > 10_000:
-        # Unbounded growth on a public endpoint is a slow memory leak with a
-        # public trigger. Drop the coldest entries rather than grow for ever.
-        for stale in [k for k, v in _recent.items() if not v or now - v[-1] > window][:5_000]:
-            _recent.pop(stale, None)
-    return False
-
-
+# The headers and the repeat-submission brake are shared with the website's
+# contact form, the other public router: see app/core/public.py.
 def _client_key(request: Request, token: str) -> str:
-    forwarded = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
-    client = forwarded or (request.client.host if request.client else "unknown")
-    return f"{token[:12]}:{client}"
+    return f"{token[:12]}:{client_address(request)}"
 
 
 # ── shaping what a candidate sees ──────────────────────────────────────
@@ -261,7 +207,7 @@ async def hosted_form(
         )
     view = await _public_view(session, opening, settings=settings, request=request)
     response = HTMLResponse(render.application_page(view))
-    _harden(response)
+    harden(response)
     return response
 
 
@@ -275,7 +221,7 @@ async def form_json(
 ) -> PublicOpeningOut:
     """For an organisation rendering the form on its own careers site."""
     opening = await _load(session, token)
-    _harden(response)
+    harden(response)
     return await _public_view(session, opening, settings=settings, request=request)
 
 
@@ -300,9 +246,9 @@ async def apply(
     content type, so no preflight is needed from anywhere.
     """
     opening = await _load(session, token)
-    _harden(response)
+    harden(response)
 
-    if _rate_limited(_client_key(request, token), limit=settings.application_rate_limit):
+    if rate_limited(_client_key(request, token), limit=settings.application_rate_limit):
         raise HTTPException(
             status_code=http_status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Too many submissions from here. Please try again later.",
@@ -400,7 +346,7 @@ def _coerce(raw: str) -> Any:
 async def careers_page(request: Request, session: Session, settings: Config) -> HTMLResponse:
     listings = await _listings(session, settings=settings, request=request)
     response = HTMLResponse(render.careers_page(listings))
-    _harden(response)
+    harden(response)
     return response
 
 
@@ -412,7 +358,7 @@ async def careers_page(request: Request, session: Session, settings: Config) -> 
 async def careers_json(
     request: Request, response: Response, session: Session, settings: Config
 ) -> list[PublicListingOut]:
-    _harden(response)
+    harden(response)
     return await _listings(session, settings=settings, request=request)
 
 

@@ -213,6 +213,22 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         ),
     ),
     ModuleSpec(
+        key="website_enquiries",
+        name="Website Enquiries",
+        description=(
+            "Messages sent through the contact form on hamdaz.com: who wrote, "
+            "how to reach them, what they asked about and which page or ad "
+            "brought them. Take one on, move it along, note what happened. The "
+            "CEO and managers see it by their role; grant it to the team that "
+            "answers enquiries — Sales — for everyone else. The form itself is "
+            "a public endpoint, not a page here."
+        ),
+        pages=(
+            PageSpec("list", "Website enquiries", "/website-enquiries"),
+            PageSpec("detail", "Website enquiry", "/website-enquiries/[id]"),
+        ),
+    ),
+    ModuleSpec(
         key="assignment",
         name="Work Assignment",
         description=(

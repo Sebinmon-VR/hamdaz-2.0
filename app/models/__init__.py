@@ -128,9 +128,12 @@ from app.models.role import Role, RoleScope, UserRole
 from app.models.team import Team, TeamMembership
 from app.models.templates import FieldType, FormTemplate, TemplateGrant, TemplateStatus
 from app.models.user import User
+from app.models.website import WebsiteEnquiry, WebsiteEnquiryStatus
 from app.models.zoho import ZohoToken
 
 __all__ = [
+    "WebsiteEnquiry",
+    "WebsiteEnquiryStatus",
     "EmployeeExit",
     "EmploymentEvent",
     "ExitKind",

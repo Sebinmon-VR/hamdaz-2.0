@@ -90,8 +90,13 @@ class GraphMailer:
         html: str,
         attachments: list[Attachment] | None = None,
         cc: list[str] | None = None,
+        reply_to: list[str] | None = None,
     ) -> dict[str, Any]:
         """Send as ``sender``, optionally with files, and with ``cc`` copied.
+
+        ``reply_to`` is for mail about somebody who is not the sender — a
+        website visitor, say — so that pressing Reply answers them rather than
+        the mailbox it happened to be sent from.
 
         Attachments go inline in the sendMail body as base64, which Graph caps
         at roughly 4 MB for the whole message. That is ample for what this sends
@@ -116,6 +121,8 @@ class GraphMailer:
         copied = [a for a in (cc or []) if a and a.lower() not in {r.lower() for r in recipients}]
         if copied:
             message["ccRecipients"] = [{"emailAddress": {"address": address}} for address in copied]
+        if reply_to:
+            message["replyTo"] = [{"emailAddress": {"address": address}} for address in reply_to if address]
         if attachments:
             kept = []
             for item in attachments:

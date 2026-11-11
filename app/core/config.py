@@ -470,6 +470,25 @@ class Settings(BaseSettings):
         """Where the JSON form lives. Never the careers site — that is a client."""
         return (self.public_base_url or request_base or "").rstrip("/")
 
+    # ── the website's contact form ─────────────────────────────────────
+    #: Messages accepted from one address per hour. The same brake as the
+    #: careers forms — in-process, best effort, reset on deploy — and tighter,
+    #: because nobody genuinely sends a company six enquiries in an hour.
+    website_enquiry_rate_limit: int = 5
+    #: Who is mailed each new enquiry, comma-separated.
+    website_enquiry_recipients: str = "hello@hamdaz.com"
+    #: The Entra mailbox the notice is sent as. Graph sends as a real account,
+    #: so there is no sensible default: empty means no email — the enquiry is
+    #: still stored and still raised in the app, and the log says why no mail.
+    website_enquiry_sender: str = ""
+    #: A Teams channel webhook for a copy of each new enquiry. Empty: in the app
+    #: and by email only.
+    website_enquiry_teams_webhook_url: str = ""
+
+    @property
+    def website_enquiry_recipient_list(self) -> list[str]:
+        return [e.strip() for e in self.website_enquiry_recipients.split(",") if e.strip()]
+
     # ── machine callers ────────────────────────────────────────────────
     #: Lets a service call this API with a header instead of a user session.
     #: Unset means header auth is off entirely — an empty key must never

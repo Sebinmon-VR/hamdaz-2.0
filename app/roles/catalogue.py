@@ -106,6 +106,11 @@ QUOTE_APPROVER: Final = "quote_approver"
 #: the quote, not the screen for raising one or the Zoho queue.
 ROLE_MODULES: Final[dict[str, dict[str, tuple[str, ...] | None]]] = {
     QUOTE_APPROVER: {"quote_requests": ("list", "detail")},
+    # A customer writing in through the website is the business's concern
+    # before it is any team's: whoever runs the company sees it without
+    # waiting for a grant. Sales is given it as a team.
+    "ceo": {"website_enquiries": None},
+    "manager": {"website_enquiries": None},
 }
 
 #: What someone gets when added to a team without a role being named.

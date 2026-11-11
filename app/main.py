@@ -8,7 +8,6 @@ from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.access.router import router as access_router
@@ -31,6 +30,7 @@ from app.directory.router import router as directory_router
 from app.enquiries.claude import ClaudeEnquiry
 from app.agents.model import AgentModel
 from app.core.mail import GraphMailer
+from app.core.public import ErpCORS
 from app.agents import ENABLED as AGENTS_ENABLED
 from app.agents.router import router as agents_router
 from app.agents import engine as agent_engine
@@ -90,6 +90,8 @@ from app.reports.router import admin_router as reports_admin_router
 from app.reports.router import router as reports_router
 from app.roles.router import router as roles_router
 from app.teams.router import router as teams_router
+from app.website.public import router as website_public_router
+from app.website.router import router as website_router
 from app.zoho.cache import QuoteCache
 from app.zoho.client import ZohoBooks
 from app.zoho.router import router as zoho_router
@@ -157,6 +159,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.agent_model = AgentModel(settings)
     # Mails an agent's owner about their own runs — as them, to them.
     app.state.agent_mailer = GraphMailer(settings, http)
+    # The website's contact form mails each enquiry to sales through it.
+    app.state.website_mailer = GraphMailer(settings, http)
     # Approvers are told a quote is waiting, from the requester's own mailbox.
     app.state.quote_mailer = QuoteMailer(settings, http)
     # Files the supplier documents people upload into OneDrive. Inert
@@ -298,7 +302,9 @@ def create_app() -> FastAPI:
     app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
 
     app.add_middleware(
-        CORSMiddleware,
+        # CORSMiddleware, except on the website's contact form, which answers
+        # with its own uncredentialed headers: see app/core/public.py.
+        ErpCORS,
         allow_origins=settings.cors_origins,
         # Required for the session cookie to travel on frontend XHR. Note this
         # forbids the "*" origin wildcard — hence an explicit list.
@@ -379,10 +385,13 @@ def create_app() -> FastAPI:
     app.include_router(payroll_invoice_router, prefix=settings.api_prefix)
     app.include_router(reports_admin_router, prefix=settings.api_prefix)
     app.include_router(reports_router, prefix=settings.api_prefix)
+    app.include_router(website_router, prefix=settings.api_prefix)
     # Mounted at the root, NOT under the API prefix, and holding no
     # authentication dependency of any kind. That separation is the whole
     # of the candidate-facing security model — see app/hr/public.py.
     app.include_router(careers_router)
+    # The same arrangement for the website's contact form: app/website/public.py.
+    app.include_router(website_public_router)
 
     # Dev console. Mounted, not merely guarded — in production the route does
     # not exist at all, so there is nothing to accidentally expose.

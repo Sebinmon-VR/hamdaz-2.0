@@ -51,6 +51,8 @@ class NotificationKind(StrEnum):
     #: One of your tasks is due in a couple of days: where does it stand?
     STATUS_REMINDER = "status_reminder"
     MENTION = "mention"
+    #: Somebody wrote in through the contact form on hamdaz.com.
+    WEBSITE_ENQUIRY = "website_enquiry"
     GENERAL = "general"
 
 
