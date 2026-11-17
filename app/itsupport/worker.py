@@ -84,9 +84,11 @@ FILES_KEPT_SECONDS = 3 * 60 * 60
 GATHER_AT_MOST = 30.0
 #: How long a person's modules are trusted before being read again.
 ACCESS_SECONDS = 5 * 60
-#: What shows while an answer is thought out, if the bouncing dots picture
-#: can't be sent; either becomes the reply (Dots).
-DOTS = "…"
+#: The typing dots, one frame per edit while an answer is thought out; the
+#: message then becomes the reply (Dots). Text, so the notification shows
+#: the dots rather than "sent an image".
+DOTS_FRAMES = ("º৹৹৹", "৹º৹৹", "৹৹º৹", "৹৹৹º")
+DOTS = DOTS_FRAMES[0]
 #: A message this short, with no files or pending question, is small talk:
 #: answered at low effort (3 s instead of 10 s for a "hi").
 SMALL_TALK_WORDS = 6
@@ -165,29 +167,49 @@ def this_conversation(newest_first: list[dict[str, Any]]) -> list[dict[str, Any]
 
 
 class Dots:
-    """Bouncing dots (a picture; "…" if that's refused) while an answer is
-    thought out, edited into the first thing said
-    after it, so the reply appears where the dots were. Graph can't show the
-    typing dots for a user account; this is the nearest. Once something is
-    said, no more dots this turn."""
+    """Typing dots while an answer is thought out: a message stepped through
+    DOTS_FRAMES by editing it, then edited into the first thing said after
+    it, so the reply appears where the dots were. Graph can't show Teams'
+    own typing dots for a user account; this is the nearest. Once something
+    is said, no more dots this turn."""
+
+    #: Seconds between frames, and how long they move before resting.
+    STEP = 0.8
+    MOVE_FOR = 90.0
 
     def __init__(self, graph: ITSupportGraph, chat: Chat) -> None:
         self._graph, self._chat = graph, chat
         self.message_id: str | None = None
         self.done = False
         self._lock = asyncio.Lock()
+        self._moving: asyncio.Task[None] | None = None
 
     async def show(self) -> None:
         async with self._lock:
             if self.done or self.message_id is not None:
                 return
-            try:
-                sent = await self._graph.send_typing(self._chat.chat_id)
-            except (GraphError, httpx.HTTPError) as exc:
-                logger.warning("it support: the typing dots picture was refused: %s", exc)
-                sent = await self._graph.send(self._chat.chat_id, DOTS)
+            sent = await self._graph.send(self._chat.chat_id, DOTS)
             self.message_id = str(sent.get("id"))
             self._chat.seen.add(self.message_id)
+        self._moving = asyncio.create_task(self._move(), name="itsupport-dots-move")
+
+    async def _move(self) -> None:
+        """Step the frames until the reply takes the message. Every edit is
+        under the lock, so the reply's edit is always the last one."""
+        until = time.monotonic() + self.MOVE_FOR
+        frame = 0
+        while time.monotonic() < until:
+            await asyncio.sleep(self.STEP)
+            frame = (frame + 1) % len(DOTS_FRAMES)
+            async with self._lock:
+                if self.done or self.message_id is None:
+                    return
+                try:
+                    await self._graph.edit(self._chat.chat_id, self.message_id,
+                                           DOTS_FRAMES[frame])
+                except (GraphError, httpx.HTTPError) as exc:
+                    logger.info("it support: the dots stopped moving: %s", exc)
+                    return
 
     async def say(self, html_body: str) -> bool:
         """Put this where the dots are. False when there are none (or the

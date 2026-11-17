@@ -54,9 +54,6 @@ FILE_SCOPES: Final = "offline_access Files.Read.All"
 CONNECT_SCOPES: Final = f"{SCOPES} Files.Read.All"
 #: A file larger than this is not downloaded.
 MAX_FILE_BYTES: Final = 25 * 1024 * 1024
-#: The typing dots (send_typing), base64 as Graph wants it.
-_TYPING: Final = base64.b64encode(
-    (Path(__file__).parent / "typing.png").read_bytes()).decode()
 
 
 class GraphError(Exception):
@@ -302,21 +299,6 @@ class ITSupportGraph:
         return await self._call(
             "POST", f"/chats/{chat_id}/messages",
             json={"body": {"contentType": "html", "content": html_body}},
-        )
-
-    async def send_typing(self, chat_id: str) -> dict[str, Any]:
-        """Three bouncing dots (an animated PNG: Graph takes only JPG or PNG
-        pictures, and Teams plays an animated PNG). The message is edited into
-        the reply after, which drops the picture."""
-        return await self._call(
-            "POST", f"/chats/{chat_id}/messages",
-            json={
-                "body": {"contentType": "html",
-                         "content": '<img src="../hostedContents/1/$value" width="44" '
-                                    'height="16" alt="typing…">'},
-                "hostedContents": [{"@microsoft.graph.temporaryId": "1",
-                                    "contentBytes": _TYPING, "contentType": "image/png"}],
-            },
         )
 
     async def send_file(self, chat_id: str, html_body: str, *, name: str, url: str,
