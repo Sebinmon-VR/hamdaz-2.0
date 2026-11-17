@@ -442,10 +442,6 @@ class Settings(BaseSettings):
     #: A file sent with no words: wait this long for them to type what it's
     #: for before asking, in seconds.
     it_support_file_wait_seconds: float = 8.0
-    #: An answer still being thought out after this long (small talk: only
-    #: once it does real work) shows a "…" message that becomes the reply.
-    #: Graph has no typing dots for a user account; this stands in for them.
-    it_support_dots_seconds: float = 1.5
 
     # ── enquiry analysis ───────────────────────────────────────────────
     #: The Claude model that reads a tender's documents and looks new items up

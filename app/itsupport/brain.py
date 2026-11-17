@@ -468,7 +468,7 @@ class Turn:
     #: Claude's effort for this turn; None: IT_SUPPORT_BRAIN_EFFORT. Small
     #: talk runs low (the user, 2026-11-17: a "hi" took 20 s at high).
     effort: str | None = None
-    #: Whether a tool ran: real work, the only time a holding line is sent.
+    #: Whether a tool ran this turn (real work, not just talk).
     working: bool = False
     #: Who answered: "groq:openai/gpt-oss-120b", "anthropic:claude-haiku-5-5".
     who: str = ""

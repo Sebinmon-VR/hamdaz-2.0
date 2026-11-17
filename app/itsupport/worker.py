@@ -84,11 +84,6 @@ FILES_KEPT_SECONDS = 3 * 60 * 60
 GATHER_AT_MOST = 30.0
 #: How long a person's modules are trusted before being read again.
 ACCESS_SECONDS = 5 * 60
-#: The typing dots while an answer is thought out; the message then becomes
-#: the reply (Dots). Still text: moving them by editing went no faster than
-#: Graph takes an edit (~0.7 s a step), too slow to look like typing, and a
-#: picture made the notification say "sent an image".
-DOTS = "৹৹৹"
 #: A message this short, with no files or pending question, is small talk:
 #: answered at low effort (3 s instead of 10 s for a "hi").
 SMALL_TALK_WORDS = 6
@@ -164,53 +159,6 @@ def this_conversation(newest_first: list[dict[str, Any]]) -> list[dict[str, Any]
         out.append(message)
         later = when or later
     return out
-
-
-class Dots:
-    """Typing dots while an answer is thought out, edited into the first
-    thing said after them, so the reply appears where the dots were. Graph
-    can't show Teams' own typing dots for a user account; this is the
-    nearest. Once something is said, no more dots this turn."""
-
-    def __init__(self, graph: ITSupportGraph, chat: Chat) -> None:
-        self._graph, self._chat = graph, chat
-        self.message_id: str | None = None
-        self.done = False
-        self._lock = asyncio.Lock()
-
-    async def show(self) -> None:
-        async with self._lock:
-            if self.done or self.message_id is not None:
-                return
-            sent = await self._graph.send(self._chat.chat_id, DOTS)
-            self.message_id = str(sent.get("id"))
-            self._chat.seen.add(self.message_id)
-
-    async def say(self, html_body: str) -> bool:
-        """Put this where the dots are. False when there are none (or the
-        edit failed and they were taken away): send it as a new message."""
-        async with self._lock:
-            self.done = True
-            message_id, self.message_id = self.message_id, None
-            if message_id is None:
-                return False
-            try:
-                await self._graph.edit(self._chat.chat_id, message_id, html_body)
-                return True
-            except (GraphError, httpx.HTTPError) as exc:
-                logger.warning("it support: the dots could not become the reply: %s", exc)
-                with contextlib.suppress(Exception):
-                    await self._graph.delete_own(self._chat.chat_id, message_id)
-                return False
-
-    async def close(self) -> None:
-        """The turn ended without saying anything after them: take them away."""
-        async with self._lock:
-            self.done = True
-            message_id, self.message_id = self.message_id, None
-        if message_id is not None:
-            with contextlib.suppress(Exception):
-                await self._graph.delete_own(self._chat.chat_id, message_id)
 
 
 def _when(value: str | None) -> datetime | None:
@@ -590,7 +538,6 @@ class ITSupportWorker:
         """One turn of the brain for the messages gathered."""
         assert self._brain is not None and self._erp is not None and self.me_id is not None
         started = time.monotonic()
-        dots: Dots | None = None
         try:
             found = await self._person(chat)
             if found is None:
@@ -680,10 +627,8 @@ class ITSupportWorker:
             context = self._context(chat, person, known, files, batch, problems, plan_note,
                                     small_talk=small)
 
-            dots = Dots(self._graph, chat)
-
             async def say(text: str) -> None:
-                await self._say(chat, talk.to_html(text.strip()[:1000]), dots)
+                await self._say(chat, talk.to_html(text.strip()[:1000]))
 
             async def find(ask: distributors.Ask) -> None:
                 self._spawn(self._find_for(chat, ask), "itsupport-find")
@@ -699,21 +644,8 @@ class ITSupportWorker:
                         agreed=agreed,
                         effort="low" if small else None)
 
-            async def hold(dots: Dots) -> None:
-                # Any answer still being thought out after a moment, as typing
-                # dots would be; small talk only once it starts real work (a
-                # lookup). Not cancelled: it ends by itself once anything is
-                # said, so the dots can't be left half sent.
-                while not dots.done:
-                    if (turn.working or not small) and (
-                            time.monotonic() - started
-                            >= self._settings.it_support_dots_seconds):
-                        with contextlib.suppress(Exception):
-                            await dots.show()
-                        return
-                    await asyncio.sleep(0.25)
-
-            self._spawn(hold(dots), "itsupport-dots")
+            # No holding line or typing dots: the reply comes when it's ready
+            # (the user's choice, 2026-11-17, after trying both).
             text = await self._brain.answer(turn, chat=history, context=context)
             if agreed and (not turn.done or turn.done[-1].endswith("failed")):
                 # Still not finished: their next message may carry what's missing.
@@ -728,7 +660,7 @@ class ITSupportWorker:
             if self._settings.it_support_show_timing:
                 body += (f"<br><br><i>({time.monotonic() - started:.1f}s · "
                          f"{turn.who or 'no model'})</i>")
-            await self._say(chat, body, dots)
+            await self._say(chat, body)
             logger.info("it support: brain answered %s in %.1fs (%d message(s), %d file(s) "
                         "at hand)", chat.email, time.monotonic() - started, len(batch),
                         len(files))
@@ -743,10 +675,8 @@ class ITSupportWorker:
             with contextlib.suppress(Exception):
                 await self._say(chat, talk.to_html(
                     "Sorry, something went wrong on my side there. Can you send that again?"
-                    + detail), dots)
+                    + detail))
         finally:
-            if dots is not None:
-                self._spawn(dots.close(), "itsupport-dots-close")
             chat.busy = False
 
     def _context(self, chat: Chat, person: Person, known: work.Work | None,
@@ -1066,11 +996,9 @@ class ITSupportWorker:
             return found
         return [m for m in found if (when := _when(m.get("createdDateTime"))) and when > cut]
 
-    async def _say(self, chat: Chat, html_body: str, dots: Dots | None = None) -> None:
-        """Send a message, or turn this turn's "…" into it."""
-        if dots is None or not await dots.say(html_body):
-            sent = await self._graph.send(chat.chat_id, html_body)
-            chat.seen.add(str(sent.get("id")))
+    async def _say(self, chat: Chat, html_body: str) -> None:
+        sent = await self._graph.send(chat.chat_id, html_body)
+        chat.seen.add(str(sent.get("id")))
         chat.active_at, chat.notes_behind = time.monotonic(), True
 
     async def _find_for(self, chat: Chat, ask: distributors.Ask) -> None:
