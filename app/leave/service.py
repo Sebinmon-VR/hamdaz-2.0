@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.leave import (
     DecisionBy,
+    HalfDay,
     LeaveRequest,
     LeaveSettings,
     LeaveStatus,
@@ -191,26 +192,32 @@ async def submit(
     start: date,
     end: date,
     reason: str | None = None,
+    half_day: HalfDay | None = None,
 ) -> LeaveRequest:
     """Raise a request and decide it, if HR has automatic decisions switched on."""
     settings = await get_settings(session)
 
     if end < start:
         raise LeaveError("The end date cannot be before the start date")
+    if half_day is not None and end != start:
+        raise LeaveError("A half day is one date: the first and last day must be the same")
     span = (end - start).days + 1
     if span > settings.max_days_per_request:
         raise LeaveError(
             f"A single request cannot cover more than {settings.max_days_per_request} days"
         )
 
-    existing = await session.scalar(
+    overlapping = (await session.scalars(
         select(LeaveRequest).where(
             LeaveRequest.user_id == user.id,
             LeaveRequest.status.in_([LeaveStatus.PENDING, LeaveStatus.APPROVED]),
             LeaveRequest.start_date <= end,
             LeaveRequest.end_date >= start,
         )
-    )
+    )).all()
+    # The morning and the afternoon of one date are two halves, not a clash.
+    existing = next((r for r in overlapping if not (
+        half_day is not None and r.half_day is not None and r.half_day != half_day)), None)
     if existing is not None:
         raise LeaveConflictError(
             f"You already have leave from {existing.start_date} to {existing.end_date} "
@@ -222,6 +229,7 @@ async def submit(
         leave_type=leave_type,
         start_date=start,
         end_date=end,
+        half_day=half_day,
         reason=reason,
         status=LeaveStatus.PENDING,
     )
@@ -430,6 +438,7 @@ async def calendar(
                 "user_id": str(r.user_id),
                 "name": r.user.display_name,
                 "leave_type": r.leave_type,
+                "half_day": r.half_day,
             }
             for r in rows
             if r.start_date <= day <= r.end_date

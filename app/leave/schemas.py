@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.models.leave import LeaveType
+from app.models.leave import HalfDay, LeaveType
 
 
 class LeaveRequestIn(BaseModel):
@@ -16,6 +16,8 @@ class LeaveRequestIn(BaseModel):
     #: Both ends inclusive. A single day has start == end.
     start_date: date
     end_date: date
+    #: Half of one date (start == end); None: whole days.
+    half_day: HalfDay | None = None
     reason: str | None = Field(default=None, max_length=2000)
 
 
@@ -27,7 +29,10 @@ class LeaveRequestOut(BaseModel):
     leave_type: str
     start_date: date
     end_date: date
-    days: int
+    #: ``morning`` or ``afternoon`` for a half day.
+    half_day: str | None = None
+    #: 0.5 for a half day.
+    days: float
     reason: str | None
     status: str
     #: "system" for an automatic decision, "hr" for a person, "requester" if withdrawn.

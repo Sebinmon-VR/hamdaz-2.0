@@ -30,10 +30,18 @@ def _body(request: LeaveRequest) -> str:
         f"<p>{who} has requested leave.</p>",
         "<table cellpadding='6' style='border-collapse:collapse'>",
         f"<tr><td><b>Type</b></td><td>{request.leave_type}</td></tr>",
-        f"<tr><td><b>From</b></td><td>{request.start_date:%A %d %B %Y}</td></tr>",
-        f"<tr><td><b>To</b></td><td>{request.end_date:%A %d %B %Y}</td></tr>",
-        f"<tr><td><b>Days</b></td><td>{days}</td></tr>",
     ]
+    if request.half_day:
+        lines += [
+            f"<tr><td><b>On</b></td><td>{request.start_date:%A %d %B %Y}</td></tr>",
+            f"<tr><td><b>Days</b></td><td>Half day ({request.half_day})</td></tr>",
+        ]
+    else:
+        lines += [
+            f"<tr><td><b>From</b></td><td>{request.start_date:%A %d %B %Y}</td></tr>",
+            f"<tr><td><b>To</b></td><td>{request.end_date:%A %d %B %Y}</td></tr>",
+            f"<tr><td><b>Days</b></td><td>{days}</td></tr>",
+        ]
     if request.reason:
         lines.append(f"<tr><td><b>Reason</b></td><td>{request.reason}</td></tr>")
     lines.append(f"<tr><td><b>Status</b></td><td>{request.status}</td></tr>")

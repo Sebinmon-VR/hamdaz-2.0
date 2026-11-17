@@ -266,7 +266,8 @@ async def on_leave_today(
 
     Approved leave only: a pending request has not taken anyone out of the pool
     yet, and treating it as though it had would quietly reassign work on the
-    strength of a request that might be refused.
+    strength of a request that might be refused. A half day doesn't count:
+    they are in for the other half, so they stay in the pool.
     """
     if not user_ids:
         return {}
@@ -278,6 +279,7 @@ async def on_leave_today(
             LeaveRequest.status == LeaveStatus.APPROVED,
             LeaveRequest.start_date <= day,
             LeaveRequest.end_date >= day,
+            LeaveRequest.half_day.is_(None),
         )
     )
     return {

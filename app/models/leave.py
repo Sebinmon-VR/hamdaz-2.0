@@ -6,7 +6,9 @@ limit is approved on submission, one that does not is rejected with the reason.
 HR overrides either way, which is what "emergency" means here.
 
 Dates are stored as plain dates, not timestamps. Leave is granted in whole days,
-and a timezone on "the 3rd of June" only creates ways for it to become the 2nd.
+or half of one (``half_day``: the morning or the afternoon of a single date,
+counted as 0.5), and a timezone on "the 3rd of June" only creates ways for it
+to become the 2nd.
 """
 
 from __future__ import annotations
@@ -46,6 +48,14 @@ class LeaveType(StrEnum):
     SICK = "sick"
     EMERGENCY = "emergency"
     UNPAID = "unpaid"
+    CASUAL = "casual"
+
+
+class HalfDay(StrEnum):
+    """Which half of a single date a half-day leave takes."""
+
+    MORNING = "morning"
+    AFTERNOON = "afternoon"
 
 
 class DecisionBy(StrEnum):
@@ -62,6 +72,10 @@ class LeaveRequest(Base, UUIDPrimaryKey, Timestamped):
     __tablename__ = "leave_requests"
     __table_args__ = (
         CheckConstraint("end_date >= start_date", name="ck_leave_dates_ordered"),
+        CheckConstraint(
+            "half_day IS NULL OR (half_day IN ('morning', 'afternoon') AND start_date = end_date)",
+            name="ck_leave_half_day_one_date",
+        ),
         # Every overlap query is "who else is off between these dates".
         Index("ix_leave_range", "start_date", "end_date", "status"),
     )
@@ -74,6 +88,8 @@ class LeaveRequest(Base, UUIDPrimaryKey, Timestamped):
     #: Inclusive on both ends: a one-day leave has start == end.
     start_date: Mapped[date] = mapped_column(Date, nullable=False)
     end_date: Mapped[date] = mapped_column(Date, nullable=False)
+    #: ``morning`` or ``afternoon`` for half a day (start == end); None: whole days.
+    half_day: Mapped[HalfDay | None] = mapped_column(String(10))
     reason: Mapped[str | None] = mapped_column(Text)
 
     status: Mapped[LeaveStatus] = mapped_column(
@@ -104,7 +120,10 @@ class LeaveRequest(Base, UUIDPrimaryKey, Timestamped):
     user: Mapped[User] = relationship(foreign_keys=[user_id], lazy="joined")
 
     @property
-    def days(self) -> int:
+    def days(self) -> float:
+        """Days off: 0.5 for a half day."""
+        if self.half_day:
+            return 0.5
         return (self.end_date - self.start_date).days + 1
 
     @property

@@ -83,6 +83,7 @@ def _out(request: LeaveRequest) -> LeaveRequestOut:
         leave_type=request.leave_type,
         start_date=request.start_date,
         end_date=request.end_date,
+        half_day=request.half_day,
         days=request.days,
         reason=request.reason,
         status=request.status,
@@ -137,6 +138,7 @@ async def create_request(
             leave_type=payload.leave_type,
             start=payload.start_date,
             end=payload.end_date,
+            half_day=payload.half_day,
             reason=payload.reason,
         )
     except LeaveError as exc:
