@@ -697,13 +697,14 @@ class ITSupportWorker:
                         effort="low" if small else None)
 
             async def hold(dots: Dots) -> None:
-                # Only for real work (a lookup, a file being read) still going
-                # after a moment, never for small talk. Not cancelled: it ends
-                # by itself once anything is said, so the dots can't be left
-                # half sent.
+                # Any answer still being thought out after a moment, as typing
+                # dots would be; small talk only once it starts real work (a
+                # lookup). Not cancelled: it ends by itself once anything is
+                # said, so the dots can't be left half sent.
                 while not dots.done:
-                    if turn.working and (time.monotonic() - started
-                                         >= self._settings.it_support_dots_seconds):
+                    if (turn.working or not small) and (
+                            time.monotonic() - started
+                            >= self._settings.it_support_dots_seconds):
                         with contextlib.suppress(Exception):
                             await dots.show()
                         return
