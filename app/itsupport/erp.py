@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from dataclasses import dataclass
 from typing import Any, Final
@@ -95,6 +96,10 @@ MODES: Final[dict[str, str]] = {
 #: Path words that mean mail goes to somebody, or a hand-off the app keeps.
 NEVER_FROM_CHAT: Final = ("supplier-emails", "/submit", "/reviews", "/negotiate", "/send",
                           "/mail", "/approve")
+#: The whole-quote edit: its body replaces every list on the costing, so a body
+#: naming one charge would empty the lines. Never from the chat; the chat
+#: changes parts with /quote-requests/{id}/changes.
+_WHOLE_QUOTE: Final = re.compile(r"^/api/v1/quote-requests/[^/]+/?$")
 #: What a reply may bring back to the model, in characters.
 MAX_RESULT: Final = 14_000
 
@@ -180,6 +185,9 @@ def blocked(method: str, path: str, access: Access, mode_of: dict[str, str]) -> 
         return "deleting is done in the app"
     if any(word in path for word in NEVER_FROM_CHAT):
         return "this sends mail or hands the work on, which is done in the app after a review"
+    if method in ("PATCH", "PUT") and _WHOLE_QUOTE.match(path):
+        return ("that replaces the whole costing (lines, charges, everything); change parts "
+                "of it with POST /quote-requests/{id}/changes instead")
     if mode != "write":
         return f"changes in {module_of(path)} are made in the app, not from the chat"
     return None
