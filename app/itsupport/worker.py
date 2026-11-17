@@ -173,8 +173,9 @@ class Dots:
     own typing dots for a user account; this is the nearest. Once something
     is said, no more dots this turn."""
 
-    #: Seconds between frames, and how long they move before resting.
-    STEP = 0.8
+    #: At least this many seconds between frames (an edit itself takes Graph
+    #: about 0.9 s, so that sets the pace), and how long they move.
+    STEP = 0.3
     MOVE_FOR = 90.0
 
     def __init__(self, graph: ITSupportGraph, chat: Chat) -> None:
@@ -197,9 +198,10 @@ class Dots:
         """Step the frames until the reply takes the message. Every edit is
         under the lock, so the reply's edit is always the last one."""
         until = time.monotonic() + self.MOVE_FOR
-        frame = 0
+        frame, last = 0, time.monotonic()
         while time.monotonic() < until:
-            await asyncio.sleep(self.STEP)
+            await asyncio.sleep(max(0.0, self.STEP - (time.monotonic() - last)))
+            last = time.monotonic()
             frame = (frame + 1) % len(DOTS_FRAMES)
             async with self._lock:
                 if self.done or self.message_id is None:
