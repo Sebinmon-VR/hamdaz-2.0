@@ -61,7 +61,13 @@ class ITSupportSettings(Base, Timestamped):
         ARRAY(Integer), nullable=False, default=list,
         server_default=text("'{0,1,2,3,4,5}'::integer[]"),
     )
-    #: Every check-in sent into this one person's chat instead, for a trial.
+    #: The morning brief, and when it goes (HH:MM, IST).
+    brief_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    brief_at: Mapped[str] = mapped_column(String(5), nullable=False, default="09:30",
+                                          server_default="09:30")
+    #: Every check-in and brief sent into this one person's chat instead, for a trial.
     due_test_to: Mapped[str] = mapped_column(String(320), nullable=False, default="",
                                              server_default="")
 
@@ -77,7 +83,17 @@ class ITSupportSettings(Base, Timestamped):
         JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
     )
 
-    # ── the worker's heartbeat ──
+    # ── the account's sign-in, made with Connect on the page ──
+    #: ``graph.sign_in_record``: the refresh token encrypted with a key from
+    #: SESSION_SECRET, and whose it is. None: not connected from the web (a
+    #: laptop may still hold one in its own file).
+    sign_in: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    connected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    connected_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+
+    # ── the worker's heartbeat: the lease of the one process answering ──
     #: The machine answering, and when it last checked in.
     running_on: Mapped[str | None] = mapped_column(String(200))
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

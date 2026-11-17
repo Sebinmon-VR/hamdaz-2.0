@@ -1,24 +1,50 @@
 """The IT Support settings API, for /admin/it-support. Super admins only:
-it decides whose Teams chats an AI answers and what it may do in the ERP."""
+it decides whose Teams chats an AI answers and what it may do in the ERP.
+
+**Connect** signs the IT Support account in from the browser, so the server
+that runs the agent has its sign-in (the laptop's ``python -m
+app.itsupport.connect`` does the same into a local file). It returns through
+the app's one registered redirect address, ``/auth/callback``, like the Mail
+watch's Teams connect: the signed login-state cookie carries ``purpose:
+itsupport`` and the auth router hands it back here (:func:`finish`). Only the
+IT Support account is kept: signing in as anybody else keeps nothing.
+"""
 
 from __future__ import annotations
 
+import logging
+import secrets
+import uuid
 from datetime import UTC, datetime
 from typing import Annotated, Any
+from urllib.parse import urlencode
 
-from fastapi import APIRouter, Depends, HTTPException, status
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.deps import CurrentUser
+from app.auth.oidc import generate_pkce_pair
 from app.core.config import Settings, get_settings
 from app.core.db import get_session
+from app.core.mail import GRAPH_BASE
+from app.core.security import sign
 from app.itsupport import settings as service
+from app.itsupport.graph import CONNECT_SCOPES, SCOPES, sign_in_record
 from app.models.user import User
 from app.roles.catalogue import SUPER_ADMIN
 from app.roles.deps import CurrentRoles
 
 router = APIRouter(prefix="/it-support", tags=["it-support"])
+logger = logging.getLogger("hamdaz.itsupport")
+
+#: What the login-state cookie carries for the auth callback to hand back.
+PURPOSE = "itsupport"
+#: The auth router's audience for the login-state cookie (app.auth.router).
+LOGIN_STATE_AUDIENCE = "hamdaz:login-state"
 
 Session = Annotated[AsyncSession, Depends(get_session)]
 Config = Annotated[Settings, Depends(get_settings)]
@@ -63,6 +89,8 @@ class ITSupportSettingsOut(BaseModel):
     due_until: str
     due_days: list[int]
     due_test_to: str
+    brief_enabled: bool
+    brief_at: str
     brain_model: str
     brain_effort: str
     modules: list[ModuleOut]
@@ -76,6 +104,11 @@ class ITSupportSettingsOut(BaseModel):
     last_error: str | None
     #: Whether this server itself may run it (IT_SUPPORT_CHAT_ENABLED).
     runs_here: bool
+    #: The account signed in with Connect, kept for the server.
+    connected: bool
+    connected_account: str | None
+    connected_at: datetime | None
+    connected_by: str | None
 
 
 class ITSupportSettingsIn(BaseModel):
@@ -87,6 +120,8 @@ class ITSupportSettingsIn(BaseModel):
     due_until: str | None = None
     due_days: list[int] | None = None
     due_test_to: str | None = None
+    brief_enabled: bool | None = None
+    brief_at: str | None = None
     brain_model: str | None = None
     brain_effort: str | None = None
     #: Each module's mode; anything left out goes back to its default.
@@ -107,13 +142,20 @@ async def _out(session: AsyncSession, config: Settings) -> ITSupportSettingsOut:
                           has_account=p["email"] in have) for p in people],
         show_timing=row.show_timing, due_enabled=row.due_enabled, due_from=row.due_from,
         due_until=row.due_until, due_days=list(row.due_days or []),
-        due_test_to=row.due_test_to, brain_model=row.brain_model,
+        due_test_to=row.due_test_to, brief_enabled=row.brief_enabled,
+        brief_at=row.brief_at, brain_model=row.brain_model,
         brain_effort=row.brain_effort, modules=modules, models=list(service.MODELS),
         efforts=list(service.EFFORTS),
         running=seen is not None
         and (datetime.now(UTC) - seen).total_seconds() < service.ALIVE_SECONDS,
         running_on=row.running_on, last_seen_at=seen, signed_in_as=row.signed_in_as,
         last_error=row.last_error, runs_here=config.it_support_chat_enabled,
+        connected=bool(row.sign_in),
+        connected_account=(row.sign_in or {}).get("account_email"),
+        connected_at=row.connected_at,
+        connected_by=await session.scalar(
+            select(User.display_name).where(User.id == row.connected_by_id))
+        if row.connected_by_id else None,
     )
 
 
@@ -135,4 +177,107 @@ async def update_settings(body: ITSupportSettingsIn, admin: SuperAdmin, session:
     except service.ITSupportSettingsError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     await session.commit()
+    return await _out(session, config)
+
+
+# ── Connect: the IT Support account's sign-in, from the browser ─────────
+
+
+@router.get("/connect", summary="Connect the IT Support account (opens Microsoft sign-in)")
+async def connect(admin: SuperAdmin, config: Config) -> RedirectResponse:
+    """Open in the browser, not from the API page: it goes to Microsoft, where
+    you sign in **as IT Support** (not as yourself), and comes back to the
+    settings page."""
+    state = secrets.token_urlsafe(32)
+    verifier, challenge = generate_pkce_pair()
+    query = urlencode({
+        "client_id": config.azure_client_id,
+        "response_type": "code",
+        "redirect_uri": config.azure_redirect_uri,
+        "response_mode": "query",
+        # The chat's scopes and the file one: consent for all at once, and the
+        # one refresh token then serves both.
+        "scope": CONNECT_SCOPES,
+        "state": state,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "login_hint": config.it_support_email,
+        "prompt": "select_account",
+    })
+    response = RedirectResponse(f"{config.authority}/oauth2/v2.0/authorize?{query}",
+                                status_code=307)
+    response.set_cookie(
+        key=config.login_state_cookie_name,
+        value=sign({"state": state, "verifier": verifier, "purpose": PURPOSE,
+                    "user_id": str(admin.id)},
+                   secret=config.session_secret, ttl_minutes=config.login_state_ttl_minutes,
+                   audience=LOGIN_STATE_AUDIENCE),
+        max_age=config.login_state_ttl_minutes * 60, httponly=True,
+        secure=config.cookie_secure, samesite=config.cookie_samesite,
+        domain=config.cookie_domain, path="/",
+    )
+    return response
+
+
+def _back(settings: Settings, **query: str) -> RedirectResponse:
+    response = RedirectResponse(
+        f"{settings.frontend_url}/admin/it-support?{urlencode(query)}", status_code=303)
+    response.delete_cookie(
+        key=settings.login_state_cookie_name, httponly=True, secure=settings.cookie_secure,
+        samesite=settings.cookie_samesite, domain=settings.cookie_domain, path="/",
+    )
+    return response
+
+
+async def finish(request: Request, session: AsyncSession, settings: Settings, *, code: str,
+                 login_state: dict[str, Any]) -> RedirectResponse:
+    """The code Microsoft sent back (the state already checked by the auth
+    router): keep the sign-in if it is the IT Support account."""
+    http: httpx.AsyncClient = request.app.state.http
+    response = await http.post(f"{settings.authority}/oauth2/v2.0/token", data={
+        "client_id": settings.azure_client_id,
+        "client_secret": settings.azure_client_secret,
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": settings.azure_redirect_uri,
+        "code_verifier": login_state.get("verifier", ""),
+        "scope": SCOPES,
+    })
+    if response.status_code != 200:
+        logger.warning("it support connect: token exchange failed %s %s",
+                       response.status_code, response.text[:300])
+        return _back(settings, connect_error="sign_in_failed")
+    tokens = response.json()
+    if not tokens.get("refresh_token"):
+        return _back(settings, connect_error="permission_not_granted")
+    me = await http.get(
+        f"{GRAPH_BASE}/me", params={"$select": "id,displayName,mail,userPrincipalName"},
+        headers={"Authorization": f"Bearer {tokens['access_token']}"},
+    )
+    account = me.json() if me.status_code == 200 else {}
+    email = (account.get("mail") or account.get("userPrincipalName") or "").lower()
+    if email != settings.it_support_email.lower():
+        logger.warning("it support connect: signed in as %s, not %s; nothing kept",
+                       email or "nobody", settings.it_support_email)
+        return _back(settings, connect_error="wrong_account", account=email or "unknown")
+    row = await service.get_row(session, settings)
+    row.sign_in = sign_in_record(settings, tokens, account)
+    row.connected_at = datetime.now(UTC)
+    who = login_state.get("user_id")
+    row.connected_by_id = uuid.UUID(who) if who else None
+    await session.commit()
+    logger.info("it support connected as %s from the settings page", email)
+    return _back(settings, connected="1")
+
+
+@router.delete("/connect", response_model=ITSupportSettingsOut,
+               summary="Disconnect: forget the sign-in kept for the server")
+async def disconnect(admin: SuperAdmin, session: Session,
+                     config: Config) -> ITSupportSettingsOut:
+    """The agent on the server stops within 30 seconds. A laptop's own
+    sign-in (its local file) is not touched."""
+    row = await service.get_row(session, config)
+    row.sign_in, row.connected_at, row.connected_by_id = None, None, None
+    await session.commit()
+    logger.warning("it support disconnected by %s", admin.email)
     return await _out(session, config)

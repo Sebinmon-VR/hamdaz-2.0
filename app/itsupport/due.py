@@ -165,6 +165,14 @@ class Asked:
     def new(self, tasks: list[DueTask]) -> list[DueTask]:
         return [t for t in tasks if self._key(t) not in self._rows]
 
+    def has(self, key: str) -> bool:
+        """A key of another kind (``brief.sent_key``): "…@YYYY-MM-DD"."""
+        return key in self._rows
+
+    def mark_key(self, key: str, now: datetime) -> None:
+        self._rows[key] = now.isoformat()
+        self.mark([], now)
+
     def mark(self, tasks: list[DueTask], now: datetime) -> None:
         for task in tasks:
             self._rows[self._key(task)] = now.isoformat()
@@ -260,7 +268,7 @@ async def _main(send_to: str | None, day_word: str, message: str | None = None) 
     async with httpx.AsyncClient(timeout=30) as http:
         sharepoint = SharePointProposals(settings, http)
         model = TextModel(settings, http)
-        graph = ITSupportGraph(settings, http)
+        graph = ITSupportGraph(settings, http, get_session_factory())
         people = [send_to] if send_to else [
             e.strip() for e in settings.it_support_allowed_emails.split(",") if e.strip() not in
             ("", "*")

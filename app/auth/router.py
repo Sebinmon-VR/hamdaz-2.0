@@ -144,6 +144,14 @@ async def callback(
     if not secrets.compare_digest(str(login_state.get("state", "")), state):
         return _login_failed(settings, "state_mismatch")
 
+    # A super admin connecting the IT Support account for its Teams agent.
+    if login_state.get("purpose") == "itsupport":
+        from app.itsupport import router as itsupport_router  # import here: no cycle
+
+        return await itsupport_router.finish(
+            request, session, settings, code=code, login_state=login_state
+        )
+
     # A super admin connecting their Teams account for the mail watch, not
     # signing in: the same registered redirect address, a different errand.
     if login_state.get("purpose") == "teams":

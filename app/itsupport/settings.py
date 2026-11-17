@@ -14,13 +14,14 @@ of the page keeps whatever the laptop's .env already said.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import socket
 import uuid
 from datetime import UTC, datetime
 from typing import Any, Final
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -37,7 +38,9 @@ REFRESH_SECONDS: Final = 30.0
 #: A heartbeat younger than this means that machine is answering.
 ALIVE_SECONDS: Final = 90.0
 #: This machine, as the heartbeat names it.
-HOST: Final = socket.gethostname()
+#: This process, as the lease names it: machine and process, since a server
+#: may run several processes of the app on one machine.
+HOST: Final = f"{socket.gethostname()}:{os.getpid()}"
 
 MODELS: Final = ("claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5")
 EFFORTS: Final = ("low", "medium", "high")
@@ -91,6 +94,8 @@ def seed(settings: Settings) -> dict[str, Any]:
         "due_days": sorted({int(d) for d in settings.it_support_due_days.split(",")
                             if d.strip().isdigit()}),
         "due_test_to": settings.it_support_due_test_to.strip().lower(),
+        "brief_enabled": settings.it_support_brief_enabled,
+        "brief_at": settings.it_support_brief_at,
         "brain_model": settings.it_support_brain_model,
         "brain_effort": settings.it_support_brain_effort,
         "module_modes": {k: v.lower() for k, v in _pairs(settings.it_support_module_modes)},
@@ -141,7 +146,7 @@ def _clean_modes(values: Any) -> dict[str, str]:
 
 _EDITABLE: Final = frozenset({
     "enabled", "people", "show_timing", "due_enabled", "due_from", "due_until", "due_days",
-    "due_test_to", "brain_model", "brain_effort", "module_modes",
+    "due_test_to", "brain_model", "brain_effort", "module_modes", "brief_enabled", "brief_at",
 })
 
 
@@ -154,11 +159,11 @@ async def update(session: AsyncSession, settings: Settings, *, actor_id: uuid.UU
         raise ITSupportSettingsError(f"Not a setting: {', '.join(sorted(unknown))}.")
     if "people" in changes:
         changes["people"] = _clean_people(changes["people"])
-    for key in ("due_from", "due_until"):
+    for key in ("due_from", "due_until", "brief_at"):
         if key in changes:
             changes[key] = str(changes[key]).strip()
             if not _CLOCK.match(changes[key]):
-                raise ITSupportSettingsError("Office hours are HH:MM, e.g. 09:00.")
+                raise ITSupportSettingsError("Times are HH:MM, e.g. 09:00.")
     if ("due_from" in changes or "due_until" in changes) and \
             changes.get("due_from", row.due_from) >= changes.get("due_until", row.due_until):
         raise ITSupportSettingsError("Office hours must end after they start.")
@@ -211,6 +216,8 @@ def apply(row: ITSupportSettings, settings: Settings) -> None:
     settings.it_support_due_until = row.due_until
     settings.it_support_due_days = ",".join(str(d) for d in row.due_days or [])
     settings.it_support_due_test_to = row.due_test_to
+    settings.it_support_brief_enabled = row.brief_enabled
+    settings.it_support_brief_at = row.brief_at
     settings.it_support_brain_model = row.brain_model
     settings.it_support_brain_effort = row.brain_effort
     settings.it_support_module_modes = ",".join(f"{k}={v}" for k, v in
@@ -233,7 +240,7 @@ async def load(factory: async_sessionmaker[AsyncSession], settings: Settings,
 
 
 def other_machine(row: ITSupportSettings, now: datetime | None = None) -> str | None:
-    """Another machine that is answering right now, if one is."""
+    """Another process holding the lease right now, if one is (for the page)."""
     now = now or datetime.now(UTC)
     if (row.running_on and row.running_on != HOST and row.last_seen_at is not None
             and (now - row.last_seen_at).total_seconds() < ALIVE_SECONDS):
@@ -241,19 +248,60 @@ def other_machine(row: ITSupportSettings, now: datetime | None = None) -> str | 
     return None
 
 
-async def beat(factory: async_sessionmaker[AsyncSession], *, signed_in_as: str | None,
-               error: str | None) -> None:
-    """The heartbeat: this machine answers, now, signed in as this, with
-    this problem (None: none)."""
+#: Taken only when nobody else holds it: free, stale, or already ours. One
+#: statement, so two processes starting together can't both win.
+_CLAIM: Final = text("""
+    UPDATE itsupport_settings
+       SET running_on = :me, last_seen_at = now(),
+           signed_in_as = COALESCE(:who, signed_in_as), last_error = :error
+     WHERE id = 1
+       AND (running_on = :me OR running_on IS NULL OR last_seen_at IS NULL
+            OR last_seen_at < now() - make_interval(secs => :alive))
+ RETURNING id""")
+#: A problem recorded only where it doesn't talk over the process answering.
+_NOTE: Final = text("""
+    UPDATE itsupport_settings SET last_error = :error
+     WHERE id = 1
+       AND (running_on = :me OR running_on IS NULL OR last_seen_at IS NULL
+            OR last_seen_at < now() - make_interval(secs => :alive))""")
+
+
+async def claim(factory: async_sessionmaker[AsyncSession], *, signed_in_as: str | None,
+                error: str | None) -> bool:
+    """The lease of the one process that answers: taken or renewed, with
+    this process's sign-in and last problem; False while another holds it."""
     try:
         async with factory() as session:
-            row = await session.get(ITSupportSettings, 1)
-            if row is None:
-                return
-            row.running_on, row.last_seen_at = HOST, datetime.now(UTC)
-            if signed_in_as is not None:
-                row.signed_in_as = signed_in_as
-            row.last_error = error
+            got = (await session.execute(_CLAIM, {
+                "me": HOST, "who": signed_in_as, "error": error, "alive": ALIVE_SECONDS,
+            })).first()
+            await session.commit()
+            return got is not None
+    except DBAPIError as exc:
+        logger.warning("it support: the lease could not be taken: %s", exc)
+        return False
+
+
+async def note_problem(factory: async_sessionmaker[AsyncSession], error: str) -> None:
+    """Why this process can't answer (not connected, wrong account), for the
+    page, without claiming the lease or overwriting the one that holds it."""
+    try:
+        async with factory() as session:
+            await session.execute(_NOTE, {"me": HOST, "error": f"{HOST}: {error}",
+                                          "alive": ALIVE_SECONDS})
             await session.commit()
     except DBAPIError as exc:
-        logger.warning("it support: heartbeat not written: %s", exc)
+        logger.warning("it support: the problem was not recorded: %s", exc)
+
+
+async def release(factory: async_sessionmaker[AsyncSession]) -> None:
+    """Let the lease go on a clean stop, so another process takes over now
+    rather than after ALIVE_SECONDS."""
+    try:
+        async with factory() as session:
+            await session.execute(text(
+                "UPDATE itsupport_settings SET last_seen_at = NULL "
+                "WHERE id = 1 AND running_on = :me"), {"me": HOST})
+            await session.commit()
+    except DBAPIError as exc:
+        logger.warning("it support: the lease was not let go: %s", exc)

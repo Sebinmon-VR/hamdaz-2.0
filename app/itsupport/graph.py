@@ -1,11 +1,20 @@
 """The IT Support account's sign-in and its chat calls, through Graph.
 
 **Delegated, as the account.** Graph does not let an application send a chat
-message as a person, so the account signs in once (``app.itsupport.connect``)
-with the backend's own app registration, whose delegated chat permissions are
-already admin-consented. The refresh token is kept in a local file, encrypted
-with a key from SESSION_SECRET, and turned into access tokens as needed; a
-new refresh token, when Microsoft rotates it, is written back.
+message as a person, so the account signs in once with the backend's own app
+registration, whose delegated chat permissions are already admin-consented:
+
+* from the web, with **Connect** on /admin/it-support (``app.itsupport.router``):
+  kept in the settings row (``itsupport_settings.sign_in``), so the server
+  that runs the agent has it;
+* or on a laptop, with ``python -m app.itsupport.connect``: kept in a local
+  file (IT_SUPPORT_TOKEN_FILE).
+
+Either way the refresh token is encrypted with a key from SESSION_SECRET. The
+database's sign-in is used first; one this machine can't read (made by a
+server with another SESSION_SECRET) falls back to the file. Access tokens are
+made as needed; a new refresh token, when Microsoft rotates it, is written
+back where it came from.
 """
 
 from __future__ import annotations
@@ -21,6 +30,8 @@ from typing import Any, Final
 
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import Settings
 from app.core.mail import GRAPH_BASE
@@ -80,33 +91,101 @@ def save_sign_in(settings: Settings, tokens: dict[str, Any], account: dict[str, 
     return path
 
 
+def _read_file(name: str) -> dict[str, Any] | None:
+    path = Path(name)
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+
+
+def sign_in_record(settings: Settings, tokens: dict[str, Any], account: dict[str, Any],
+                   ) -> dict[str, Any]:
+    """The sign-in as kept: the refresh token encrypted, and whose it is."""
+    return {
+        "refresh_token": _fernet(settings).encrypt(tokens["refresh_token"].encode()).decode(),
+        "account_id": account.get("id"),
+        "account_email": (account.get("mail") or account.get("userPrincipalName") or "").lower(),
+        "account_name": account.get("displayName"),
+        "scope": tokens.get("scope", ""),
+    }
+
+
 class ITSupportGraph:
     """Graph as the IT Support account."""
 
-    def __init__(self, settings: Settings, http: httpx.AsyncClient) -> None:
+    def __init__(self, settings: Settings, http: httpx.AsyncClient,
+                 factory: async_sessionmaker[AsyncSession] | None = None) -> None:
         self._settings = settings
         self._http = http
+        #: Where the database's sign-in is read from; None: the file only.
+        self._factory = factory
+        #: Where the sign-in in use came from: "db" or "file".
+        self.source: str | None = None
         #: Access tokens by the scopes they were asked for, with their expiry.
         self._access: dict[str, tuple[str, float]] = {}
         self._lock = asyncio.Lock()
         self.account_id: str | None = None
 
-    def _record(self) -> dict[str, Any]:
-        path = Path(self._settings.it_support_token_file)
-        if not path.exists():
-            raise NotConnectedError(f"no sign-in at {path}; run: python -m app.itsupport.connect")
-        return json.loads(path.read_text(encoding="utf-8"))
+    def forget(self) -> None:
+        """Drop the access tokens held, so the next call reads the sign-in
+        again (after a Connect or Disconnect on the page)."""
+        self._access.clear()
+
+    async def _db_record(self) -> dict[str, Any] | None:
+        if self._factory is None:
+            return None
+        from app.models.itsupport import ITSupportSettings  # no cycle at import
+
+        try:
+            async with self._factory() as session:
+                row = await session.get(ITSupportSettings, 1)
+                return dict(row.sign_in) if row is not None and row.sign_in else None
+        except DBAPIError:
+            return None  # the column not there yet: the file stands
+
+    def _readable(self, record: dict[str, Any]) -> str | None:
+        try:
+            return _fernet(self._settings).decrypt(record["refresh_token"].encode()).decode()
+        except (InvalidToken, KeyError):
+            return None
+
+    async def _record(self) -> tuple[dict[str, Any], str, str]:
+        """The sign-in to use, where it came from, and its refresh token."""
+        record = await self._db_record()
+        if record is not None and (refresh := self._readable(record)) is not None:
+            return record, "db", refresh
+        kept = await asyncio.to_thread(_read_file, self._settings.it_support_token_file)
+        if kept is not None:
+            if (refresh := self._readable(kept)) is not None:
+                return kept, "file", refresh
+            raise NotConnectedError("the kept sign-in can't be read; connect again")
+        if record is not None:
+            raise NotConnectedError("the sign-in was made on a server with another "
+                                    "SESSION_SECRET; connect again from this one")
+        raise NotConnectedError("not connected: use Connect on the IT Support settings page")
+
+    async def _keep(self, record: dict[str, Any], source: str) -> None:
+        """A rotated refresh token, written back where it came from."""
+        if source == "file":
+            await asyncio.to_thread(
+                Path(self._settings.it_support_token_file).write_text,
+                json.dumps(record, indent=1), "utf-8",
+            )
+            return
+        from app.models.itsupport import ITSupportSettings
+
+        assert self._factory is not None
+        async with self._factory() as session:
+            row = await session.get(ITSupportSettings, 1)
+            if row is not None and row.sign_in:
+                row.sign_in = {**row.sign_in, "refresh_token": record["refresh_token"]}
+                await session.commit()
 
     async def _token(self, scopes: str = SCOPES) -> str:
         async with self._lock:
             held = self._access.get(scopes)
             if held and time.monotonic() < held[1]:
                 return held[0]
-            record = self._record()
-            try:
-                refresh = _fernet(self._settings).decrypt(record["refresh_token"].encode()).decode()
-            except (InvalidToken, KeyError) as exc:
-                raise NotConnectedError("the kept sign-in can't be read; connect again") from exc
+            record, source, refresh = await self._record()
+            self.source = source
             s = self._settings
             response = await self._http.post(
                 f"{s.authority}/oauth2/v2.0/token",
@@ -133,10 +212,7 @@ class ITSupportGraph:
                 record["refresh_token"] = (
                     _fernet(s).encrypt(payload["refresh_token"].encode()).decode()
                 )
-                await asyncio.to_thread(
-                    Path(s.it_support_token_file).write_text,
-                    json.dumps(record, indent=1), "utf-8",
-                )
+                await self._keep(record, source)
             self.account_id = record.get("account_id")
             self._access[scopes] = (
                 payload["access_token"],

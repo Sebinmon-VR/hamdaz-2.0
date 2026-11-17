@@ -56,6 +56,7 @@ from app.comparison.extraction import QuoteExtractor
 from app.core.config import Settings
 from app.core.llm import TextModel
 from app.enquiries.claude import ClaudeEnquiry
+from app.itsupport import brief as brief_mod
 from app.itsupport import distributors, docs, due, memory, talk, work
 from app.itsupport import files as files_mod
 from app.itsupport import goal as goal_mod
@@ -177,7 +178,7 @@ class ITSupportWorker:
         # settings_mod.REFRESH_SECONDS, and the rest of the app keeps its own.
         settings = settings.model_copy()
         self._settings = settings
-        self._graph = ITSupportGraph(settings, http)
+        self._graph = ITSupportGraph(settings, http, factory)
         self._model = model
         self._factory = factory
         self._finder = finder or AgentModel(settings)
@@ -209,7 +210,7 @@ class ITSupportWorker:
         self._me_email: str | None = None
         #: Whether it answers now: the page's switch is on and no other
         #: machine is answering. Off, the loop still runs, to see it come on.
-        self.answering = True
+        self.answering = False
         self._refreshed = 0.0
         #: The last problem, for the heartbeat; cleared once it is written.
         self._error: str | None = None
@@ -230,31 +231,45 @@ class ITSupportWorker:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
+        if self._task is not None and self._factory is not None and self.answering:
+            await settings_mod.release(self._factory)
 
     async def _run(self) -> None:
-        if not await self._sign_in():
-            return
+        """Signed in (waiting for a Connect if need be), then the loop. A
+        sign-in that stops working (disconnected, refused) goes back to
+        waiting; it never ends the worker."""
+        while True:
+            await self._sign_in()
+            try:
+                await self._loop()
+            except NotConnectedError as exc:
+                logger.error("it support: %s", exc)
+                self.answering = False
+                self._graph.forget()
+                if self._factory is not None:
+                    await settings_mod.note_problem(self._factory, str(exc))
+
+    async def _loop(self) -> None:
         await self._refresh()
         chats = self._chats
-        self._background = asyncio.create_task(
-            self._background_jobs(chats), name="itsupport-background"
-        )
+        if self._background is None or self._background.done():
+            self._background = asyncio.create_task(
+                self._background_jobs(chats), name="itsupport-background"
+            )
         while True:
             if time.monotonic() - self._refreshed >= settings_mod.REFRESH_SECONDS:
                 try:
                     await self._refresh()
-                except NotConnectedError as exc:
-                    await self._stopped(exc)
-                    return
+                except NotConnectedError:
+                    raise
                 except Exception as exc:  # noqa: BLE001 - the last settings stand
                     logger.exception("it support: reading the settings failed")
                     self._error = f"reading the settings: {exc}"
             for chat in list(chats) if self.answering else []:
                 try:
                     await self.check(chat)
-                except NotConnectedError as exc:
-                    await self._stopped(exc)
-                    return
+                except NotConnectedError:
+                    raise
                 except (GraphError, httpx.HTTPError) as exc:
                     logger.warning("it support: checking %s failed: %s", chat.email, exc)
                     self._error = f"checking {chat.email}'s chat: {exc}"
@@ -265,62 +280,67 @@ class ITSupportWorker:
                     await asyncio.sleep(BACKOFF_SECONDS)
             await asyncio.sleep(self._settings.it_support_poll_seconds)
 
-    async def _stopped(self, exc: Exception) -> None:
-        logger.error("it support: %s", exc)
-        if self._factory is not None:
-            await settings_mod.beat(self._factory, signed_in_as=self._me_email,
-                                    error=f"stopped: {exc}")
-
-    async def _sign_in(self) -> bool:
-        """Who the sign-in is; it must be the IT Support account."""
+    async def _sign_in(self) -> None:
+        """Wait until the sign-in works and is the IT Support account: a
+        Connect on the settings page is picked up within REFRESH_SECONDS."""
         s = self._settings
+        said = None
         while True:
+            problem = None
             try:
                 me = await self._graph.me()
+                email = (me.get("mail") or me.get("userPrincipalName") or "").lower()
+                if email == s.it_support_email.lower():
+                    self._me_email, self.me_id = email, me["id"]
+                    logger.info("it support: signed in as %s (sign-in from the %s)", email,
+                                "settings page" if self._graph.source == "db" else "local file")
+                    return
+                problem = f"signed in as {email}, not {s.it_support_email}; connect again"
             except NotConnectedError as exc:
-                await self._stopped(exc)
-                return False
+                problem = str(exc)
             except (GraphError, httpx.HTTPError) as exc:
                 logger.warning("it support: could not start yet: %s", exc)
-                await asyncio.sleep(BACKOFF_SECONDS * 3)
-                continue
-            email = (me.get("mail") or me.get("userPrincipalName") or "").lower()
-            self._me_email = email
-            if email != s.it_support_email.lower():
-                await self._stopped(RuntimeError(
-                    f"signed in as {email}, not {s.it_support_email}; connect again"))
-                return False
-            self.me_id = me["id"]
-            return True
+            self._graph.forget()
+            if problem is not None and problem != said:
+                logger.error("it support: %s", problem)
+                if self._factory is not None:
+                    await settings_mod.note_problem(self._factory, problem)
+                said = problem
+            await asyncio.sleep(settings_mod.REFRESH_SECONDS)
 
     async def _refresh(self) -> None:
-        """The settings page's row over this copy, the chats made to match
-        its people, and the heartbeat. Without the table yet (migration not
-        run), the environment's values stand."""
+        """The settings page's row over this copy, the lease (only the
+        process holding it answers), and the chats made to match the people.
+        Without the table yet (migration not run), the environment's values
+        stand."""
         self._refreshed = time.monotonic()
         row = None
         if self._factory is not None:
             row = await settings_mod.load(self._factory, self._settings)
         was = self.answering
-        if row is not None:
+        if row is None:
+            self.answering = True  # no settings table yet: the environment decides
+        else:
+            if row.sign_in is None and self._graph.source == "db":
+                # Disconnected on the page: stop using the sign-in in hand.
+                raise NotConnectedError("disconnected on the settings page")
             settings_mod.apply(row, self._settings)
             if self._erp is not None:
                 self._erp.reload_modes()
-            other = settings_mod.other_machine(row)
-            if other is not None:
+            error, self._error = self._error, None
+            held = await settings_mod.claim(self._factory, signed_in_as=self._me_email,
+                                            error=error)
+            if not held:
                 if was:
-                    logger.warning("it support: %s is answering already; this machine stays "
-                                   "quiet so nobody gets two replies", other)
+                    logger.warning("it support: another process (%s) is answering; this one "
+                                   "stays quiet so nobody gets two replies", row.running_on)
                 self.answering = False
-                return  # the heartbeat is the other machine's; not touched
+                return
             self.answering = row.enabled
             if was != self.answering:
-                logger.info("it support: switched %s on the settings page",
-                            "on" if self.answering else "off")
+                logger.info("it support: %s", "answering" if self.answering else
+                            "switched off on the settings page")
         await self._sync_chats(mark_seen=self.answering and not was)
-        if self._factory is not None and row is not None:
-            error, self._error = self._error, None
-            await settings_mod.beat(self._factory, signed_in_as=self._me_email, error=error)
 
     async def _sync_chats(self, *, mark_seen: bool) -> None:
         """A chat for everyone it should answer, none for anyone else; with
@@ -764,7 +784,8 @@ class ITSupportWorker:
 
     async def _background_jobs(self, chats: list[Chat]) -> None:
         while True:
-            for job in (self._refresh_work, self._update_notes, self._due_check_ins)\
+            for job in (self._refresh_work, self._update_notes, self._morning_briefs,
+                        self._due_check_ins)\
                     if self.answering else ():
                 try:
                     await job(list(chats))
@@ -819,6 +840,60 @@ class ITSupportWorker:
             logger.info("it support: notes on %s brought up to date (%d lines)", chat.email,
                         notes.count("\n") + 1)
 
+    async def _morning_briefs(self, chats: list[Chat]) -> None:
+        """Each person's first message of the working day, once, when there
+        is something due. Off unless the settings page turns it on; with a
+        trial address set, every brief goes into that one chat. See ``brief``."""
+        s = self._settings
+        if not s.it_support_brief_enabled or self._sharepoint is None or self.me_id is None:
+            return
+        now = datetime.now(UTC)
+        day = brief_mod.due_now(s, now)
+        if day is None:
+            return
+        test_to = s.it_support_due_test_to.strip().lower()
+        by_email = {c.email: c for c in chats}
+        for chat in chats:
+            key = brief_mod.sent_key(chat.email, day)
+            if self._asked.has(key):
+                continue
+            known = self._work.get(chat.email)
+            if known is None or known.read_at is None or now - known.read_at > timedelta(
+                    minutes=30):
+                continue  # tasks not read yet this morning; next round
+            if self._factory is not None:
+                from app.mailwatch.availability import away_reason
+
+                async with self._factory() as session:
+                    away = await away_reason(session, chat.email)
+                if away:
+                    self._asked.mark_key(key, now)
+                    logger.info("it support: no brief for %s, away (%s)", chat.email, away)
+                    continue
+            plan = brief_mod.plan(known, now=now, settings=s)
+            if plan.empty:
+                self._asked.mark_key(key, now)
+                continue
+            target = by_email.get(test_to) if test_to else chat
+            if target is None:
+                logger.warning("it support: the trial address %s is not a chat it answers",
+                               test_to)
+                return
+            spoken = await brief_mod.write(
+                self._model, first_name=chat.first_name, brief=plan, now=now,
+                order=s.it_support_chat_providers, context=work.describe(known, now),
+            )
+            text = spoken.text
+            if target is not chat:
+                text = f"(test: this is {chat.first_name}'s morning brief) {text}"
+            await self._say(target, talk.to_html(text))
+            self._asked.mark_key(key, now)
+            # What the brief named gets no "need a hand?" later the same day.
+            self._asked.mark(plan.today + plan.next_day, now)
+            logger.info("it support: morning brief to %s (%d today, %d early tomorrow, %d "
+                        "late)%s", chat.email, len(plan.today), len(plan.next_day),
+                        len(plan.late), f", sent to {target.email}" if target is not chat else "")
+
     async def _due_check_ins(self, chats: list[Chat]) -> None:
         """Message each person whose task has its BCD later today, once.
 
@@ -832,8 +907,8 @@ class ITSupportWorker:
         if time.monotonic() - self._due_checked < s.it_support_due_check_minutes * 60:
             return
         now = datetime.now(UTC)
-        if not due.in_office_hours(s, now):
-            return
+        if not due.in_office_hours(s, now) or brief_mod.before_brief(s, now):
+            return  # the morning brief speaks first
         self._due_checked = time.monotonic()
         test_to = s.it_support_due_test_to.strip().lower()
         by_email = {c.email: c for c in chats}

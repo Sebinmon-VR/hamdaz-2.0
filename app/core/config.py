@@ -408,6 +408,11 @@ class Settings(BaseSettings):
     it_support_due_test_to: str = ""
     #: Which tasks were already asked about, on this machine. Gitignored.
     it_support_due_asked_file: str = ".itsupport-asked.json"
+    #: The morning brief: one message to each person at the start of their
+    #: working day (in IT_SUPPORT_DUE_ZONE, on IT_SUPPORT_DUE_DAYS) with what
+    #: closes today. Off until the user says to send. See app/itsupport/brief.py.
+    it_support_brief_enabled: bool = False
+    it_support_brief_at: str = "09:30"
     #: The brain: a model with tools working the ERP as the person chatting
     #: (app/itsupport/brain.py). Off: the older chat (talk.py) answers.
     it_support_brain_enabled: bool = True
