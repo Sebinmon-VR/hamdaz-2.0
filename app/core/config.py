@@ -442,9 +442,10 @@ class Settings(BaseSettings):
     #: A file sent with no words: wait this long for them to type what it's
     #: for before asking, in seconds.
     it_support_file_wait_seconds: float = 8.0
-    #: Work taking longer than this gets a short "on it" line first, unless
-    #: the model already said one, in seconds.
-    it_support_holding_seconds: float = 8.0
+    #: Real work (a lookup, a file being read) still going after this long
+    #: shows a "…" message that becomes the reply when it's ready, in seconds.
+    #: Graph has no typing dots for a user account; this stands in for them.
+    it_support_dots_seconds: float = 1.5
 
     # ── enquiry analysis ───────────────────────────────────────────────
     #: The Claude model that reads a tender's documents and looks new items up
