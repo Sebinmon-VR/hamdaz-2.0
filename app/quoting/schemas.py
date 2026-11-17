@@ -53,6 +53,59 @@ class ItemIn(BaseModel):
     source_supplier_quote_id: uuid.UUID | None = None
 
 
+class ChargeChange(BaseModel):
+    """One change to the landed-cost charges, by its label."""
+
+    action: Literal["add", "update", "remove", "on", "off"]
+    #: For ``add``, the new charge's name; otherwise which charge (its label,
+    #: or a part of it that names one charge only).
+    label: str = Field(min_length=1, max_length=300)
+    new_label: str | None = Field(default=None, max_length=300)
+    #: A figure, in ``currency`` (the quote's own when not given) ...
+    amount: Decimal | None = Field(default=None, ge=0)
+    currency: str | None = Field(default=None, min_length=3, max_length=3)
+    #: ... or a rate: 2 means 2% of the goods (or of the CIF value).
+    percent: Decimal | None = Field(default=None, ge=0, le=1000)
+    percent_of: PercentBasis | None = None
+    #: origin (up to arrival: freight, insurance) or destination (after:
+    #: clearance, delivery, installation, bank). Delivery-type by default.
+    stage: CostStage | None = None
+    #: A charge for one line only (1 is the first line); per unit of it.
+    line: int | None = Field(default=None, ge=1)
+    per_unit: bool | None = None
+    notes: str | None = None
+
+
+class LineChange(BaseModel):
+    """One change to the quote's lines."""
+
+    action: Literal["add", "update", "remove"]
+    #: Which line, 1 the first (update, remove).
+    line: int | None = Field(default=None, ge=1)
+    name: str | None = Field(default=None, max_length=500)
+    description: str | None = None
+    brand: str | None = Field(default=None, max_length=120)
+    item_code: str | None = Field(default=None, max_length=120)
+    unit: str | None = Field(default=None, max_length=40)
+    quantity: Decimal | None = Field(default=None, ge=0)
+    #: What it costs us, each.
+    cost_rate: Decimal | None = Field(default=None, ge=0)
+    #: A selling price set by hand, each: kept as given, not repriced.
+    rate: Decimal | None = Field(default=None, ge=0)
+
+
+class QuoteChangesIn(BaseModel):
+    """Parts of a quote to change; everything not named stays as it is."""
+
+    #: Quote details by field name: title, customer_name, payment_terms,
+    #: delivery_terms, expiry_date, notes, terms, reference_number, ...
+    details: dict[str, Any] = Field(default_factory=dict)
+    #: Reprice every costed line at this margin (a share of the selling price).
+    margin_percent: Decimal | None = Field(default=None, ge=0, lt=100)
+    charges: list[ChargeChange] = Field(default_factory=list)
+    lines: list[LineChange] = Field(default_factory=list)
+
+
 class CostLineIn(BaseModel):
     """One row of the landed-cost build-up.
 

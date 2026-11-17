@@ -452,6 +452,182 @@ def set_items(request: QuoteRequest, items: list[dict[str, Any]]) -> None:
     ]
 
 
+#: Details a partial change may set: the form's own fields, not the money
+#: (the money moves through margin, charges and lines, which reprice).
+CHANGEABLE_DETAILS: Final = frozenset(
+    set(_ESTIMATE_FIELDS) - {"currency", "customer_id"} | set(_BID_FIELDS)
+)
+
+
+def _cost_row(row: QuoteCostLine) -> dict[str, Any]:
+    return {
+        "stage": row.stage, "label": row.label, "basis": row.basis,
+        "amount_source": row.amount_source, "source_currency": row.source_currency,
+        "amount_base": row.amount_base, "is_principal": row.is_principal,
+        "is_firm": row.is_firm, "notes": row.notes, "percent": row.percent,
+        "percent_of": row.percent_of, "line_position": row.line_position,
+        "per_unit": row.per_unit, "is_active": row.is_active,
+    }
+
+
+def _item_row(item: QuoteRequestItem) -> dict[str, Any]:
+    return {
+        "name": item.name, "description": item.description, "item_code": item.item_code,
+        "brand": item.brand, "unit": item.unit, "quantity": item.quantity, "rate": item.rate,
+        "discount": item.discount, "cost_rate": item.cost_rate,
+        "source_supplier_quote_id": item.source_supplier_quote_id,
+    }
+
+
+def _find_charge(rows: list[dict[str, Any]], label: str) -> int:
+    """The one charge a label names: exactly, else as part of its label."""
+    want = label.strip().casefold()
+    exact = [i for i, r in enumerate(rows) if (r["label"] or "").strip().casefold() == want]
+    if len(exact) == 1:
+        return exact[0]
+    found = exact or [i for i, r in enumerate(rows) if want in (r["label"] or "").casefold()]
+    if len(found) == 1:
+        return found[0]
+    names = ", ".join(f'"{r["label"]}"' for r in rows) or "none"
+    if not found:
+        raise QuoteError(f'No charge called "{label}" on this quote. Its charges: {names}.')
+    raise QuoteError(f'"{label}" names more than one charge: '
+                     + ", ".join(f'"{rows[i]["label"]}"' for i in found) + ".")
+
+
+def _charge_money(request: QuoteRequest, row: dict[str, Any], change: Any) -> None:
+    """A charge's figure or rate, from a change, in the quote's currency."""
+    if change.percent is not None:
+        row.update(percent=change.percent, percent_of=change.percent_of or "goods",
+                   amount_source=None, source_currency=None, amount_base=Decimal(0))
+        return
+    if change.amount is None:
+        return
+    ours = (request.currency or "").upper()
+    theirs = (change.currency or ours).upper()
+    row.update(percent=None, percent_of=None)
+    if theirs == ours or not theirs:
+        row.update(amount_base=change.amount, amount_source=None, source_currency=None)
+        return
+    if theirs != (request.supplier_currency or "").upper() or not request.fx_rate:
+        raise QuoteError(
+            f"This quote has no exchange rate for {theirs}: give the charge in {ours}"
+            + (f" or {request.supplier_currency}" if request.supplier_currency else "") + "."
+        )
+    row.update(amount_source=change.amount, source_currency=theirs, amount_base=Decimal(0))
+
+
+def apply_changes(request: QuoteRequest, changes: Any) -> list[str]:
+    """Change only the parts named: details, the margin, charges, lines.
+    Everything else stays. Lines are repriced at the margin when their costs
+    or the charges moved, as the Landed cost tab does; a selling price given
+    by hand for a line is kept. What changed, in words."""
+    done: list[str] = []
+    unknown = sorted(set(changes.details) - CHANGEABLE_DETAILS)
+    if unknown:
+        raise QuoteError(f"Not a detail that can be changed here: {', '.join(unknown)}.")
+    if changes.details:
+        apply_fields(request, dict(changes.details))
+        done.append("details: " + ", ".join(sorted(changes.details)))
+
+    items = [_item_row(i) for i in sorted(request.items, key=lambda i: i.position or 0)]
+    rows = [_cost_row(r) for r in sorted(request.cost_lines, key=lambda r: r.position or 0)]
+    hand_priced: dict[int, Decimal] = {}
+    moved = False
+    for change in changes.lines:
+        if change.action == "add":
+            if not change.name:
+                raise QuoteError("A new line needs a name.")
+            items.append({"name": change.name, "description": change.description,
+                          "item_code": change.item_code, "brand": change.brand,
+                          "unit": change.unit, "quantity": change.quantity or Decimal(1),
+                          "rate": change.rate or Decimal(0), "discount": Decimal(0),
+                          "cost_rate": change.cost_rate, "source_supplier_quote_id": None})
+            if change.rate is not None:
+                hand_priced[len(items) - 1] = change.rate
+            moved = True
+            done.append(f"line {len(items)} added ({change.name})")
+            continue
+        if change.line is None or change.line > len(items):
+            raise QuoteError(f"There is no line {change.line}; the quote has {len(items)}.")
+        index = change.line - 1
+        if change.action == "remove":
+            gone = items.pop(index)
+            for row in rows:
+                position = row["line_position"]
+                if position == index:
+                    row.update(line_position=None, per_unit=False)
+                elif position is not None and position > index:
+                    row["line_position"] = position - 1
+            hand_priced = {k - (k > index): v for k, v in hand_priced.items() if k != index}
+            moved = True
+            done.append(f"line {change.line} removed ({gone['name']})")
+            continue
+        item = items[index]
+        for key in ("name", "description", "brand", "item_code", "unit", "quantity",
+                    "cost_rate"):
+            value = getattr(change, key)
+            if value is not None:
+                item[key] = value
+                moved = moved or key in ("quantity", "cost_rate")
+        if change.rate is not None:
+            hand_priced[index] = change.rate
+        done.append(f"line {change.line} changed")
+
+    for change in changes.charges:
+        if change.action == "add":
+            row = {"stage": change.stage or CostStage.DESTINATION, "label": change.label,
+                   "basis": "Added from chat", "amount_source": None, "source_currency": None,
+                   "amount_base": Decimal(0), "is_principal": False, "is_firm": False,
+                   "notes": change.notes, "percent": None, "percent_of": None,
+                   "line_position": None, "per_unit": False, "is_active": True}
+            if change.amount is None and change.percent is None:
+                raise QuoteError(f'The charge "{change.label}" needs an amount or a percent.')
+            _charge_money(request, row, change)
+            rows.append(row)
+        else:
+            row = rows[_find_charge(rows, change.label)]
+            if change.action == "remove":
+                rows.remove(row)
+                done.append(f'charge "{row["label"]}" removed')
+                moved = True
+                continue
+            if change.action in ("on", "off"):
+                row["is_active"] = change.action == "on"
+            if change.new_label:
+                row["label"] = change.new_label
+            if change.stage is not None:
+                row["stage"] = change.stage
+            if change.notes is not None:
+                row["notes"] = change.notes
+            _charge_money(request, row, change)
+        if change.line is not None:
+            if change.line > len(items):
+                raise QuoteError(f"There is no line {change.line}; the quote has {len(items)}.")
+            row["line_position"] = change.line - 1
+            row["per_unit"] = bool(change.per_unit)
+        moved = True
+        done.append(f'charge "{row["label"]}" {change.action}')
+
+    if changes.lines:
+        set_items(request, items)
+    if changes.charges or changes.lines:
+        set_cost_lines(request, rows)
+    margin = changes.margin_percent
+    if margin is None and moved and request.target_markup_percent is not None:
+        margin = request.target_markup_percent
+    if margin is not None:
+        priced = reprice_at_margin(request, margin)
+        done.append(f"{priced} line(s) priced at {margin}% margin")
+    if hand_priced:
+        ordered = sorted(request.items, key=lambda i: i.position or 0)
+        for index, rate in hand_priced.items():
+            ordered[index].rate = rate
+        done.append("selling price set by hand on line(s) "
+                    + ", ".join(str(i + 1) for i in sorted(hand_priced)))
+    return done
+
+
 def drop_stale_sources(request: QuoteRequest, items: list[dict[str, Any]]) -> None:
     """Forget a line's supplier when that supplier's offer is no longer on the quote.
 

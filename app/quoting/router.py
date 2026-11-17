@@ -110,6 +110,7 @@ from app.quoting.schemas import (
     NegotiationIn,
     QuotableTaskOut,
     QuotableTasksOut,
+    QuoteChangesIn,
     QuoteDocumentOut,
     QuoteRequestIn,
     QuoteRequestOut,
@@ -794,6 +795,35 @@ async def update(
         await session.flush()
     except QuoteError as exc:
         raise _translate(exc) from exc
+    return await _out(session, request, user=user, roles=roles)
+
+
+@router.post(
+    "/{request_id}/changes",
+    response_model=QuoteRequestOut,
+    summary="Change parts of a quote: details, margin, charges, lines; the rest is kept",
+)
+async def change_parts(
+    request_id: uuid.UUID,
+    payload: QuoteChangesIn,
+    user: CurrentUser,
+    roles: CurrentRoles,
+    session: Session,
+) -> QuoteRequestOut:
+    """Only what is named changes: unlike the whole-quote edit, a body that
+    names one charge leaves the lines, the other charges and the compliance
+    list as they are. Adding or changing a charge, a cost or a quantity
+    reprices the lines at the quote's margin, as the Landed cost tab does; a
+    selling price given for a line is kept as given. Charges are named by
+    their label. Only while the quote is editable (draft, or a rework)."""
+    request = await _load(session, request_id)
+    try:
+        service.require_editable(request, user=user, roles=roles)
+        done = service.apply_changes(request, payload)
+        await session.flush()
+    except QuoteError as exc:
+        raise _translate(exc) from exc
+    logger.info("quote %s changed in parts by %s: %s", request.id, user.email, "; ".join(done))
     return await _out(session, request, user=user, roles=roles)
 
 
