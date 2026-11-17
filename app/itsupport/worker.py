@@ -84,7 +84,8 @@ FILES_KEPT_SECONDS = 3 * 60 * 60
 GATHER_AT_MOST = 30.0
 #: How long a person's modules are trusted before being read again.
 ACCESS_SECONDS = 5 * 60
-#: What shows while real work runs, then becomes the reply (Dots).
+#: What shows while an answer is thought out, if the bouncing dots picture
+#: can't be sent; either becomes the reply (Dots).
 DOTS = "…"
 #: A message this short, with no files or pending question, is small talk:
 #: answered at low effort (3 s instead of 10 s for a "hi").
@@ -164,7 +165,8 @@ def this_conversation(newest_first: list[dict[str, Any]]) -> list[dict[str, Any]
 
 
 class Dots:
-    """A "…" message while real work runs, edited into the first thing said
+    """Bouncing dots (a picture; "…" if that's refused) while an answer is
+    thought out, edited into the first thing said
     after it, so the reply appears where the dots were. Graph can't show the
     typing dots for a user account; this is the nearest. Once something is
     said, no more dots this turn."""
@@ -179,7 +181,11 @@ class Dots:
         async with self._lock:
             if self.done or self.message_id is not None:
                 return
-            sent = await self._graph.send(self._chat.chat_id, DOTS)
+            try:
+                sent = await self._graph.send_typing(self._chat.chat_id)
+            except (GraphError, httpx.HTTPError) as exc:
+                logger.warning("it support: the typing dots picture was refused: %s", exc)
+                sent = await self._graph.send(self._chat.chat_id, DOTS)
             self.message_id = str(sent.get("id"))
             self._chat.seen.add(self.message_id)
 
