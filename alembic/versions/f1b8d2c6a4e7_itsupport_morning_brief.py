@@ -1,11 +1,9 @@
-"""it support morning brief and web sign-in; half-day leave
+"""it support morning brief and web sign-in
 
 The morning brief's switch (off) and time (09:30 IST) on IT Support's
 settings row (app/itsupport/brief.py), and the IT Support account's sign-in
 made with Connect on the settings page, kept encrypted so the server running
-the agent has it (app/itsupport/graph.py). And leave taken as half a day
-(``leave_requests.half_day``: morning or afternoon of one date). Casual leave
-needs no change: the leave type is free text.
+the agent has it (app/itsupport/graph.py).
 
 Revision ID: f1b8d2c6a4e7
 Revises: e5c1a7d3b902
@@ -38,15 +36,9 @@ def upgrade() -> None:
         'connected_by_id', postgresql.UUID(as_uuid=True), nullable=True))
     op.create_foreign_key('fk_itsupport_settings_connected_by', 'itsupport_settings', 'users',
                           ['connected_by_id'], ['id'], ondelete='SET NULL')
-    op.add_column('leave_requests', sa.Column('half_day', sa.String(length=10), nullable=True))
-    op.create_check_constraint(
-        'ck_leave_half_day_one_date', 'leave_requests',
-        "half_day IS NULL OR (half_day IN ('morning', 'afternoon') AND start_date = end_date)")
 
 
 def downgrade() -> None:
-    op.drop_constraint('ck_leave_half_day_one_date', 'leave_requests', type_='check')
-    op.drop_column('leave_requests', 'half_day')
     op.drop_constraint('fk_itsupport_settings_connected_by', 'itsupport_settings',
                        type_='foreignkey')
     op.drop_column('itsupport_settings', 'connected_by_id')
