@@ -36,3 +36,8 @@ tests/
 
 # Nova's Teams package, built with teams-nova/make_package.py (carries the bot id)
 teams-nova/*.zip
+
+# IT Support agent: the account sign-in kept on this machine (app/itsupport).
+.itsupport-token
+.itsupport-asked.json
+.itsupport-memory.json

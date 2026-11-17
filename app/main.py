@@ -12,6 +12,11 @@ from fastapi.responses import JSONResponse
 
 from app.access.router import router as access_router
 from app.admin.router import router as admin_router
+from app.agents import ENABLED as AGENTS_ENABLED
+from app.agents import engine as agent_engine
+from app.agents.model import AgentModel
+from app.agents.router import router as agents_router
+from app.agents.worker import AgentWorker
 from app.analytics.router import router as analytics_router
 from app.ariba.mailer import AribaMailer
 from app.ariba.router import router as ariba_router
@@ -19,37 +24,26 @@ from app.ariba.worker import AribaWorker
 from app.assignment.router import router as assignment_router
 from app.auth.oidc import EntraOIDC
 from app.auth.router import router as auth_router
+from app.bcd.mailer import BcdMailer
+from app.bcd.router import router as bcd_router
+from app.bcd.worker import BcdWorker
 from app.comparison.extraction import QuoteExtractor
 from app.comparison.router import router as comparison_router
 from app.core.config import get_settings
 from app.core.db import dispose_engine, get_session_factory, init_engine
 from app.core.llm import TextModel
+from app.core.mail import GraphMailer
+from app.core.public import ErpCORS
 from app.dashboards.router import router as dashboards_router
 from app.directory.graph import GraphDirectory
 from app.directory.router import router as directory_router
 from app.enquiries.claude import ClaudeEnquiry
-from app.agents.model import AgentModel
-from app.core.mail import GraphMailer
-from app.core.public import ErpCORS
-from app.agents import ENABLED as AGENTS_ENABLED
-from app.agents.router import router as agents_router
-from app.agents import engine as agent_engine
-from app.agents.worker import AgentWorker
 from app.enquiries.router import router as enquiries_router
 from app.finance.cache import PnlCache
 from app.finance.router import router as finance_router
 from app.followups.mailer import FollowupMailer
 from app.followups.router import router as followups_router
 from app.followups.worker import FollowupWorker
-from app.reminders.mailer import ReminderMailer
-from app.reminders.router import router as reminders_router
-from app.reminders.worker import ReminderWorker
-from app.bcd.mailer import BcdMailer
-from app.bcd.router import router as bcd_router
-from app.bcd.worker import BcdWorker
-from app.taskcalendar.graph import TaskCalendar
-from app.taskcalendar.router import router as task_calendar_router
-from app.taskcalendar.worker import TaskCalendarWorker
 from app.forms.router import router as templates_router
 from app.hr.public import router as careers_router
 from app.hr.router import router as hr_router
@@ -59,22 +53,24 @@ from app.intake.graph_mail import MailReader
 from app.intake.router import router as intake_router
 from app.intake.router import webhook_router as intake_webhook_router
 from app.intake.worker import Worker
+from app.itsupport.router import router as itsupport_router
+from app.itsupport.worker import ITSupportWorker
+from app.labels.router import router as labels_router
+from app.leave.mailer import LeaveMailer
+from app.leave.router import router as leave_router
 from app.mailwatch.router import router as mailwatch_router
 from app.mailwatch.router import webhook_router as mailwatch_webhook_router
 from app.mailwatch.teams import TeamsPoster
 from app.mailwatch.worker import MailWatchWorker
+from app.meetings.calendar import GraphCalendar
+from app.meetings.router import router as meetings_router
+from app.notifications.router import router as notifications_router
 from app.nova.bot import TeamsBot
 from app.nova.chat import NovaChat
 from app.nova.router import router as nova_router
 from app.payroll.invoice_router import router as payroll_invoice_router
 from app.payroll.mailer import PayrollMailer
 from app.payroll.router import router as payroll_router
-from app.labels.router import router as labels_router
-from app.leave.mailer import LeaveMailer
-from app.leave.router import router as leave_router
-from app.meetings.calendar import GraphCalendar
-from app.meetings.router import router as meetings_router
-from app.notifications.router import router as notifications_router
 from app.profiles.router import router as profiles_router
 from app.projects.router import router as projects_router
 from app.proposals.analytics import WorkloadCache
@@ -85,10 +81,16 @@ from app.quoting.mailer import QuoteMailer
 from app.quoting.probability import WinRates
 from app.quoting.router import router as quoting_router
 from app.quoting.storage import QuoteDrive
+from app.reminders.mailer import ReminderMailer
+from app.reminders.router import router as reminders_router
+from app.reminders.worker import ReminderWorker
 from app.reports.mailer import ReportMailer
 from app.reports.router import admin_router as reports_admin_router
 from app.reports.router import router as reports_router
 from app.roles.router import router as roles_router
+from app.taskcalendar.graph import TaskCalendar
+from app.taskcalendar.router import router as task_calendar_router
+from app.taskcalendar.worker import TaskCalendarWorker
 from app.teams.router import router as teams_router
 from app.website.public import router as website_public_router
 from app.website.router import router as website_router
@@ -276,6 +278,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             deps=lambda: agent_engine.deps_for(app.state, settings, get_session_factory()),
         )
         app.state.agent_worker.start()
+    # IT Support in Teams: answers chats sent to the IT Support account, as
+    # that account, through Graph. Off unless IT_SUPPORT_CHAT_ENABLED; the
+    # trial runs from a laptop, Sebin only — see app/itsupport.
+    app.state.itsupport_worker = ITSupportWorker(
+        settings, http, app.state.text_model, get_session_factory(), app.state.agent_model,
+        app.state.sharepoint, app=app,
+    )
+    app.state.itsupport_worker.start()
     logger.info("started environment=%s", settings.environment)
 
     try:
@@ -293,6 +303,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await app.state.mailwatch_worker.stop()
         if app.state.agent_worker is not None:
             await app.state.agent_worker.stop()
+        await app.state.itsupport_worker.stop()
         await http.aclose()
         await dispose_engine()
 
@@ -373,6 +384,7 @@ def create_app() -> FastAPI:
     app.include_router(bcd_router, prefix=settings.api_prefix)
     app.include_router(task_calendar_router, prefix=settings.api_prefix)
     app.include_router(ariba_router, prefix=settings.api_prefix)
+    app.include_router(itsupport_router, prefix=settings.api_prefix)
     # The webhook first: Graph posts to it unauthenticated, and it must not
     # inherit anything that would refuse Microsoft.
     app.include_router(intake_webhook_router, prefix=settings.api_prefix)

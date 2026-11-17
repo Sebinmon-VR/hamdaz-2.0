@@ -35,7 +35,8 @@ import base64
 import json
 import logging
 import re
-from collections.abc import Callable, Iterator
+import time
+from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
@@ -344,6 +345,127 @@ class TextModel:
             return Answer(parsed, f"{provider.name}:{provider.model}", used_in, used_out)
         return None
 
+    async def chat(
+        self,
+        *,
+        system: str,
+        messages: list[dict[str, str]],
+        spoken: Spoken,
+        order: str = "",
+        max_tokens: int = 800,
+        label: str | None = None,
+        reasoning_effort: str | None = "low",
+    ) -> AsyncIterator[str]:
+        """A conversation's next reply, as plain text, a few words at a time.
+
+        For a chat, where the first words matter more than the last: no JSON,
+        and the words handed on as they come. ``messages`` are the turns so far
+        ({"role": "user" | "assistant", "content"}), the last the person's.
+        ``order`` names the providers to try ("cerebras,groq"), from those
+        configured; blank keeps LLM_PROVIDERS' order. A provider that fails
+        before its first word is passed over for the next; one that fails
+        after it ends the reply where it stopped. ``spoken`` is filled in as
+        it goes: who wrote it, the text, and how long the first word took.
+        """
+        providers = self._providers
+        if order.strip():
+            by_name = {p.name: p for p in self._providers}
+            wanted = [n.strip().lower() for n in order.split(",") if n.strip()]
+            providers = [by_name[n] for n in wanted if n in by_name]
+        turns = _alternating(messages)
+        started = time.monotonic()
+        for provider in providers:
+            used = [0, 0]
+            try:
+                pieces = self._chat_stream(
+                    provider, system, turns, max_tokens, reasoning_effort, used
+                )
+                async for piece in pieces:
+                    if spoken.first_ms is None:
+                        spoken.first_ms = int((time.monotonic() - started) * 1000)
+                        spoken.who = f"{provider.name}:{provider.model}"
+                    spoken.text += piece
+                    yield piece
+            except ModelError as exc:
+                if spoken.first_ms is None:
+                    logger.info("model %s declined to chat: %s", provider.name, exc)
+                    continue
+                logger.warning("model %s stopped mid-reply: %s", provider.name, exc)
+            if spoken.first_ms is None:
+                # Answered nothing at all: as good as a refusal.
+                logger.info("model %s said nothing", provider.name)
+                continue
+            _record(provider, label, used[0], used[1]).used = True
+            break
+        spoken.total_ms = int((time.monotonic() - started) * 1000)
+
+    async def _chat_stream(
+        self,
+        provider: Provider,
+        system: str,
+        turns: list[dict[str, str]],
+        max_tokens: int,
+        reasoning_effort: str | None,
+        used: list[int],
+    ) -> AsyncIterator[str]:
+        """One provider's streamed reply: its text pieces; tokens into ``used``."""
+        timeout = httpx.Timeout(self._settings.llm_timeout_seconds, connect=10.0)
+        if provider.name == "anthropic":
+            url = provider.base_url
+            headers = {
+                "x-api-key": provider.api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            }
+            if self._settings.anthropic_workspace_id:
+                headers["anthropic-workspace-id"] = self._settings.anthropic_workspace_id
+            body: dict[str, Any] = {
+                "model": provider.model, "max_tokens": max_tokens, "system": system,
+                "messages": turns, "stream": True,
+            }
+        else:
+            url = f"{provider.base_url}/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {provider.api_key}",
+                "content-type": "application/json",
+                "HTTP-Referer": "https://hamdaz.com",
+                "X-Title": "Hamdaz ERP",
+            }
+            body = {
+                "model": provider.model,
+                "messages": [{"role": "system", "content": system}, *turns],
+                "temperature": 0.7,
+                "max_tokens": max_tokens,
+                "stream": True,
+                **(
+                    {"reasoning_effort": reasoning_effort}
+                    if reasoning_effort and "gpt-oss" in provider.model
+                    else {}
+                ),
+            }
+        try:
+            async with self._http.stream(
+                "POST", url, headers=headers, json=body, timeout=timeout
+            ) as response:
+                if response.status_code != 200:
+                    detail = (await response.aread()).decode(errors="replace")[:160]
+                    raise ModelError(f"{provider.name} answered {response.status_code}: {detail}")
+                async for line in response.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if not data or data == "[DONE]":
+                        continue
+                    try:
+                        event = json.loads(data)
+                    except ValueError:
+                        continue
+                    piece = _stream_piece(provider.name, event, used)
+                    if piece:
+                        yield piece
+        except httpx.HTTPError as exc:
+            raise ModelError(f"could not reach {provider.name}: {exc}") from exc
+
     def _prompt(self, instructions: str, text: str, shape: dict[str, Any]) -> tuple[str, str]:
         system = (
             "You transcribe business documents into JSON for a procurement team. "
@@ -446,6 +568,62 @@ class TextModel:
             int(usage.get("prompt_tokens") or 0),
             int(usage.get("completion_tokens") or 0),
         )
+
+
+@dataclass(slots=True)
+class Spoken:
+    """What a streamed chat reply came to, filled in while it streams."""
+
+    who: str = ""
+    text: str = ""
+    #: From the call to the first words, and to the last.
+    first_ms: int | None = None
+    total_ms: int = 0
+
+
+def _alternating(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+    """The turns as every provider takes them: starting with the person, never
+    two of one side in a row (Claude refuses either), none empty."""
+    out: list[dict[str, str]] = []
+    for m in messages:
+        role = "assistant" if m.get("role") == "assistant" else "user"
+        content = (m.get("content") or "").strip()
+        if not content or (not out and role == "assistant"):
+            continue
+        if out and out[-1]["role"] == role:
+            out[-1] = {"role": role, "content": f"{out[-1]['content']}\n\n{content}"}
+        else:
+            out.append({"role": role, "content": content})
+    return out
+
+
+def _stream_piece(provider: str, event: dict[str, Any], used: list[int]) -> str:
+    """The text in one streamed event, counting the tokens it reports."""
+    if provider == "anthropic":
+        kind = event.get("type")
+        if kind == "error":
+            raise ModelError(f"anthropic stopped: {(event.get('error') or {}).get('message')}")
+        if kind == "message_start":
+            usage = (event.get("message") or {}).get("usage") or {}
+            used[0] = int(usage.get("input_tokens") or 0)
+        elif kind == "message_delta":
+            used[1] = int((event.get("usage") or {}).get("output_tokens") or 0)
+        elif kind == "content_block_delta":
+            delta = event.get("delta") or {}
+            if delta.get("type") == "text_delta":
+                return str(delta.get("text") or "")
+        return ""
+    if event.get("error"):
+        raise ModelError(f"{provider} stopped: {event['error']}")
+    # Groq reports usage under x_groq on its last event; others under usage.
+    usage = event.get("usage") or (event.get("x_groq") or {}).get("usage")
+    if usage:
+        used[0] = int(usage.get("prompt_tokens") or 0)
+        used[1] = int(usage.get("completion_tokens") or 0)
+    choices = event.get("choices") or []
+    delta = (choices[0].get("delta") if choices else None) or {}
+    # Only the answer: a reasoning model's thinking comes as "reasoning".
+    return str(delta.get("content") or "")
 
 
 def trim(text: str, budget: int) -> str:

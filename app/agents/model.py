@@ -25,7 +25,7 @@ a second copy of either.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Final
 
@@ -48,6 +48,8 @@ class Spent:
     searches: int = 0
     #: The free model that answered instead, e.g. "groq:openai/gpt-oss-120b".
     free_by: str | None = None
+    #: What the web was searched for, in order.
+    queries: list[str] = field(default_factory=list)
 
     def cost(self, model: str) -> Decimal:
         return cost_of(model, self.input_tokens, self.output_tokens) + SEARCH_FEE * self.searches
@@ -142,10 +144,21 @@ class AgentModel:
         schema: dict[str, Any],
         user_key: str,
         spent: Spent,
+        allowed_domains: list[str] | None = None,
+        max_uses: int | None = None,
     ) -> dict[str, Any]:
-        """Search the web, then record the findings as JSON shaped by ``schema``."""
+        """Search the web, then record the findings as JSON shaped by ``schema``.
+
+        ``allowed_domains`` keeps the search to those sites (a directory step
+        that must look there, not wherever the model likes)."""
+        search_tool: dict[str, Any] = {
+            "type": WEB_SEARCH_TOOL, "name": "web_search",
+            "max_uses": max_uses or self._settings.agent_web_max_uses,
+        }
+        if allowed_domains:
+            search_tool["allowed_domains"] = allowed_domains
         tools: list[dict[str, Any]] = [
-            {"type": WEB_SEARCH_TOOL, "name": "web_search", "max_uses": self._settings.agent_web_max_uses},
+            search_tool,
             {
                 "name": "record_findings",
                 "description": "Record what the search found. Call it once, at the end.",
@@ -172,6 +185,10 @@ class AgentModel:
             spent.input_tokens += used_in
             spent.output_tokens += used_out
             spent.searches += _searches(message)
+            spent.queries += [
+                str((block.input or {}).get("query") or "")
+                for block in message.content if block.type == "server_tool_use"
+            ]
             _refused(message)
             for block in message.content:
                 if block.type == "tool_use" and block.name == "record_findings":

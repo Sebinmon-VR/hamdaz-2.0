@@ -353,6 +353,94 @@ class Settings(BaseSettings):
     #: what was found in the data.
     nova_reply_seconds: float = 8.0
 
+    # ── IT Support in Teams: the agent as a person's account ───────────
+    #: Answer Teams chats sent to the IT Support account, as that account,
+    #: through Graph: the messages are read and the replies sent with its own
+    #: delegated sign-in (``python -m app.itsupport.connect``). Off until the
+    #: trial is wanted; the trial runs from a laptop. See app/itsupport.
+    it_support_chat_enabled: bool = False
+    #: The account the agent speaks as; the sign-in must be this account.
+    it_support_email: str = "itsupport@hamdaz.com"
+    #: Whose chats it answers, by email, comma-separated. Anyone else's chat
+    #: with the account is left alone, for a person to answer. The trial:
+    #: Sebin only.
+    it_support_allowed_emails: str = "sebin@hamdaz.com"
+    #: How often the chat is checked for a new message, in seconds. Graph has
+    #: no push for a laptop, so this is most of the wait before a reply.
+    it_support_poll_seconds: float = 1.5
+    #: Where the account's sign-in is kept on this machine, encrypted with a
+    #: key from SESSION_SECRET. Gitignored.
+    it_support_token_file: str = ".itsupport-token"
+    #: The chat's model providers, fastest first, from those configured for
+    #: LLM_PROVIDERS; blank keeps LLM_PROVIDERS' order.
+    it_support_chat_providers: str = ""
+    #: Messages of the chat the model is shown, the newest last.
+    it_support_history_messages: int = 30
+    #: What to call people whose Teams name says otherwise, as
+    #: "email=Name,email=Name". Blank: the first word of their Teams name.
+    it_support_names: str = ""
+    #: Long-term memory: a few notes per person, updated by the model once a
+    #: conversation has been quiet this long, given to every reply. Kept in
+    #: a local file on this machine (gitignored). See app/itsupport/memory.py.
+    it_support_memory_enabled: bool = True
+    it_support_memory_idle_minutes: float = 10
+    it_support_memory_file: str = ".itsupport-memory.json"
+    #: How often each person's tasks are read from the Proposals list, for
+    #: the chat to know them and for the due check-ins, in minutes.
+    it_support_work_refresh_minutes: float = 5
+    #: During the trial: end each reply with how long it took and who wrote it.
+    it_support_show_timing: bool = False
+    #: Due-today check-ins: IT Support messages a person first when a task of
+    #: theirs on the Proposals list has its BCD today ("saw you've got ...
+    #: due at 5 PM, need a hand?"). Off until the user says to send; preview
+    #: with ``python -m app.itsupport.due``. See app/itsupport/due.py.
+    it_support_due_enabled: bool = False
+    #: How often the Proposals list is read for today's BCDs, in minutes.
+    it_support_due_check_minutes: float = 10
+    #: When a check-in may go, in IT_SUPPORT_DUE_ZONE: office hours, and the
+    #: working days (Monday = 0; the team works Monday to Saturday).
+    it_support_due_zone: str = "Asia/Kolkata"
+    it_support_due_from: str = "09:00"
+    it_support_due_until: str = "17:00"
+    it_support_due_days: str = "0,1,2,3,4,5"
+    #: Everyone's check-ins sent into this one person's chat instead, marked
+    #: as a test, for a trial. Blank: each goes to the task's holder.
+    it_support_due_test_to: str = ""
+    #: Which tasks were already asked about, on this machine. Gitignored.
+    it_support_due_asked_file: str = ".itsupport-asked.json"
+    #: The brain: a model with tools working the ERP as the person chatting
+    #: (app/itsupport/brain.py). Off: the older chat (talk.py) answers.
+    it_support_brain_enabled: bool = True
+    #: The providers it tries, in order; blank: LLM_PROVIDERS' order. Rules
+    #: answer first in any case (worker). Haiku leads (the user, 2026-11-13:
+    #: "very intelligent even on the low model; we can use Haiku"); the free
+    #: ones stand in when Claude can't be reached. Groq's free tier (8,000
+    #: tokens a minute) can't carry a turn with a few lookups on its own.
+    it_support_brain_providers: str = "anthropic,groq,cerebras"
+    #: gpt-oss reasoning on the free providers: low | medium | high.
+    it_support_free_reasoning: str = "medium"
+    #: Claude's model for the brain: Haiku, cheap enough to lead.
+    it_support_brain_model: str = "claude-haiku-5-5"
+    #: low | medium | high | xhigh | max, for Claude. High: understanding
+    #: what they mean matters more than a second saved.
+    it_support_brain_effort: str = "high"
+    #: The web app's address for links in replies; blank: FRONTEND_URL.
+    it_support_link_url: str = ""
+    #: What the agent may do per ERP module, over the defaults in
+    #: app/itsupport/erp.py MODES: "module=off|read|write,...", e.g.
+    #: "hr=off,leave=write". Finance and payroll are always off. Each person
+    #: still only reaches the modules the access screen gives them.
+    it_support_module_modes: str = ""
+    #: After a message, wait this long for more before answering, so a few
+    #: messages in a row are answered as one, in seconds.
+    it_support_gather_seconds: float = 2.5
+    #: A file sent with no words: wait this long for them to type what it's
+    #: for before asking, in seconds.
+    it_support_file_wait_seconds: float = 8.0
+    #: Work taking longer than this gets a short "on it" line first, unless
+    #: the model already said one, in seconds.
+    it_support_holding_seconds: float = 8.0
+
     # ── enquiry analysis ───────────────────────────────────────────────
     #: The Claude model that reads a tender's documents and looks new items up
     #: on the web, through ANTHROPIC_API_KEY (the user's choice, 2026-10-06,
