@@ -879,6 +879,13 @@ class QuoteCostLine(Base, UUIDPrimaryKey, Timestamped):
         Boolean, default=False, server_default=text("false"), nullable=False
     )
     notes: Mapped[str | None] = mapped_column(Text)
+    #: Counted in the landed cost. A row switched off stays on the sheet with
+    #: its rate, so it can be switched back on, but adds nothing to the price.
+    #: Payment / bank charges come in switched off: counted by default they
+    #: priced quotes over the Zoho estimate (QT-001862).
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=text("true"), nullable=False
+    )
 
     #: The priced line this cost belongs to, by its position; null when it is
     #: the whole bid's and is shared across the lines by value. A position and

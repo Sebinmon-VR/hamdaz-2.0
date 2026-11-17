@@ -154,13 +154,12 @@ class Settings(BaseSettings):
     costing_default_duty_percent: Decimal = Decimal("5")
     #: Cargo insurance, as a rated row over the goods, on an import.
     costing_default_insurance_percent: Decimal = Decimal("1")
-    #: The bank's or the card's cut, as a rated row over the goods, when the
-    #: supplier is paid up front or online. Off (0) since 9 Nov 2026: seeded
-    #: by default it went into every line's landed cost, so the quote was
-    #: priced over the Zoho estimate (QT-001862: 52.59 against 51.06 a unit).
-    #: A bank charge is added by hand on the Landed cost tab when it applies;
-    #: set a rate here to seed it again.
-    costing_default_bank_charge_percent: Decimal = Decimal("0")
+    #: The bank's or the card's cut, as a rated row over the goods, put on
+    #: every priced quote SWITCHED OFF — counted by default it priced quotes
+    #: over the Zoho estimate (QT-001862: 52.59 against 51.06 a unit). The
+    #: rate it starts at when somebody switches it on, on the Landed cost
+    #: tab. 0 leaves the row off the sheet altogether.
+    costing_default_bank_charge_percent: Decimal = Decimal("3")
 
     # ── Zoho Books (quotes) ────────────────────────────────────────────
     #: READ ONLY, like SharePoint. Zoho Books is where quotes are actually

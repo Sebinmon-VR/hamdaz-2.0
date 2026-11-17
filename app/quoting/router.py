@@ -34,12 +34,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Annotated, Any, Literal
 
+import httpx
 from fastapi import (
     APIRouter,
     Depends,
@@ -99,6 +101,7 @@ from app.quoting.schemas import (
     CostingReportOut,
     CurrencyIn,
     DocumentEditIn,
+    FiledReportOut,
     FxQuoteOut,
     ItemOut,
     LineChoiceIn,
@@ -1004,6 +1007,55 @@ async def costing_report_pdf(
     )
 
 
+_ETAG_GUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+
+
+@router.post(
+    "/{request_id}/report/file",
+    response_model=FiledReportOut,
+    summary="File the costing sheet PDF in the task's folder, for sharing",
+)
+async def file_costing_report(
+    request_id: uuid.UUID,
+    user: CurrentUser,
+    session: Session,
+    zoho: Zoho,
+    drive: Drive,
+) -> FiledReportOut:
+    """The costing sheet PDF, as it stands now, put in the task's folder in
+    the Proposal Team library with the quote's other paperwork, and its link.
+
+    For handing the sheet over where a download can't go (a Teams chat: the
+    user, 2026-11-13, "give back the pdf of the costing sheet"). The same file
+    and name the submit files for this pass, so sending for approval later
+    replaces it rather than adding a second copy. Nothing is sent to anybody.
+    """
+    if not drive.enabled:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
+                            "No document library is set up to file the PDF in.")
+    request = await _load(session, request_id)
+    report = await _report(request, zoho)
+    document = await filing.file_report(
+        session, drive, request, content=report_pdf.render(report),
+        reference=report.reference, user=user,
+    )
+    if document is None or not document.drive_item_id:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY,
+                            request.filing_error or "The library didn't take the PDF.")
+    attachment_id = None
+    try:
+        found = _ETAG_GUID.search((await drive.item(document.drive_item_id)).get("eTag") or "")
+        attachment_id = found.group(0).lower() if found else None
+    except (DriveError, httpx.HTTPError) as exc:
+        logger.info("quote %s: no eTag for the filed report: %s", request_id, exc)
+    logger.info("costing report for quote %s filed for sharing by %s", request_id, user.email)
+    return FiledReportOut(
+        file_name=document.file_name, web_url=document.drive_url or "",
+        item_id=document.drive_item_id, attachment_id=attachment_id,
+        folder_url=request.drive_folder_url,
+    )
+
+
 @router.delete(
     "/{request_id}",
     status_code=status.HTTP_204_NO_CONTENT,
@@ -1500,7 +1552,9 @@ async def _follow_offer_currency(
         return
     nothing_priced = (
         not request.items
-        and not request.cost_lines
+        and not any(
+            row.is_active is not False or row.percent is None for row in request.cost_lines
+        )
         and not (request.discount or 0)
         and not (request.shipping_charge or 0)
         and not (request.adjustment or 0)

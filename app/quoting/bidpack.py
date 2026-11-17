@@ -155,6 +155,9 @@ class CostElement:
     #: then the line's total — the figure × ``quantity``.
     per_unit: bool = False
     quantity: Decimal | None = None
+    #: False on a stored row switched off. Such a row is listed in
+    #: ``LandedCost.switched_off`` and counted nowhere.
+    is_active: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,6 +243,10 @@ class LandedCost:
     lines: list[LineLanded] = field(default_factory=list)
     #: ``total`` before it was rounded — what the report converts to AED.
     total_exact: Decimal | None = None
+    #: Stored rows switched off, with what each would add if switched on. Not
+    #: in ``elements`` and not in any figure above, so the report, the
+    #: workbook and the prices never see them.
+    switched_off: list[CostElement] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -430,6 +437,10 @@ def landed_cost(request: QuoteRequest) -> LandedCost:
     manual_freight, freight_note = freight_form_amount(request, request.freight_charges)
     if request.freight_charges is not None:
         stored = [row for row in stored if not is_seeded_freight(row)]
+    # A row switched off stays on the sheet and out of every sum. ``None`` is
+    # on: a row added in this session reads its column default only at insert.
+    off_rows = [row for row in stored if getattr(row, "is_active", True) is False]
+    stored = [row for row in stored if getattr(row, "is_active", True) is not False]
     # Partitioned so that every row lands on one side or the other. Testing for
     # destination and treating everything else as origin — rather than testing
     # for each — means a row whose stage is unset cannot fall out of the
@@ -682,6 +693,48 @@ def landed_cost(request: QuoteRequest) -> LandedCost:
     principal = sum((e.amount_base for e in elements if e.is_principal), _ZERO)
     lines = _per_line(elements, shares, quantities, line_goods)
 
+    # What each switched-off row would add, worked out as it would be if it
+    # were on — so switching it on shows no surprise — and counted nowhere.
+    switched_off: list[CostElement] = []
+    for row in off_rows:
+        after = row.stage == CostStage.DESTINATION
+        on_cif = after and (getattr(row, "percent_of", None) or "goods") == "cif"
+        p = line_of(row)
+        if p is not None:
+            would = _rated(row, line_cif[p] if on_cif else line_goods[p])
+        else:
+            would = _rated(row, cif if on_cif else goods)
+        rated = would is not None
+        if would is None:
+            would = (row.amount_base or _ZERO) * times(row)
+        switched_off.append(
+            CostElement(
+                ref=0,
+                stage=CostStage.DESTINATION if after else CostStage.ORIGIN,
+                label=row.label,
+                basis=(
+                    _rate_basis(row, "CIF value" if on_cif else "supplier price")
+                    if rated
+                    else row.basis
+                ),
+                amount_source=(
+                    None if rated or row.amount_source is None else row.amount_source * times(row)
+                ),
+                source_currency=None if rated else row.source_currency,
+                amount_base=_money(would),
+                amount_exact=would,
+                is_principal=bool(row.is_principal),
+                is_firm=bool(row.is_firm),
+                computed=False,
+                notes=row.notes,
+                id=str(row.id),
+                percent=row.percent if rated else None,
+                percent_of=("cif" if on_cif else "goods") if rated else None,
+                is_active=False,
+                **_line_fields(row, line_of(row), quantities),
+            )
+        )
+
     return LandedCost(
         currency=currency,
         elements=elements,
@@ -702,6 +755,7 @@ def landed_cost(request: QuoteRequest) -> LandedCost:
         ),
         principal_value=_money(principal),
         lines=lines,
+        switched_off=switched_off,
     )
 
 

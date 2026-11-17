@@ -17,7 +17,9 @@ documents and from the house's own rules, plainly labelled as which:
   purchase — gets the house insurance rate as a rated row and the house duty
   rate on the bid, both marked as defaults to edit. Never on the currency
   alone: a Dubai distributor quotes in dollars too.
-* **An online or advance-payment purchase** gets the house bank-charge rate.
+* **Payment / bank charges** go on every priced quote at the house rate,
+  **switched off**: on the sheet, ready to switch on, adding nothing until
+  somebody does. A bank charge the supplier stated comes in switched off too.
 * **VAT** at the house rate goes on the quote's total, where it has none.
 
 Nothing here overwrites a figure somebody typed. Rows are only seeded into an
@@ -259,11 +261,9 @@ def seed_costing(
         request.customs_duty_percent = settings.costing_default_duty_percent
         added.append("duty")
 
-    if (
-        pays_up_front(request, quote)
-        and settings.costing_default_bank_charge_percent > 0
-        and "bank" not in stated
-    ):
+    # Switched off, always. Counted by default it went into every line's
+    # landed cost and priced quotes over the Zoho estimate (QT-001862).
+    if settings.costing_default_bank_charge_percent > 0 and "bank" not in stated:
         rows.append(
             QuoteCostLine(
                 position=len(rows) + 1,
@@ -275,9 +275,16 @@ def seed_costing(
                 is_firm=False,
                 percent=settings.costing_default_bank_charge_percent,
                 percent_of="goods",
+                is_active=False,
+                notes=(
+                    "Switched off. Switch it on when we pay by card or before dispatch."
+                    if not pays_up_front(request, quote)
+                    else "Switched off. The supplier wants paying up front or online — "
+                    "switch it on if the bank or card charges us for that."
+                ),
             )
         )
-        added.append("bank charges")
+        added.append("bank charges (off)")
 
     if rows:
         request.cost_lines = rows
@@ -355,6 +362,9 @@ def _charge_row(
         is_principal=False,
         is_firm=False,
         notes=_stated(charge, quote.supplier_name),
+        # The bank's cut comes in off even when the supplier names it: it is
+        # ours to decide whether we pay by card or transfer.
+        is_active=charge.kind != "bank",
     )
     if charge.included:
         row.label = f"{name} – included in {quote.supplier_name}'s price"

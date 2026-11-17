@@ -233,7 +233,9 @@ def _is_bid(request: QuoteRequest) -> bool:
         or request.line_item_ref
         or request.incoterm_required
         or request.compliance
-        or request.cost_lines
+        # A switched-off row — the bank charge every priced quote carries —
+        # is not a costing anybody did.
+        or any(row.is_active is not False for row in request.cost_lines)
         or request.submission_fields
     )
 

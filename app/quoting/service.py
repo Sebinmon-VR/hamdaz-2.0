@@ -503,6 +503,9 @@ def set_cost_lines(request: QuoteRequest, rows: list[dict[str, Any]]) -> None:
             line_position=row.get("line_position"),
             # Per unit means nothing without a line to count the units of.
             per_unit=bool(row.get("per_unit")) and row.get("line_position") is not None,
+            # Off keeps the row on the sheet but out of the price. Missing
+            # means on: a caller that never heard of the switch counts its rows.
+            is_active=row.get("is_active") is not False,
         )
         for position, row in enumerate(rows)
     ]
@@ -1212,7 +1215,10 @@ async def _adopt_currency(
     and without one the switch is refused rather than mislabelled.
     """
     ours = (request.currency or "").upper()
-    priced = bool(request.cost_lines) or any(
+    # A switched-off rate holds no money in any currency; anything else does.
+    priced = any(
+        row.is_active is not False or row.percent is None for row in request.cost_lines
+    ) or any(
         (value or Decimal(0)) != 0
         for value in (
             request.discount,

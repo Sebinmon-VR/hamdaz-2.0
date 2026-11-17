@@ -357,6 +357,18 @@ class QuoteDrive:
             f"the folder was not made ({response.status_code}): {response.text[:160]}"
         )
 
+    async def item(self, item_id: str) -> dict[str, Any]:
+        """One file's id, name, link and eTag. Teams wants the eTag's GUID as
+        the attachment id when a chat message carries the file."""
+        response = await self._http.get(
+            self._item_url(item_id), params={"$select": "id,name,webUrl,eTag"},
+            headers=await self._headers(),
+        )
+        if response.status_code != 200:
+            raise DriveError(f"file lookup refused ({response.status_code}): "
+                             f"{response.text[:160]}")
+        return response.json()
+
     async def folder_url(self, path: str) -> str | None:
         """The link to a folder, once something has been put in it."""
         response = await self._http.get(self._path_url(path), headers=await self._headers())

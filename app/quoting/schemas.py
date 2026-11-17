@@ -91,6 +91,9 @@ class CostLineIn(BaseModel):
     #: The amounts are per unit of that line, multiplied by its quantity.
     #: Only meaningful with ``line_position`` set.
     per_unit: bool = False
+    #: Counted in the landed cost. Off keeps the row and its rate on the sheet
+    #: but adds nothing to the price.
+    is_active: bool = True
 
 
 class CostLineOut(CostLineIn):
@@ -372,6 +375,8 @@ class CostElementOut(BaseModel):
     #: ``quantity`` units.
     per_unit: bool = False
     quantity: Decimal | None = None
+    #: False on a row switched off — listed in ``switched_off``, never counted.
+    is_active: bool = True
 
 
 class LinePartOut(BaseModel):
@@ -421,6 +426,9 @@ class LandedCostOut(BaseModel):
     #: Each line's landed cost, in line order. A line's selling price is its
     #: ``each`` ÷ (1 − margin).
     lines: list[LineLandedOut] = Field(default_factory=list)
+    #: Rows switched off: what each would add, shown so it can be switched back
+    #: on, and in none of the figures above.
+    switched_off: list[CostElementOut] = Field(default_factory=list)
 
 
 class MarkupScenarioOut(BaseModel):
@@ -1162,6 +1170,18 @@ class ReportSupplierOut(BaseModel):
     missing: list[str] = Field(default_factory=list)
     #: The report's line numbers priced from this supplier, when several are.
     lines: list[int] = Field(default_factory=list)
+
+
+class FiledReportOut(BaseModel):
+    """The costing sheet PDF, as filed in the task's folder."""
+
+    file_name: str
+    #: The file in the library; the reader's own access decides if it opens.
+    web_url: str
+    item_id: str
+    #: The GUID in the file's eTag: the id Teams wants for a file in a chat.
+    attachment_id: str | None = None
+    folder_url: str | None = None
 
 
 class CostingReportOut(BaseModel):
