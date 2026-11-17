@@ -57,7 +57,7 @@ from app.core.config import Settings
 from app.core.llm import TextModel
 from app.enquiries.claude import ClaudeEnquiry
 from app.itsupport import brief as brief_mod
-from app.itsupport import distributors, docs, due, memory, talk, work
+from app.itsupport import distributors, docs, due, memory, smalltalk, talk, work
 from app.itsupport import files as files_mod
 from app.itsupport import goal as goal_mod
 from app.itsupport import settings as settings_mod
@@ -92,6 +92,9 @@ HOLDING = ("one sec, looking into it", "checking now", "give me a minute on this
 #: A message this short, with no files or pending question, is small talk:
 #: answered at low effort (3 s instead of 10 s for a "hi").
 SMALL_TALK_WORDS = 6
+#: A silence this long ends a conversation: the model sees only the one
+#: going on now (``this_conversation``).
+CONVERSATION_GAP = timedelta(hours=2)
 #: A yes to the offer just made.
 _YES = re.compile(
     r"^\s*(yes|yeah|yep|yup|sure|ok(ay)?|please|pls|go\s+ahead|do\s+it|go\s+for\s+it)\b",
@@ -146,6 +149,21 @@ def _small_talk(words: str, batch: list[dict[str, Any]], files: dict[str, Any],
     return (len(words.split()) <= SMALL_TALK_WORDS and not plan_note
             and not any(files_mod.in_message(m) for m in batch)
             and not re.search(r"\d{3,}", words))
+
+
+def this_conversation(newest_first: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The messages of the conversation going on now: back to the last
+    silence of ``CONVERSATION_GAP``. What was said before it (Friday's search)
+    is not brought up again; the notes carry what matters from it."""
+    out: list[dict[str, Any]] = []
+    later: datetime | None = None
+    for message in newest_first:
+        when = _when(message.get("createdDateTime"))
+        if later is not None and when is not None and later - when > CONVERSATION_GAP:
+            break
+        out.append(message)
+        later = when or later
+    return out
 
 
 def _holding_line(newest_first: list[dict[str, Any]]) -> str:
@@ -566,6 +584,18 @@ class ITSupportWorker:
                             chat.email, ask.label, ask.place)
                 self._spawn(self._find_for(chat, ask), "itsupport-find")
                 return
+            # Small talk ("hi", "test", "thanks", "ok", "bye") gets a colleague's
+            # one line, no model, when nothing is waiting on their answer (an
+            # "ok" to a plan is a yes, handled below).
+            waiting = (chat.plan is not None or time.monotonic() < chat.agreed_until
+                       or chat.waiting_files is not None or chat.offer is not None)
+            if words and not waiting and set(chat.files) == before:
+                recent = [talk.plain(m) for m in await self._messages(chat, top=12)
+                          if ((m.get("from") or {}).get("user") or {}).get("id") == self.me_id]
+                if (line := smalltalk.reply(words, chat.first_name, recent)) is not None:
+                    await self._say(chat, talk.to_html(line))
+                    logger.info("it support: small talk from %s answered by rules", chat.email)
+                    return
             person = Person(user_id, chat.email, chat.first_name, tasks, access)
             files = {n: o for n, (o, _) in chat.files.items()}
 
@@ -603,8 +633,8 @@ class ITSupportWorker:
                                  "done. Their message below answers that: on a no, drop it; "
                                  "if they changed it, make the plan again as they want it.")
 
-            newest_first = await self._messages(
-                chat, top=self._settings.it_support_history_messages)
+            newest_first = this_conversation(await self._messages(
+                chat, top=self._settings.it_support_history_messages))
             history = talk.turns(list(reversed(newest_first)), self.me_id)
             small = _small_talk(words, batch, files, plan_note)
             context = self._context(chat, person, known, files, batch, problems, plan_note,
