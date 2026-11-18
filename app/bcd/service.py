@@ -78,13 +78,23 @@ class BcdForbidden(BcdError):
 
 
 def placeholder_of(task: ProposalTask) -> datetime | None:
-    """The task's BCD when it is the assignment-time placeholder, else None."""
+    """The task's BCD when it is the assignment-time placeholder, else None.
+
+    Two ways in: Power Automate stamps the raw value (the offsets above), and
+    this app writes a BCD as the UAE clock it means (``fu.as_typed`` reads it
+    back), so a task the mail watch made from a mail with no closing date
+    carries "now" read that way: raw, 12 hours off its created time; meant,
+    the minute it was created (found 2026-11-18 on 1995 and 1997).
+    """
     created = parse_when(task.created_at)
     bcd = parse_when(task.bid_closing_date)
     if created is None or bcd is None:
         return None
+    meant = fu.as_typed(bcd)
     for offset in PLACEHOLDER_OFFSETS:
-        if abs(bcd - (created + offset)) <= PLACEHOLDER_TOLERANCE:
+        target = created + offset
+        if abs(bcd - target) <= PLACEHOLDER_TOLERANCE or \
+                abs(meant - target) <= PLACEHOLDER_TOLERANCE:
             return bcd
     return None
 
