@@ -274,6 +274,10 @@ class TaskFollowup(Base, UUIDPrimaryKey, Timestamped):
     #: What the person said. Null until they do; also null on a false
     #: positive, whose note goes in ``resolved_note``.
     reason: Mapped[str | None] = mapped_column(Text)
+    #: What kind of reason it is (``app.followups.tags``): supplier, customer,
+    #: approval, workload, portal, other. Set by rules when it is given, for
+    #: the daily report's grouping.
+    reason_tag: Mapped[str | None] = mapped_column(String(40))
     answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     #: When the managers were told, and what stopped it if they were not.
     forwarded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from html import escape
 
 from app.core.mail import Attachment, GraphMailer
+from app.followups.tags import LABELS, counted
 from app.models.followup import TaskFollowup
 from app.models.user import User
 
@@ -463,7 +464,8 @@ def person_report_body(
             [
                 r.task_title + (" (carried over from the previous day)" if r.carried_over else ""),
                 _when(r.due_at),
-                label,
+                label + (f" · {LABELS.get(r.reason_tag, r.reason_tag)}"
+                         if label == "Reason given" and getattr(r, "reason_tag", None) else ""),
                 *_notes_and_note(r, notes),
             ]
             for r, (label, _) in zip(rows, states, strict=True)
@@ -479,6 +481,8 @@ def person_report_body(
                 ("Not answered", missing, True),
             ]
         )
+        + (f"<p style='margin:14px 0 0;font-size:13px'>Reasons: {kinds}</p>"
+           if (kinds := counted([getattr(r, "reason_tag", None) for r in rows])) else "")
         + "<div style='height:14px'></div>"
         + table
         + f"<p style='margin:20px 0 0'>{button(link, 'View Follow-ups')}</p>"

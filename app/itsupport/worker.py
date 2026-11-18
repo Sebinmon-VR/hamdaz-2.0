@@ -42,7 +42,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Final
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -55,17 +55,33 @@ from app.comparison.extraction import QuoteExtractor
 from app.core.config import Settings
 from app.core.llm import TextModel
 from app.enquiries.claude import ClaudeEnquiry
+from app.itsupport import (
+    activity,
+    distributors,
+    docs,
+    due,
+    features,
+    jobs,
+    memory,
+    smalltalk,
+    talk,
+    when,
+    work,
+)
 from app.itsupport import brief as brief_mod
-from app.itsupport import distributors, docs, due, memory, smalltalk, talk, work
 from app.itsupport import files as files_mod
 from app.itsupport import goal as goal_mod
+from app.itsupport import lookups as lookups_mod
+from app.itsupport import sent as sent_mod
 from app.itsupport import settings as settings_mod
-from app.itsupport.brain import Brain, Person, Plan, Turn
-from app.itsupport.erp import ERP, Access, access_for
+from app.itsupport import status as status_mod
+from app.itsupport.brain import Brain, Person, Plan, Step, Turn
+from app.itsupport.erp import ERP, Access, Answer, access_for
 from app.itsupport.graph import FilesNotAllowedError, GraphError, ITSupportGraph, NotConnectedError
 from app.itsupport.progress import Progress
 from app.models.team import Team, TeamMembership
 from app.models.user import User
+from app.proposals.oversight import TeamTasksCache
 from app.proposals.sharepoint import SharePointProposals
 
 logger = logging.getLogger("hamdaz.itsupport")
@@ -75,6 +91,18 @@ DUBAI = ZoneInfo("Asia/Dubai")
 BACKOFF_SECONDS = 10.0
 #: How often the background jobs (tasks, notes, check-ins) look for work.
 BACKGROUND_SECONDS = 60.0
+#: The live read of a person's tasks before a reply waits at most this long.
+LIVE_READ_SECONDS = 6.0
+#: A super admin may belong to several teams; this many are put in the context.
+MAX_TEAMS_SHOWN = 3
+#: Reading one team's tasks before a reply waits at most this long.
+TEAM_READ_SECONDS = 15.0
+#: Who is in a team and who of them is away are read again after this long.
+TEAM_PEOPLE_SECONDS = 600.0
+#: A numbered ask is what a reply refers to for this long.
+ASKED_SECONDS = 16 * 3600
+#: An answer is passed back to whoever asked for this long after the message.
+RELAY_SECONDS = 8 * 3600
 #: How long files waiting on an answer ("is this the RFQ or a quote?") and an
 #: offer waiting on a yes ("want me to find suppliers?") are kept.
 WAITING_SECONDS = 30 * 60
@@ -127,8 +155,28 @@ class Chat:
     agreed_until: float = 0.0
     #: Their teams in the ERP, (handle, name), read with their modules.
     teams: list[tuple[str, str]] = field(default_factory=list)
+    #: The teams whose tasks they oversee, (id, name), by the app's own rule
+    #: (``proposals.oversight``): super admins, the CEO and managers every
+    #: team, a team's lead or manager theirs. For them "any tasks?" means the
+    #: team's (the user, 2026-11-18).
+    oversees: list[tuple[uuid.UUID, str]] = field(default_factory=list)
+    #: Whether "any tasks?" means the team's: an organisation role (super
+    #: admin, CEO, manager). A team's lead is a member who holds tasks too
+    #: (Jasna): theirs first, the team's when they ask about it.
+    team_first: bool = False
     #: Their name in Teams, for what to call them when the page names none.
     display_name: str | None = None
+    #: The last numbered list IT Support sent here (a daily ask, the team's
+    #: day, a BCD question), so "1 submitted" knows what 1 is.
+    asked: status_mod.Asked | None = None
+    #: Someone asked IT Support to message this person (connect_colleague):
+    #: (their email, the task, when, monotonic). This person's next answer
+    #: goes back to them.
+    relay: tuple[str, str, float] | None = None
+    #: The task the conversation is on (the last one looked up or filed):
+    #: (task id, title, holder, holder's email, monotonic), so "can you call"
+    #: or "message her" knows who.
+    focus: tuple[str, str, str, str, float] | None = None
 
 
 def _words(message: dict[str, Any]) -> str:
@@ -137,13 +185,96 @@ def _words(message: dict[str, Any]) -> str:
     return "" if text == "(sent a file or a picture)" else text.strip()
 
 
+#: What small talk sounds like. Only this runs at low effort with no notes:
+#: a short message that isn't social ("can you call", "yes", "the 2nd one")
+#: carries on the conversation and needs it all (2026-11-18: "can you call"
+#: after talking about 855 got "call who? 1981?" at low effort).
+#: Words of small talk, and those that make a message social on their own
+#: ("ok" or "yes" alone answers whatever was just asked, so it isn't).
+_SOCIAL_WORDS: Final = frozenset({
+    "hi", "hii", "hiii", "hey", "heyy", "hello", "hai", "good", "morning", "afternoon",
+    "evening", "night", "gm", "gn", "how", "are", "r", "you", "u", "doing", "whats", "what's",
+    "up", "sup", "thanks", "thank", "thx", "ty", "bye", "see", "cya", "nice", "great",
+    "cool", "lol", "haha", "test", "testing", "ok", "okay", "there", "again", "all", "much",
+    "so", "very", "the", "team", "dear", "bro", "man", "it", "support", "itsupport"})
+_SOCIAL_STRONG: Final = frozenset({
+    "hi", "hii", "hiii", "hey", "heyy", "hello", "hai", "morning", "afternoon", "evening",
+    "gm", "gn", "sup", "thanks", "thank", "thx", "ty", "bye", "cya", "lol", "haha", "test",
+    "testing", "there", "how"})
+
+
+def _social(words: str) -> bool:
+    tokens = [t for t in re.findall(r"[a-z']+", words.casefold())]
+    return (bool(tokens) and all(t in _SOCIAL_WORDS for t in tokens)
+            and any(t in _SOCIAL_STRONG for t in tokens))
+
+
 def _small_talk(words: str, batch: list[dict[str, Any]], files: dict[str, Any],
                 plan_note: str) -> bool:
-    """A greeting, a thanks, an "ok": a few words, nothing sent with it, no
+    """A greeting, a thanks: social, a few words, nothing sent with it, no
     question of ours waiting on the answer."""
     return (len(words.split()) <= SMALL_TALK_WORDS and not plan_note
+            and _social(words)
             and not any(files_mod.in_message(m) for m in batch)
             and not re.search(r"\d{3,}", words))
+
+
+def whose_tasks(chat: Chat) -> str:
+    """For someone who oversees a team: whose tasks a question about tasks
+    means. A manager or super admin: the team's. A team's lead, who holds
+    tasks too: their own, the team's when they ask about it."""
+    teams = ", ".join(n for _, n in chat.oversees[:MAX_TEAMS_SHOWN])
+    if chat.team_first:
+        return (f"They oversee {teams}: a question about tasks (any due today, pending, late, "
+                "this week) is about the team, not their own list, unless they say my/mine/I. "
+                "Answer from the team's list straight away, naming who holds each; don't say "
+                "what their own list has.")
+    return (f"They lead {teams} and hold tasks themselves: a question about tasks (any due "
+            "today, pending, late) is about their own list first. Use the team's list when "
+            "they ask about the team, everyone, or a colleague by name, or when they have no "
+            "open tasks of their own; then name who holds each.")
+
+
+def focus_note(chat: Chat) -> str:
+    """What the conversation is on, if it was on a task in the last half hour."""
+    if chat.focus is None or time.monotonic() - chat.focus[4] > 30 * 60:
+        return ""
+    task_id, title, holder, email, _ = chat.focus
+    who = f", held by {holder}" + (f" ({email})" if email else "") if holder else ""
+    return (f"THE CONVERSATION IS ON task {task_id} ({title[:70]}){who}. A short message "
+            f"(\"can you call\", \"message her\", \"yes\", \"what about the costing\") "
+            "carries on from this, not from the lists below.")
+
+
+def answering_last(newest_first: list[dict[str, Any]],
+                   batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The chat oldest first, with the messages this turn answers moved to the
+    end. A message sent while the last reply was being written sits before
+    that reply in Teams' order, so the model took it as answered and replied
+    to nothing (2026-11-18: "4500 USD in AED", sent while it answered about
+    Fortinet, got a remark about task 1981). One not in the read yet is added."""
+    ids = {m.get("id") for m in batch}
+    oldest_first = list(reversed(newest_first))
+    earlier = [m for m in oldest_first if m.get("id") not in ids]
+    seen = {m.get("id") for m in oldest_first}
+    now_asked = [m for m in oldest_first if m.get("id") in ids] + \
+        [m for m in batch if m.get("id") not in seen]
+    return earlier + now_asked
+
+
+def asked_note(asked: status_mod.Asked) -> str:
+    """The last numbered list sent here, for the brain."""
+    what = {"status": "where these stand", "reason": "why these are late",
+            "team": "the team's tasks", "bcd": "a placeholder BCD"}.get(asked.kind, asked.kind)
+    listed = "; ".join(f"{i.number} = {i.task_id} {i.title[:50]}" for i in asked.items[:30])
+    out = (f"Your last numbered message ({what}, {when.said(asked.at, datetime.now(UTC))}): "
+           f"{listed}. Numbers in their reply refer to these.")
+    if asked.kind in ("status", "reason"):
+        out += " File their answers with update_task."
+    if asked.kind == "team":
+        out += (" \"check with 2\" / \"ask Haleema about it\": connect_colleague (a call "
+                "link, or a message after their yes).")
+    return out
 
 
 def this_conversation(newest_first: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -183,6 +314,7 @@ class ITSupportWorker:
         # Its own copy: the settings page's row is written over it every
         # settings_mod.REFRESH_SECONDS, and the rest of the app keeps its own.
         settings = settings.model_copy()
+        settings_mod.trial_overrides(settings)
         self._settings = settings
         self._graph = ITSupportGraph(settings, http, factory)
         self._model = model
@@ -206,8 +338,24 @@ class ITSupportWorker:
         self.me_id: str | None = None
         #: The brain, when it can run: Claude with the ERP as the person.
         self._erp = ERP(app, settings) if app is not None else None
+        #: Each overseen team's members and who of them is away, with when read.
+        self._team_people: dict[uuid.UUID, tuple[list, dict, float]] = {}
+        self._team_age: dict[uuid.UUID, int] = {}
+        #: Team tasks: the app's own cache (a minute), shared with its screens.
+        self._team_cache: TeamTasksCache = getattr(
+            getattr(app, "state", None), "team_tasks_cache", None) or TeamTasksCache()
         self._brain = Brain(settings, self._erp, self._finder, self._claude, self._extractor,
                             http=http) if self._erp is not None else None
+        #: What it has sent once (asks, alerts), in the database.
+        self._sent = sent_mod.Ledger(factory)
+        #: Where the polling jobs got to ("reviews": the last review seen).
+        self._watermarks: dict[str, datetime] = {}
+        if self._brain is not None and self._erp is not None:
+            self._brain.lookups = lookups_mod.Lookups(settings, self._erp, factory)
+            self._brain.lookups.on_teams = self._teams_message
+            self._brain.lookups.sharepoint = sharepoint
+            self._brain.on_teams = self._teams_message
+            self._brain.on_change = self._log_change
         #: Each person's ERP account and modules, by email, with when read.
         self._people: dict[str, tuple[uuid.UUID, Access, float]] = {}
         #: The chats it answers; changed in place when the page changes the
@@ -334,15 +482,26 @@ class ITSupportWorker:
             if self._erp is not None:
                 self._erp.reload_modes()
             error, self._error = self._error, None
-            held = await settings_mod.claim(self._factory, signed_in_as=self._me_email,
-                                            error=error)
+            if features.trial(self._settings):
+                # A trial answers only its own people and leaves the lease to
+                # the process answering everyone else.
+                held = True
+                if not was:
+                    logger.warning("it support: TRIAL on this machine: answering only %s, "
+                                   "without the lease", self._settings.it_support_allowed_emails)
+            else:
+                held = await settings_mod.claim(self._factory, signed_in_as=self._me_email,
+                                                error=error)
             if not held:
                 if was:
                     logger.warning("it support: another process (%s) is answering; this one "
                                    "stays quiet so nobody gets two replies", row.running_on)
                 self.answering = False
                 return
-            self.answering = row.enabled
+            # A trial answers its own people even with the page's switch off:
+            # production is switched off there so the trial can run alone
+            # (the user, 2026-11-18). Stopping the laptop stops the trial.
+            self.answering = row.enabled or features.trial(self._settings)
             if was != self.answering:
                 logger.info("it support: %s", "answering" if self.answering else
                             "switched off on the settings page")
@@ -402,6 +561,10 @@ class ITSupportWorker:
         newest_first = await self._messages(chat, top=s.it_support_history_messages)
         new = [m for m in newest_first if m["id"] not in chat.seen]
         chat.seen.update(m["id"] for m in new)
+        try:
+            await jobs.feedback(self, chat, newest_first)
+        except Exception:  # noqa: BLE001 - feedback is a record, not the chat
+            logger.exception("it support: feedback check failed")
         asked = [
             m for m in new
             if m.get("messageType") == "message" and not m.get("deletedDateTime")
@@ -501,11 +664,116 @@ class ITSupportWorker:
                 select(Team.slug, Team.name).join(TeamMembership, TeamMembership.team_id == Team.id)
                 .where(TeamMembership.user_id == user_id).distinct().order_by(Team.name))
             chat.teams = [(slug, name) for slug, name in rows.all()]
+            chat.oversees, chat.team_first = await self._oversees(session, user_id)
         self._people[chat.email] = (user_id, access, time.monotonic())
         logger.info("it support: %s reaches %s%s", chat.email,
                     ", ".join(sorted(access.modules)) or "no modules",
                     " (super admin)" if access.is_admin else "")
         return user_id, access
+
+    @staticmethod
+    async def _oversees(session: AsyncSession, user_id: uuid.UUID
+                        ) -> tuple[list[tuple[uuid.UUID, str]], bool]:
+        """The teams whose tasks they may see, as the team task board decides
+        (``oversight.GLOBAL_OVERSIGHT`` / ``TEAM_OVERSIGHT``), and whether
+        their questions about tasks mean the team's (an organisation role
+        only). An organisation role covers the follow-up's watched team
+        (Presale) and their own."""
+        from app.followups import service as fu
+        from app.proposals.oversight import GLOBAL_OVERSIGHT, TEAM_OVERSIGHT
+        from app.roles.service import global_role_keys
+        from app.teams.service import team_role_keys
+
+        rows = (await session.execute(
+            select(Team.id, Team.name).join(TeamMembership, TeamMembership.team_id == Team.id)
+            .where(TeamMembership.user_id == user_id).distinct().order_by(Team.name))).all()
+        if await global_role_keys(session, user_id) & GLOBAL_OVERSIGHT:
+            out: list[tuple[uuid.UUID, str]] = []
+            watched = (await fu.get_settings(session)).team_id
+            if watched is not None and (team := await session.get(Team, watched)) is not None:
+                out.append((team.id, team.name))
+            out += [(tid, name) for tid, name in rows if tid != watched]
+            return out, True
+        return [(tid, name) for tid, name in rows
+                if await team_role_keys(session, team_id=tid, user_id=user_id) & TEAM_OVERSIGHT
+                ], False
+
+    async def _team_view(self, chat: Chat) -> str:
+        """The tasks of the teams they oversee, as the list has them now
+        (the app's shared team cache, a minute at most), with who holds each
+        and who's away. Empty for everyone else."""
+        if not chat.oversees or self._sharepoint is None or self._factory is None:
+            return ""
+        parts: list[tuple[str, int]] = []
+        for team_id, name in chat.oversees[:MAX_TEAMS_SHOWN]:
+            try:
+                parts.append(await asyncio.wait_for(self._team_tasks(team_id, name),
+                                                    TEAM_READ_SECONDS))
+            except Exception as exc:  # noqa: BLE001 - say so; the ERP can still be read
+                logger.warning("it support: reading the %s team's tasks failed: %s", name,
+                               exc or type(exc).__name__)
+                parts.append((f"(The {name} team's tasks couldn't be read just now; read "
+                              "them from the ERP.)", 1))
+        # A team with nothing on the Proposals list (HR, say) is left out,
+        # unless nothing else has anything either.
+        busy = [text for text, count in parts if count]
+        return "\n\n".join(busy or [text for text, _ in parts[:1]])
+
+    async def _team_tasks(self, team_id: uuid.UUID, name: str) -> tuple[str, int]:
+        """The team's list as text, and how many open tasks are on it."""
+        now = datetime.now(UTC)
+        data = await self._team_data(team_id)
+        if data is None:
+            return "", 0
+        holders, held = data
+        age = self._team_age.get(team_id, 0)
+        return work.describe_team(name, holders, held, read_at=now - timedelta(seconds=age),
+                                  now=now)
+
+    async def _team_data(self, team_id: uuid.UUID
+                         ) -> tuple[list[tuple[str, str | None, list]], set[str]] | None:
+        """Each member's name, why they're away (or None) and tasks, and the
+        tasks still on a placeholder BCD. The tasks are a minute old at most;
+        who's in the team and who's away are kept TEAM_PEOPLE_SECONDS (a
+        9-person team's leave check took 8 s from the laptop, one at a time)."""
+        from app.bcd import service as bcd
+        from app.mailwatch.availability import away_reasons
+        from app.proposals.oversight import resolve_members
+
+        if self._factory is None or self._sharepoint is None:
+            return None
+        async with self._factory() as session:
+            kept = self._team_people.get(team_id)
+            if kept is None or time.monotonic() - kept[2] > TEAM_PEOPLE_SECONDS:
+                team = await session.get(Team, team_id)
+                if team is None:
+                    return None
+                members = await resolve_members(session, team, self._sharepoint)
+                away = await away_reasons(session, [m.user_id for m in members])
+                kept = (members, away, time.monotonic())
+                self._team_people[team_id] = kept
+            members, away, _ = kept
+            rows, _, age = await self._team_cache.rows(
+                self._sharepoint, team_id=team_id, members=members, limit=500, refresh=False)
+            everyone = [t for m in members if m.lookup_id for t in rows.get(m.lookup_id, [])]
+            held = await bcd.held_ids(session, everyone)
+        self._team_age[team_id] = age
+        return [(m.name, away.get(m.user_id), rows.get(m.lookup_id or "", []))
+                for m in members], held
+
+    def _team_emails(self, chat: Chat) -> frozenset[str]:
+        """The teammates of the teams they oversee, as last read."""
+        return frozenset(self._team_names(chat).values())
+
+    def _team_names(self, chat: Chat) -> dict[str, str]:
+        """Those teammates by name, lower case: name → email."""
+        out: dict[str, str] = {}
+        for team_id, _ in chat.oversees:
+            kept = self._team_people.get(team_id)
+            if kept is not None:
+                out.update({(m.name or m.email).casefold(): m.email.lower()
+                            for m in kept[0] if m.email and m.email.lower() != chat.email})
+        return out
 
     async def _open_sent(self, chat: Chat, batch: list[dict[str, Any]],
                          tasks: list) -> list[str]:
@@ -583,7 +851,17 @@ class ITSupportWorker:
                     await self._say(chat, talk.to_html(line))
                     logger.info("it support: small talk from %s answered by rules", chat.email)
                     return
-            person = Person(user_id, chat.email, chat.first_name, tasks, access)
+            # Only a turn the model answers waits for the live read: "hi" doesn't.
+            known = await self._fresh_work(chat)
+            tasks = known.tasks if known else []
+            await self._relay(chat, words)
+            if words and not waiting and await self._status_rules(
+                    chat, user_id, access, words, tasks):
+                return
+            team = await self._team_view(chat)
+            person = Person(user_id, chat.email, chat.first_name, tasks, access,
+                            team_emails=self._team_emails(chat),
+                            team_names=self._team_names(chat))
             files = {n: o for n, (o, _) in chat.files.items()}
 
             # A change asked about last turn: their answer decides it.
@@ -622,10 +900,11 @@ class ITSupportWorker:
 
             newest_first = this_conversation(await self._messages(
                 chat, top=self._settings.it_support_history_messages))
-            history = talk.turns(list(reversed(newest_first)), self.me_id)
+            history = talk.turns(answering_last(newest_first, batch), self.me_id)
             small = _small_talk(words, batch, files, plan_note)
             context = self._context(chat, person, known, files, batch, problems, plan_note,
-                                    small_talk=small)
+                                    small_talk=small, earlier=self._earlier(newest_first),
+                                    team=team)
 
             async def say(text: str) -> None:
                 await self._say(chat, talk.to_html(text.strip()[:1000]))
@@ -643,10 +922,15 @@ class ITSupportWorker:
             turn = Turn(person, files, on_find=find, on_say=say, on_file=send_file,
                         agreed=agreed,
                         effort="low" if small else None)
+            if focus_note(chat) and chat.focus is not None:
+                turn.focus = chat.focus[:4]  # what the conversation is on, carried over
 
             # No holding line or typing dots: the reply comes when it's ready
             # (the user's choice, 2026-11-17, after trying both).
             text = await self._brain.answer(turn, chat=history, context=context)
+            await self._log_turn(chat, turn)
+            if turn.focus is not None:
+                chat.focus = (*turn.focus, time.monotonic())
             if agreed and (not turn.done or turn.done[-1].endswith("failed")):
                 # Still not finished: their next message may carry what's missing.
                 chat.agreed_until = time.monotonic() + WAITING_SECONDS
@@ -679,15 +963,187 @@ class ITSupportWorker:
         finally:
             chat.busy = False
 
+    def _last_ask(self, chat: Chat) -> status_mod.Asked | None:
+        asked = chat.asked
+        if asked is None or (datetime.now(UTC) - asked.at).total_seconds() > ASKED_SECONDS:
+            return None
+        return asked
+
+    async def _status_rules(self, chat: Chat, user_id: uuid.UUID, access: Access, words: str,
+                            tasks: list) -> bool:
+        """A reply the rules read fully ("1 submitted, 2 on hold waiting for
+        price", "1952 submitted", "BCD correct") filed at once, no model.
+        False: the brain takes the message (with the ask in its context)."""
+        s = self._settings
+        if self._erp is None or self._factory is None:
+            return False
+        asked = self._last_ask(chat)
+        if asked is None:
+            asked = await self._asked_from_history(chat)
+        if asked is not None and asked.kind == "bcd" and features.on(s, "bcd_asks"):
+            if re.search(r"\b(correct|right|fine|ok(ay)?|yes|confirm(ed)?)\b", words, re.I) \
+                    and not status_mod.looks_like_question(words):
+                item = asked.items[0]
+                answer = await self._erp.call(user_id, "POST",
+                                              f"/bcd-checks/{item.ref}/confirm", access=access,
+                                              body={})
+                said = (f"Thanks, I've marked {item.task_id}'s BCD as right." if answer.ok
+                        else f"Couldn't mark it: {status_mod._why(answer)}")
+                await self._say(chat, talk.to_html(said))
+                await activity.record(self._factory, email=chat.email, kind=activity.ANSWER,
+                                      summary=f"BCD confirmed for {item.task_id}",
+                                      ok=answer.ok, detail={"check": item.ref})
+                chat.asked = None
+                return True
+            return False
+        if not features.on(s, "status_updates"):
+            return False
+        if asked is not None and asked.kind == "team":
+            return False  # the team's list: "check with 2" is the brain's
+        reading = status_mod.read(words, asked=asked, tasks=tasks)
+        if reading.unsure or not reading.updates:
+            return False
+        mine = {t.id: t for t in tasks}
+        if any(u.task_id not in mine for u in reading.updates):
+            return False
+        if features.trial(s) and any("test" not in (mine[u.task_id].title or "").casefold()
+                                     for u in reading.updates):
+            await self._say(chat, talk.to_html(
+                "Trial: I only file updates on tasks with \"test\" in the title."))
+            return True
+        from app.models.followup import FollowupStatus, TaskFollowup
+        from app.reminders import service as reminders
+
+        async with self._factory() as session:
+            pending = {r.task_id: str(r.id) for r in (await session.scalars(
+                select(TaskFollowup).where(TaskFollowup.assignee_id == user_id,
+                                           TaskFollowup.status == FollowupStatus.PENDING))
+            ).all()}
+            written = (await reminders.get_settings(session)).write_sharepoint
+        now = datetime.now(UTC)
+        filed = []
+        for update in reading.updates:
+            done = await status_mod.file(self._erp, user_id=user_id, access=access,
+                                         update=update, task=mine.get(update.task_id),
+                                         pending_reason=pending, now=now)
+            filed.append(done)
+            await activity.record(self._factory, email=chat.email, kind=activity.ANSWER,
+                                  summary=f"{update.task_id}: {done.said}", ok=done.ok,
+                                  detail={"said": words[:500], "by": "rules"})
+        await self._say(chat, talk.to_html(status_mod.reply(filed, list_written=written)))
+        logger.info("it support: %s's update filed by rules: %s", chat.email,
+                    "; ".join(f"{f.task_id} {f.said}" for f in filed))
+        return True
+
+    async def _asked_from_history(self, chat: Chat) -> status_mod.Asked | None:
+        """The last numbered ask, read back from the chat (after a restart)."""
+        try:
+            for message in await self._messages(chat, top=15):
+                sender = ((message.get("from") or {}).get("user") or {}).get("id")
+                at = _when(message.get("createdDateTime"))
+                if sender != self.me_id or at is None:
+                    continue
+                if (datetime.now(UTC) - at).total_seconds() > ASKED_SECONDS:
+                    return None
+                if (found := status_mod.asked_in(talk.plain(message), at)) is not None:
+                    chat.asked = found
+                    return found
+        except Exception:  # noqa: BLE001 - without it, the brain reads the chat
+            logger.exception("it support: reading the last ask back failed")
+        return None
+
+    async def _relay(self, chat: Chat, words: str) -> None:
+        """Their answer passed back to whoever asked IT Support to message them."""
+        if chat.relay is None or not words:
+            return
+        asker, task_id, sent_at = chat.relay
+        if time.monotonic() - sent_at > RELAY_SECONDS:
+            chat.relay = None
+            return
+        chat.relay = None
+        target = next((c for c in self._chats if c.email == asker), None)
+        if target is None:
+            return
+        about = f" about {task_id}" if task_id else ""
+        said = f"{chat.first_name} replied{about}: \"{words[:800]}\""
+        await self._say(target, talk.to_html(said))
+        await activity.record(self._factory, email=asker, kind=activity.SENT,
+                              summary=f"passed on {chat.first_name}'s answer{about}",
+                              detail={"from": chat.email, "task": task_id})
+
+    async def _teams_message(self, person: Person, step: Step) -> Answer:
+        """A message to a teammate from IT Support, after the asker's yes;
+        their answer comes back to the asker when the agent chats with them."""
+        email = step.path.removeprefix("message:").strip().lower()
+        text = str((step.body or {}).get("text") or "").strip()
+        if not email or not text:
+            return Answer(400, "Nothing to send.")
+        if self._factory is not None:
+            from app.followups.service import ceo_emails
+
+            async with self._factory() as session:
+                if email in {e.casefold() for e in await ceo_emails(session)}:
+                    return Answer(403, "Not the CEO, for now.")
+        testers = settings_mod.trial_people(self._settings)
+        if features.trial(self._settings) and email not in testers:
+            trial_chat = next((c for c in self._chats if c.email == person.email), None)
+            if trial_chat is None:
+                return Answer(503, "Trial: no chat to send the test message to.")
+            await self._say(trial_chat, talk.to_html(
+                f"(trial: this would go to {email})\n{text}"))
+            await activity.record(self._factory, email=person.email, kind=activity.SENT,
+                                  summary=f"trial message (not sent) to {email}: {text[:200]}",
+                                  detail={"to": email, "task": step.query, "trial": True})
+            return Answer(200, f"Trial: not sent to {email}; shown here instead. In real use "
+                               "their answer comes back to you.")
+        target = next((c for c in self._chats if c.email == email), None)
+        try:
+            chat = target or await self._open_chat(email)
+        except Exception as exc:  # noqa: BLE001
+            return Answer(502, f"Couldn't open a chat with {email}: {exc}")
+        await self._say(chat, talk.to_html(text))
+        if target is not None:
+            target.relay = (person.email, step.query, time.monotonic())
+            back = "their answer will come back to you here"
+        else:
+            back = "I don't chat with them, so their answer stays in their Teams"
+        await activity.record(self._factory, email=person.email, kind=activity.SENT,
+                              summary=f"message to {email}: {text[:200]}",
+                              detail={"to": email, "task": step.query})
+        return Answer(200, f"Sent to {email}; {back}.")
+
+    async def _log_change(self, person: Person, step: Step, answer: Answer) -> None:
+        await activity.record(self._factory, email=person.email, kind=activity.CHANGE,
+                              summary=step.what[:300], ok=answer.ok,
+                              detail={"method": step.method, "path": step.path,
+                                      "status": answer.status})
+
+    async def _log_turn(self, chat: Chat, turn: Turn) -> None:
+        """The turn's model spend, for the page's daily total."""
+        if not (turn.input_tokens or turn.output_tokens):
+            return
+        from app.enquiries.claude import cost_of
+
+        model = self._settings.it_support_brain_model
+        cost = float(cost_of(model, turn.input_tokens, turn.output_tokens))
+        await activity.record(self._factory, email=chat.email, kind=activity.TURN,
+                              summary=f"{model}: {turn.input_tokens} in, "
+                                      f"{turn.output_tokens} out",
+                              cost_usd=cost, detail={"done": turn.done[:10]})
+
     def _context(self, chat: Chat, person: Person, known: work.Work | None,
                  files: dict[str, files_mod.Opened], batch: list[dict[str, Any]],
-                 problems: list[str], plan_note: str, *, small_talk: bool = False) -> str:
+                 problems: list[str], plan_note: str, *, small_talk: bool = False,
+                 earlier: str = "", team: str = "") -> str:
         """What the brain knows this turn, beyond the chat itself."""
         assert self._erp is not None
         now = datetime.now(DUBAI)
         new_files = {f.name for m in batch for f in files_mod.in_message(m)}
         lines = [
-            f"Now: {work.both(now)}. You're chatting with {chat.first_name} ({chat.email}).",
+            f"{when.today_line(now, self._settings)} "
+            f"You're chatting with {chat.first_name} ({chat.email}).",
+            earlier,
+            focus_note(chat),
             f"Their ERP modules (what you may do in each from the chat): "
             f"{self._erp.modules_said(person.access) or 'none'}"
             + (". They're a super admin." if person.access.is_admin else "."),
@@ -695,6 +1151,11 @@ class ITSupportWorker:
                 "; ".join(f"{slug}: {name}" for slug, name in chat.teams) or "none"),
             work.describe(known, now) if self._sharepoint is not None else "",
         ]
+        if team:
+            lines.append(whose_tasks(chat))
+            lines.append(team)
+        if (asked := self._last_ask(chat)) is not None:
+            lines.append(asked_note(asked))
         # Small talk gets no notes: shown them, the model reads old work out
         # on every "hi" (tried 2026-11-17, the prompt alone didn't stop it).
         if self._settings.it_support_memory_enabled and not small_talk and (
@@ -789,17 +1250,40 @@ class ITSupportWorker:
 
     async def _background_jobs(self, chats: list[Chat]) -> None:
         while True:
-            for job in (self._refresh_work, self._update_notes, self._morning_briefs,
-                        self._due_check_ins)\
-                    if self.answering else ():
+            for name, job in self._jobs() if self.answering else ():
                 try:
                     await job(list(chats))
                 except NotConnectedError as exc:
                     logger.error("it support: %s", exc)
                     return
                 except Exception:  # noqa: BLE001 - one job failing leaves the others
-                    logger.exception("it support: %s failed", job.__name__)
+                    logger.exception("it support: %s failed", name)
             await asyncio.sleep(BACKGROUND_SECONDS)
+
+    def _jobs(self) -> list[tuple[str, Any]]:
+        """The background jobs, in order: reads first, then what is sent
+        (each behind its feature switch; see ``jobs``)."""
+        def bound(fn):
+            return lambda chats: fn(self, chats)
+        return [("refresh work", self._refresh_work), ("notes", self._update_notes),
+                ("morning brief", self._morning_briefs), ("due check-ins", self._due_check_ins),
+                ("daily asks", bound(jobs.daily_asks)), ("team briefs", bound(jobs.team_briefs)),
+                ("bcd asks", bound(jobs.bcd_asks)),
+                ("approval pings", bound(jobs.approval_pings)),
+                ("website enquiries", bound(jobs.website_enquiries)),
+                ("leave handovers", bound(jobs.leave_handovers)),
+                ("delivery watch", bound(jobs.delivery_watch))]
+
+    async def _keep_work(self, chat: Chat, fresh: work.Work) -> None:
+        """A new read of the person's tasks kept, and what changed since the
+        last one told (a new task, a BCD moved), when those are on."""
+        old = self._work.get(chat.email)
+        self._work[chat.email] = fresh
+        if old is not None:
+            try:
+                await jobs.work_changes(self, chat, list(self._chats), old, fresh)
+            except Exception:  # noqa: BLE001 - the read is kept regardless
+                logger.exception("it support: work changes for %s failed", chat.email)
 
     async def _refresh_work(self, chats: list[Chat]) -> None:
         """Each person's tasks, read again once older than
@@ -813,11 +1297,50 @@ class ITSupportWorker:
             if known is not None and known.read_at is not None and known.read_at > stale:
                 continue
             try:
-                self._work[chat.email] = await work.read(
-                    self._sharepoint, self._factory, chat.email
-                )
+                fresh = await work.read(self._sharepoint, self._factory, chat.email)
             except Exception as exc:  # noqa: BLE001 - the last read stands
                 logger.warning("it support: reading %s's tasks failed: %s", chat.email, exc)
+                continue
+            await self._keep_work(chat, fresh)
+
+    async def _fresh_work(self, chat: Chat) -> work.Work | None:
+        """The person's tasks as the list has them now: read again before a
+        reply when the last read is older than IT_SUPPORT_LIVE_SECONDS. A slow
+        or failing list leaves the last read standing (the context says when
+        it was read)."""
+        known = self._work.get(chat.email)
+        if self._sharepoint is None:
+            return known
+        age = (datetime.now(UTC) - known.read_at).total_seconds() \
+            if known is not None and known.read_at is not None else None
+        if age is not None and age < self._settings.it_support_live_seconds:
+            return known
+        try:
+            fresh = await asyncio.wait_for(
+                work.read(self._sharepoint, self._factory, chat.email), LIVE_READ_SECONDS)
+        except Exception as exc:  # noqa: BLE001 - the last read stands
+            logger.warning("it support: live read of %s's tasks failed (%s); using the one "
+                           "from %s", chat.email, exc or type(exc).__name__,
+                           f"{age:.0f}s ago" if age is not None else "never")
+            return known
+        await self._keep_work(chat, fresh)
+        return fresh
+
+    def _earlier(self, newest_first: list[dict[str, Any]]) -> str:
+        """When IT Support last spoke in this chat: what it said then about
+        tasks or times was true then, not now."""
+        now = datetime.now(UTC)
+        for message in newest_first:
+            sender = ((message.get("from") or {}).get("user") or {}).get("id")
+            if sender != self.me_id or message.get("messageType") != "message":
+                continue
+            sent = _when(message.get("createdDateTime"))
+            if sent is None or (now - sent).total_seconds() < 120:
+                return ""
+            return (f"Your last message above was sent {when.said(sent, now)}: what it says "
+                    "about tasks, statuses or times was true then. Read again for anything "
+                    "about now.")
+        return ""
 
     async def _update_notes(self, chats: list[Chat]) -> None:
         """Fold a conversation that has gone quiet into the notes kept about
@@ -852,6 +1375,8 @@ class ITSupportWorker:
         s = self._settings
         if not s.it_support_brief_enabled or self._sharepoint is None or self.me_id is None:
             return
+        if features.on(s, "daily_asks"):
+            return  # the morning ask says it, numbered; one message, not two
         now = datetime.now(UTC)
         day = brief_mod.due_now(s, now)
         if day is None:

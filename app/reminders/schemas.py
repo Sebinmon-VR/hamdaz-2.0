@@ -73,6 +73,15 @@ class AnswerIn(BaseModel):
     seen: TaskFields
 
 
+class UpdateIn(BaseModel):
+    """One of my tasks, updated without a reminder (the IT Support chat)."""
+
+    #: The SharePoint list item id of one of the caller's own tasks.
+    task_id: str = Field(min_length=1, max_length=64)
+    #: What each column should say. A field left out is not touched.
+    values: TaskFields
+
+
 class TryIn(BaseModel):
     #: The SharePoint list item id of one of the caller's own tasks.
     task_id: str = Field(min_length=1, max_length=64)

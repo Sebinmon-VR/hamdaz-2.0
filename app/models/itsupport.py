@@ -18,9 +18,10 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Numeric, String, Text, text
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -82,6 +83,12 @@ class ITSupportSettings(Base, Timestamped):
     module_modes: Mapped[dict[str, str]] = mapped_column(
         JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
     )
+    #: The feature switches (``app.itsupport.features``): ``{"status_updates":
+    #: true}``. A feature not named here is at its default, which is off for
+    #: anything that sends a message unasked.
+    features: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
 
     # ── the account's sign-in, made with Connect on the page ──
     #: ``graph.sign_in_record``: the refresh token encrypted with a key from
@@ -104,3 +111,43 @@ class ITSupportSettings(Base, Timestamped):
     updated_by_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )
+
+
+class ITSupportActivity(Base):
+    """What the agent did, one row each: a change it made in the ERP for
+    somebody, an answer filed, a message it sent unasked, a 👎 on one of its
+    replies, a turn's model spend. Shown on the settings page; the audit
+    trail for everything it writes."""
+
+    __tablename__ = "itsupport_activity"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True,
+                                          default=uuid.uuid4)
+    at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False,
+                                         server_default=text("now()"), index=True)
+    #: Whose chat it was for.
+    email: Mapped[str] = mapped_column(String(320), nullable=False)
+    #: change, answer, sent, feedback, turn.
+    kind: Mapped[str] = mapped_column(String(30), nullable=False)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    detail: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+    ok: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True,
+                                     server_default=text("true"))
+    cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(10, 5))
+
+
+class ITSupportSent(Base):
+    """Something the agent sends once (a daily ask, an alert), by a key that
+    names it: ``status-ask:sebin@…:2026-11-18``. In the database so a
+    redeploy doesn't send it again."""
+
+    __tablename__ = "itsupport_sent"
+
+    key: Mapped[str] = mapped_column(String(300), primary_key=True)
+    email: Mapped[str] = mapped_column(String(320), nullable=False)
+    kind: Mapped[str] = mapped_column(String(40), nullable=False)
+    sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False,
+                                              server_default=text("now()"), index=True)
+    detail: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))

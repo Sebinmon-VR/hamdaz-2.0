@@ -97,5 +97,6 @@ class LeaveSummaryOut(BaseModel):
     approved: int
     rejected: int
     cancelled: int
-    days_approved: int
+    #: Half days count 0.5, so 2.5 is a real total.
+    days_approved: float
     upcoming: list[dict[str, Any]]

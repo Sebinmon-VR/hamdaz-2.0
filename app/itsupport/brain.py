@@ -46,6 +46,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any, Final
 
 import anthropic
@@ -56,7 +57,10 @@ from app.comparison.extraction import QuoteExtractor
 from app.core.config import Settings
 from app.core.llm import ModelError, Provider, providers_from
 from app.enquiries.claude import FALLBACK_BETA, ClaudeEnquiry
-from app.itsupport import distributors, docs
+from app.followups.service import due_of as fu_due
+from app.itsupport import distributors, docs, when
+from app.itsupport import features as features_mod
+from app.itsupport import lookups as lookups_mod
 from app.itsupport.erp import ERP, Access, Answer
 from app.itsupport.files import Opened, describe
 from app.proposals.sharepoint import ProposalTask
@@ -111,6 +115,65 @@ Understanding them (the most important part of the job):
   OB8 one?"). If one reading is clearly likelier, go with it and say what you assumed.
 - Check your answer against the source before you send it: numbers, dates, names and task
   ids exactly as the ERP or the file has them.
+
+Dates and live data:
+- The context gives today's date, weekday, the time and the working days. Work "today",
+  "tomorrow", "this week", "overdue" and "in 2 hours" out from it, never from an earlier
+  message. It's background: say a date or time only when it's part of the answer (a BCD,
+  when something closes or changed), never as a greeting or an opener.
+- Tasks, statuses, BCDs, quotes and approvals change all day. For any question about them,
+  use their task list in the context (read from the list moments ago) or read the ERP again
+  now. What an earlier message in this chat says was true when it was sent, not now: never
+  repeat an earlier list, status or count without reading again.
+- In ERP results every date and time has a "<field>_said" next to it, worked out for you
+  (BCDs already as UAE time, with IST): use those words. Never convert a raw timestamp
+  yourself: the Proposals list stores BCDs in another time zone and they read wrong.
+- A BCD that has already passed isn't "due today" any more: say it closed at its time, and
+  whether it's marked submitted.
+- A task marked "BCD not set yet" still shows the time it was assigned as its BCD: it is NOT
+  due then and its real closing date may be different. Say it was assigned (when, to whom)
+  and that its BCD isn't set yet; never count it as due today.
+- If they oversee a team, the context says whose tasks "any tasks?", "what's due" or
+  "anything pending" means: the team's (a manager) or their own first (a lead who holds
+  tasks too). Follow it, and name who holds each team task.
+
+Tasks, status and the team (use the tools you have; a tool that isn't there is switched off):
+- Their own task's status, submission status, a remark, or why it's late ("1952 submitted",
+  "2 on hold waiting for price", "the OZ2 one is delayed, customer hasn't replied"): file it
+  with update_task at once, they said it. Only their own tasks; for someone else's, say only
+  the holder can. Then tell them in a line what you filed. The Proposals list itself isn't
+  changed by this: say so when you file a Status, Submission Status or remark.
+- Numbers in their reply refer to your last numbered message (the context lists it). If a
+  number or a status word is unclear, ask one short question; don't guess a status.
+- For someone who oversees a team: after a list of the team's tasks, you may offer once to
+  check with the holder of one that looks stuck. connect_colleague gives a Teams call link at
+  once, or messages the teammate from IT Support after their yes (write the message as from
+  IT Support, naming who's asking and the task, short and polite); the answer comes back here.
+- "call", "can you call", "call her/him", "ring them": give the call link NOW with
+  connect_colleague how=call, for the person the conversation is on (the context says who);
+  never ask "want a link?" first. Only a message waits for their yes.
+- The conversation comes first. A short message ("can you call", "yes", "that one", "what
+  about the costing") carries on from what you were just talking about, never from the
+  lists in the context. Only ask "who?" when nothing was being talked about.
+- Links: write each as [short label](url), e.g. [Folder](…), [Open costing QR-0042](…),
+  [📞 Call Krish](…); they show as clickable words. Never paste a long bare address.
+- Answer their LATEST message, and only it. Don't go back to an earlier exchange to fix it,
+  finish an old offer, apologise for it or add to it, unless they bring it up. What you
+  said earlier is done; a new question gets a new answer.
+- "Who hasn't answered today?", "why is 1952 late?": read the follow-ups (erp_read
+  /followups/team with the team's handle, or /followups/<id>) and the reminders
+  (/reminders/recent for a super admin). Name who, which task, and what they said.
+- A tender by number or name ("tell me about 6000156411", "the ADNOC robots one"):
+  find_tender. Past bids, "have we done this before", "who's bid on Fortinet": search_bids.
+  "What did we pay for X", "last price for Y": past_prices. Customer POs: customer_pos.
+- An amount in another currency: convert_currency (Zoho's rate). Never convert yourself.
+- "How do I … in the ERP": erp_guide, and give the page's link.
+- Leave: "who's off today/this week" from the team list in the context (it marks who's away)
+  or erp_read /leave/calendar. Applying for leave: say the type and dates back in one line
+  and ask once ("Casual leave Thu 19 Nov, half day morning: apply?"), then erp_change POST
+  /leave/requests on their yes (leave_type, start_date, end_date, half_day, reason).
+  Approving leave is HR's, in the app.
+- Never message, call or bring in the CEO.
 
 How you work:
 - Work out what they actually want, from their words, the files and the chat so far, the way
@@ -275,8 +338,9 @@ _TOOLS: Final[list[dict[str, Any]]] = [
     },
     {
         "name": "erp_read",
-        "description": "GET any route from the catalogue, as the person. Returns the HTTP "
-                       "status and the JSON (cut if very long).",
+        "description": "GET any route from the catalogue, as the person, live. Returns the "
+                       "HTTP status and the JSON (cut if very long); every date or time in "
+                       "it has a <field>_said next to it, in UAE and IST time.",
         "strict": True,
         "input_schema": {
             "type": "object",
@@ -372,8 +436,12 @@ _TOOLS: Final[list[dict[str, Any]]] = [
         "strict": True,
         "input_schema": {
             "type": "object",
-            "properties": {"file_names": {"type": "array", "items": {"type": "string"}}},
-            "required": ["file_names"], "additionalProperties": False,
+            "properties": {"file_names": {"type": "array", "items": {"type": "string"}},
+                           "task_id": {"type": "string",
+                                       "description": "Their task these quotes are for, so "
+                                                      "validity is checked against its BCD; "
+                                                      "\"\" if none"}},
+            "required": ["file_names", "task_id"], "additionalProperties": False,
         },
     },
     {
@@ -447,6 +515,10 @@ class Person:
     tasks: list[ProposalTask]
     #: Their modules in the ERP, as its access screen gives them.
     access: Access = field(default_factory=lambda: Access(frozenset()))
+    #: The teammates of the teams they oversee (for connect_colleague).
+    team_emails: frozenset[str] = frozenset()
+    #: The same teammates by name ("Krishnendu" → krishnendu@…), lower case.
+    team_names: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -479,6 +551,14 @@ class Turn:
     done: list[str] = field(default_factory=list)
     #: The replies of the steps done at once, in order, for {{n.id}}.
     results: list[Any] = field(default_factory=list)
+    #: Status updates filed this turn (``status.Filed``).
+    filed: list[Any] = field(default_factory=list)
+    #: The task this turn was about (looked up or filed): (id, title, holder,
+    #: holder's email); the worker keeps it as the conversation's subject.
+    focus: tuple[str, str, str, str] | None = None
+    #: Claude's tokens this turn, for the spend.
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 #: Text given to the model a part at a time, in characters.
@@ -553,11 +633,11 @@ class NeedsEyesError(Exception):
     the turn goes to Claude, which can."""
 
 
-def _openai_tools() -> list[dict[str, Any]]:
+def _openai_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """The same tools in the chat-completions shape the free providers take."""
     return [{"type": "function", "function": {
         "name": t["name"], "description": t["description"], "parameters": t["input_schema"],
-    }} for t in _TOOLS]
+    }} for t in tools]
 
 
 class Brain:
@@ -577,7 +657,18 @@ class Brain:
         self._http = http
         self._client: anthropic.AsyncAnthropic | None = None
         self._system: str | None = None
-        self._openai_tools = _openai_tools()
+        #: Set by the worker: the deterministic tools (``lookups``), where a
+        #: change made from the chat is logged (``activity``), and how a
+        #: planned Teams message is sent.
+        self.lookups: lookups_mod.Lookups | None = None
+        self.on_change: Callable[[Person, Step, Answer], Awaitable[None]] | None = None
+        self.on_teams: Callable[[Person, Step], Awaitable[Answer]] | None = None
+
+    def tools(self) -> list[dict[str, Any]]:
+        """The tools this turn: the ERP's, and those of the features on."""
+        if self.lookups is None:
+            return _TOOLS
+        return _TOOLS + lookups_mod.offered(self._settings)
 
     def providers(self) -> list[Provider]:
         """IT_SUPPORT_BRAIN_PROVIDERS' order (blank: LLM_PROVIDERS'), of those
@@ -686,7 +777,7 @@ class Brain:
                    "content-type": "application/json"}
         for _ in range(MAX_ROUNDS):
             body: dict[str, Any] = {
-                "model": provider.model, "messages": messages, "tools": self._openai_tools,
+                "model": provider.model, "messages": messages, "tools": _openai_tools(self.tools()),
                 "tool_choice": "auto", "max_tokens": 4000, "temperature": 0.3,
             }
             if "gpt-oss" in provider.model:
@@ -740,11 +831,13 @@ class Brain:
         for _ in range(MAX_ROUNDS):
             message = await self.client().beta.messages.create(
                 model=self.model, max_tokens=8000, system=system, messages=messages,
-                tools=_TOOLS,
+                tools=self.tools(),
                 output_config={"effort": turn.effort or self._settings.it_support_brain_effort},
                 metadata={"user_id": str(turn.person.user_id)}, **extra,
             )
             usage = message.usage
+            turn.input_tokens += usage.input_tokens or 0
+            turn.output_tokens += usage.output_tokens or 0
             logger.info("it support: brain round on Claude for %s: %s in (%s cached), %s out, "
                         "%s", turn.person.email, usage.input_tokens,
                         getattr(usage, "cache_read_input_tokens", 0), usage.output_tokens,
@@ -768,10 +861,15 @@ class Brain:
 
     async def _tool(self, turn: Turn, name: str, args: dict[str, Any]) -> str | list[Any]:
         person = turn.person
+        if name in lookups_mod.NAMES:
+            if self.lookups is None:
+                return "Not available."
+            return await self.lookups.run(turn, name, args)
         if name == "erp_read":
             answer = await self._erp.call(person.user_id, "GET", args["path"],
                                           access=person.access, query=args["query"])
-            return answer.for_model()
+            # Every date and time said for the model, BCDs corrected (``when``).
+            return Answer(answer.status, when.stamp(answer.body, datetime.now(UTC))).for_model()
         if name == "erp_routes":
             return self._erp.catalogue(person.access, args["module"].strip()) or (
                 f"No routes in {args['module']} for them: it's not one of their modules, or "
@@ -835,7 +933,12 @@ class Brain:
             if not opened:
                 return "None of those files are in the chat. See chat_files."
             read = await docs.read_quotes(self._extractor, opened)
-            return json.dumps(docs.quotes_summary(read), ensure_ascii=False, default=str)[:14_000]
+            task = next((t for t in turn.person.tasks if t.id == args.get("task_id", "")), None)
+            due = fu_due(task) if task is not None else None
+            summary = docs.quotes_summary(
+                read, bcd=due.astimezone(when.UAE).date() if due else None,
+                checks=features_mod.on(self._settings, "quote_checks"))
+            return json.dumps(summary, ensure_ascii=False, default=str)[:14_000]
         if name == "send_costing_pdf":
             return await self._send_costing_pdf(turn, _fill(args["quote_request_id"],
                                                             turn.results).strip())
@@ -906,13 +1009,21 @@ class Brain:
 
     async def _run_step(self, person: Person, step: Step, files: dict[str, Opened],
                         results: list[Any]) -> Answer:
-        """One change, as the person, with earlier results filled in."""
+        """One change, as the person, with earlier results filled in; logged."""
+        if step.method == "TEAMS":
+            if self.on_teams is None:
+                return Answer(503, "Messages to colleagues aren't available here.")
+            return await self.on_teams(person, step)
         path = _fill(step.path, results)
         query = _fill(step.query, results)
         body = json.loads(_fill(json.dumps(step.body), results)) if step.body is not None \
             else None
         attached = [(f, files[f].data or b"", files[f].media_type) for f in step.files
                     if f in files]
-        return await self._erp.call(person.user_id, step.method, path, access=person.access,
-                                    query=query, body=body, files=attached or None,
-                                    form={k: str(v) for k, v in step.form.items()})
+        answer = await self._erp.call(person.user_id, step.method, path,
+                                      access=person.access, query=query, body=body,
+                                      files=attached or None,
+                                      form={k: str(v) for k, v in step.form.items()})
+        if self.on_change is not None:
+            await self.on_change(person, step, answer)
+        return answer

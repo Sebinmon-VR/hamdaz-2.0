@@ -331,8 +331,10 @@ async def _record(
     due_at: datetime,
     *,
     team_id: uuid.UUID | None,
+    notify: bool = True,
 ) -> StatusReminder:
-    """The reminder as a row, the task as it now is, and the in-app notice."""
+    """The reminder as a row, the task as it now is, and the in-app notice
+    (none for an update nobody asked for: ``notify=False``)."""
     reminder = StatusReminder(
         task_id=task.id,
         task_title=(task.title or "(untitled)")[:2000],
@@ -349,6 +351,8 @@ async def _record(
     _snapshot(reminder, task)
     session.add(reminder)
     await session.flush()
+    if not notify:
+        return reminder
     await notifications.notify(
         session,
         users=[user],
@@ -645,6 +649,85 @@ async def _report(
         )
     except Exception as exc:  # noqa: BLE001 - the answer is kept regardless
         logger.warning("status update %s not mailed to the managers: %s", row.id, exc)
+
+
+
+# ── an update nobody asked for ─────────────────────────────────────────
+
+
+async def update_own(
+    session: AsyncSession,
+    *,
+    user: User,
+    task_id: str,
+    wanted: dict[str, str],
+    sharepoint: SharePointProposals,
+    settings: Settings | None = None,
+    mailer=None,
+) -> StatusReminder:
+    """The person updates one of their own tasks without being asked (from
+    the IT Support chat: "1952 submitted"). Filed exactly as an answer to a
+    reminder, on the task's reminder for its deadline (made now if there is
+    none), and reported to the team's managers the same way. A second update
+    for the same deadline adds to the first. The list is only written when
+    the reminder's ``write_sharepoint`` is on, as for the form."""
+    try:
+        task = await sharepoint.task(task_id)
+    except Exception as exc:  # noqa: BLE001
+        raise ReminderNotFound("That task could not be read from the Proposals list.") from exc
+    lookup = await sharepoint.lookup_id_for(user.email)
+    if lookup is None or task.assigned_to_lookup_id != lookup:
+        raise ReminderForbidden("Only the person the task is assigned to can update it here.")
+    current = LiveTask(live_values(task), await choices(sharepoint))
+    if not changes_for(wanted, {}, current):
+        raise ReminderError("Nothing to change: the list already says that.")
+    now = datetime.now(UTC)
+    due = fu.due_of(task) or now
+    row = await session.scalar(
+        select(StatusReminder).where(StatusReminder.task_id == task.id,
+                                     StatusReminder.due_at == due))
+    earlier: dict[str, str] = {}
+    if row is None:
+        fs = await fu.get_settings(session)
+        watched = {u.id for u in await fu.watched_people(session, fs)}
+        row = await _record(session, user, task, due,
+                            team_id=fs.team_id if user.id in watched else None, notify=False)
+        row.asked_at = now
+    else:
+        if row.assignee_id != user.id:
+            # Handed on since it was asked: the reminder is now theirs.
+            row.assignee_id, row.assignee_email = user.id, user.email
+        if not row.is_open:
+            earlier = dict(row.changes or {})
+            row.status, row.closed_note = ReminderStatus.PENDING, None
+    await answer(session, row, user=user, wanted=wanted, seen=current.values,
+                 sharepoint=sharepoint, settings=settings, mailer=mailer)
+    if earlier:
+        row.changes = {**earlier, **(row.changes or {})}
+    await session.flush()
+    return row
+
+
+def says_done(changes: dict[str, str] | None) -> bool:
+    """An answer that marks the work Completed or the bid Submitted."""
+    changes = changes or {}
+    return is_completed(changes.get(STATUS)) or fu.is_submitted(changes.get(SUBMISSION))
+
+
+async def said_done(session: AsyncSession, task_ids: set[str]) -> dict[str, datetime]:
+    """Tasks whose holder said, in an answer, that they're Completed or
+    Submitted, with the deadline they said it for. The list may not say so
+    yet (it's written only when ``write_sharepoint`` is on); the overdue
+    follow-up takes their word rather than asking why it's late."""
+    if not task_ids:
+        return {}
+    out: dict[str, datetime] = {}
+    for row in (await session.scalars(
+            select(StatusReminder).where(StatusReminder.task_id.in_(task_ids),
+                                         StatusReminder.status == ReminderStatus.ANSWERED))).all():
+        if says_done(row.changes):
+            out[row.task_id] = row.due_at
+    return out
 
 
 # ── listings ───────────────────────────────────────────────────────────

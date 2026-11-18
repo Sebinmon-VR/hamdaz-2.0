@@ -35,6 +35,7 @@ from app.reminders.schemas import (
     RunOut,
     TaskFields,
     TryIn,
+    UpdateIn,
 )
 from app.roles.catalogue import SUPER_ADMIN
 from app.roles.deps import CurrentRoles
@@ -148,6 +149,26 @@ async def try_on_my_task(
     await session.commit()
     await session.refresh(row)
     return _out(row, admin)
+
+
+@router.post("/update", response_model=ReminderOut,
+             summary="Update one of my tasks, without being asked")
+async def update_my_task(
+    body: UpdateIn, user: CurrentUser, session: Session, request: Request, config: Config
+) -> ReminderOut:
+    """The caller's own task: its Status, Submission Status, Remarks or
+    Working notes, filed and reported as an answer to a reminder is (the IT
+    Support chat uses this for "1952 submitted")."""
+    try:
+        row = await service.update_own(
+            session, user=user, task_id=body.task_id, wanted=_by_column(body.values),
+            sharepoint=request.app.state.sharepoint, settings=config, mailer=_mailer(request),
+        )
+    except service.ReminderError as exc:
+        raise _translate(exc) from exc
+    await session.commit()
+    await session.refresh(row)
+    return _out(row, user)
 
 
 @router.get("/recent", response_model=list[ReminderOut], summary="The latest reminders and answers")

@@ -32,6 +32,8 @@ from app.core.config import Settings, get_settings
 from app.core.db import get_session
 from app.core.mail import GRAPH_BASE
 from app.core.security import sign
+from app.itsupport import activity as activity_mod
+from app.itsupport import features as features_mod
 from app.itsupport import settings as service
 from app.itsupport.graph import CONNECT_SCOPES, SCOPES, sign_in_record
 from app.models.user import User
@@ -80,6 +82,18 @@ class ModuleOut(BaseModel):
     mode: str
 
 
+class FeatureOut(BaseModel):
+    key: str
+    name: str
+    about: str
+    group: str
+    default: bool
+    on: bool
+    #: It messages people unasked; it changes something in the ERP.
+    sends: bool
+    writes: bool
+
+
 class ITSupportSettingsOut(BaseModel):
     enabled: bool
     people: list[PersonOut]
@@ -94,6 +108,7 @@ class ITSupportSettingsOut(BaseModel):
     brain_model: str
     brain_effort: str
     modules: list[ModuleOut]
+    features: list[FeatureOut] = []
     models: list[str]
     efforts: list[str]
     # the worker's heartbeat
@@ -126,6 +141,8 @@ class ITSupportSettingsIn(BaseModel):
     brain_effort: str | None = None
     #: Each module's mode; anything left out goes back to its default.
     module_modes: dict[str, str] | None = None
+    #: Switches to change, by key; the rest keep what was saved.
+    features: dict[str, bool] | None = None
 
 
 async def _out(session: AsyncSession, config: Settings) -> ITSupportSettingsOut:
@@ -144,7 +161,9 @@ async def _out(session: AsyncSession, config: Settings) -> ITSupportSettingsOut:
         due_until=row.due_until, due_days=list(row.due_days or []),
         due_test_to=row.due_test_to, brief_enabled=row.brief_enabled,
         brief_at=row.brief_at, brain_model=row.brain_model,
-        brain_effort=row.brain_effort, modules=modules, models=list(service.MODELS),
+        brain_effort=row.brain_effort, modules=modules,
+        features=[FeatureOut(**f) for f in features_mod.rows(row.features)],
+        models=list(service.MODELS),
         efforts=list(service.EFFORTS),
         running=seen is not None
         and (datetime.now(UTC) - seen).total_seconds() < service.ALIVE_SECONDS,
@@ -178,6 +197,36 @@ async def update_settings(body: ITSupportSettingsIn, admin: SuperAdmin, session:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     await session.commit()
     return await _out(session, config)
+
+
+
+class ActivityOut(BaseModel):
+    at: datetime
+    email: str
+    kind: str
+    summary: str
+    ok: bool
+    cost_usd: float | None
+    detail: dict[str, Any]
+
+
+class ActivityPageOut(BaseModel):
+    rows: list[ActivityOut]
+    #: Model spend per day, newest first: {"day": "2026-11-18", "usd": 0.42, "turns": 31}.
+    spend: list[dict[str, Any]]
+
+
+@router.get("/activity", response_model=ActivityPageOut,
+            summary="What the agent did: changes, answers, messages sent, feedback, spend")
+async def activity(admin: SuperAdmin, session: Session, kind: str | None = None,
+                   email: str | None = None, limit: int = 200) -> ActivityPageOut:
+    rows = await activity_mod.recent(session, kind=kind, email=email,
+                                     limit=max(1, min(limit, 500)))
+    return ActivityPageOut(
+        rows=[ActivityOut(at=r.at, email=r.email, kind=r.kind, summary=r.summary, ok=r.ok,
+                          cost_usd=float(r.cost_usd) if r.cost_usd is not None else None,
+                          detail=r.detail or {}) for r in rows],
+        spend=await activity_mod.spend_by_day(session, days=14))
 
 
 # ── Connect: the IT Support account's sign-in, from the browser ─────────

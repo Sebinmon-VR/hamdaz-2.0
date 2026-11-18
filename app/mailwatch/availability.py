@@ -24,6 +24,23 @@ from app.labels.service import leaving_reasons, on_leave_today
 from app.models.user import User
 
 
+async def away_reasons(
+    session: AsyncSession, user_ids: list, *, on: date | None = None
+) -> dict:
+    """:func:`away_reason` for several people at once, by user id: three
+    queries for a whole team rather than three each. Only the away are in it."""
+    ids = list(dict.fromkeys(user_ids))
+    if not ids:
+        return {}
+    day = on or office_today()
+    out = dict(await on_leave_today(session, ids, on=day))
+    off = (await session.scalars(
+        select(User.id).where(User.id.in_(ids), User.is_active.is_(False)))).all()
+    out.update({uid: "Account switched off" for uid in off})
+    out.update(await leaving_reasons(session, ids, on=day))
+    return out
+
+
 async def away_reason(
     session: AsyncSession, email: str | None, *, on: date | None = None
 ) -> str | None:

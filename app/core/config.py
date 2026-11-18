@@ -388,6 +388,27 @@ class Settings(BaseSettings):
     #: How often each person's tasks are read from the Proposals list, for
     #: the chat to know them and for the due check-ins, in minutes.
     it_support_work_refresh_minutes: float = 5
+    #: Before a reply, the person's tasks are read from the list again when the
+    #: last read is older than this, in seconds, so an answer about their work
+    #: is about it now (the user, 2026-11-18: "realtime data").
+    it_support_live_seconds: float = 60
+    #: The feature switches saved on the settings page (``app.itsupport.features``),
+    #: written over the worker's copy; empty means every feature at its default.
+    it_support_features: dict[str, bool] = {}
+    #: A trial on this machine (the user, 2026-11-18: "test with me, no other
+    #: managers or super users"): only these people are answered and messaged by
+    #: this process, whatever the settings page says, and every message sent
+    #: unasked goes to the first of them. It doesn't take the lease, so
+    #: production keeps answering everyone else (take these people off the
+    #: page's list meanwhile, or both answer them). A status is filed only on a
+    #: task with "test" in its title, and a message to a colleague comes to the
+    #: trial chat instead. Blank: no trial.
+    it_support_trial_only: str = ""
+    #: In a trial, the features on for this process only ("all", or keys with
+    #: commas), so the page's switches, which production shares, stay as they are.
+    it_support_trial_features: str = ""
+    #: In a trial, the morning brief's time (HH:MM, IST) for this process only.
+    it_support_trial_brief_at: str = ""
     #: During the trial: end each reply with how long it took and who wrote it.
     it_support_show_timing: bool = False
     #: Due-today check-ins: IT Support messages a person first when a task of

@@ -488,6 +488,12 @@ async def sweep(
         ).all():
             known.setdefault(existing_row.task_id, []).append(existing_row)
 
+    # Said Completed or Submitted in a status answer (the form, or the IT
+    # Support chat), though the list may not say so yet: taken at their word.
+    from app.reminders.service import said_done
+
+    done = await said_done(session, ids)
+
     batches: dict[uuid.UUID, tuple[User, list[TaskFollowup]]] = {}
     # Each asked task's Remarks and Working notes, as just read, for the mail.
     notes: dict[str, TaskNotes] = {}
@@ -501,6 +507,10 @@ async def sweep(
             _close_pending(
                 [r for r in asked_before if r.status == FollowupStatus.PENDING], task, report, now
             )
+            if _said_done_for(done, task):
+                _resolve_said_done([r for r in asked_before
+                                    if r.status == FollowupStatus.PENDING], report)
+                continue
             if not asking or task.id in held:
                 continue
             decision = decide(
@@ -583,6 +593,21 @@ def _close_pending(
             row.status = FollowupStatus.RESOLVED
             row.resolved_note = note
             report.resolved += 1
+
+
+def _said_done_for(done: dict[str, datetime], task: ProposalTask) -> bool:
+    """Its holder said it's Completed or Submitted for its current deadline."""
+    said = done.get(task.id)
+    due = due_of(task)
+    return said is not None and due is not None and abs((said - due).total_seconds()) <= 60
+
+
+def _resolve_said_done(pending: list[TaskFollowup], report: SweepReport) -> None:
+    for row in pending:
+        row.status = FollowupStatus.RESOLVED
+        row.resolved_note = ("Said Completed or Submitted in a status answer; the Proposals "
+                             "list may not show it yet.")
+        report.resolved += 1
 
 
 async def _sender_for(session: AsyncSession, row: FollowupSettings, assignee: User) -> User:
@@ -834,6 +859,9 @@ async def answer(
         raise FollowupError("Say a little more — the reason is what your manager reads.")
     now = datetime.now(UTC)
     row.reason = text[:5000]
+    from app.followups.tags import tag
+
+    row.reason_tag = tag(extra or text)
     row.status = FollowupStatus.ANSWERED
     row.answered_at = now
 

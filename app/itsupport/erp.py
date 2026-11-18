@@ -96,6 +96,18 @@ MODES: Final[dict[str, str]] = {
 #: Path words that mean mail goes to somebody, or a hand-off the app keeps.
 NEVER_FROM_CHAT: Final = ("supplier-emails", "/submit", "/reviews", "/negotiate", "/send",
                           "/mail", "/approve")
+#: A person's own answers, in modules the chat otherwise only reads, each
+#: allowed only while its feature is on (``features``): the status form and
+#: the late-task reason (status_updates; the reminder keeps them in the ERP,
+#: the Proposals list is not written), and their own leave request
+#: (leave_apply; approval stays in the app).
+OWN_WRITES: Final[dict[str, tuple[re.Pattern[str], ...]]] = {
+    "status_updates": (re.compile(r"^/api/v1/reminders/(update|[^/]+/answer)$"),
+                       re.compile(r"^/api/v1/followups/[^/]+/(reason|false-positive)$")),
+    "leave_apply": (re.compile(r"^/api/v1/leave/requests$"),),
+    # "BCD correct" to a placeholder-BCD question (bcd_asks).
+    "bcd_asks": (re.compile(r"^/api/v1/bcd-checks/[^/]+/confirm$"),),
+}
 #: The whole-quote edit: its body replaces every list on the costing, so a body
 #: naming one charge would empty the lines. Never from the chat; the chat
 #: changes parts with /quote-requests/{id}/changes.
@@ -115,6 +127,14 @@ def modes(settings: Settings) -> dict[str, str]:
             out[module] = mode
     out["finance"] = out["payroll"] = "off"
     return out
+
+
+def own_writes(settings: Settings) -> tuple[re.Pattern[str], ...]:
+    """The own-answer routes allowed now: those of the features switched on."""
+    from app.itsupport import features
+
+    return tuple(p for key, patterns in OWN_WRITES.items() if features.on(settings, key)
+                 for p in patterns)
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,8 +193,10 @@ def mode_for(path: str, access: Access, mode_of: dict[str, str]) -> str:
     return mode_of.get(module, "read") if reachable else "off"
 
 
-def blocked(method: str, path: str, access: Access, mode_of: dict[str, str]) -> str | None:
-    """Why this call may not be made from the chat; None when it may."""
+def blocked(method: str, path: str, access: Access, mode_of: dict[str, str],
+            own: tuple[re.Pattern[str], ...] = ()) -> str | None:
+    """Why this call may not be made from the chat; None when it may. ``own``:
+    the person's own answers allowed in a read module (``OWN_WRITES``)."""
     method = method.upper()
     mode = mode_for(path, access, mode_of)
     if mode == "off":
@@ -188,7 +210,7 @@ def blocked(method: str, path: str, access: Access, mode_of: dict[str, str]) -> 
     if method in ("PATCH", "PUT") and _WHOLE_QUOTE.match(path):
         return ("that replaces the whole costing (lines, charges, everything); change parts "
                 "of it with POST /quote-requests/{id}/changes instead")
-    if mode != "write":
+    if mode != "write" and not (method == "POST" and any(p.match(path) for p in own)):
         return f"changes in {module_of(path)} are made in the app, not from the chat"
     return None
 
@@ -198,14 +220,15 @@ class ERP:
         self._app = app
         self._settings = settings
         self.mode_of = modes(settings)
+        self.own = own_writes(settings)
         self._catalogues: dict[str, str] = {}
         self._spec: dict[str, Any] | None = None
 
     def reload_modes(self) -> None:
         """The modes read again, after the settings page changed them."""
-        mode_of = modes(self._settings)
-        if mode_of != self.mode_of:
-            self.mode_of = mode_of
+        mode_of, own = modes(self._settings), own_writes(self._settings)
+        if mode_of != self.mode_of or own != self.own:
+            self.mode_of, self.own = mode_of, own
             self._catalogues.clear()
 
     def spec(self) -> dict[str, Any]:
@@ -215,7 +238,7 @@ class ERP:
 
     def blocked(self, method: str, path: str, access: Access) -> str | None:
         path = API + path if not path.startswith(API) else path
-        return blocked(method, path, access, self.mode_of)
+        return blocked(method, path, access, self.mode_of, self.own)
 
     def catalogue(self, access: Access, module: str | None = None) -> str:
         """Every route this person's chat may use (in one module, or all), a
@@ -232,7 +255,7 @@ class ERP:
                 for method, op in ops.items():
                     if method not in ("get", "post", "put", "patch"):
                         continue
-                    rule = "" if blocked(method, path, access, self.mode_of) is None \
+                    rule = "" if blocked(method, path, access, self.mode_of, self.own) is None \
                         else "  [in the app only]"
                     summary = (op.get("summary") or "").strip()
                     lines.append(f"{method.upper()} {path.removeprefix(API)} — {summary}{rule}")
@@ -291,7 +314,7 @@ class ERP:
     ) -> Answer:
         """One request to the ERP as ``user_id``, through the app itself."""
         path = API + path if not path.startswith(API) else path
-        if (why := blocked(method, path, access, self.mode_of)) is not None:
+        if (why := blocked(method, path, access, self.mode_of, self.own)) is not None:
             return Answer(403, f"Not from the chat: {why}.")
         cookie = sign({"sub": str(user_id)}, secret=self._settings.session_secret,
                       ttl_minutes=10, audience=SESSION_AUDIENCE)

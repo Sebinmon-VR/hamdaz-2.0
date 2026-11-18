@@ -81,10 +81,33 @@ def plain(message: dict[str, Any]) -> str:
     return text
 
 
+#: A link in a reply: "[📞 Call Krishnendu](https://…)" or a bare https://….
+_LINK = re.compile(r"\[([^\]\n]{1,120})\]\((https?://[^\s)]+)\)|(https?://[^\s<>\"]+)")
+#: What ends a sentence, not a bare link.
+_TRAILING = ".,;:!?)]'\""
+
+
+def _text_html(text: str) -> str:
+    return _BOLD.sub(r"<b>\1</b>", html.escape(text)).replace("\n", "<br>")
+
+
 def to_html(text: str) -> str:
-    """The reply as Teams shows it: escaped, **bold** kept, lines kept."""
-    escaped = html.escape(text)
-    return _BOLD.sub(r"<b>\1</b>", escaped).replace("\n", "<br>")
+    """The reply as Teams shows it: escaped, **bold** kept, lines kept, and
+    links clickable: "[label](url)" as the label, a bare address as itself
+    (Teams doesn't make a link of text in a message sent through Graph; the
+    user, 2026-11-18: "at least make the link clickable")."""
+    out, last = [], 0
+    for found in _LINK.finditer(text):
+        if found.group(2):
+            label, url, end = found.group(1), found.group(2), found.end()
+        else:
+            url = found.group(3).rstrip(_TRAILING)
+            label, end = url, found.start(3) + len(url)
+        out.append(_text_html(text[last:found.start()]))
+        out.append(f'<a href="{html.escape(url, quote=True)}">{_text_html(label)}</a>')
+        last = end
+    out.append(_text_html(text[last:]))
+    return "".join(out)
 
 
 def first_name(settings, email: str, display_name: str | None) -> str:

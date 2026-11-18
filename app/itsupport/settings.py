@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.access.catalogue import BY_KEY
 from app.core.config import Settings
+from app.itsupport import features as features_mod
 from app.itsupport.erp import ADMIN, MODES, PERSONAL
 from app.models.itsupport import ITSupportSettings
 from app.models.user import User
@@ -99,6 +100,7 @@ def seed(settings: Settings) -> dict[str, Any]:
         "brain_model": settings.it_support_brain_model,
         "brain_effort": settings.it_support_brain_effort,
         "module_modes": {k: v.lower() for k, v in _pairs(settings.it_support_module_modes)},
+        "features": {},
     }
 
 
@@ -147,6 +149,7 @@ def _clean_modes(values: Any) -> dict[str, str]:
 _EDITABLE: Final = frozenset({
     "enabled", "people", "show_timing", "due_enabled", "due_from", "due_until", "due_days",
     "due_test_to", "brain_model", "brain_effort", "module_modes", "brief_enabled", "brief_at",
+    "features",
 })
 
 
@@ -180,6 +183,15 @@ async def update(session: AsyncSession, settings: Settings, *, actor_id: uuid.UU
         raise ITSupportSettingsError(f"The effort is one of {', '.join(EFFORTS)}.")
     if "module_modes" in changes:
         changes["module_modes"] = _clean_modes(changes["module_modes"])
+    if "features" in changes:
+        try:
+            # The switches sent change; the others keep what was saved.
+            if not isinstance(changes["features"], dict):
+                raise ValueError("Features are a map of name to on/off.")
+            changes["features"] = features_mod.clean(
+                {**(row.features or {}), **changes["features"]})
+        except ValueError as exc:
+            raise ITSupportSettingsError(str(exc)) from exc
     people = changes.get("people", row.people)
     test_to = changes.get("due_test_to", row.due_test_to)
     if test_to and test_to not in {p["email"] for p in people}:
@@ -222,6 +234,30 @@ def apply(row: ITSupportSettings, settings: Settings) -> None:
     settings.it_support_brain_effort = row.brain_effort
     settings.it_support_module_modes = ",".join(f"{k}={v}" for k, v in
                                                 (row.module_modes or {}).items())
+    settings.it_support_features = dict(row.features or {})
+    trial_overrides(settings)
+
+
+def trial_overrides(settings: Settings) -> None:
+    """A trial on this machine (IT_SUPPORT_TRIAL_ONLY) over whatever the page
+    says: only those people, every unasked message to the first of them, the
+    trial's features and brief time."""
+    people = trial_people(settings)
+    if not people:
+        return
+    settings.it_support_allowed_emails = ",".join(people)
+    settings.it_support_due_test_to = people[0]
+    wanted = settings.it_support_trial_features.strip()
+    keys = [f.key for f in features_mod.CATALOGUE] if wanted.lower() == "all" else \
+        [k.strip() for k in wanted.split(",") if k.strip() in features_mod.BY_KEY]
+    settings.it_support_features = {**settings.it_support_features, **{k: True for k in keys}}
+    if _CLOCK.match(settings.it_support_trial_brief_at.strip()):
+        settings.it_support_brief_at = settings.it_support_trial_brief_at.strip()
+
+
+def trial_people(settings: Settings) -> list[str]:
+    return [e.strip().lower() for e in settings.it_support_trial_only.split(",")
+            if "@" in e]
 
 
 async def load(factory: async_sessionmaker[AsyncSession], settings: Settings,

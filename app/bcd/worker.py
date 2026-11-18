@@ -83,6 +83,11 @@ class BcdWorker:
                 return
 
     async def run_once(self) -> None:
+        if self._settings.it_support_trial_only.strip():
+            # An IT Support trial on this machine (the user, 2026-11-18: only
+            # Sebin gets anything): its BCD checks would mail real holders, so
+            # the machine answering everyone (production) does them meanwhile.
+            return
         async with self._factory() as session:
             row = await service.get_settings(session)
             if not row.enabled:

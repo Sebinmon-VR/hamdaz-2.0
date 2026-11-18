@@ -73,7 +73,7 @@ from app.models.status_reminder import ReminderStatus, StatusReminder, StatusRem
 from app.models.bcd_check import BcdCheck, BcdCheckSettings, BcdCheckStatus
 from app.models.task_calendar import TaskCalendarEvent, TaskCalendarSettings
 from app.models.task_folder import TaskFolder
-from app.models.itsupport import ITSupportSettings
+from app.models.itsupport import ITSupportActivity, ITSupportSent, ITSupportSettings
 from app.models.mailwatch import (
     MailWatchManualTask,
     MailWatchSettings,
@@ -237,6 +237,8 @@ __all__ = [
     "EnquiryLine",
     "TaskCalendarSettings",
     "TaskFolder",
+    "ITSupportActivity",
+    "ITSupportSent",
     "ITSupportSettings",
     "FormTemplate",
     "JobApplication",
