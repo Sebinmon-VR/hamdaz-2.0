@@ -346,6 +346,20 @@ class ITSupportGraph:
             },
         )
 
+    async def send_files(self, chat_id: str, html_body: str,
+                         cards: list[tuple[str, str, str]]) -> dict[str, Any]:
+        """A message carrying several files already in SharePoint, each as
+        its Teams file card: ``cards`` = (eTag GUID, the file's address, name)."""
+        tags = "".join(f'<attachment id="{guid}"></attachment>' for guid, _, _ in cards)
+        return await self._call(
+            "POST", f"/chats/{chat_id}/messages",
+            json={
+                "body": {"contentType": "html", "content": f"{html_body}{tags}"},
+                "attachments": [{"id": guid, "contentType": "reference", "contentUrl": url,
+                                 "name": name} for guid, url, name in cards],
+            },
+        )
+
     # ── files sent in the chat ─────────────────────────────────────────
 
     async def _bytes(self, url: str, token: str) -> bytes:

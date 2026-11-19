@@ -70,7 +70,14 @@ CATALOGUE: Final[tuple[Feature, ...]] = (
     Feature("approval_pings", "Approval results",
             "Tells whoever sent a costing for approval when it's approved, rejected or sent "
             "back.", "Alerts", False, sends=True),
+    Feature("costing_ask", "Submitted without a costing",
+            "When a task shows Submitted and there's no costing for it, neither in the ERP nor "
+            "as a costing file on the task (its list attachments or task folder), IT Support "
+            "asks its holder for it, once per task.", "Alerts", False, sends=True),
     # ── answers (read only) ──
+    Feature("task_files", "A task's files in chat",
+            "Asked for a task's files (\"send me the RFQ of 1958\"), IT Support gives links to "
+            "the files in its task folder and on its Proposals list item.", "Answers", True),
     Feature("tender_lookup", "Ask about any tender",
             "One answer about a tender by number or name: the task, its costing, quotes and "
             "analysis.", "Answers", True),

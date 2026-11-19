@@ -63,13 +63,14 @@ def _target(w: ITSupportWorker, chat: Chat, chats: list[Chat]) -> Chat | None:
 
 async def send(w: ITSupportWorker, chat: Chat, chats: list[Chat], text: str, *, key: str,
                kind: str, detail: dict[str, Any] | None = None,
-               asked: Asked | None = None, html_body: str | None = None) -> bool:
+               asked: Asked | None = None, html_body: str | None = None,
+               to: Chat | None = None) -> bool:
     """One message, once: to the person (or the trial chat), logged. With
     ``html_body`` that is what's sent (a list as tables) and ``text`` is its
-    first line, for the log."""
+    first line, for the log. ``to``: this feature's own test chat instead."""
     if await w._sent.seen(key):
         return False
-    target = _target(w, chat, chats)
+    target = to or _target(w, chat, chats)
     if target is None:
         logger.warning("it support: the trial address is not a chat it answers; %s held", key)
         return False
@@ -204,6 +205,69 @@ async def team_briefs(w: ITSupportWorker, chats: list[Chat]) -> None:
         await send(w, chat, chats, shown.line, key=key, kind="team-brief",
                    detail={"tasks": [i.task_id for i in shown.items]},
                    asked=Asked("team", shown.items, now), html_body=shown.html)
+
+
+# ── submitted without a costing ────────────────────────────────────────
+
+#: How often the submitted tasks are looked over (each look may read the
+#: list's attachments and the task folders of the new ones).
+COSTING_EVERY: Final = timedelta(minutes=10)
+
+
+async def costing_asks(w: ITSupportWorker, chats: list[Chat]) -> None:
+    """A task marked Submitted with no costing anywhere (the ERP, its list
+    attachments, its task folder): its holder is asked for it, once per task."""
+    from app.itsupport import costcheck
+
+    s = w._settings
+    if not features.on(s, "costing_ask") or w._factory is None or w._files is None:
+        return
+    now = datetime.now(UTC)
+    if not in_office_hours(s, now):
+        return
+    last = w._watermarks.get("costing")
+    if last is not None and now - last < COSTING_EVERY:
+        return
+    w._watermarks["costing"] = now
+    # Tried on one person first: every ask goes into their chat only, marked
+    # whose it is (the user, 2026-11-19: "don't test with real users").
+    to = costcheck.test_to(s)
+    tester = next((c for c in chats if c.email == to), None) if to else None
+    if to and tester is None:
+        logger.warning("it support: costing asks held: %s isn't a chat it answers", to)
+        return
+    ceo = await _ceo(w)
+    for chat in chats:
+        known = w._work.get(chat.email)
+        if chat.email in ceo or known is None or known.read_at is None:
+            continue
+        found = [t for t in costcheck.submitted(known.tasks, now)
+                 if costcheck.may_try(s, chat.email, t)
+                 and not await w._sent.seen(costcheck.key(t.id, test=bool(to)))]
+        if features.trial(s):
+            found = [t for t in found if "test" in (t.title or "").casefold()]
+        if not found:
+            continue
+        missing = await w._files.without_costing(found)
+        if missing is None:
+            continue  # something couldn't be read: not sure, next round
+        for task in found:
+            if task not in missing:
+                await w._sent.mark(costcheck.key(task.id, test=bool(to)), email=chat.email,
+                                   kind="costing-ask", detail={"skipped": "has a costing"})
+        if not missing:
+            continue
+        line, body, asked = costcheck.ask(chat.first_name, missing, now, link_base(s))
+        sent = await send(w, chat, chats, line,
+                          key=f"costing-{'test' if to else 'ask'}:"
+                              + "+".join(t.id for t in missing),
+                          kind="costing-ask", detail={"tasks": [t.id for t in missing],
+                                                      **({"test_to": to} if to else {})},
+                          asked=asked, html_body=body, to=tester)
+        if sent:
+            for task in missing:
+                await w._sent.mark(costcheck.key(task.id, test=bool(to)), email=chat.email,
+                                   kind="costing-ask", detail={"asked": True})
 
 
 # ── placeholder BCDs ───────────────────────────────────────────────────

@@ -334,11 +334,16 @@ SPACE: Final = "<p>&nbsp;</p>"
 TENDER_CHARS: Final = 38
 
 
+class Html(str):
+    """A cell that is markup already (a link), not text to escape."""
+
+
 def grid(head: list[str], rows: list[list[str]]) -> str:
     """A Teams table. Plain headings: bold ones on every table made the
     message heavy (2026-11-19: "the dark text are making mess")."""
-    lines = ["<tr>" + "".join(f"<td>{html.escape(c)}</td>" for c in cells) + "</tr>"
-             for cells in [head, *rows]]
+    lines = ["<tr>" + "".join(
+        f"<td>{c if isinstance(c, Html) else html.escape(c)}</td>" for c in cells) + "</tr>"
+        for cells in [head, *rows]]
     return "<table><tbody>" + "".join(lines) + "</tbody></table>"
 
 

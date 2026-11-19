@@ -57,6 +57,7 @@ from app.core.llm import TextModel
 from app.enquiries.claude import ClaudeEnquiry
 from app.itsupport import (
     activity,
+    costcheck,
     distributors,
     docs,
     due,
@@ -72,6 +73,7 @@ from app.itsupport import (
 from app.itsupport import brief as brief_mod
 from app.itsupport import files as files_mod
 from app.itsupport import goal as goal_mod
+from app.itsupport import links as app_links
 from app.itsupport import lookups as lookups_mod
 from app.itsupport import sent as sent_mod
 from app.itsupport import settings as settings_mod
@@ -266,7 +268,8 @@ def answering_last(newest_first: list[dict[str, Any]],
 def asked_note(asked: status_mod.Asked) -> str:
     """The last numbered list sent here, for the brain."""
     what = {"status": "where these stand", "reason": "why these are late",
-            "team": "the team's tasks", "bcd": "a placeholder BCD"}.get(asked.kind, asked.kind)
+            "team": "the team's tasks", "bcd": "a placeholder BCD",
+            "costing": "submitted tasks with no costing sheet"}.get(asked.kind, asked.kind)
     listed = "; ".join(f"{i.number} = {i.task_id} {i.title[:50]}" for i in asked.items[:30])
     out = (f"Your last numbered message ({what}, {when.said(asked.at, datetime.now(UTC))}): "
            f"{listed}. Numbers in their reply refer to these.")
@@ -275,6 +278,10 @@ def asked_note(asked: status_mod.Asked) -> str:
     if asked.kind == "team":
         out += (" \"check with 2\" / \"ask Haleema about it\": connect_colleague (a call "
                 "link, or a message after their yes).")
+    if asked.kind == "costing":
+        out += (" A supplier quote they send for one: make that task's costing (as in Making "
+                "a costing sheet). \"not needed\", \"it was an EOI\": fine, nothing to "
+                "file; say so in a line. \"done\"/\"added\": thank them.")
     return out
 
 
@@ -361,12 +368,21 @@ class ITSupportWorker:
                             http=http) if self._erp is not None else None
         #: What it has sent once (asks, alerts), in the database.
         self._sent = sent_mod.Ledger(factory)
+        #: A task's files (its task folder, its list attachments) and whether
+        #: it has a costing; read only.
+        from app.quoting.storage import QuoteDrive
+
+        self._files = (costcheck.Files(factory, sharepoint, QuoteDrive(settings, http))
+                       if sharepoint is not None else None)
         #: Where the polling jobs got to ("reviews": the last review seen).
         self._watermarks: dict[str, datetime] = {}
         if self._brain is not None and self._erp is not None:
             self._brain.lookups = lookups_mod.Lookups(settings, self._erp, factory)
             self._brain.lookups.on_teams = self._teams_message
             self._brain.lookups.sharepoint = sharepoint
+            self._brain.lookups.files = self._files
+            self._brain.lookups.on_submitted = self._submitted_note
+            self._brain.lookups.sent = self._sent
             self._brain.on_teams = self._teams_message
             self._brain.on_change = self._log_change
         #: Each person's ERP account and modules, by email, with when read.
@@ -1006,6 +1022,7 @@ class ITSupportWorker:
                                     team=team)
 
             async def say(text: str) -> None:
+                text = app_links.check(text, lookups_mod.link_base(self._settings))
                 await self._say(chat, talk.to_html(text.strip()[:1000]))
 
             async def find(ask: distributors.Ask) -> None:
@@ -1036,9 +1053,15 @@ class ITSupportWorker:
                         f"it at most. {shown.line}\n"
                         + tasklist.describe_rows(rows, datetime.now(UTC)))
 
+            async def send_files(cards: list[tuple[str, str, str]], line: str) -> None:
+                sent = await self._graph.send_files(chat.chat_id, talk.to_html(line), cards)
+                chat.seen.add(str(sent.get("id")))
+                logger.info("it support: sent %d file card(s) to %s", len(cards), chat.email)
+
             turn = Turn(person, files, on_find=find, on_say=say, on_file=send_file,
                         agreed=agreed,
                         effort="low" if small else None)
+            turn.on_files = send_files
             if chat.oversees:
                 turn.on_team_list = team_list
             if focus_note(chat) and chat.focus is not None:
@@ -1059,6 +1082,8 @@ class ITSupportWorker:
             if turn.plan.steps:
                 chat.plan = (turn.plan, time.monotonic())
                 logger.info("it support: asked %s to confirm: %s", chat.email, turn.plan.said())
+            # Links into the app only to pages it has (2026-11-19: some were wrong).
+            text = app_links.check(text, lookups_mod.link_base(self._settings))
             body = tasklist.fill(talk.to_html(text.strip()[:4000]), turn.block)
             if self._settings.it_support_show_timing:
                 body += (f"<br><br><i>({time.monotonic() - started:.1f}s · "
@@ -1117,8 +1142,8 @@ class ITSupportWorker:
             return False
         if not features.on(s, "status_updates"):
             return False
-        if asked is not None and asked.kind == "team":
-            return False  # the team's list: "check with 2" is the brain's
+        if asked is not None and asked.kind in ("team", "costing"):
+            return False  # "check with 2", "here's the quote for 1": the brain's
         reading = status_mod.read(words, asked=asked, tasks=tasks)
         if reading.unsure or not reading.updates:
             return False
@@ -1149,10 +1174,73 @@ class ITSupportWorker:
             await activity.record(self._factory, email=chat.email, kind=activity.ANSWER,
                                   summary=f"{update.task_id}: {done.said}", ok=done.ok,
                                   detail={"said": words[:500], "by": "rules"})
-        await self._say(chat, talk.to_html(status_mod.reply(filed, list_written=written)))
+        said = status_mod.reply(filed, list_written=written)
+        said += await self._costing_after(chat, reading.updates, filed, mine)
+        await self._say(chat, talk.to_html(said))
         logger.info("it support: %s's update filed by rules: %s", chat.email,
                     "; ".join(f"{f.task_id} {f.said}" for f in filed))
         return True
+
+    async def _costing_after(self, chat: Chat, updates: list, filed: list,
+                             mine: dict) -> str:
+        """After "1958 submitted": a line asking for its costing sheet when
+        it has none anywhere (feature costing_ask), and that task isn't
+        asked about again."""
+        if not features.on(self._settings, "costing_ask") or self._files is None:
+            return ""
+        to = costcheck.test_to(self._settings)
+        if to and chat.email != to:
+            return ""  # being tried: only the tester's own chat
+        ok = {f.task_id for f in filed if f.ok}
+        tasks = [mine[u.task_id] for u in updates if u.task_id in ok and u.task_id in mine
+                 and u.submission and not u.submission.casefold().startswith("not")
+                 and costcheck.may_try(self._settings, chat.email, mine[u.task_id])
+                 and not await self._sent.seen(costcheck.key(u.task_id, test=bool(to)))]
+        if not tasks:
+            return ""
+        try:
+            missing = await self._files.without_costing(tasks)
+        except Exception:  # noqa: BLE001 - the update stands; the job asks later
+            logger.exception("it support: costing check after %s's update failed", chat.email)
+            return ""
+        if missing is None:
+            return ""  # something couldn't be read: the job asks later
+        for task in tasks:
+            await self._sent.mark(costcheck.key(task.id, test=bool(to)), email=chat.email,
+                                  kind="costing-ask",
+                                  detail={"after": "status answer",
+                                          "asked": bool(missing and task in missing)})
+        return (" " + costcheck.after_filing(missing, lookups_mod.link_base(self._settings))
+                if missing else "")
+
+    async def _submitted_note(self, person: Person, task) -> str:
+        """For the model, after it filed "submitted": whether to ask for the
+        costing sheet in its reply (none anywhere; feature costing_ask)."""
+        if not features.on(self._settings, "costing_ask") or self._files is None:
+            return ""
+        to = costcheck.test_to(self._settings)
+        if not costcheck.may_try(self._settings, person.email, task):
+            return ""  # being tried: only the tester's own test tasks
+        if await self._sent.seen(costcheck.key(task.id, test=bool(to))):
+            return ""
+        try:
+            missing = await self._files.without_costing([task])
+        except Exception:  # noqa: BLE001 - the job asks later
+            logger.exception("it support: costing check for %s failed", task.id)
+            return ""
+        if missing is None:
+            return ""
+        await self._sent.mark(costcheck.key(task.id, test=bool(to)), email=person.email,
+                              kind="costing-ask",
+                              detail={"after": "status answer", "asked": bool(missing)})
+        if not missing:
+            return ""
+        link = costcheck.make_link(lookups_mod.link_base(self._settings), task.id)
+        return (" It has no costing sheet anywhere (not in the ERP, not on the task). In the "
+                "same reply, ask for it: if they made it elsewhere, they send it to you here "
+                "(you file it with file_to_task) or attach it on the Proposals list; only if "
+                f"there's none, they make it in the ERP under this task: [Make the costing for "
+                f"{task.id}]({link}).")
 
     async def _asked_from_history(self, chat: Chat) -> status_mod.Asked | None:
         """The last numbered ask, read back from the chat (after a restart)."""
@@ -1388,6 +1476,7 @@ class ITSupportWorker:
                 ("morning brief", self._morning_briefs), ("due check-ins", self._due_check_ins),
                 ("daily asks", bound(jobs.daily_asks)), ("team briefs", bound(jobs.team_briefs)),
                 ("bcd asks", bound(jobs.bcd_asks)),
+                ("costing asks", bound(jobs.costing_asks)),
                 ("approval pings", bound(jobs.approval_pings)),
                 ("website enquiries", bound(jobs.website_enquiries)),
                 ("leave handovers", bound(jobs.leave_handovers)),

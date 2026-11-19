@@ -361,7 +361,7 @@ class QuoteDrive:
         """One file's id, name, link and eTag. Teams wants the eTag's GUID as
         the attachment id when a chat message carries the file."""
         response = await self._http.get(
-            self._item_url(item_id), params={"$select": "id,name,webUrl,eTag"},
+            self._item_url(item_id), params={"$select": "id,name,webUrl,webDavUrl,eTag"},
             headers=await self._headers(),
         )
         if response.status_code != 200:

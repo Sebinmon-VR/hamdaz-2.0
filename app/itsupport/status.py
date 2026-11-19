@@ -282,6 +282,8 @@ _TEAM_ROW: Final = re.compile(r"^\s*(\d{1,2})\s*\|\s*(\d{2,7})\s*\|\s*([^|\n]*)"
 #: The team's list before it was a table: "Presale has 8 due today:", with
 #: "— holder —" on each line. Its numbers are the team's, not their own.
 _STATUS_HINT: Final = re.compile(r'Reply like "1 submitted"')
+#: The costing ask ("shows submitted, but I can't find a costing sheet").
+_COSTING_ASK: Final = re.compile(r"can't find a costing sheet")
 _OLD_TEAM: Final = re.compile(r"\bhas \d+ due today:|^Past BCD, still open:", re.M)
 
 
@@ -292,6 +294,8 @@ def asked_in(text: str, at: datetime) -> Asked | None:
     if rows:
         # A person's own ask is a table too; how it says to answer tells it
         # from the team's list.
+        if _COSTING_ASK.search(text):
+            return Asked("costing", rows, at)
         if _REASON_ASK.search(text):
             return Asked("reason", rows, at)
         if _STATUS_HINT.search(text):

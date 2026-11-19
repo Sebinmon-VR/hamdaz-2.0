@@ -170,6 +170,17 @@ Tasks, status and the team (use the tools you have; a tool that isn't there is s
 - "Who hasn't answered today?", "why is 1952 late?": read the follow-ups (erp_read
   /followups/team with the team's handle, or /followups/<id>) and the reminders
   (/reminders/recent for a super admin). Name who, which task, and what they said.
+- A task's files ("send me the RFQ of 1958", "attachments for the zebra one", "the files of
+  that one"): task_files with which = the words of what they want ("rfq", "specs") or "all";
+  those go into the chat as file cards. Don't link them again; one short line is enough.
+  With "which files are there?", which="" lists them. Never say you can't get files
+  without trying it.
+- A task submitted with no costing sheet: if they made the sheet outside the ERP and send it
+  here, put it in their task's folder with file_to_task at once and tell them it's there;
+  they may also attach it on the Proposals list themselves. Only if there's no sheet at all,
+  it's made in the ERP under that task, with this link (never the bare new-costing page):
+  [Make the costing for <id>]({app}/quote-requests/new?task=<id>)
+  "Not needed" (an EOI, a regret): fine, nothing to file.
 - A tender by number or name ("tell me about 6000156411", "the ADNOC robots one"):
   find_tender. Past bids, "have we done this before", "who's bid on Fortinet": search_bids.
   "What did we pay for X", "last price for Y": past_prices. Customer POs: customer_pos.
@@ -328,6 +339,7 @@ charges. The body, every part optional:
   tool returns.
 
 App links (the web app): {app}/quote-requests/<quote id> for a quote's costing,
+{app}/quote-requests/new?task=<task id> to make a task's costing (opens on that task),
 {app}/enquiries/<task id> for an enquiry analysis, {app}/proposals/my-tasks for their own
 tasks, {app}/teams/<team handle>/proposals for a team's tasks (the handle from "Their teams").
 Only these, the erp_guide's pages and links a tool gives you: never make up a page address
@@ -591,6 +603,9 @@ class Turn:
     on_team_list: Callable[[str, str, str], Awaitable[str]] | None = None
     #: The table the reply's [[list]] stands for.
     block: str | None = None
+    #: Sends task files into the chat as Teams file cards (the worker's):
+    #: (cards, the line above them).
+    on_files: Callable[[list[tuple[str, str, str]], str], Awaitable[None]] | None = None
     #: Claude's tokens this turn, for the spend.
     input_tokens: int = 0
     output_tokens: int = 0
@@ -699,11 +714,13 @@ class Brain:
         self.on_change: Callable[[Person, Step, Answer], Awaitable[None]] | None = None
         self.on_teams: Callable[[Person, Step], Awaitable[Answer]] | None = None
 
-    def tools(self) -> list[dict[str, Any]]:
-        """The tools this turn: the ERP's, and those of the features on."""
+    def tools(self, turn: Turn | None = None) -> list[dict[str, Any]]:
+        """The tools this turn: the ERP's, and those of the features on (one
+        being tried, only for the person it's tried on)."""
         if self.lookups is None:
             return _TOOLS
-        return _TOOLS + lookups_mod.offered(self._settings)
+        return _TOOLS + lookups_mod.offered(self._settings,
+                                            turn.person.email if turn is not None else "")
 
     def providers(self) -> list[Provider]:
         """IT_SUPPORT_BRAIN_PROVIDERS' order (blank: LLM_PROVIDERS'), of those
@@ -812,7 +829,8 @@ class Brain:
                    "content-type": "application/json"}
         for _ in range(MAX_ROUNDS):
             body: dict[str, Any] = {
-                "model": provider.model, "messages": messages, "tools": _openai_tools(self.tools()),
+                "model": provider.model, "messages": messages,
+                "tools": _openai_tools(self.tools(turn)),
                 "tool_choice": "auto", "max_tokens": 4000, "temperature": 0.3,
             }
             if "gpt-oss" in provider.model:
@@ -866,7 +884,7 @@ class Brain:
         for _ in range(MAX_ROUNDS):
             message = await self.client().beta.messages.create(
                 model=self.model, max_tokens=8000, system=system, messages=messages,
-                tools=self.tools(),
+                tools=self.tools(turn),
                 output_config={"effort": turn.effort or self._settings.it_support_brain_effort},
                 metadata={"user_id": str(turn.person.user_id)}, **extra,
             )

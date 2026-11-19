@@ -71,6 +71,24 @@ TOOLS: Final[list[tuple[str, dict[str, Any]]]] = [
         "One tender by its number (tender/RFQ/PR/task id) or a few words of its title: who "
         "holds it, BCD, status, end user, remarks, its folder, and its costing if one exists.",
         {"query": {"type": "string"}})),
+    ("task_files", _tool(
+        "task_files",
+        "A task's files (by task id, tender number or a few words of its title), from its "
+        "task folder and its Proposals list item. which=\"all\" or words of the names "
+        "(\"rfq\", \"specs boq\") SENDS those files into the chat as file cards at once; "
+        "which=\"\" only lists them. For \"send me the RFQ of 1958\", \"attachments for "
+        "the zebra one\", \"the files\".",
+        {"query": {"type": "string"},
+         "which": {"type": "string", "description": "\"all\", words of file names, or "
+                                                     "\"\" to only list"}})),
+    ("costing_ask", _tool(
+        "file_to_task",
+        "Put a costing sheet they sent in this chat into THEIR task's folder (named so it "
+        "reads as the costing), so the task has its costing. Use it when they send a "
+        "costing sheet made outside the ERP for a task (often after you asked for one).",
+        {"task_id": {"type": "string"},
+         "file_names": {"type": "array", "items": {"type": "string"},
+                        "description": "As chat_files names them"}})),
     ("past_bids", _tool(
         "search_bids",
         "Past tasks like this one (by words of the title, optionally one end user), newest "
@@ -115,8 +133,16 @@ TOOLS: Final[list[tuple[str, dict[str, Any]]]] = [
 NAMES: Final = {tool["name"] for _, tool in TOOLS}
 
 
-def offered(settings: Settings) -> list[dict[str, Any]]:
-    return [tool for key, tool in TOOLS if features.on(settings, key)]
+#: Features tried on one person first (IT_SUPPORT_TRY_TO) before everyone.
+TRYING: Final = frozenset({"task_files", "costing_ask"})
+
+
+def offered(settings: Settings, email: str = "") -> list[dict[str, Any]]:
+    """The tools of the features on, for this person: one being tried is
+    theirs only if they're the one it's tried on."""
+    tester = (getattr(settings, "it_support_try_to", "") or "").strip().lower()
+    return [tool for key, tool in TOOLS if features.on(settings, key)
+            and not (key in TRYING and tester and email.strip().lower() != tester)]
 
 
 def link_base(settings: Settings) -> str:
@@ -142,6 +168,13 @@ class Lookups:
         self.on_teams: Callable[[Person, Any], Awaitable[Any]] | None = None
         #: The Proposals site reader, for the project tracker list.
         self.sharepoint: Any = None
+        #: A task's files and costing (``costcheck.Files``), the worker's.
+        self.files: Any = None
+        #: The sent ledger (the worker's): a costing filed here isn't asked for.
+        self.sent: Any = None
+        #: After "submitted" is filed: what to add about its costing (the
+        #: worker's; "" when it has one or the ask is off).
+        self.on_submitted: Callable[[Person, Any], Awaitable[str]] | None = None
 
     async def run(self, turn: Turn, name: str, args: dict[str, Any]) -> str:
         if self._factory is None:
@@ -152,6 +185,10 @@ class Lookups:
                 return await self._update(turn, args)
             if name == "find_tender":
                 return await self._find(turn, args["query"])
+            if name == "task_files":
+                return await self._task_files(turn, args["query"], args.get("which", ""))
+            if name == "file_to_task":
+                return await self._file_to_task(turn, args["task_id"], args["file_names"])
             if name == "search_bids":
                 return await self._bids(person, args["words"], args["end_user"])
             if name == "past_prices":
@@ -200,41 +237,158 @@ class Lookups:
         turn.done.append(f"update {task_id}: {filed.said}")
         turn.focus = (task_id, mine[task_id].title or "", person.first_name, person.email)
         turn.filed.append(filed)
+        costing = ""
+        if filed.ok and update.submission and not update.submission.startswith("Not") \
+                and self.on_submitted is not None:
+            costing = await self.on_submitted(person, mine[task_id])
         return (("Filed: " if filed.ok else "Not filed: ") + f"{task_id} {filed.said}."
                 + (" The Proposals list itself isn't changed: tell them to update it there."
-                   if filed.ok and filed.on_list else ""))
+                   if filed.ok and filed.on_list else "") + costing)
 
     # ── tenders ──
 
     def _sees_proposals(self, person: Person) -> bool:
         return person.access.is_admin or "proposals" in person.access.modules
 
+    async def _match(self, session: AsyncSession, query: str) -> list[Any]:
+        """The tasks a number or a few words of a title mean, at most three."""
+        from app.mailwatch import matching
+        from app.models.proposal_index import ProposalIndexItem
+
+        numbers = re.findall(r"\d{3,}", query)
+        rows: list[ProposalIndexItem] = []
+        ids = [n for n in numbers if len(n) <= 6]
+        if ids:
+            rows = list((await session.scalars(select(ProposalIndexItem).where(
+                ProposalIndexItem.item_id.in_(ids),
+                ProposalIndexItem.deleted.is_(False)))).all())
+        if not rows and numbers:
+            rows = await matching.by_number(session, numbers)
+        if not rows:
+            found = await matching.by_words(session, query, customer=None, numbers=set())
+            if found:
+                rows = list((await session.scalars(select(ProposalIndexItem).where(
+                    ProposalIndexItem.item_id.in_([c.item_id for c in found[:3]])))).all())
+        return rows[:3]
+
+    async def _file_to_task(self, turn: Turn, task_id: str, names: list[str]) -> str:
+        """Costing sheets sent in the chat, into the person's own task's folder."""
+        from app.itsupport import activity, costcheck
+
+        person = turn.person
+        if not any(t["name"] == "file_to_task" for t in offered(self._settings, person.email)):
+            return "Filing a costing sheet isn't switched on for them yet."
+        task = {t.id: t for t in person.tasks}.get(task_id.strip())
+        if task is None:
+            return (f"{task_id} isn't one of their open tasks, so I can't file into it: only "
+                    "the holder's own tasks. Ask which task it's for.")
+        if self.files is None:
+            return "Task folders can't be reached here."
+        if not costcheck.may_try(self._settings, person.email, task):
+            return ("While this is being tried, sheets go only into the tester's own tasks with "
+                    "\"test\" in the title. Tell them so.")
+        opened = [turn.files[n] for n in names if n in turn.files]
+        if not opened:
+            return "None of those files are in the chat. See chat_files."
+        saved = []
+        for o in opened:
+            data = (o.readable.data if o.readable else None) or o.data
+            if not data:
+                saved.append(f"{o.name}: couldn't be read")
+                continue
+            try:
+                f = await self.files.save(task, o.name, data, o.media_type)
+            except Exception as exc:  # noqa: BLE001 - say what went wrong
+                logger.exception("it support: filing %s into %s failed", o.name, task.id)
+                saved.append(f"{o.name}: not saved ({exc})"[:200])
+                continue
+            saved.append(f"saved as [{f.name}]({f.link})")
+            turn.done.append(f"filed {f.name} into {task.id}'s folder")
+            await activity.record(self._factory, email=person.email, kind=activity.CHANGE,
+                                  summary=f"costing sheet {f.name} put in {task.id}'s folder",
+                                  detail={"task": task.id, "file": f.name})
+        if any(s.startswith("saved") for s in saved) and self.sent is not None:
+            tester = (getattr(self._settings, "it_support_try_to", "") or "").strip().lower()
+            await self.sent.mark(costcheck.key(task.id, test=bool(tester)), email=person.email,
+                                 kind="costing-ask", detail={"filed": True})
+        turn.focus = (task.id, task.title or "", person.first_name, person.email)
+        return f"{task.id}: " + "; ".join(saved) + (". It now counts as the task's costing; "
+                                                     "tell them in a line, with the link.")
+
+    async def _task_files(self, turn: Turn, query: str, which: str = "") -> str:
+        person = turn.person
+        if not self._sees_proposals(person):
+            return "They don't have the Proposals module, so a task's files can't be fetched."
+        if self.files is None:
+            return "Task files can't be read here."
+        if not any(t["name"] == "task_files" for t in offered(self._settings, person.email)):
+            return "Fetching a task's files isn't switched on for them yet."
+        from app.itsupport import costcheck
+
+        said = query.strip()
+        task = {t.id: t for t in person.tasks}.get(said)
+        if task is not None:
+            task_id, title = task.id, task.title or ""
+            turn.focus = (task.id, title, person.first_name, person.email)
+        else:
+            assert self._factory is not None
+            async with self._factory() as session:
+                rows = await self._match(session, said)
+            if not rows:
+                return "No task matches that on the Proposals list."
+            exact = next((r for r in rows if r.item_id == said), None)
+            if exact is None and len(rows) > 1:
+                return _json({"several": [{"id": r.item_id, "title": r.title,
+                                           "holder": r.assigned_name} for r in rows],
+                              "note": "Ask which one, naming them."})
+            row = exact or rows[0]
+            task_id, title = row.item_id, row.title or ""
+            turn.focus = (row.item_id, title, row.assigned_name or "",
+                          (row.assigned_email or "").lower())
+        files, folder, problems = await self.files.of(task or task_id)
+        if not files and not problems:
+            return _json({"task": {"id": task_id, "title": title}, "folder": folder,
+                          "files": [], "note": "No files in its task folder or on the list. "
+                          "Say so, with the folder link if there is one."})
+        out = costcheck.for_model(task, task_id, title, files, folder, problems)
+        wanted = picked(files, which)
+        if wanted and turn.on_files is not None:
+            cards, links = [], []
+            for f in wanted[:MAX_CARDS]:
+                card = await self.files.card(f)
+                (cards.append(card) if card else links.append(f))
+            if cards:
+                try:
+                    await turn.on_files(cards, f"{task_id}'s files 👇")
+                    turn.done.append(f"sent {len(cards)} file card(s) of {task_id}")
+                except Exception as exc:  # noqa: BLE001 - the links still get them there
+                    logger.warning("it support: Teams refused the file cards: %s", exc)
+                    by_name = {f.name: f for f in wanted}
+                    links += [by_name.get(c[2]) or costcheck.File(c[2], "", c[1])
+                              for c in cards]
+                    cards = []
+            out["sent_as_cards"] = [c[2] for c in cards]
+            out["give_as_links"] = [{"name": f.name, "link": f.link} for f in links]
+            out["how_to_give"] = (
+                "The files in sent_as_cards are in the chat now as file cards: don't list "
+                "or link them again, just say in a few words they're there. Give any in "
+                "give_as_links as [name](link)." + (f" {len(wanted) - MAX_CARDS} more "
+                                                     "matched: give the folder link for those."
+                                                     if len(wanted) > MAX_CARDS else ""))
+        elif which.strip():
+            out["note"] = "No file name matched what they asked for: say so and list a few."
+        return _json(out)
+
     async def _find(self, turn: Turn, query: str) -> str:
         person = turn.person
         if not self._sees_proposals(person):
             return "They don't have the Proposals module, so tenders can't be looked up."
-        from app.mailwatch import matching
-        from app.models.proposal_index import ProposalIndexItem
         from app.models.task_folder import TaskFolder
         from app.quoting.service import quotes_for_tasks
 
-        numbers = re.findall(r"\d{3,}", query)
         assert self._factory is not None
         async with self._factory() as session:
-            rows: list[ProposalIndexItem] = []
-            ids = [n for n in numbers if len(n) <= 6]
-            if ids:
-                rows = list((await session.scalars(select(ProposalIndexItem).where(
-                    ProposalIndexItem.item_id.in_(ids),
-                    ProposalIndexItem.deleted.is_(False)))).all())
-            if not rows and numbers:
-                rows = await matching.by_number(session, numbers)
-            if not rows:
-                found = await matching.by_words(session, query, customer=None, numbers=set())
-                if found:
-                    rows = list((await session.scalars(select(ProposalIndexItem).where(
-                        ProposalIndexItem.item_id.in_([c.item_id for c in found[:3]])))).all())
-            rows = rows[:3]
+            rows = await self._match(session, query)
             if not rows:
                 return "No task matches that on the Proposals list."
             task_ids = [r.item_id for r in rows]
@@ -422,6 +576,23 @@ class Lookups:
         turn.plan.steps.append(step)
         return ("Added as a step, not sent yet. Ask them once in one line (\"want me to "
                 "message <name>: '<text>'?\"); it goes on their yes.")
+
+
+#: File cards in one message, at most.
+MAX_CARDS: Final = 10
+
+
+def picked(files: list[Any], which: str) -> list[Any]:
+    """The files they asked for: all, or those whose name has any of the
+    words ("rfq", "specs boq"); none for "" (only a list)."""
+    which = which.strip().casefold()
+    if not which:
+        return []
+    if which in ("all", "everything", "all files"):
+        return list(files)
+    words = [w for w in re.findall(r"[a-z0-9]{2,}", which) if w not in ("the", "and", "file",
+                                                                        "files", "of")]
+    return [f for f in files if any(w in f.name.casefold() for w in words)]
 
 
 def teammate(said: str, emails: frozenset[str],

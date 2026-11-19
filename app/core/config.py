@@ -427,6 +427,11 @@ class Settings(BaseSettings):
     #: Everyone's check-ins sent into this one person's chat instead, marked
     #: as a test, for a trial. Blank: each goes to the task's holder.
     it_support_due_test_to: str = ""
+    #: New features are tried on this one person until it's set blank (the
+    #: user, 2026-11-19: "don't test with real users, only ask Sebin"): the
+    #: "submitted without a costing" ask goes only into their chat, marked
+    #: whose it is, and a task's files are fetched only for them. Blank: live.
+    it_support_try_to: str = "sebin@hamdaz.com"
     #: Which tasks were already asked about, on this machine. Gitignored.
     it_support_due_asked_file: str = ".itsupport-asked.json"
     #: The morning brief: one message to each person at the start of their
