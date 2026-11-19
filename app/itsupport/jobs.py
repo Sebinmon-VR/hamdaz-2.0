@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Any, Final
 from sqlalchemy import func, select
 
 from app.followups import service as fu
-from app.itsupport import activity, asks, features, talk, when
+from app.itsupport import activity, asks, features, talk, tasklist, when
 from app.itsupport.due import in_office_hours, short
 from app.itsupport.lookups import link_base
 from app.itsupport.status import Asked, Item
@@ -63,17 +63,21 @@ def _target(w: ITSupportWorker, chat: Chat, chats: list[Chat]) -> Chat | None:
 
 async def send(w: ITSupportWorker, chat: Chat, chats: list[Chat], text: str, *, key: str,
                kind: str, detail: dict[str, Any] | None = None,
-               asked: Asked | None = None) -> bool:
-    """One message, once: to the person (or the trial chat), logged."""
+               asked: Asked | None = None, html_body: str | None = None) -> bool:
+    """One message, once: to the person (or the trial chat), logged. With
+    ``html_body`` that is what's sent (a list as tables) and ``text`` is its
+    first line, for the log."""
     if await w._sent.seen(key):
         return False
     target = _target(w, chat, chats)
     if target is None:
         logger.warning("it support: the trial address is not a chat it answers; %s held", key)
         return False
+    body = html_body if html_body is not None else talk.to_html(text)
     if target is not chat:
         text = f"(test: this is for {chat.first_name})\n{text}"
-    await w._say(target, talk.to_html(text))
+        body = talk.to_html(f"(test: this is for {chat.first_name})") + "<br>" + body
+    await w._say(target, body)
     if asked is not None:
         target.asked = asked
     await w._sent.mark(key, email=chat.email, kind=kind, detail=detail)
@@ -157,10 +161,11 @@ async def daily_asks(w: ITSupportWorker, chats: list[Chat]) -> None:
                    for r in found}
             risks = await notes(session, ids, now)
     for chat, kind, found, key in plans:
-        text, asked = asks.message(kind, chat.first_name, found, now,
-                                   risks=risks if kind == asks.STATUS else None)
+        noted = risks if kind == asks.STATUS else None
+        text, asked = asks.message(kind, chat.first_name, found, now, risks=noted)
         await send(w, chat, chats, text, key=key, kind=f"{kind}-ask",
-                   detail={"tasks": [r.task_id for r in found]}, asked=asked)
+                   detail={"tasks": [r.task_id for r in found]}, asked=asked,
+                   html_body=asks.html_message(kind, chat.first_name, found, now, risks=noted))
 
 
 # ── the team's day, for a super admin or manager ───────────────────────
@@ -184,90 +189,21 @@ async def team_briefs(w: ITSupportWorker, chats: list[Chat]) -> None:
         key = f"team-brief:{chat.email}:{day.isoformat()}"
         if await w._sent.seen(key):
             continue
-        parts: list[str] = []
-        items: list[Item] = []
+        teams: list[tuple[str, list[tasklist.Row]]] = []
         for team_id, name in chat.oversees[:3]:
             data = await w._team_data(team_id)
             if data is None:
                 continue
-            holders, held = data
-            text, numbered = brief_text(name, holders, held, now, start=len(items) + 1)
-            if text:
-                parts.append(text)
-                items += numbered
-        if not parts:
+            members, held = data
+            teams.append((name, tasklist.collect(members, held, now)))
+        shown = tasklist.brief(chat.first_name, teams, now)
+        if shown is None:
             await w._sent.mark(key, email=chat.email, kind="team-brief",
                                detail={"skipped": "nothing due"})
             continue
-        text = f"Morning {chat.first_name}. " + "\n\n".join(parts) + \
-            "\nWant me to check with anyone on these?"
-        await send(w, chat, chats, text, key=key, kind="team-brief",
-                   detail={"tasks": [i.task_id for i in items]},
-                   asked=Asked("team", items, now))
-
-
-def brief_text(team: str, holders: list[tuple[str, str | None, list[Any]]], held: set[str],
-               now: datetime, *, start: int = 1) -> tuple[str, list[Item]]:
-    """A team's tasks due today (done ones too, marked), and what's past its
-    BCD and still open; numbered so "check with 2" can pick one."""
-    from app.reminders.service import is_done
-
-    today = now.astimezone(when.UAE).date()
-    due_today, late, unset = [], [], []
-    for name, away, tasks in holders:
-        holder = name + (f" (away: {away})" if away else "")
-        for task in tasks:
-            due = fu.due_of(task)
-            if task.id in held:
-                # Its BCD is still the time it was assigned: not due then.
-                if not is_done(task):
-                    created = when.parse_when(task.created_at)
-                    if created is not None and now - created <= timedelta(days=3):
-                        unset.append((created, holder, task))
-                continue
-            if due is None:
-                continue
-            local = due.astimezone(when.UAE).date()
-            if local == today:
-                due_today.append((due, holder, task))
-            elif due < now and (today - local).days <= 3 and not is_done(task):
-                late.append((due, holder, task))
-    if not due_today and not late and not unset:
-        return "", []
-    due_today.sort(key=lambda x: x[0])
-    late.sort(key=lambda x: x[0])
-    unset.sort(key=lambda x: x[0])
-    lines, items = [], []
-    n = start
-    if due_today:
-        lines.append(f"{team} has {len(due_today)} due today:")
-        for due, holder, task in due_today:
-            state = task.submission_status if is_done(task) and task.submission_status \
-                else (task.status or "no status")
-            mark = "✓ " if is_done(task) else ""
-            at = when.both(due) if due > now or is_done(task) else f"closed {when.both(due)}"
-            lines.append(f"{n}. {task.id} · {short((task.title or '').strip(), 50)} — {holder} "
-                         f"— {at} · {mark}{state}")
-            items.append(Item(n, task.id, task.title or ""))
-            n += 1
-    if late:
-        lines.append("Past BCD, still open:")
-        for due, holder, task in late:
-            lines.append(f"{n}. {task.id} · {short((task.title or '').strip(), 50)} — {holder} "
-                         f"— closed {when.day_and_time(due, now)}")
-            items.append(Item(n, task.id, task.title or ""))
-            n += 1
-    if unset:
-        lines.append("Assigned recently, BCD not set yet (it still shows the assignment time, "
-                     "so the real closing date may be different):")
-        for created, holder, task in unset:
-            lines.append(f"{n}. {task.id} · {short((task.title or '').strip(), 50)} — {holder} "
-                         f"— assigned {when.day_and_time(created, now)}")
-            items.append(Item(n, task.id, task.title or ""))
-            n += 1
-    if not due_today and not late:
-        lines.insert(0, f"{team} has nothing due today.")
-    return "\n".join(lines), items
+        await send(w, chat, chats, shown.line, key=key, kind="team-brief",
+                   detail={"tasks": [i.task_id for i in shown.items]},
+                   asked=Asked("team", shown.items, now), html_body=shown.html)
 
 
 # ── placeholder BCDs ───────────────────────────────────────────────────
@@ -460,12 +396,13 @@ async def leave_handovers(w: ITSupportWorker, chats: list[Chat]) -> None:
         data = await w._team_data(team_id)
         if data is None:
             continue
-        holders, held = data
-        for holder, away, tasks in holders:
+        members, held = data
+        for member in members:
+            holder, away = member.name, member.away
             if not away:
                 continue
             soon = []
-            for task in tasks:
+            for task in member.tasks:
                 due = fu.due_of(task)
                 if due is None or is_done(task) or task.id in held or due < now:
                     continue
@@ -477,7 +414,7 @@ async def leave_handovers(w: ITSupportWorker, chats: list[Chat]) -> None:
             listed = "; ".join(f"{t.id} · {short((t.title or '').strip(), 45)}, "
                                f"{when.day_and_time(d, now)}" for d, t in soon)
             for lead in leads:
-                if lead.display_name == holder or lead.first_name == holder:
+                if lead.email == member.email.lower() or lead.first_name == holder:
                     continue
                 text = (f"{holder} is away today ({away}). Closing soon: {listed}. "
                         "Who's picking these up?")

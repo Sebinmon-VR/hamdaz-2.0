@@ -20,6 +20,7 @@ brief is not sent while these are on (they'd say the same thing twice).
 
 from __future__ import annotations
 
+import html
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
 from typing import Final
@@ -121,10 +122,40 @@ def message(kind: str, first_name: str, found: list[Row], now: datetime, *,
             line += f" ⚠ {risks[row.task_id]}"
         lines.append(line)
         items.append(Item(n, row.task_id, row.title))
-    if kind == STATUS:
-        lines.append('Reply like "1 submitted" or "2 on hold, waiting for price".')
-    else:
-        hint = 'What held them up? Reply like "1 waiting for the supplier\'s price", or ' \
-               '"1 submitted" if it went in.'
-        lines.append(hint if len(found) > 1 else hint.replace("them", "it"))
+    lines.append(_hint(kind, len(found)))
     return "\n".join(lines), Asked(kind, items, now)
+
+
+def _hint(kind: str, count: int) -> str:
+    if kind == STATUS:
+        return 'Reply like "1 submitted" or "2 on hold, waiting for price".'
+    hint = 'What held them up? Reply like "1 waiting for the supplier\'s price", or ' \
+           '"1 submitted" if it went in.'
+    return hint if count > 1 else hint.replace("them", "it")
+
+
+def html_message(kind: str, first_name: str, found: list[Row], now: datetime, *,
+                 risks: dict[str, str] | None = None) -> str:
+    """The same ask as Teams shows it: the opener, a table numbered as
+    ``message``'s list, and how to answer (2026-11-19: the team's list became
+    a table, and each person's ask looks the same)."""
+    from app.itsupport import tasklist
+
+    risks = risks or {}
+    text, _ = message(kind, first_name, found, now, risks=risks)
+    flagged = any(risks.get(r.task_id) for r in found)
+    head = ["#", "Task", "Tender", "BCD (UAE)" if kind == STATUS else "Closed (UAE)", "IST"]
+    head += ["Status"] if kind == STATUS else []
+    head += ["Heads-up"] if flagged else []
+    cells = []
+    for n, row in enumerate(found, start=1):
+        uae, ist = tasklist.when_cells(row.due_at, now)
+        if kind == STATUS and row.due_at < now:
+            uae += " (passed)"
+        cell = [str(n), row.task_id, tasklist.tender(row.title or "", tasklist.TENDER_CHARS),
+                uae, ist]
+        cell += [row.status or "Not set"] if kind == STATUS else []
+        cell += [f"⚠ {risks[row.task_id]}" if risks.get(row.task_id) else ""] if flagged else []
+        cells.append(cell)
+    return (f"<p>{html.escape(text.splitlines()[0])}</p>" + tasklist.grid(head, cells)
+            + tasklist.SPACE + f"<p>{html.escape(_hint(kind, len(found)))}</p>")

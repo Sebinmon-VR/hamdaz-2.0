@@ -330,3 +330,126 @@ async def disconnect(admin: SuperAdmin, session: Session,
     await session.commit()
     logger.warning("it support disconnected by %s", admin.email)
     return await _out(session, config)
+
+
+# ── The chats: what each person and the agent said, read-only ───────────
+
+
+class ChatOut(BaseModel):
+    chat_id: str
+    email: str
+    name: str
+    #: Whether the agent answers them now (on the people list).
+    answered: bool
+    last_at: datetime | None
+
+
+class ChatMessageOut(BaseModel):
+    id: str
+    at: datetime | None
+    #: Sent by IT Support (the agent), not by the person.
+    mine: bool
+    sender: str
+    text: str
+    files: list[str]
+    reactions: list[str]
+    deleted: bool
+
+
+class ChatPageOut(BaseModel):
+    messages: list[ChatMessageOut]
+    #: Pass back as ``more`` for the older messages; None at the chat's start.
+    more: str | None
+
+
+def _graph(request: Request, config: Settings):
+    """The agent's own Graph client (its tokens shared), else one for this
+    request: the same sign-in, from the database."""
+    from app.core.db import get_session_factory
+    from app.itsupport.graph import ITSupportGraph
+
+    worker = getattr(request.app.state, "itsupport_worker", None)
+    if worker is not None:
+        return worker.graph
+    return ITSupportGraph(config, request.app.state.http, get_session_factory())
+
+
+def _when_of(value: str | None) -> datetime | None:
+    try:
+        return datetime.fromisoformat(value) if value else None
+    except ValueError:
+        return None
+
+
+@router.get("/chats", response_model=list[ChatOut],
+            summary="IT Support's Teams chats, one per person, newest first")
+async def chats(admin: SuperAdmin, session: Session, config: Config,
+                request: Request) -> list[ChatOut]:
+    from app.itsupport.graph import GraphError
+
+    row = await service.get_row(session, config)
+    me = ((row.sign_in or {}).get("account_email") or config.it_support_email).lower()
+    answered = {p["email"].lower() for p in row.people or []}
+    names = {p["email"].lower(): p.get("name") or "" for p in row.people or []}
+    await session.commit()
+    try:
+        found = await _graph(request, config).one_to_one_chats()
+    except GraphError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail=f"Teams couldn't be read: {exc}") from exc
+    out: list[ChatOut] = []
+    for chat in found:
+        other = next((m for m in chat.get("members") or []
+                      if (m.get("email") or "").lower() not in ("", me)), None)
+        if other is None:
+            continue
+        email = other["email"].lower()
+        out.append(ChatOut(
+            chat_id=chat["id"], email=email,
+            name=names.get(email) or other.get("displayName") or email,
+            answered=email in answered,
+            last_at=_when_of((chat.get("lastMessagePreview") or {}).get("createdDateTime"))))
+    # The people it answers first, then by the latest chat.
+    out.sort(key=lambda c: (not c.answered,
+                            -(c.last_at.timestamp() if c.last_at else 0)))
+    return out
+
+
+@router.get("/chats/messages", response_model=ChatPageOut,
+            summary="One chat's messages, newest first, 50 at a time")
+async def chat_messages(admin: SuperAdmin, session: Session, config: Config, request: Request,
+                        chat_id: str, more: str | None = None) -> ChatPageOut:
+    """Read-only: what the person wrote and what the agent answered, as
+    Teams has it. Tables (the team's list) come as rows of cells."""
+    from app.itsupport import talk
+    from app.itsupport.graph import GraphError
+
+    row = await service.get_row(session, config)
+    me = (row.sign_in or {}).get("account_id")
+    await session.commit()
+    graph = _graph(request, config)
+    try:
+        found, older = await graph.message_page(chat_id, more=more)
+    except GraphError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail=f"Teams couldn't be read: {exc}") from exc
+    me = me or graph.account_id
+    out: list[ChatMessageOut] = []
+    for m in found:
+        if m.get("messageType") != "message":
+            continue
+        user = (m.get("from") or {}).get("user") or {}
+        deleted = bool(m.get("deletedDateTime"))
+        files = [a.get("name") or "file" for a in m.get("attachments") or []
+                 if a.get("contentType") not in ("messageReference",)]
+        text = "" if deleted else talk.plain(m)
+        if text == "(sent a file or a picture)" and files:
+            text = ""
+        out.append(ChatMessageOut(
+            id=str(m.get("id")), at=_when_of(m.get("createdDateTime")),
+            mine=bool(me) and user.get("id") == me,
+            sender=user.get("displayName") or "",
+            text=text, files=files,
+            reactions=[r.get("reactionType") or "" for r in m.get("reactions") or []],
+            deleted=deleted))
+    return ChatPageOut(messages=out, more=older)

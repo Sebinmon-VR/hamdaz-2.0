@@ -65,17 +65,22 @@ What you can and can't do:
 _TAG = re.compile(r"<[^>]+>")
 _BREAK = re.compile(r"<br\s*/?>|</(?:p|div|li|h[1-6]|tr)>|<li[^>]*>", re.IGNORECASE)
 _BOLD = re.compile(r"\*\*(.+?)\*\*")
+_CELL = re.compile(r"</t[dh]>", re.IGNORECASE)
 
 
 def plain(message: dict[str, Any]) -> str:
     """A Teams message's words: no HTML, entities undone; a file or picture
     with no words said as such."""
     body = (message.get("body") or {}).get("content") or ""
+    # A table's cells stay apart ("1 | 1958 | 6000156515 · …"), so a list
+    # sent as a table reads back by its numbers (``status.asked_in``).
+    body = _CELL.sub(" | ", body)
     # Every block ends a line: paragraphs, list points, headings, rows.
     lines = _BREAK.sub("\n", body)
     text = html.unescape(_TAG.sub(" ", lines))
     text = re.sub(r"[ \t ]+", " ", text)
-    text = "\n".join(line.strip() for line in text.splitlines()).strip()
+    text = "\n".join(line.strip().removesuffix("|").strip()
+                     for line in text.splitlines()).strip()
     if not text and (message.get("attachments") or "<img" in body):
         return "(sent a file or a picture)"
     return text

@@ -276,9 +276,30 @@ _ASK_LINE: Final = re.compile(r"^\s*(\d{1,2})\.\s+(\d{2,7})\s+·\s*(.*)$", re.M)
 _REASON_ASK: Final = re.compile(r"held (?:these|it|them) up|past (?:their|its) BCD", re.I)
 
 
+#: A team list's row, sent as a table and read back cell by cell:
+#: "1 | 1958 | 6000156515 · PR 4001754766 | Vishnu | …" (``talk.plain``).
+_TEAM_ROW: Final = re.compile(r"^\s*(\d{1,2})\s*\|\s*(\d{2,7})\s*\|\s*([^|\n]*)", re.M)
+#: The team's list before it was a table: "Presale has 8 due today:", with
+#: "— holder —" on each line. Its numbers are the team's, not their own.
+_STATUS_HINT: Final = re.compile(r'Reply like "1 submitted"')
+_OLD_TEAM: Final = re.compile(r"\bhas \d+ due today:|^Past BCD, still open:", re.M)
+
+
 def asked_in(text: str, at: datetime) -> Asked | None:
-    """An ask found in one of IT Support's own messages (its numbered lines)."""
+    """An ask found in one of IT Support's own messages (its numbered lines,
+    or a team list's numbered rows)."""
+    rows = [Item(int(n), task_id, title.strip()) for n, task_id, title in _TEAM_ROW.findall(text)]
+    if rows:
+        # A person's own ask is a table too; how it says to answer tells it
+        # from the team's list.
+        if _REASON_ASK.search(text):
+            return Asked("reason", rows, at)
+        if _STATUS_HINT.search(text):
+            return Asked("status", rows, at)
+        return Asked("team", rows, at)
     items = [Item(int(n), task_id, title.strip()) for n, task_id, title in _ASK_LINE.findall(text)]
     if not items:
         return None
+    if _OLD_TEAM.search(text):
+        return Asked("team", items, at)
     return Asked("reason" if _REASON_ASK.search(text) else "status", items, at)

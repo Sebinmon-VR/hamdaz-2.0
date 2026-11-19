@@ -136,6 +136,13 @@ Dates and live data:
 - If they oversee a team, the context says whose tasks "any tasks?", "what's due" or
   "anything pending" means: the team's (a manager) or their own first (a lead who holds
   tasks too). Follow it, and name who holds each team task.
+- Any list of the team's tasks ("only not submitted", "Haleema's", "the late ones", "what's
+  closing tomorrow", the morning's list again): call team_tasks and put [[list]] on its own
+  line in your reply. It goes out as a table, numbered as your last list was. Never type the
+  rows yourself and never erp_read the Proposals feed for a team list. One short line before
+  it at most; a count or a remark only if they asked a question ("who's furthest behind?").
+- After your numbered list, a filter word in their reply ("not submitted", "pending",
+  "submitted ones") narrows that list; it never files a status.
 
 Tasks, status and the team (use the tools you have; a tool that isn't there is switched off):
 - Their own task's status, submission status, a remark, or why it's late ("1952 submitted",
@@ -321,7 +328,10 @@ charges. The body, every part optional:
   tool returns.
 
 App links (the web app): {app}/quote-requests/<quote id> for a quote's costing,
-{app}/enquiries/<task id> for an enquiry analysis, {app}/tasks for their tasks.
+{app}/enquiries/<task id> for an enquiry analysis, {app}/proposals/my-tasks for their own
+tasks, {app}/teams/<team handle>/proposals for a team's tasks (the handle from "Their teams").
+Only these, the erp_guide's pages and links a tool gives you: never make up a page address
+(there is no {app}/tasks).
 """
 
 _TOOLS: Final[list[dict[str, Any]]] = [
@@ -460,6 +470,26 @@ _TOOLS: Final[list[dict[str, Any]]] = [
         },
     },
     {
+        "name": "team_tasks",
+        "description": "For someone who oversees a team: the team's tasks, read now, narrowed "
+                       "as they ask, shown in the chat as a table (put [[list]] in your reply "
+                       "where it goes). who: a teammate's name or \"\" for everyone; section: "
+                       "\"\" for the morning's list (closing today, past BCD, BCD not set), or "
+                       "one of today/tomorrow/week/late/unset; state: open (not submitted or "
+                       "completed), done, or all.",
+        "strict": True,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "who": {"type": "string"},
+                "section": {"type": "string",
+                            "enum": ["", "today", "tomorrow", "week", "late", "unset"]},
+                "state": {"type": "string", "enum": ["all", "open", "done"]},
+            },
+            "required": ["who", "section", "state"], "additionalProperties": False,
+        },
+    },
+    {
         "name": "find_suppliers",
         "description": "Start the supplier and distributor search (our past quotes, the web, "
                        "UAE directories). It posts its own progress and the list in the chat; "
@@ -556,6 +586,11 @@ class Turn:
     #: The task this turn was about (looked up or filed): (id, title, holder,
     #: holder's email); the worker keeps it as the conversation's subject.
     focus: tuple[str, str, str, str] | None = None
+    #: The team's list, for someone who oversees a team (the worker's):
+    #: (who, section, state) → the rows in words; the table goes to ``block``.
+    on_team_list: Callable[[str, str, str], Awaitable[str]] | None = None
+    #: The table the reply's [[list]] stands for.
+    block: str | None = None
     #: Claude's tokens this turn, for the spend.
     input_tokens: int = 0
     output_tokens: int = 0
@@ -942,6 +977,10 @@ class Brain:
         if name == "send_costing_pdf":
             return await self._send_costing_pdf(turn, _fill(args["quote_request_id"],
                                                             turn.results).strip())
+        if name == "team_tasks":
+            if turn.on_team_list is None:
+                return "Only for someone who oversees a team; this person doesn't."
+            return await turn.on_team_list(args["who"], args["section"], args["state"])
         if name == "find_suppliers":
             if turn.on_find is None:
                 return "The finder isn't available right now."

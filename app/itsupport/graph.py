@@ -268,6 +268,36 @@ class ITSupportGraph:
         )
         return list(payload.get("value") or [])
 
+    async def one_to_one_chats(self) -> list[dict[str, Any]]:
+        """The account's one-to-one chats with their members, for the
+        settings page's chat viewer."""
+        out: list[dict[str, Any]] = []
+        payload = await self._call("GET", "/me/chats",
+                                   params={"$expand": "members,lastMessagePreview",
+                                           "$top": "50"})
+        for _ in range(10):
+            out.extend(payload.get("value") or [])
+            more = payload.get("@odata.nextLink")
+            if not more:
+                break
+            payload = await self._call("GET", more.removeprefix(GRAPH_BASE))
+        return [c for c in out if c.get("chatType") == "oneOnOne"]
+
+    async def message_page(self, chat_id: str, *, more: str | None = None,
+                           top: int = 50) -> tuple[list[dict[str, Any]], str | None]:
+        """A page of a chat's messages, newest first, and the link to the
+        older ones (None at the start of the chat). ``more`` must be that
+        link, for this chat."""
+        if more:
+            if not more.startswith(f"{GRAPH_BASE}/chats/{chat_id}/messages"):
+                raise GraphError("that page link isn't this chat's")
+            payload = await self._call("GET", more.removeprefix(GRAPH_BASE))
+        else:
+            payload = await self._call(
+                "GET", f"/chats/{chat_id}/messages",
+                params={"$top": str(top), "$orderby": "createdDateTime desc"})
+        return list(payload.get("value") or []), payload.get("@odata.nextLink")
+
     async def every_message(self, chat_id: str) -> list[dict[str, Any]]:
         """The whole chat, page by page, newest first."""
         out: list[dict[str, Any]] = []

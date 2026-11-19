@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Final
+from typing import TYPE_CHECKING, Final
 from zoneinfo import ZoneInfo
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -21,6 +21,9 @@ from app.followups import service as fu
 from app.itsupport import when
 from app.proposals.sharepoint import ProposalTask, SharePointProposals
 from app.reminders.service import is_done
+
+if TYPE_CHECKING:
+    from app.itsupport.tasklist import Member
 
 #: BCD times are UAE times ("BCD UAE Time"), and "today" is the UAE's.
 UAE: Final = ZoneInfo("Asia/Dubai")
@@ -109,8 +112,11 @@ def describe(work: Work | None, now: datetime) -> str:
 def _bits(task: ProposalTask, due: datetime, held: set[str], now: datetime, *,
           remarks: int) -> list[str]:
     """One task's line after its title: BCD, status, submission, end user, remarks."""
-    bits = [unset(task, now)] if task.id in held else [
-        f"BCD {when.said(due, now)}" + (" (PASSED, not marked done)" if due < now else "")]
+    if is_done(task):
+        bits = [f"DONE, BCD {when.said(due, now)}"]
+    else:
+        bits = [unset(task, now)] if task.id in held else [
+            f"BCD {when.said(due, now)}" + (" (PASSED, not marked done)" if due < now else "")]
     bits.append(f"status {task.status or 'not set'}")
     if task.submission_status:
         bits.append(f"submission {task.submission_status}")
@@ -133,24 +139,29 @@ def unset(task: ProposalTask, now: datetime) -> str:
 TEAM_SHOWN_MAX: Final = 40
 
 
-def describe_team(team: str, holders: list[tuple[str, str | None, list[ProposalTask]]],
-                  held: set[str], *, read_at: datetime, now: datetime) -> tuple[str, int]:
+def describe_team(team: str, members: list[Member], held: set[str], *, read_at: datetime,
+                  now: datetime) -> tuple[str, int]:
     """A team's open tasks, a line each with who holds it (and whether they're
-    away), for someone who oversees the team. ``holders``: (name, why they're
-    away or None, their tasks). With it, how many open tasks it has."""
+    away), for someone who oversees the team; today's done ones too, marked,
+    so it matches the morning's list. With it, how many tasks it has."""
     read = f"(read from the Proposals list {when.from_now(read_at, now)}, at " \
            f"{when.both(read_at)})"
+    today = now.astimezone(UAE).date()
     items = []
-    for name, away, tasks in holders:
-        for task in tasks:
+    for member in members:
+        for task in member.tasks:
             due = fu.due_of(task)
-            if due is None or is_done(task) or not (now - SHOWN_SINCE <= due <= now + SHOWN_UNTIL):
+            if due is None or not (now - SHOWN_SINCE <= due <= now + SHOWN_UNTIL):
                 continue
-            items.append((due, name + (f" (away: {away})" if away else ""), task))
+            if is_done(task) and due.astimezone(UAE).date() != today:
+                continue
+            name = member.full_name or member.name
+            items.append((due, name + (f" (away: {member.away})" if member.away else ""), task))
     if not items:
         return f"The {team} team has no open tasks due from 2 days ago to a week ahead {read}.", 0
     items.sort(key=lambda item: item[0])
-    lines = [f"The {team} team's open tasks, due from 2 days ago to a week ahead {read}:"]
+    lines = [f"The {team} team's open tasks, due from 2 days ago to a week ahead, and today's "
+             f"done ones (marked DONE) {read}:"]
     for due, holder, task in items[:TEAM_SHOWN_MAX]:
         lines.append(f"- {task.id}: {(task.title or '').strip()[:90]} — {holder} — "
                      + "; ".join(_bits(task, due, held, now, remarks=80)))

@@ -65,6 +65,7 @@ from app.itsupport import (
     memory,
     smalltalk,
     talk,
+    tasklist,
     when,
     work,
 )
@@ -292,6 +293,18 @@ def this_conversation(newest_first: list[dict[str, Any]]) -> list[dict[str, Any]
     return out
 
 
+def mentioned(task_id: str, title: str, said: str) -> bool:
+    """Whether a message names the task: its id, or its tender number (the
+    check-in calls a task by its RFQ or tender number)."""
+    numbers = {task_id} | set(re.findall(r"\d{6,}", title or ""))
+    return any(re.search(rf"(?<!\d){re.escape(n)}(?!\d)", said) for n in numbers if n)
+
+
+def due_key(task: due.DueTask) -> str:
+    """A due-today check-in's flag in the sent ledger: the task on its UAE day."""
+    return f"due-ask:{task.task_id}@{task.due_at.astimezone(DUBAI).date().isoformat()}"
+
+
 def _when(value: str | None) -> datetime | None:
     try:
         return datetime.fromisoformat(value) if value else None
@@ -368,6 +381,11 @@ class ITSupportWorker:
         self._refreshed = 0.0
         #: The last problem, for the heartbeat; cleared once it is written.
         self._error: str | None = None
+
+    @property
+    def graph(self) -> ITSupportGraph:
+        """Graph as IT Support (the settings page's chat viewer reads with it)."""
+        return self._graph
 
     @property
     def thinking(self) -> bool:
@@ -731,9 +749,9 @@ class ITSupportWorker:
                                   now=now)
 
     async def _team_data(self, team_id: uuid.UUID
-                         ) -> tuple[list[tuple[str, str | None, list]], set[str]] | None:
-        """Each member's name, why they're away (or None) and tasks, and the
-        tasks still on a placeholder BCD. The tasks are a minute old at most;
+                         ) -> tuple[list[tasklist.Member], set[str]] | None:
+        """Each member (what the team calls them, why they're away or None,
+        their tasks), and the tasks still on a placeholder BCD. The tasks are a minute old at most;
         who's in the team and who's away are kept TEAM_PEOPLE_SECONDS (a
         9-person team's leave check took 8 s from the laptop, one at a time)."""
         from app.bcd import service as bcd
@@ -758,8 +776,84 @@ class ITSupportWorker:
             everyone = [t for m in members if m.lookup_id for t in rows.get(m.lookup_id, [])]
             held = await bcd.held_ids(session, everyone)
         self._team_age[team_id] = age
-        return [(m.name, away.get(m.user_id), rows.get(m.lookup_id or "", []))
-                for m in members], held
+        return [tasklist.Member(
+            name=talk.first_name(self._settings, m.email or "", m.name or m.email),
+            away=away.get(m.user_id), tasks=rows.get(m.lookup_id or "", []),
+            email=(m.email or "").lower(), full_name=m.name or "")
+            for m in members], held
+
+    def _list_names(self, chat: Chat) -> dict[str, str]:
+        """Every word of the overseen teammates' names, lower case → the name
+        the team's list shows ("sri" and "vishnu" → "Vishnu")."""
+        out: dict[str, str] = {}
+        for team_id, _ in chat.oversees:
+            kept = self._team_people.get(team_id)
+            for m in kept[0] if kept is not None else []:
+                short = talk.first_name(self._settings, m.email or "", m.name or m.email)
+                for word in f"{m.name or ''} {short} {(m.email or '').split('@')[0]}".split():
+                    if len(word) > 2:
+                        out.setdefault(word.casefold().strip(".,"), short)
+        return out
+
+    async def _team_rows(self, chat: Chat, ahead: int = 0
+                         ) -> list[tuple[str, list[tasklist.Row]]] | None:
+        """The rows of each team they oversee, read now (the shared cache, a
+        minute at most); None when no team could be read."""
+        now = datetime.now(UTC)
+        out: list[tuple[str, list[tasklist.Row]]] = []
+        for team_id, name in chat.oversees[:MAX_TEAMS_SHOWN]:
+            try:
+                data = await asyncio.wait_for(self._team_data(team_id), TEAM_READ_SECONDS)
+            except Exception as exc:  # noqa: BLE001 - the others may still read
+                logger.warning("it support: reading the %s team's tasks failed: %s", name,
+                               exc or type(exc).__name__)
+                continue
+            if data is not None:
+                members, held = data
+                out.append((name, tasklist.collect(members, held, now, ahead=ahead)))
+        return out or None
+
+    async def _team_list(self, chat: Chat, flt: tasklist.Filter
+                         ) -> tuple[tasklist.Shown, list[tasklist.Row]] | None:
+        """The team's list narrowed as asked, numbered as the last list was;
+        the chat's numbered list becomes this one. None: unreadable now."""
+        teams = await self._team_rows(chat, ahead=flt.ahead)
+        if teams is None:
+            return None
+        # A team with nothing at all (HR) says nothing.
+        if len(teams) > 1:
+            teams = [(n, rows) for n, rows in teams if rows] or teams[:1]
+        now = datetime.now(UTC)
+        earlier = self._last_ask(chat)
+        shown = tasklist.filtered(teams, flt, now, earlier)
+        if shown.items:
+            chat.asked = status_mod.Asked("team", shown.items, now)
+        return shown, [r for _, rows in teams for r in flt.apply(rows)]
+
+    async def _list_rules(self, chat: Chat, words: str) -> bool:
+        """"show only not submitted", "Haleema's", "the late ones": the team's
+        list again, narrowed by rules (no model), after the team's list was
+        sent here, or any time for a manager (for whom tasks are the team's)."""
+        if not chat.oversees:
+            return False
+        asked = self._last_ask(chat) or await self._asked_from_history(chat)
+        if not chat.team_first and (asked is None or asked.kind != "team"):
+            return False
+        if any(t not in self._team_people for t, _ in chat.oversees[:MAX_TEAMS_SHOWN]):
+            await self._team_rows(chat)  # their names, to read "Haleema's"
+        flt = tasklist.read_filter(words, self._list_names(chat))
+        if flt is None:
+            return False
+        found = await self._team_list(chat, flt)
+        if found is None:
+            await self._say(chat, talk.to_html(
+                "I couldn't read the team's list just now. Try me again in a minute?"))
+            return True
+        shown, _ = found
+        await self._say(chat, shown.html)
+        logger.info("it support: %s asked for the team's list narrowed (%s): %d row(s), rules",
+                    chat.email, flt.said(), shown.count)
+        return True
 
     def _team_emails(self, chat: Chat) -> frozenset[str]:
         """The teammates of the teams they oversee, as last read."""
@@ -858,6 +952,11 @@ class ITSupportWorker:
             if words and not waiting and await self._status_rules(
                     chat, user_id, access, words, tasks):
                 return
+            # "show only not submitted" after the team's list: the list again,
+            # narrowed by rules (2026-11-19: the model gave up on it).
+            if words and not waiting and set(chat.files) == before and \
+                    await self._list_rules(chat, words):
+                return
             team = await self._team_view(chat)
             person = Person(user_id, chat.email, chat.first_name, tasks, access,
                             team_emails=self._team_emails(chat),
@@ -919,9 +1018,29 @@ class ITSupportWorker:
                 chat.seen.add(str(sent.get("id")))
                 logger.info("it support: sent %s to %s", name, chat.email)
 
+            async def team_list(who: str, section: str, state: str) -> str:
+                names = self._list_names(chat)
+                picked = {names[w] for w in re.findall(r"[a-z]+", who.casefold())
+                          if w in names}
+                if who.strip() and not picked:
+                    return f"{who} isn't in a team they oversee."
+                flt = tasklist.Filter("" if state == "all" else state, frozenset(picked),
+                                      frozenset({section}) if section else frozenset())
+                found = await self._team_list(chat, flt)
+                if found is None:
+                    return "The team's list couldn't be read just now; say so."
+                shown, rows = found
+                turn.block = shown.html
+                return (f"Shown as a table where you put {tasklist.MARK} on its own line in "
+                        "your reply (once). Don't type the rows yourself; a short line before "
+                        f"it at most. {shown.line}\n"
+                        + tasklist.describe_rows(rows, datetime.now(UTC)))
+
             turn = Turn(person, files, on_find=find, on_say=say, on_file=send_file,
                         agreed=agreed,
                         effort="low" if small else None)
+            if chat.oversees:
+                turn.on_team_list = team_list
             if focus_note(chat) and chat.focus is not None:
                 turn.focus = chat.focus[:4]  # what the conversation is on, carried over
 
@@ -940,7 +1059,7 @@ class ITSupportWorker:
             if turn.plan.steps:
                 chat.plan = (turn.plan, time.monotonic())
                 logger.info("it support: asked %s to confirm: %s", chat.email, turn.plan.said())
-            body = talk.to_html(text.strip()[:4000])
+            body = tasklist.fill(talk.to_html(text.strip()[:4000]), turn.block)
             if self._settings.it_support_show_timing:
                 body += (f"<br><br><i>({time.monotonic() - started:.1f}s · "
                          f"{turn.who or 'no model'})</i>")
@@ -1385,7 +1504,10 @@ class ITSupportWorker:
         by_email = {c.email: c for c in chats}
         for chat in chats:
             key = brief_mod.sent_key(chat.email, day)
-            if self._asked.has(key):
+            # The database's flag, not only the local file: a deploy wipes the
+            # file, and the brief went out again (the user, 2026-11-19: "each
+            # msg need its own flag ... if sent it dont sent again").
+            if self._asked.has(key) or await self._sent.seen(key):
                 continue
             known = self._work.get(chat.email)
             if known is None or known.read_at is None or now - known.read_at > timedelta(
@@ -1398,11 +1520,15 @@ class ITSupportWorker:
                     away = await away_reason(session, chat.email)
                 if away:
                     self._asked.mark_key(key, now)
+                    await self._sent.mark(key, email=chat.email, kind="morning-brief",
+                                          detail={"skipped": away})
                     logger.info("it support: no brief for %s, away (%s)", chat.email, away)
                     continue
             plan = brief_mod.plan(known, now=now, settings=s)
             if plan.empty:
                 self._asked.mark_key(key, now)
+                await self._sent.mark(key, email=chat.email, kind="morning-brief",
+                                      detail={"skipped": "nothing due"})
                 continue
             target = by_email.get(test_to) if test_to else chat
             if target is None:
@@ -1418,8 +1544,12 @@ class ITSupportWorker:
                 text = f"(test: this is {chat.first_name}'s morning brief) {text}"
             await self._say(target, talk.to_html(text))
             self._asked.mark_key(key, now)
+            await self._sent.mark(key, email=chat.email, kind="morning-brief")
             # What the brief named gets no "need a hand?" later the same day.
             self._asked.mark(plan.today + plan.next_day, now)
+            for task in plan.today + plan.next_day:
+                await self._sent.mark(due_key(task), email=chat.email, kind="due-ask",
+                                      detail={"by": "morning brief"})
             logger.info("it support: morning brief to %s (%d today, %d early tomorrow, %d "
                         "late)%s", chat.email, len(plan.today), len(plan.next_day),
                         len(plan.late), f", sent to {target.email}" if target is not chat else "")
@@ -1447,6 +1577,9 @@ class ITSupportWorker:
             if known is None or known.read_at is None:
                 continue
             tasks = self._asked.new(due.to_ask(known, now=now, settings=s))
+            # Each task's own flag in the database too: the file is gone after
+            # a deploy.
+            tasks = [t for t in tasks if not await self._sent.seen(due_key(t))]
             if not tasks:
                 continue
             target = by_email.get(test_to) if test_to else chat
@@ -1454,6 +1587,21 @@ class ITSupportWorker:
                 logger.warning("it support: IT_SUPPORT_DUE_TEST_TO %s is not a chat it answers",
                                test_to)
                 return
+            # And the chat itself: anything IT Support already said about the
+            # task today (an ask sent before its flag was kept anywhere but
+            # the local file) isn't asked again.
+            try:
+                said = await self._said_today(target, now)
+            except Exception:  # noqa: BLE001 - unsure: ask nothing this round
+                logger.exception("it support: reading %s's chat before a check-in failed",
+                                 target.email)
+                continue
+            for task in [t for t in tasks if mentioned(t.task_id, t.title, said)]:
+                await self._sent.mark(due_key(task), email=chat.email, kind="due-ask",
+                                      detail={"skipped": "already said in the chat"})
+            tasks = [t for t in tasks if not mentioned(t.task_id, t.title, said)]
+            if not tasks:
+                continue
             spoken = await due.write(
                 self._model, first_name=chat.first_name, tasks=tasks, now=now,
                 order=s.it_support_chat_providers, context=work.describe(known, now),
@@ -1465,8 +1613,24 @@ class ITSupportWorker:
             target.seen.add(str(sent.get("id")))
             target.active_at, target.notes_behind = time.monotonic(), True
             self._asked.mark(tasks, now)
+            for task in tasks:
+                await self._sent.mark(due_key(task), email=chat.email, kind="due-ask",
+                                      detail={"task": task.task_id})
             logger.info("it support: asked %s about %d task(s) closing soon%s", chat.email,
                         len(tasks), f" (sent to {target.email})" if target is not chat else "")
+
+    async def _said_today(self, chat: Chat, now: datetime) -> str:
+        """Everything IT Support wrote in this chat on today's UAE date."""
+        today = now.astimezone(DUBAI).date()
+        out = []
+        for message in await self._messages(chat, top=30):
+            at = _when(message.get("createdDateTime"))
+            sender = ((message.get("from") or {}).get("user") or {}).get("id")
+            if at is None or at.astimezone(DUBAI).date() != today:
+                continue
+            if sender == self.me_id:
+                out.append(talk.plain(message))
+        return "\n".join(out)
 
     # ── files in the chat: read, understood, answered ─────────────────
 
